@@ -1,0 +1,30 @@
+[package]
+name = "xshm"
+version = "0.2.0"
+edition = "2021"
+description = "High-performance cross-process shared memory IPC using NT syscalls via SSN"
+authors = ["Platon"]
+
+[lib]
+name = "xshm"
+crate-type = ["rlib", "staticlib"]
+
+[build-dependencies]
+cbindgen = "0.29"
+
+[dependencies]
+thiserror = "1.0"
+
+# SSN - прямые NT syscalls
+ssn = { git = "https://github.com/Platon7788/SSN", default-features = false, features = ["std", "direct", "wrapper"] }
+
+[features]
+default = []
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true

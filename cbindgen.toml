@@ -1,0 +1,41 @@
+language = "C"
+include_guard = "XSHM_H"
+pragma_once = true
+sys_includes = ["stdint.h", "stdbool.h", "stddef.h"]
+cpp_compat = true
+
+[export]
+include = [
+    "shm_endpoint_config_t",
+    "shm_callbacks_t",
+    "shm_error_t",
+    "shm_direction_t",
+    "shm_auto_options_t",
+    "shm_auto_stats_t",
+    "ServerHandle",
+    "ClientHandle",
+    "AutoServerHandle",
+    "AutoClientHandle",
+    "shm_server_start",
+    "shm_server_wait_for_client",
+    "shm_server_stop",
+    "shm_server_send",
+    "shm_server_receive",
+    "shm_server_poll",
+    "shm_auto_options_default",
+    "shm_server_start_auto",
+    "shm_server_send_auto",
+    "shm_server_stats_auto",
+    "shm_server_stop_auto",
+    "shm_client_connect",
+    "shm_client_disconnect",
+    "shm_client_is_connected",
+    "shm_client_send",
+    "shm_client_receive",
+    "shm_client_poll",
+    "shm_client_connect_auto",
+    "shm_client_send_auto",
+    "shm_client_stats_auto",
+    "shm_client_disconnect_auto"
+]
+
