@@ -13,6 +13,7 @@ mod win;
 
 pub mod auto;
 pub mod ffi;
+pub mod ntapi;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;

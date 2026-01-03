@@ -1,23 +1,30 @@
-//! Platform layer - NT syscalls через SSN
+//! Platform layer - прямые вызовы NT API через ntdll.dll
 //!
-//! Полностью использует SSN для всех операций с ядром Windows.
-//! Никаких зависимостей от windows-sys/winapi.
+//! Использует статическую линковку с ntdll.dll.
+//! Никаких внешних зависимостей, никакого TLS.
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use crate::error::{Result, ShmError};
 use crate::layout::shared_mapping_size;
-
-// SSN imports
-use ssn::hash::precomputed;
-use ssn::syscall_direct;
-use ssn::types::{
-    security::NullDaclSecurityDescriptor,
-    HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, PVOID, STATUS_SUCCESS, UNICODE_STRING, ULONG,
-    OBJ_CASE_INSENSITIVE, PAGE_READWRITE, SEC_COMMIT, SECTION_ALL_ACCESS, VIEW_UNMAP,
+use crate::ntapi::{
+    // Types
+    HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, PVOID, LARGE_INTEGER,
+    NullDaclSecurityDescriptor,
+    // Constants
+    STATUS_SUCCESS, STATUS_TIMEOUT,
+    OBJ_CASE_INSENSITIVE,
+    SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, VIEW_UNMAP,
+    EVENT_ALL_ACCESS, SYNCHRONIZATION_EVENT,
+    WAIT_ANY,
+    // Functions
+    NtClose, NtCreateEvent, NtOpenEvent, NtSetEvent,
+    NtWaitForSingleObject, NtWaitForMultipleObjects,
+    NtCreateSection, NtOpenSection, NtMapViewOfSection, NtUnmapViewOfSection,
+    NT_CURRENT_PROCESS,
+    // Helpers
+    NtName, duration_to_nt_timeout,
 };
 
 // ============================================================================
@@ -25,12 +32,6 @@ use ssn::types::{
 // ============================================================================
 
 const INVALID_HANDLE_VALUE: isize = -1;
-
-// Event access rights
-const EVENT_ALL_ACCESS: u32 = 0x1F0003;
-
-// Event types
-const SYNCHRONIZATION_EVENT: u32 = 0;
 
 // ============================================================================
 // Handle wrapper
@@ -53,7 +54,7 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 as isize != INVALID_HANDLE_VALUE {
             unsafe {
-                let _ = syscall_direct!(precomputed::NTCLOSE, self.0);
+                let _ = NtClose(self.0);
             }
         }
     }
@@ -63,72 +64,6 @@ impl Drop for Handle {
 // Helper functions
 // ============================================================================
 
-fn to_wide(value: &str) -> Vec<u16> {
-    OsStr::new(value)
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-/// Преобразование Win32 имени в NT путь
-fn to_nt_path(name: &str) -> String {
-    if let Some(stripped) = name.strip_prefix("Local\\") {
-        format!("\\BaseNamedObjects\\{}", stripped)
-    } else if let Some(stripped) = name.strip_prefix("Global\\") {
-        format!("\\BaseNamedObjects\\{}", stripped)
-    } else if name.starts_with('\\') {
-        name.to_owned()
-    } else {
-        format!("\\BaseNamedObjects\\{}", name)
-    }
-}
-
-/// Структура для хранения NT имени с валидным указателем
-struct NtName {
-    wide: Vec<u16>,
-    unicode: UNICODE_STRING,
-}
-
-impl NtName {
-    fn new(name: &str) -> Self {
-        let nt_path = to_nt_path(name);
-        let wide = to_wide(&nt_path);
-        let byte_len = ((wide.len() - 1) * 2) as u16;
-        
-        let mut result = Self {
-            wide,
-            unicode: UNICODE_STRING {
-                Length: byte_len,
-                MaximumLength: byte_len + 2,
-                Buffer: null_mut(), // Временно null
-            },
-        };
-        
-        // Теперь wide уже на своём месте, можно взять указатель
-        result.unicode.Buffer = result.wide.as_ptr() as *mut u16;
-        result
-    }
-    
-    fn as_unicode_ptr(&mut self) -> *mut UNICODE_STRING {
-        &mut self.unicode
-    }
-}
-
-fn init_object_attributes(
-    name: *mut UNICODE_STRING,
-    attributes: ULONG,
-    sd: PVOID,
-) -> OBJECT_ATTRIBUTES {
-    OBJECT_ATTRIBUTES {
-        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as ULONG,
-        RootDirectory: null_mut(),
-        ObjectName: name,
-        Attributes: attributes,
-        SecurityDescriptor: sd,
-        SecurityQualityOfService: null_mut(),
-    }
-}
-
 fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
     ShmError::WindowsError {
         code: status as u32,
@@ -137,7 +72,7 @@ fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
 }
 
 // ============================================================================
-// EventHandle - NT Event через SSN
+// EventHandle - NT Event через ntdll.dll
 // ============================================================================
 
 pub struct EventHandle {
@@ -153,8 +88,8 @@ impl EventHandle {
     pub fn create(name: &str) -> Result<Self> {
         let mut nt_name = NtName::new(name);
         let mut sd = NullDaclSecurityDescriptor::new();
-        let mut obj_attr = init_object_attributes(
-            nt_name.as_unicode_ptr(),
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
             OBJ_CASE_INSENSITIVE,
             sd.as_ptr(),
         );
@@ -162,13 +97,12 @@ impl EventHandle {
         let mut handle: HANDLE = null_mut();
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTCREATE_EVENT,
-                &mut handle as *mut HANDLE,
+            NtCreateEvent(
+                &mut handle,
                 EVENT_ALL_ACCESS,
-                &mut obj_attr as *mut OBJECT_ATTRIBUTES,
+                &mut obj_attr,
                 SYNCHRONIZATION_EVENT,
-                0u32
+                0, // InitialState = FALSE
             )
         };
 
@@ -185,16 +119,19 @@ impl EventHandle {
     /// Открытие события через NtOpenEvent
     pub fn open(name: &str) -> Result<Self> {
         let mut nt_name = NtName::new(name);
-        let mut obj_attr = init_object_attributes(nt_name.as_unicode_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
+            OBJ_CASE_INSENSITIVE,
+            null_mut(),
+        );
 
         let mut handle: HANDLE = null_mut();
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTOPEN_EVENT,
-                &mut handle as *mut HANDLE,
+            NtOpenEvent(
+                &mut handle,
                 EVENT_ALL_ACCESS,
-                &mut obj_attr as *mut OBJECT_ATTRIBUTES
+                &mut obj_attr,
             )
         };
 
@@ -212,11 +149,7 @@ impl EventHandle {
     pub fn set(&self) -> Result<()> {
         let mut previous_state: i32 = 0;
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTSET_EVENT,
-                self.handle.raw(),
-                &mut previous_state as *mut i32
-            )
+            NtSetEvent(self.handle.raw(), &mut previous_state)
         };
 
         if status != STATUS_SUCCESS {
@@ -228,7 +161,7 @@ impl EventHandle {
     /// Ожидание через NtWaitForSingleObject
     pub fn wait(&self, timeout: Option<Duration>) -> Result<bool> {
         let timeout_value: i64 = match timeout {
-            Some(d) => -((d.as_nanos() / 100) as i64),
+            Some(d) => duration_to_nt_timeout(d),
             None => 0,
         };
 
@@ -238,19 +171,17 @@ impl EventHandle {
             null()
         };
 
-        // NtWaitForSingleObject(Handle, Alertable, Timeout)
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTWAIT_FOR_SINGLE_OBJECT,
-                self.handle.raw() as usize,
-                0usize,                    // Alertable = FALSE
-                timeout_ptr as usize
+            NtWaitForSingleObject(
+                self.handle.raw(),
+                0, // Alertable = FALSE
+                timeout_ptr,
             )
         };
 
         match status {
             STATUS_SUCCESS => Ok(true),
-            0x00000102 => Ok(false), // STATUS_TIMEOUT
+            STATUS_TIMEOUT => Ok(false),
             _ => Err(status_to_error(status, "NtWaitForSingleObject")),
         }
     }
@@ -261,7 +192,7 @@ impl EventHandle {
 }
 
 // ============================================================================
-// Mapping - NT Section через SSN
+// Mapping - NT Section через ntdll.dll
 // ============================================================================
 
 #[derive(Debug)]
@@ -281,25 +212,24 @@ impl Mapping {
         let size = shared_mapping_size();
         let mut nt_name = NtName::new(name);
         let mut sd = NullDaclSecurityDescriptor::new();
-        let mut obj_attr = init_object_attributes(
-            nt_name.as_unicode_ptr(),
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
             OBJ_CASE_INSENSITIVE,
             sd.as_ptr(),
         );
 
         let mut section_handle: HANDLE = null_mut();
-        let mut max_size: i64 = size as i64;
+        let mut max_size = LARGE_INTEGER { QuadPart: size as i64 };
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTCREATE_SECTION,
-                &mut section_handle as *mut HANDLE,
+            NtCreateSection(
+                &mut section_handle,
                 SECTION_ALL_ACCESS,
-                &mut obj_attr as *mut OBJECT_ATTRIBUTES,
-                &mut max_size as *mut i64,
+                &mut obj_attr,
+                &mut max_size,
                 PAGE_READWRITE,
                 SEC_COMMIT,
-                0usize // FileHandle = NULL
+                null_mut(), // FileHandle = NULL
             )
         };
 
@@ -314,18 +244,17 @@ impl Mapping {
         let mut view_size: usize = 0;
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTMAP_VIEW_OF_SECTION,
+            NtMapViewOfSection(
                 handle.raw(),
-                -1isize as HANDLE,
-                &mut base_address as *mut PVOID,
-                0usize,
-                0usize,
-                null_mut::<i64>(),
-                &mut view_size as *mut usize,
+                NT_CURRENT_PROCESS,
+                &mut base_address,
+                0,
+                0,
+                null_mut(), // SectionOffset
+                &mut view_size,
                 VIEW_UNMAP,
-                0u32,
-                PAGE_READWRITE
+                0,
+                PAGE_READWRITE,
             )
         };
 
@@ -345,16 +274,19 @@ impl Mapping {
     pub fn open(name: &str) -> Result<Self> {
         let size = shared_mapping_size();
         let mut nt_name = NtName::new(name);
-        let mut obj_attr = init_object_attributes(nt_name.as_unicode_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
+            OBJ_CASE_INSENSITIVE,
+            null_mut(),
+        );
 
         let mut section_handle: HANDLE = null_mut();
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTOPEN_SECTION,
-                &mut section_handle as *mut HANDLE,
+            NtOpenSection(
+                &mut section_handle,
                 SECTION_ALL_ACCESS,
-                &mut obj_attr as *mut OBJECT_ATTRIBUTES
+                &mut obj_attr,
             )
         };
 
@@ -369,18 +301,17 @@ impl Mapping {
         let mut view_size: usize = 0;
 
         let status = unsafe {
-            syscall_direct!(
-                precomputed::NTMAP_VIEW_OF_SECTION,
+            NtMapViewOfSection(
                 handle.raw(),
-                -1isize as HANDLE,
-                &mut base_address as *mut PVOID,
-                0usize,
-                0usize,
-                null_mut::<i64>(),
-                &mut view_size as *mut usize,
+                NT_CURRENT_PROCESS,
+                &mut base_address,
+                0,
+                0,
+                null_mut(),
+                &mut view_size,
                 VIEW_UNMAP,
-                0u32,
-                PAGE_READWRITE
+                0,
+                PAGE_READWRITE,
             )
         };
 
@@ -405,11 +336,7 @@ impl Drop for Mapping {
     fn drop(&mut self) {
         if !self.view.is_null() {
             unsafe {
-                let _ = syscall_direct!(
-                    precomputed::NTUNMAP_VIEW_OF_SECTION,
-                    -1isize as HANDLE,
-                    self.view as PVOID
-                );
+                let _ = NtUnmapViewOfSection(NT_CURRENT_PROCESS, self.view as PVOID);
             }
             self.view = null_mut();
         }
@@ -426,7 +353,7 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
     }
 
     let timeout_value: i64 = match timeout {
-        Some(d) => -((d.as_nanos() / 100) as i64),
+        Some(d) => duration_to_nt_timeout(d),
         None => 0,
     };
 
@@ -436,22 +363,19 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
         null()
     };
 
-    // NtWaitForMultipleObjects(Count, Handles, WaitType, Alertable, Timeout)
-    // WaitType: 0 = WaitAll, 1 = WaitAny
     let status = unsafe {
-        syscall_direct!(
-            precomputed::NTWAIT_FOR_MULTIPLE_OBJECTS,
-            handles.len() as usize,      // Count
-            handles.as_ptr() as usize,   // Handles array
-            1usize,                       // WaitType = WaitAny
-            0usize,                       // Alertable = FALSE
-            timeout_ptr as usize         // Timeout
+        NtWaitForMultipleObjects(
+            handles.len() as u32,
+            handles.as_ptr() as *const HANDLE,
+            WAIT_ANY,
+            0, // Alertable = FALSE
+            timeout_ptr,
         )
     };
 
     match status {
         s if s >= 0 && (s as usize) < handles.len() => Ok(Some(s as usize)),
-        0x00000102 => Ok(None), // STATUS_TIMEOUT
+        STATUS_TIMEOUT => Ok(None),
         _ => Err(status_to_error(status, "NtWaitForMultipleObjects")),
     }
 }

@@ -1,8 +1,8 @@
 [package]
 name = "xshm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "High-performance cross-process shared memory IPC using NT syscalls via SSN"
+description = "High-performance cross-process shared memory IPC using direct NT API calls"
 authors = ["Platon"]
 
 [lib]
@@ -15,8 +15,8 @@ cbindgen = "0.29"
 [dependencies]
 thiserror = "1.0"
 
-# SSN - прямые NT syscalls
-ssn = { git = "https://github.com/Platon7788/SSN", default-features = false, features = ["std", "direct", "wrapper"] }
+# Без внешних зависимостей для NT API!
+# Используем прямую линковку с ntdll.dll через #[link(name = "ntdll")]
 
 [features]
 default = []

@@ -8,11 +8,12 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 
 - Cross-process channel with two ring buffers (server→client and client→server), each 2 MB
 - Lock-free concurrent access: independent read/write, automatic overwrite on overflow
-- Event-based synchronization via NT syscalls for data/space/connection notifications
+- Event-based synchronization via NT API for data/space/connection notifications
 - Clean start guarantee: buffers reset on each new connection with generation tracking
 - Ready-to-use C headers (`xshm.h`, `xshm_server.h`, `xshm_client.h`) with helper functions
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`)
-- **NT Syscalls via SSN**: direct syscalls bypassing Win32 API for minimal overhead
+- **Direct NT API**: static linking with ntdll.dll, no external dependencies
+- **No TLS**: no thread-local storage, safe for DLL injection scenarios
 
 ## Architecture
 
@@ -33,8 +34,8 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 │              Shared Memory Layout (layout.rs)               │
 │         ControlBlock + RingHeader + Data regions            │
 ├─────────────────────────────────────────────────────────────┤
-│                  Platform Layer (win.rs)                    │
-│           NT Syscalls via SSN library                       │
+│                  Platform Layer (ntapi/, win.rs)            │
+│         Direct NT API calls via #[link(name = "ntdll")]     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -65,36 +66,39 @@ Total: ~4 MB + headers
 - Windows 10/11
 - Rust 1.77+ (stable)
 - MSVC or MinGW toolchain
+- **Administrator privileges** (for named kernel objects in `\BaseNamedObjects\`)
 
 ## Dependencies
 
-This library uses [SSN](https://github.com/Platon7788/SSN) for direct NT syscalls, bypassing Win32 API:
+**Minimal dependencies** — only `thiserror` for error handling:
 
 ```toml
 [dependencies]
-ssn = { git = "https://github.com/Platon7788/SSN", features = ["std", "direct", "wrapper"] }
+thiserror = "1.0"
 ```
 
-SSN provides:
-- Direct syscall execution via `syscall_direct!` macro
-- Precomputed hashes for NT functions
-- NTSTATUS types and constants
+NT API calls are made directly via static linking with `ntdll.dll`:
+- No SSN dependency
+- No GetProcAddress at runtime
+- No TLS (Thread Local Storage)
 
 ## Build
 
 ```bash
-# Run tests
+# Run tests (requires admin privileges)
 cargo test
 
 # Build static libraries
-cargo build --release --target i686-pc-windows-msvc        # x86 MSVC
-cargo build --release --target x86_64-pc-windows-gnu       # x64 MinGW
+cargo build --release                                        # x64 MSVC (default)
+cargo build --release --target i686-pc-windows-msvc          # x86 MSVC
+cargo build --release --target x86_64-pc-windows-gnu         # x64 MinGW
 ```
 
 Output files:
 
 | Target | Debug | Release |
 |--------|-------|---------|
+| MSVC x64 | `target/debug/xshm.lib` | `target/release/xshm.lib` |
 | MSVC x86 | `target/i686-pc-windows-msvc/debug/xshm.lib` | `target/i686-pc-windows-msvc/release/xshm.lib` |
 | MinGW x64 | `target/x86_64-pc-windows-gnu/debug/libxshm.a` | `target/x86_64-pc-windows-gnu/release/libxshm.a` |
 
@@ -174,8 +178,8 @@ fn main() -> Result<()> {
 
 ### Linking
 
-- MSVC: `xshm.lib` + `ws2_32.lib`, `userenv.lib`, `ntdll.lib`
-- MinGW: `libxshm.a` + `-lws2_32`, `-luserenv`, `-lntdll`
+- MSVC: `xshm.lib` + `ntdll.lib`
+- MinGW: `libxshm.a` + `-lntdll`
 
 ### Server Example (C)
 
@@ -249,7 +253,8 @@ int main(void) {
 
 - **SPSC**: Strictly one producer and one consumer per channel
 - **Overwrite on overflow**: New messages evict oldest when queue is full
-- **Windows only**: Uses NT syscalls via SSN library
+- **Windows only**: Uses direct NT API calls
+- **Admin required**: Named kernel objects require elevated privileges
 - **Message size**: 2 to 65535 bytes
 
 ## Project Structure
@@ -258,12 +263,17 @@ int main(void) {
 xshm/
 ├── src/
 │   ├── lib.rs          # Main module, public exports
+│   ├── ntapi/          # Direct NT API layer (no external deps)
+│   │   ├── mod.rs      # Module exports
+│   │   ├── types.rs    # NT types (HANDLE, NTSTATUS, OBJECT_ATTRIBUTES...)
+│   │   ├── funcs.rs    # NT function declarations (#[link(name = "ntdll")])
+│   │   └── helpers.rs  # UNICODE_STRING, NtName, path conversion
+│   ├── win.rs          # High-level wrappers (EventHandle, Mapping)
 │   ├── server.rs       # SharedServer endpoint
 │   ├── client.rs       # SharedClient endpoint
 │   ├── ring.rs         # Lock-free SPSC ring buffer
 │   ├── layout.rs       # Shared memory structures
-│   ├── events.rs       # NT Event wrappers
-│   ├── win.rs          # NT syscalls via SSN
+│   ├── events.rs       # Event synchronization
 │   ├── ffi.rs          # C-compatible FFI layer
 │   ├── error.rs        # Error types
 │   ├── constants.rs    # Protocol constants
@@ -275,6 +285,9 @@ xshm/
 │   ├── xshm.h          # Main FFI header
 │   ├── xshm_server.h   # Server helpers
 │   └── xshm_client.h   # Client helpers
+├── examples/
+│   ├── test_ntapi.rs   # NT API test
+│   └── test_client_x86.rs
 ├── tests/
 │   └── stress.rs       # Stress tests
 ├── Cargo.toml

@@ -121,6 +121,65 @@ typedef void ServerHandle;
 
 typedef void ClientHandle;
 
+typedef int32_t NTSTATUS;
+
+typedef uint32_t ULONG;
+
+typedef uint32_t ACCESS_MASK;
+
+typedef void *HANDLE;
+
+#define STATUS_SUCCESS 0
+
+#define STATUS_TIMEOUT 258
+
+#define STATUS_WAIT_0 0
+
+#define OBJ_CASE_INSENSITIVE 64
+
+#define SECTION_ALL_ACCESS 983071
+
+#define PAGE_READWRITE 4
+
+#define SEC_COMMIT 134217728
+
+/**
+ * ViewUnmap - секция будет размаппена при закрытии handle
+ */
+#define VIEW_UNMAP 2
+
+#define EVENT_ALL_ACCESS 2031619
+
+/**
+ * SynchronizationEvent - auto-reset event
+ */
+#define SYNCHRONIZATION_EVENT 1
+
+/**
+ * NotificationEvent - manual-reset event
+ */
+#define NOTIFICATION_EVENT 0
+
+/**
+ * WaitAny - вернуться когда любой объект сигнализирован
+ */
+#define WAIT_ANY 1
+
+/**
+ * WaitAll - вернуться когда все объекты сигнализированы
+ */
+#define WAIT_ALL 0
+
+/**
+ * Псевдо-handle текущего процесса
+ */
+#define NT_CURRENT_PROCESS (HANDLE)-1
+
+/**
+ * SECURITY_DESCRIPTOR_REVISION
+ */
+#define SECURITY_DESCRIPTOR_REVISION 1
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus

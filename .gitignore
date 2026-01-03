@@ -1,3 +1,4 @@
 /target
 /.kiro
 Cargo.lock
+/x_core
