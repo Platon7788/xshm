@@ -4,6 +4,8 @@ version = "0.3.0"
 edition = "2021"
 description = "High-performance cross-process shared memory IPC using direct NT API calls"
 authors = ["Platon"]
+license = "MIT"
+repository = "https://github.com/Platon7788/xshm"
 
 [lib]
 name = "xshm"
