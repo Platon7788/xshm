@@ -12,8 +12,9 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 - Clean start guarantee: buffers reset on each new connection with generation tracking
 - Ready-to-use C headers (`xshm.h`, `xshm_server.h`, `xshm_client.h`) with helper functions
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`)
+- **Multi-client mode**: single server handles up to N clients (default 10) with individual channels
 - **Direct NT API**: static linking with ntdll.dll, no external dependencies
-- **No TLS**: no thread-local storage, safe for DLL injection scenarios
+- **Static CRT**: TLS and CRT statically linked, no runtime DLL dependencies
 
 ## Architecture
 
@@ -24,6 +25,9 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 ├─────────────────────────────────────────────────────────────┤
 │                    Auto Layer (auto/)                       │
 │         Background worker threads with callbacks            │
+├─────────────────────────────────────────────────────────────┤
+│                   Multi Layer (multi/)                      │
+│      Multi-client server: N slots, each with SPSC channel   │
 ├─────────────────────────────────────────────────────────────┤
 │              Endpoint Layer (server.rs, client.rs)          │
 │            Synchronous server and client API                │
@@ -167,6 +171,60 @@ fn main() -> Result<()> {
 }
 ```
 
+### Multi-client mode (Rust)
+
+```rust
+use std::sync::Arc;
+use xshm::multi::{MultiServer, MultiHandler, MultiOptions};
+use xshm::{AutoClient, AutoHandler, AutoOptions, ChannelKind, Result};
+
+struct ServerHandler;
+
+impl MultiHandler for ServerHandler {
+    fn on_client_connect(&self, client_id: u32) {
+        println!("Client {} connected", client_id);
+    }
+    fn on_client_disconnect(&self, client_id: u32) {
+        println!("Client {} disconnected", client_id);
+    }
+    fn on_message(&self, client_id: u32, data: &[u8]) {
+        println!("Message from client {}: {:?}", client_id, data);
+    }
+}
+
+struct ClientHandler;
+
+impl AutoHandler for ClientHandler {
+    fn on_message(&self, _dir: ChannelKind, data: &[u8]) {
+        println!("Received: {:?}", data);
+    }
+}
+
+fn main() -> Result<()> {
+    // Start multi-client server with 10 slots
+    let server = MultiServer::start("MyService", Arc::new(ServerHandler), MultiOptions::default())?;
+    
+    // Clients connect to individual slots: "MyService_0", "MyService_1", etc.
+    let client0 = AutoClient::connect(
+        &server.channel_name(0).unwrap(),
+        Arc::new(ClientHandler),
+        AutoOptions::default()
+    )?;
+    
+    // Send to specific client
+    server.send_to(0, b"Hello client 0")?;
+    
+    // Broadcast to all connected clients
+    server.broadcast(b"Hello everyone")?;
+    
+    // Client sends to server
+    client0.send(b"Hello server")?;
+    
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    Ok(())
+}
+```
+
 ## C/C++ Integration
 
 ### Headers
@@ -240,6 +298,52 @@ int main(void) {
 }
 ```
 
+### Multi-client Server (C)
+
+```c
+#include "xshm_server.h"
+#include <stdio.h>
+
+void on_connect(uint32_t client_id, void* user_data) {
+    printf("Client %u connected\n", client_id);
+}
+
+void on_disconnect(uint32_t client_id, void* user_data) {
+    printf("Client %u disconnected\n", client_id);
+}
+
+void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_data) {
+    printf("Message from client %u: %.*s\n", client_id, (int)size, (const char*)data);
+}
+
+int main(void) {
+    shm_multi_callbacks_t callbacks = xshm_multi_callbacks_default();
+    callbacks.on_client_connect = on_connect;
+    callbacks.on_client_disconnect = on_disconnect;
+    callbacks.on_message = on_message;
+
+    shm_multi_options_t options = xshm_multi_options_default();
+    options.max_clients = 10;
+
+    MultiServerHandle* server = shm_multi_server_start("MyService", &callbacks, &options);
+    if (!server) return 1;
+
+    // Send to specific client
+    shm_multi_server_send_to(server, 0, "Hello client 0", 14);
+
+    // Broadcast to all
+    uint32_t sent = 0;
+    shm_multi_server_broadcast(server, "Hello all", 9, &sent);
+    printf("Broadcast sent to %u clients\n", sent);
+
+    // Get connected clients
+    printf("Connected: %u clients\n", shm_multi_server_client_count(server));
+
+    shm_multi_server_stop(server);
+    return 0;
+}
+```
+
 ## Constants
 
 | Constant | Value | Description |
@@ -261,6 +365,8 @@ int main(void) {
 
 ```
 xshm/
+├── .cargo/
+│   └── config.toml     # Static CRT linking configuration
 ├── src/
 │   ├── lib.rs          # Main module, public exports
 │   ├── ntapi/          # Direct NT API layer (no external deps)
@@ -279,17 +385,19 @@ xshm/
 │   ├── constants.rs    # Protocol constants
 │   ├── naming.rs       # Kernel object naming
 │   ├── shared.rs       # SharedView for mapped memory
-│   └── auto/
-│       └── mod.rs      # Auto-mode with background workers
+│   ├── auto/
+│   │   └── mod.rs      # Auto-mode with background workers
+│   └── multi/
+│       ├── mod.rs      # MultiServer - multi-client support
+│       └── ffi.rs      # Multi-client C API
 ├── include/
 │   ├── xshm.h          # Main FFI header
-│   ├── xshm_server.h   # Server helpers
+│   ├── xshm_server.h   # Server helpers + Multi API
 │   └── xshm_client.h   # Client helpers
-├── examples/
-│   ├── test_ntapi.rs   # NT API test
-│   └── test_client_x86.rs
 ├── tests/
-│   └── stress.rs       # Stress tests
+│   ├── stress.rs       # Stress tests
+│   ├── ordering.rs     # Memory ordering tests
+│   └── multi.rs        # Multi-client tests
 ├── Cargo.toml
 ├── build.rs            # cbindgen integration
 └── cbindgen.toml

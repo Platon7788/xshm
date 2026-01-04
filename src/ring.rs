@@ -1,3 +1,9 @@
+//! Lock-free SPSC кольцевой буфер для shared memory IPC.
+//!
+//! ВАЖНО: Код оптимизирован для x86/x86_64 с TSO (Total Store Order).
+//! На этих архитектурах stores видны в порядке программы, что упрощает
+//! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
+
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering;
 
@@ -160,16 +166,21 @@ impl RingBuffer {
                 self.copy_into_wrapped((idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize), payload);
             }
 
+            // ВАЖНО: сначала увеличиваем message_count, потом обновляем write_pos
+            // Это гарантирует, что reader увидит count > 0 когда видит новый write_pos
+            // На x86/x64 TSO это безопасно, но порядок операций всё равно важен
+            let prev_count = header.message_count.fetch_add(1, Ordering::AcqRel);
+            
             let new_write = write.wrapping_add(total_required);
             header.write_pos.store(new_write, Ordering::Release);
-            let prev = header.message_count.fetch_add(1, Ordering::Release);
-            if prev == 0 {
+            
+            if prev_count == 0 {
                 header.sequence.fetch_add(1, Ordering::Relaxed);
             }
 
             return Ok(WriteOutcome {
                 overwritten,
-                was_empty: prev == 0,
+                was_empty: prev_count == 0,
             });
         }
     }
@@ -201,9 +212,13 @@ impl RingBuffer {
 
         let total = MESSAGE_HEADER_SIZE + msg_len;
         let new_read = read.wrapping_add(total as u32);
+        
+        // ВАЖНО: сначала обновляем read_pos, потом уменьшаем message_count
+        // Симметрично write_message для корректной синхронизации
         header.read_pos.store(new_read, Ordering::Release);
-        let prev = header.message_count.fetch_sub(1, Ordering::Release);
-        if prev <= 1 {
+        let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
+        
+        if prev_count <= 1 {
             header.sequence.fetch_add(1, Ordering::Relaxed);
         }
 

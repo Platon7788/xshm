@@ -60,6 +60,11 @@
 
 #define HANDSHAKE_SERVER_READY 2
 
+/**
+ * Максимальное количество клиентов по умолчанию
+ */
+#define DEFAULT_MAX_CLIENTS 10
+
 typedef enum shm_error_t {
   SHM_SUCCESS = 0,
   SHM_ERROR_INVALID_PARAM = -1,
@@ -121,64 +126,54 @@ typedef void ServerHandle;
 
 typedef void ClientHandle;
 
-typedef int32_t NTSTATUS;
-
-typedef uint32_t ULONG;
-
-typedef uint32_t ACCESS_MASK;
-
-typedef void *HANDLE;
-
-#define STATUS_SUCCESS 0
-
-#define STATUS_TIMEOUT 258
-
-#define STATUS_WAIT_0 0
-
-#define OBJ_CASE_INSENSITIVE 64
-
-#define SECTION_ALL_ACCESS 983071
-
-#define PAGE_READWRITE 4
-
-#define SEC_COMMIT 134217728
+/**
+ * Опции для мультиклиентного сервера
+ */
+typedef struct shm_multi_options_t {
+  /**
+   * Максимальное количество клиентов (по умолчанию 10)
+   */
+  uint32_t max_clients;
+  /**
+   * Таймаут ожидания событий в мс (по умолчанию 50)
+   */
+  uint32_t poll_timeout_ms;
+  /**
+   * Количество сообщений за один цикл (по умолчанию 32)
+   */
+  uint32_t recv_batch;
+} shm_multi_options_t;
 
 /**
- * ViewUnmap - секция будет размаппена при закрытии handle
+ * Callbacks для мультиклиентного сервера
  */
-#define VIEW_UNMAP 2
-
-#define EVENT_ALL_ACCESS 2031619
-
-/**
- * SynchronizationEvent - auto-reset event
- */
-#define SYNCHRONIZATION_EVENT 1
-
-/**
- * NotificationEvent - manual-reset event
- */
-#define NOTIFICATION_EVENT 0
-
-/**
- * WaitAny - вернуться когда любой объект сигнализирован
- */
-#define WAIT_ANY 1
-
-/**
- * WaitAll - вернуться когда все объекты сигнализированы
- */
-#define WAIT_ALL 0
-
-/**
- * Псевдо-handle текущего процесса
- */
-#define NT_CURRENT_PROCESS (HANDLE)-1
+typedef struct shm_multi_callbacks_t {
+  /**
+   * Вызывается при подключении клиента
+   */
+  void (*on_client_connect)(uint32_t client_id, void *user_data);
+  /**
+   * Вызывается при отключении клиента
+   */
+  void (*on_client_disconnect)(uint32_t client_id, void *user_data);
+  /**
+   * Вызывается при получении сообщения
+   */
+  void (*on_message)(uint32_t client_id, const void *data, uint32_t size, void *user_data);
+  /**
+   * Вызывается при ошибке (client_id = u32::MAX для общих ошибок)
+   */
+  void (*on_error)(uint32_t client_id, enum shm_error_t error, void *user_data);
+  /**
+   * Пользовательские данные, передаются во все callbacks
+   */
+  void *user_data;
+} shm_multi_callbacks_t;
 
 /**
- * SECURITY_DESCRIPTOR_REVISION
+ * Handle мультиклиентного сервера
  */
-#define SECURITY_DESCRIPTOR_REVISION 1
+typedef void MultiServerHandle;
 
 #ifdef __cplusplus
 extern "C" {
@@ -232,6 +227,142 @@ enum shm_error_t shm_client_send(ClientHandle *handle, const void *data, uint32_
 enum shm_error_t shm_client_receive(ClientHandle *handle, void *buffer, uint32_t *size);
 
 enum shm_error_t shm_client_poll(ClientHandle *handle, uint32_t timeout_ms);
+
+/**
+ * Получить опции по умолчанию
+ */
+struct shm_multi_options_t shm_multi_options_default(void);
+
+/**
+ * Получить callbacks по умолчанию (все NULL)
+ */
+struct shm_multi_callbacks_t shm_multi_callbacks_default(void);
+
+/**
+ * Запуск мультиклиентного сервера
+ *
+ * # Parameters
+ * - `base_name`: Базовое имя канала (клиенты подключаются к "{base_name}_{slot_id}")
+ * - `callbacks`: Callbacks для событий
+ * - `options`: Опции сервера (NULL для значений по умолчанию)
+ *
+ * # Returns
+ * Handle сервера или NULL при ошибке
+ */
+MultiServerHandle *shm_multi_server_start(const char *base_name,
+                                          const struct shm_multi_callbacks_t *callbacks,
+                                          const struct shm_multi_options_t *options);
+
+/**
+ * Отправка сообщения конкретному клиенту
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `client_id`: ID клиента
+ * - `data`: Данные для отправки
+ * - `size`: Размер данных
+ *
+ * # Returns
+ * SHM_SUCCESS или код ошибки
+ */
+enum shm_error_t shm_multi_server_send_to(MultiServerHandle *handle,
+                                          uint32_t client_id,
+                                          const void *data,
+                                          uint32_t size);
+
+/**
+ * Отправка сообщения всем подключённым клиентам
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `data`: Данные для отправки
+ * - `size`: Размер данных
+ * - `sent_count`: (out) Количество клиентов, которым отправлено (может быть NULL)
+ *
+ * # Returns
+ * SHM_SUCCESS или код ошибки
+ */
+enum shm_error_t shm_multi_server_broadcast(MultiServerHandle *handle,
+                                            const void *data,
+                                            uint32_t size,
+                                            uint32_t *sent_count);
+
+/**
+ * Отключение клиента
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `client_id`: ID клиента для отключения
+ *
+ * # Returns
+ * SHM_SUCCESS или код ошибки
+ */
+enum shm_error_t shm_multi_server_disconnect_client(MultiServerHandle *handle, uint32_t client_id);
+
+/**
+ * Получение количества подключённых клиентов
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ *
+ * # Returns
+ * Количество подключённых клиентов или 0 при ошибке
+ */
+uint32_t shm_multi_server_client_count(const MultiServerHandle *handle);
+
+/**
+ * Проверка подключения конкретного клиента
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `client_id`: ID клиента
+ *
+ * # Returns
+ * true если клиент подключён
+ */
+bool shm_multi_server_is_client_connected(const MultiServerHandle *handle, uint32_t client_id);
+
+/**
+ * Получение списка подключённых клиентов
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `client_ids`: Буфер для записи ID клиентов
+ * - `max_count`: Размер буфера
+ * - `actual_count`: (out) Фактическое количество клиентов
+ *
+ * # Returns
+ * SHM_SUCCESS или код ошибки
+ */
+enum shm_error_t shm_multi_server_get_clients(const MultiServerHandle *handle,
+                                              uint32_t *client_ids,
+                                              uint32_t max_count,
+                                              uint32_t *actual_count);
+
+/**
+ * Получение имени канала для конкретного слота
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `slot_id`: ID слота
+ * - `buffer`: Буфер для записи имени
+ * - `buffer_size`: Размер буфера
+ *
+ * # Returns
+ * Длина имени (без null-терминатора) или 0 при ошибке
+ */
+uint32_t shm_multi_server_channel_name(const MultiServerHandle *handle,
+                                       uint32_t slot_id,
+                                       char *buffer,
+                                       uint32_t buffer_size);
+
+/**
+ * Остановка мультиклиентного сервера
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ */
+void shm_multi_server_stop(MultiServerHandle *handle);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::constants::{
     HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, MAX_MESSAGE_SIZE,
-    MIN_MESSAGE_SIZE,
+    MIN_MESSAGE_SIZE, SHARED_MAGIC, SHARED_VERSION,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -29,6 +29,16 @@ impl SharedClient {
         let map_name = mapping_name(name);
         let mapping = Mapping::open(&map_name)?;
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
+        
+        // Проверка magic и version для валидации shared memory
+        let control = view.control_block();
+        if control.magic != SHARED_MAGIC {
+            return Err(ShmError::Corrupted);
+        }
+        if control.version != SHARED_VERSION {
+            return Err(ShmError::HandshakeFailed);
+        }
+        
         let events = SharedEvents::open(name)?;
 
         view.control_block()

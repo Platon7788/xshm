@@ -3,7 +3,7 @@
 mod client;
 mod constants;
 mod error;
-mod events;
+pub(crate) mod events;
 mod layout;
 mod naming;
 mod ring;
@@ -13,11 +13,15 @@ mod win;
 
 pub mod auto;
 pub mod ffi;
-pub mod ntapi;
+pub mod multi;
+
+// Внутренний модуль - не экспортируется в C API
+pub(crate) mod ntapi;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
 pub use error::{Result, ShmError};
+pub use multi::{MultiHandler, MultiOptions, MultiServer};
 pub use ring::WriteOutcome;
 pub use server::SharedServer;
 

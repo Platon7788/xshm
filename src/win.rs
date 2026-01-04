@@ -2,6 +2,12 @@
 //!
 //! Использует статическую линковку с ntdll.dll.
 //! Никаких внешних зависимостей, никакого TLS.
+//!
+//! ВАЖНО: Поддерживаются только x86 и x86_64 архитектуры!
+
+// Compile-time проверка архитектуры
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+compile_error!("xShm поддерживает только x86 и x86_64 архитектуры!");
 
 use std::ptr::{null, null_mut};
 use std::time::Duration;

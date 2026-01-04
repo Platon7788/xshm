@@ -72,11 +72,18 @@ impl SharedServer {
             return Err(ShmError::HandshakeFailed);
         }
 
-        let new_generation = control.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        // ВАЖНО: сначала сбрасываем буферы, потом обновляем generation
+        // Это гарантирует, что клиент увидит чистые буферы когда прочитает новый generation
+        let current_gen = control.generation.load(Ordering::Acquire);
+        let new_generation = current_gen.wrapping_add(1);
+        
         unsafe {
             (&*self.view.ring_header_a()).reset(new_generation);
             (&*self.view.ring_header_b()).reset(new_generation);
         }
+        
+        // Теперь атомарно публикуем новый generation
+        control.generation.store(new_generation, Ordering::Release);
 
         let header_a = unsafe { &*self.view.ring_header_a() };
         let header_b = unsafe { &*self.view.ring_header_b() };
@@ -104,12 +111,37 @@ impl SharedServer {
         self.connected
     }
 
-    pub(crate) fn events(&self) -> &SharedEvents {
+    /// Доступ к событиям сервера (для внутреннего использования)
+    pub fn events(&self) -> &SharedEvents {
         &self.events
+    }
+    
+    /// Доступ к shared view (для внутреннего использования)
+    pub(crate) fn view(&self) -> &SharedView {
+        &self.view
+    }
+    
+    /// Установка состояния подключения (для внутреннего использования)
+    pub(crate) fn set_connected(&mut self, connected: bool) {
+        self.connected = connected;
     }
 
     pub(crate) fn mark_disconnected(&mut self) {
         self.connected = false;
+        
+        // Сбрасываем состояние в shared memory для возможности reconnect
+        let control = self.view.control_block();
+        control.server_state.store(HANDSHAKE_IDLE, Ordering::Release);
+        control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+        
+        unsafe {
+            (&*self.view.ring_header_a())
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+            (&*self.view.ring_header_b())
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+        }
     }
 
     fn ensure_connected(&self) -> Result<()> {

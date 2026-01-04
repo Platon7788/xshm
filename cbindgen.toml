@@ -4,7 +4,47 @@ pragma_once = true
 sys_includes = ["stdint.h", "stdbool.h", "stddef.h"]
 cpp_compat = true
 
+[parse]
+# Исключаем внутренний модуль ntapi из генерации
+parse_deps = false
+include = ["xshm"]
+exclude = ["ntapi"]
+
 [export]
+# Исключаем NT типы и константы которые конфликтуют с Windows SDK
+exclude = [
+    # Типы
+    "NTSTATUS",
+    "ULONG", 
+    "ACCESS_MASK",
+    "HANDLE",
+    "PVOID",
+    "BOOLEAN",
+    "ULONG_PTR",
+    "LARGE_INTEGER",
+    "LARGE_INTEGER_PARTS",
+    "UNICODE_STRING",
+    "OBJECT_ATTRIBUTES",
+    "SECURITY_DESCRIPTOR",
+    "NullDaclSecurityDescriptor",
+    "NtName",
+    # Константы
+    "STATUS_SUCCESS",
+    "STATUS_TIMEOUT",
+    "STATUS_WAIT_0",
+    "OBJ_CASE_INSENSITIVE",
+    "SECTION_ALL_ACCESS",
+    "PAGE_READWRITE",
+    "SEC_COMMIT",
+    "VIEW_UNMAP",
+    "EVENT_ALL_ACCESS",
+    "SYNCHRONIZATION_EVENT",
+    "NOTIFICATION_EVENT",
+    "WAIT_ANY",
+    "WAIT_ALL",
+    "NT_CURRENT_PROCESS",
+    "SECURITY_DESCRIPTOR_REVISION",
+]
 include = [
     "shm_endpoint_config_t",
     "shm_callbacks_t",
