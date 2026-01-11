@@ -7,6 +7,10 @@
 extern "C" {
 #endif
 
+// ============================================================================
+// Single-client helpers
+// ============================================================================
+
 static inline shm_endpoint_config_t xshm_client_config(const char *name) {
     shm_endpoint_config_t cfg = {name, 0u};
     return cfg;
@@ -31,6 +35,21 @@ static inline shm_auto_options_t xshm_client_auto_options_default(void) {
 
 static inline shm_auto_options_t shm_client_auto_options_default(void) {
     return shm_auto_options_default();
+}
+
+// ============================================================================
+// Multi-client helpers
+// ============================================================================
+
+// Note: Types shm_multi_client_options_t, shm_multi_client_callbacks_t,
+// MultiClientHandle and all shm_multi_client_* functions are declared in xshm.h
+
+static inline shm_multi_client_options_t xshm_multi_client_options_default(void) {
+    return shm_multi_client_options_default();
+}
+
+static inline shm_multi_client_callbacks_t xshm_multi_client_callbacks_default(void) {
+    return shm_multi_client_callbacks_default();
 }
 
 #ifdef __cplusplus

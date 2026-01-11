@@ -431,3 +431,265 @@ pub extern "C" fn shm_multi_server_stop(handle: *mut MultiServerHandle) {
         // state drops here, cleaning up
     }
 }
+
+// ============================================================================
+// MultiClient FFI
+// ============================================================================
+
+use crate::multi::{MultiClient, MultiClientHandler, MultiClientOptions};
+use crate::constants::SLOT_ID_NO_SLOT;
+
+/// Опции для мультиклиента
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct shm_multi_client_options_t {
+    /// Таймаут подключения к lobby в мс (по умолчанию 5000)
+    pub lobby_timeout_ms: u32,
+    /// Таймаут подключения к слоту в мс (по умолчанию 5000)
+    pub slot_timeout_ms: u32,
+    /// Таймаут ожидания событий в мс (по умолчанию 50)
+    pub poll_timeout_ms: u32,
+    /// Количество сообщений за один цикл (по умолчанию 32)
+    pub recv_batch: u32,
+}
+
+impl Default for shm_multi_client_options_t {
+    fn default() -> Self {
+        Self {
+            lobby_timeout_ms: 5000,
+            slot_timeout_ms: 5000,
+            poll_timeout_ms: 50,
+            recv_batch: 32,
+        }
+    }
+}
+
+/// Callbacks для мультиклиента
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct shm_multi_client_callbacks_t {
+    /// Вызывается при успешном подключении (slot_id — назначенный слот)
+    pub on_connect: Option<extern "C" fn(slot_id: u32, user_data: *mut c_void)>,
+    /// Вызывается при отключении
+    pub on_disconnect: Option<extern "C" fn(user_data: *mut c_void)>,
+    /// Вызывается при получении сообщения от сервера
+    pub on_message: Option<extern "C" fn(data: *const c_void, size: u32, user_data: *mut c_void)>,
+    /// Вызывается при ошибке
+    pub on_error: Option<extern "C" fn(error: shm_error_t, user_data: *mut c_void)>,
+    /// Пользовательские данные
+    pub user_data: *mut c_void,
+}
+
+impl Default for shm_multi_client_callbacks_t {
+    fn default() -> Self {
+        Self {
+            on_connect: None,
+            on_disconnect: None,
+            on_message: None,
+            on_error: None,
+            user_data: null_mut(),
+        }
+    }
+}
+
+/// Handle мультиклиента
+pub type MultiClientHandle = c_void;
+
+/// Внутренний handler для FFI клиента
+struct FfiMultiClientHandler {
+    callbacks: shm_multi_client_callbacks_t,
+}
+
+unsafe impl Send for FfiMultiClientHandler {}
+unsafe impl Sync for FfiMultiClientHandler {}
+
+impl MultiClientHandler for FfiMultiClientHandler {
+    fn on_connect(&self, slot_id: u32) {
+        if let Some(cb) = self.callbacks.on_connect {
+            cb(slot_id, self.callbacks.user_data);
+        }
+    }
+
+    fn on_disconnect(&self) {
+        if let Some(cb) = self.callbacks.on_disconnect {
+            cb(self.callbacks.user_data);
+        }
+    }
+
+    fn on_message(&self, data: &[u8]) {
+        if let Some(cb) = self.callbacks.on_message {
+            cb(
+                data.as_ptr() as *const c_void,
+                data.len() as u32,
+                self.callbacks.user_data,
+            );
+        }
+    }
+
+    fn on_error(&self, err: ShmError) {
+        if let Some(cb) = self.callbacks.on_error {
+            cb(err.into(), self.callbacks.user_data);
+        }
+    }
+}
+
+/// Внутреннее состояние клиента
+struct MultiClientState {
+    client: MultiClient,
+    _handler: Arc<FfiMultiClientHandler>,
+}
+
+/// Получить опции клиента по умолчанию
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_options_default() -> shm_multi_client_options_t {
+    shm_multi_client_options_t::default()
+}
+
+/// Получить callbacks клиента по умолчанию (все NULL)
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_callbacks_default() -> shm_multi_client_callbacks_t {
+    shm_multi_client_callbacks_t::default()
+}
+
+/// Подключение мультиклиента к серверу
+///
+/// Клиент автоматически:
+/// 1. Подключается к lobby (base_name)
+/// 2. Получает назначенный slot_id от сервера
+/// 3. Переподключается к слоту (base_name_N)
+///
+/// # Parameters
+/// - `base_name`: Базовое имя канала (то же что у MultiServer)
+/// - `callbacks`: Callbacks для событий
+/// - `options`: Опции клиента (NULL для значений по умолчанию)
+///
+/// # Returns
+/// Handle клиента или NULL при ошибке
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_connect(
+    base_name: *const c_char,
+    callbacks: *const shm_multi_client_callbacks_t,
+    options: *const shm_multi_client_options_t,
+) -> *mut MultiClientHandle {
+    let name = match to_rust_str(base_name) {
+        Some(n) => n,
+        None => return null_mut(),
+    };
+
+    let callbacks_val = if callbacks.is_null() {
+        shm_multi_client_callbacks_t::default()
+    } else {
+        unsafe { *callbacks }
+    };
+
+    let opts = if options.is_null() {
+        MultiClientOptions::default()
+    } else {
+        let o = unsafe { *options };
+        MultiClientOptions {
+            lobby_timeout: Duration::from_millis(o.lobby_timeout_ms as u64),
+            slot_timeout: Duration::from_millis(o.slot_timeout_ms as u64),
+            poll_timeout: Duration::from_millis(o.poll_timeout_ms as u64),
+            recv_batch: o.recv_batch as usize,
+        }
+    };
+
+    let handler = Arc::new(FfiMultiClientHandler {
+        callbacks: callbacks_val,
+    });
+
+    match MultiClient::connect(&name, handler.clone(), opts) {
+        Ok(client) => {
+            let state = Box::new(MultiClientState {
+                client,
+                _handler: handler,
+            });
+            Box::into_raw(state) as *mut MultiClientHandle
+        }
+        Err(err) => {
+            if let Some(cb) = callbacks_val.on_error {
+                cb(err.into(), callbacks_val.user_data);
+            }
+            null_mut()
+        }
+    }
+}
+
+/// Отправка сообщения серверу
+///
+/// # Parameters
+/// - `handle`: Handle клиента
+/// - `data`: Данные для отправки
+/// - `size`: Размер данных
+///
+/// # Returns
+/// SHM_SUCCESS или код ошибки
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_send(
+    handle: *mut MultiClientHandle,
+    data: *const c_void,
+    size: u32,
+) -> shm_error_t {
+    if handle.is_null() || data.is_null() || size == 0 {
+        return shm_error_t::SHM_ERROR_INVALID_PARAM;
+    }
+
+    let state = unsafe { &*(handle as *const MultiClientState) };
+    let slice = unsafe { std::slice::from_raw_parts(data as *const u8, size as usize) };
+
+    match state.client.send(slice) {
+        Ok(()) => shm_error_t::SHM_SUCCESS,
+        Err(err) => err.into(),
+    }
+}
+
+/// Получение назначенного slot_id
+///
+/// # Parameters
+/// - `handle`: Handle клиента
+///
+/// # Returns
+/// slot_id или SLOT_ID_NO_SLOT (0xFFFFFFFF) если не подключён
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_slot_id(handle: *const MultiClientHandle) -> u32 {
+    if handle.is_null() {
+        return SLOT_ID_NO_SLOT;
+    }
+
+    let state = unsafe { &*(handle as *const MultiClientState) };
+    state.client.slot_id()
+}
+
+/// Проверка подключения клиента
+///
+/// # Parameters
+/// - `handle`: Handle клиента
+///
+/// # Returns
+/// true если клиент подключён к слоту
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_is_connected(handle: *const MultiClientHandle) -> bool {
+    if handle.is_null() {
+        return false;
+    }
+
+    let state = unsafe { &*(handle as *const MultiClientState) };
+    state.client.is_connected()
+}
+
+/// Отключение мультиклиента
+///
+/// # Parameters
+/// - `handle`: Handle клиента
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_multi_client_disconnect(handle: *mut MultiClientHandle) {
+    if handle.is_null() {
+        return;
+    }
+
+    unsafe {
+        let state = Box::from_raw(handle as *mut MultiClientState);
+        state.client.stop();
+        // state drops here, cleaning up
+    }
+}

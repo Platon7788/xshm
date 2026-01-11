@@ -186,6 +186,59 @@ typedef struct shm_multi_callbacks_t {
  */
 typedef void MultiServerHandle;
 
+/**
+ * Опции для мультиклиента
+ */
+typedef struct shm_multi_client_options_t {
+  /**
+   * Таймаут подключения к lobby в мс (по умолчанию 5000)
+   */
+  uint32_t lobby_timeout_ms;
+  /**
+   * Таймаут подключения к слоту в мс (по умолчанию 5000)
+   */
+  uint32_t slot_timeout_ms;
+  /**
+   * Таймаут ожидания событий в мс (по умолчанию 50)
+   */
+  uint32_t poll_timeout_ms;
+  /**
+   * Количество сообщений за один цикл (по умолчанию 32)
+   */
+  uint32_t recv_batch;
+} shm_multi_client_options_t;
+
+/**
+ * Callbacks для мультиклиента
+ */
+typedef struct shm_multi_client_callbacks_t {
+  /**
+   * Вызывается при успешном подключении (slot_id — назначенный слот)
+   */
+  void (*on_connect)(uint32_t slot_id, void *user_data);
+  /**
+   * Вызывается при отключении
+   */
+  void (*on_disconnect)(void *user_data);
+  /**
+   * Вызывается при получении сообщения от сервера
+   */
+  void (*on_message)(const void *data, uint32_t size, void *user_data);
+  /**
+   * Вызывается при ошибке
+   */
+  void (*on_error)(enum shm_error_t error, void *user_data);
+  /**
+   * Пользовательские данные
+   */
+  void *user_data;
+} shm_multi_client_callbacks_t;
+
+/**
+ * Handle мультиклиента
+ */
+typedef void MultiClientHandle;
+
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
@@ -374,6 +427,79 @@ uint32_t shm_multi_server_channel_name(const MultiServerHandle *handle,
  * - `handle`: Handle сервера
  */
 void shm_multi_server_stop(MultiServerHandle *handle);
+
+/**
+ * Получить опции клиента по умолчанию
+ */
+struct shm_multi_client_options_t shm_multi_client_options_default(void);
+
+/**
+ * Получить callbacks клиента по умолчанию (все NULL)
+ */
+struct shm_multi_client_callbacks_t shm_multi_client_callbacks_default(void);
+
+/**
+ * Подключение мультиклиента к серверу
+ *
+ * Клиент автоматически:
+ * 1. Подключается к lobby (base_name)
+ * 2. Получает назначенный slot_id от сервера
+ * 3. Переподключается к слоту (base_name_N)
+ *
+ * # Parameters
+ * - `base_name`: Базовое имя канала (то же что у MultiServer)
+ * - `callbacks`: Callbacks для событий
+ * - `options`: Опции клиента (NULL для значений по умолчанию)
+ *
+ * # Returns
+ * Handle клиента или NULL при ошибке
+ */
+MultiClientHandle *shm_multi_client_connect(const char *base_name,
+                                            const struct shm_multi_client_callbacks_t *callbacks,
+                                            const struct shm_multi_client_options_t *options);
+
+/**
+ * Отправка сообщения серверу
+ *
+ * # Parameters
+ * - `handle`: Handle клиента
+ * - `data`: Данные для отправки
+ * - `size`: Размер данных
+ *
+ * # Returns
+ * SHM_SUCCESS или код ошибки
+ */
+enum shm_error_t shm_multi_client_send(MultiClientHandle *handle, const void *data, uint32_t size);
+
+/**
+ * Получение назначенного slot_id
+ *
+ * # Parameters
+ * - `handle`: Handle клиента
+ *
+ * # Returns
+ * slot_id или SLOT_ID_NO_SLOT (0xFFFFFFFF) если не подключён
+ */
+uint32_t shm_multi_client_slot_id(const MultiClientHandle *handle);
+
+/**
+ * Проверка подключения клиента
+ *
+ * # Parameters
+ * - `handle`: Handle клиента
+ *
+ * # Returns
+ * true если клиент подключён к слоту
+ */
+bool shm_multi_client_is_connected(const MultiClientHandle *handle);
+
+/**
+ * Отключение мультиклиента
+ *
+ * # Parameters
+ * - `handle`: Handle клиента
+ */
+void shm_multi_client_disconnect(MultiClientHandle *handle);
 
 #ifdef __cplusplus
 }  // extern "C"
