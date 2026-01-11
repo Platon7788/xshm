@@ -56,6 +56,7 @@ pub enum shm_error_t {
     SHM_ERROR_NOT_READY = -8,
     SHM_ERROR_PROTOCOL = -9,
     SHM_ERROR_FULL = -10,
+    SHM_ERROR_NO_SLOT = -11,
 }
 
 impl From<ShmError> for shm_error_t {
@@ -72,6 +73,7 @@ impl From<ShmError> for shm_error_t {
             ShmError::AlreadyConnected => shm_error_t::SHM_ERROR_EXISTS,
             ShmError::HandshakeFailed | ShmError::Corrupted => shm_error_t::SHM_ERROR_PROTOCOL,
             ShmError::WindowsError { .. } => shm_error_t::SHM_ERROR_ACCESS,
+            ShmError::NoFreeSlot => shm_error_t::SHM_ERROR_NO_SLOT,
         }
     }
 }

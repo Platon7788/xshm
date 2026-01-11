@@ -21,7 +21,10 @@ pub(crate) mod ntapi;
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
 pub use error::{Result, ShmError};
-pub use multi::{MultiHandler, MultiOptions, MultiServer};
+pub use multi::{
+    MultiClient, MultiClientHandler, MultiClientOptions,
+    MultiHandler, MultiOptions, MultiServer,
+};
 pub use ring::WriteOutcome;
 pub use server::SharedServer;
 

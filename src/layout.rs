@@ -34,7 +34,9 @@ pub struct ControlBlock {
     pub generation: AtomicU32,
     pub server_state: AtomicU32,
     pub client_state: AtomicU32,
-    pub reserved: [u32; 11],
+    /// Reserved поля для расширения протокола.
+    /// reserved[0] используется для передачи slot_id в multi-client режиме.
+    pub reserved: [AtomicU32; 11],
 }
 
 impl ControlBlock {
@@ -44,20 +46,27 @@ impl ControlBlock {
         self.generation.store(1, Ordering::Relaxed);
         self.server_state.store(HANDSHAKE_IDLE, Ordering::Relaxed);
         self.client_state.store(HANDSHAKE_IDLE, Ordering::Relaxed);
+        for r in &self.reserved {
+            r.store(0, Ordering::Relaxed);
+        }
     }
 }
 
 impl Default for ControlBlock {
     fn default() -> Self {
-        let block = ControlBlock {
+        ControlBlock {
             magic: SHARED_MAGIC,
             version: SHARED_VERSION,
             generation: AtomicU32::new(1),
             server_state: AtomicU32::new(HANDSHAKE_IDLE),
             client_state: AtomicU32::new(HANDSHAKE_IDLE),
-            reserved: [0; 11],
-        };
-        block
+            reserved: [
+                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+                AtomicU32::new(0), AtomicU32::new(0),
+            ],
+        }
     }
 }
 

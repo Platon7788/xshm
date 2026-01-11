@@ -33,3 +33,8 @@ pub const EVENT_DISCONNECT_SUFFIX: &str = "DISCONNECT";
 pub const HANDSHAKE_IDLE: u32 = 0;
 pub const HANDSHAKE_CLIENT_HELLO: u32 = 1;
 pub const HANDSHAKE_SERVER_READY: u32 = 2;
+
+/// Индекс в reserved[] для передачи slot_id при multi-client handshake.
+pub const RESERVED_SLOT_ID_INDEX: usize = 0;
+/// Специальное значение: нет свободных слотов.
+pub const SLOT_ID_NO_SLOT: u32 = 0xFFFF_FFFF;

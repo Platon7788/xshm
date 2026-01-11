@@ -42,4 +42,7 @@ pub enum ShmError {
         /// Контекст операции.
         context: &'static str,
     },
+    /// Нет свободных слотов на мультиклиентном сервере.
+    #[error("no free slots available on multi-client server")]
+    NoFreeSlot,
 }

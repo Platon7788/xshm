@@ -12,7 +12,7 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 - Clean start guarantee: buffers reset on each new connection with generation tracking
 - Ready-to-use C headers (`xshm.h`, `xshm_server.h`, `xshm_client.h`) with helper functions
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`)
-- **Multi-client mode**: single server handles up to N clients (default 10) with individual channels
+- **Multi-client mode**: single server handles up to N clients (default 20) with automatic slot assignment
 - **Direct NT API**: static linking with ntdll.dll, no external dependencies
 - **Static CRT**: TLS and CRT statically linked, no runtime DLL dependencies
 
@@ -175,8 +175,8 @@ fn main() -> Result<()> {
 
 ```rust
 use std::sync::Arc;
-use xshm::multi::{MultiServer, MultiHandler, MultiOptions};
-use xshm::{AutoClient, AutoHandler, AutoOptions, ChannelKind, Result};
+use xshm::multi::{MultiServer, MultiClient, MultiHandler, MultiClientHandler, MultiOptions, MultiClientOptions};
+use xshm::Result;
 
 struct ServerHandler;
 
@@ -194,31 +194,40 @@ impl MultiHandler for ServerHandler {
 
 struct ClientHandler;
 
-impl AutoHandler for ClientHandler {
-    fn on_message(&self, _dir: ChannelKind, data: &[u8]) {
+impl MultiClientHandler for ClientHandler {
+    fn on_connect(&self, slot_id: u32) {
+        println!("Connected to slot {}", slot_id);
+    }
+    fn on_disconnect(&self) {
+        println!("Disconnected");
+    }
+    fn on_message(&self, data: &[u8]) {
         println!("Received: {:?}", data);
     }
 }
 
 fn main() -> Result<()> {
-    // Start multi-client server with 10 slots
+    // Start multi-client server (default 20 slots)
     let server = MultiServer::start("MyService", Arc::new(ServerHandler), MultiOptions::default())?;
     
-    // Clients connect to individual slots: "MyService_0", "MyService_1", etc.
-    let client0 = AutoClient::connect(
-        &server.channel_name(0).unwrap(),
-        Arc::new(ClientHandler),
-        AutoOptions::default()
-    )?;
+    // Clients connect to base name - server assigns slot automatically
+    let client1 = MultiClient::connect("MyService", Arc::new(ClientHandler), MultiClientOptions::default())?;
+    let client2 = MultiClient::connect("MyService", Arc::new(ClientHandler), MultiClientOptions::default())?;
+    let client3 = MultiClient::connect("MyService", Arc::new(ClientHandler), MultiClientOptions::default())?;
     
-    // Send to specific client
+    // Each client gets unique slot (0, 1, 2...)
+    println!("Client 1 slot: {}", client1.slot_id());
+    println!("Client 2 slot: {}", client2.slot_id());
+    println!("Client 3 slot: {}", client3.slot_id());
+    
+    // Send to specific client by slot_id
     server.send_to(0, b"Hello client 0")?;
     
     // Broadcast to all connected clients
     server.broadcast(b"Hello everyone")?;
     
     // Client sends to server
-    client0.send(b"Hello server")?;
+    client1.send(b"Hello server")?;
     
     std::thread::sleep(std::time::Duration::from_millis(100));
     Ok(())
@@ -317,16 +326,19 @@ void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_
 }
 
 int main(void) {
-    shm_multi_callbacks_t callbacks = xshm_multi_callbacks_default();
+    shm_multi_callbacks_t callbacks = shm_multi_callbacks_default();
     callbacks.on_client_connect = on_connect;
     callbacks.on_client_disconnect = on_disconnect;
     callbacks.on_message = on_message;
 
-    shm_multi_options_t options = xshm_multi_options_default();
-    options.max_clients = 10;
+    shm_multi_options_t options = shm_multi_options_default();
+    options.max_clients = 20;  // default is 20
 
     MultiServerHandle* server = shm_multi_server_start("MyService", &callbacks, &options);
     if (!server) return 1;
+
+    // Clients connect to "MyService" - server assigns slots automatically
+    // Use MultiClient from Rust or implement lobby handshake in C
 
     // Send to specific client
     shm_multi_server_send_to(server, 0, "Hello client 0", 14);

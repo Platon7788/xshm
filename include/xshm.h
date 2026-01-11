@@ -61,6 +61,16 @@
 #define HANDSHAKE_SERVER_READY 2
 
 /**
+ * Индекс в reserved[] для передачи slot_id при multi-client handshake.
+ */
+#define RESERVED_SLOT_ID_INDEX 0
+
+/**
+ * Специальное значение: нет свободных слотов.
+ */
+#define SLOT_ID_NO_SLOT 4294967295
+
+/**
  * Максимальное количество клиентов по умолчанию
  */
 #define DEFAULT_MAX_CLIENTS 10
@@ -77,6 +87,7 @@ typedef enum shm_error_t {
   SHM_ERROR_NOT_READY = -8,
   SHM_ERROR_PROTOCOL = -9,
   SHM_ERROR_FULL = -10,
+  SHM_ERROR_NO_SLOT = -11,
 } shm_error_t;
 
 typedef enum shm_direction_t {
