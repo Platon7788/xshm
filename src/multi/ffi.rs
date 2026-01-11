@@ -10,13 +10,13 @@ use std::time::Duration;
 
 use crate::error::ShmError;
 use crate::ffi::shm_error_t;
-use crate::multi::{MultiHandler, MultiOptions, MultiServer};
+use crate::multi::{MultiHandler, MultiOptions, MultiServer, DEFAULT_MAX_CLIENTS};
 
 /// Опции для мультиклиентного сервера
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_multi_options_t {
-    /// Максимальное количество клиентов (по умолчанию 10)
+    /// Максимальное количество клиентов (по умолчанию 20)
     pub max_clients: u32,
     /// Таймаут ожидания событий в мс (по умолчанию 50)
     pub poll_timeout_ms: u32,
@@ -27,7 +27,7 @@ pub struct shm_multi_options_t {
 impl Default for shm_multi_options_t {
     fn default() -> Self {
         Self {
-            max_clients: 10,
+            max_clients: DEFAULT_MAX_CLIENTS,
             poll_timeout_ms: 50,
             recv_batch: 32,
         }

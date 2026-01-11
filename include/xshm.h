@@ -73,7 +73,7 @@
 /**
  * Максимальное количество клиентов по умолчанию
  */
-#define DEFAULT_MAX_CLIENTS 10
+#define DEFAULT_MAX_CLIENTS 20
 
 typedef enum shm_error_t {
   SHM_SUCCESS = 0,
@@ -142,7 +142,7 @@ typedef void ClientHandle;
  */
 typedef struct shm_multi_options_t {
   /**
-   * Максимальное количество клиентов (по умолчанию 10)
+   * Максимальное количество клиентов (по умолчанию 20)
    */
   uint32_t max_clients;
   /**
