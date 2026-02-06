@@ -7,7 +7,17 @@ use xshm::{SharedClient, SharedServer, ShmError};
 const MIN_SLEEP: Duration = Duration::from_micros(50);
 
 fn unique_name(tag: &str) -> String {
-    format!("XSHM_STRESS_{}_{}", tag, std::process::id())
+    use std::time::SystemTime;
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!(
+        "XSHM_STRESS_{}_{}_{}",
+        tag,
+        std::process::id(),
+        ts % 1_000_000
+    )
 }
 
 #[test]
