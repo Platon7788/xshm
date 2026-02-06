@@ -3,7 +3,7 @@
 mod client;
 mod constants;
 mod error;
-pub(crate) mod events;
+pub mod events;
 mod layout;
 mod naming;
 mod ring;
@@ -21,12 +21,31 @@ pub(crate) mod ntapi;
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
 pub use error::{Result, ShmError};
+pub use events::EventHandles;
 pub use multi::{
-    MultiClient, MultiClientHandler, MultiClientOptions,
-    MultiHandler, MultiOptions, MultiServer,
+    MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
 pub use ring::WriteOutcome;
 pub use server::SharedServer;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// Ожидание с периодической проверкой флага остановки.
+/// Возвращает `false` если `running` стал `false` (сигнал остановки).
+pub(crate) fn wait_delay(running: &AtomicBool, delay: Duration) -> bool {
+    if delay.is_zero() {
+        return running.load(Ordering::Acquire);
+    }
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if !running.load(Ordering::Acquire) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    running.load(Ordering::Acquire)
+}
 
 #[cfg(test)]
 mod tests {

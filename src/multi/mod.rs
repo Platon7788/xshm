@@ -32,14 +32,15 @@ use std::time::Duration;
 
 use crate::client::SharedClient;
 use crate::constants::{
-    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY,
-    MAX_MESSAGE_SIZE, RESERVED_SLOT_ID_INDEX, SLOT_ID_NO_SLOT,
+    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, MAX_MESSAGE_SIZE,
+    RESERVED_SLOT_ID_INDEX, SLOT_ID_NO_SLOT,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::naming::mapping_name;
 use crate::server::SharedServer;
 use crate::shared::SharedView;
+use crate::wait_delay;
 use crate::win::{self, Mapping};
 
 /// Максимальное количество клиентов по умолчанию
@@ -49,13 +50,13 @@ pub const DEFAULT_MAX_CLIENTS: u32 = 20;
 pub trait MultiHandler: Send + Sync + 'static {
     /// Вызывается при подключении нового клиента
     fn on_client_connect(&self, client_id: u32);
-    
+
     /// Вызывается при отключении клиента
     fn on_client_disconnect(&self, client_id: u32);
-    
+
     /// Вызывается при получении сообщения от клиента
     fn on_message(&self, client_id: u32, data: &[u8]);
-    
+
     /// Вызывается при ошибке (client_id = None для общих ошибок)
     fn on_error(&self, client_id: Option<u32>, err: ShmError) {
         let _ = (client_id, err);
@@ -66,13 +67,13 @@ pub trait MultiHandler: Send + Sync + 'static {
 pub trait MultiClientHandler: Send + Sync + 'static {
     /// Вызывается при успешном подключении (slot_id — назначенный слот)
     fn on_connect(&self, slot_id: u32);
-    
+
     /// Вызывается при отключении
     fn on_disconnect(&self);
-    
+
     /// Вызывается при получении сообщения от сервера
     fn on_message(&self, data: &[u8]);
-    
+
     /// Вызывается при ошибке
     fn on_error(&self, err: ShmError) {
         let _ = err;
@@ -144,19 +145,24 @@ impl Lobby {
         let map_name = mapping_name(base_name);
         let mapping = Mapping::create(&map_name)?;
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
-        
-        let control = view.control_block_mut();
+
+        // SAFETY: единственный владелец на этапе инициализации, алиасинга нет
+        let control = unsafe { &mut *view.control_block_ptr() };
         control.reset();
-        
+
         let events = SharedEvents::create(base_name)?;
-        
-        Ok(Self { mapping, view, events })
+
+        Ok(Self {
+            mapping,
+            view,
+            events,
+        })
     }
-    
+
     fn events(&self) -> &SharedEvents {
         &self.events
     }
-    
+
     fn view(&self) -> &SharedView {
         &self.view
     }
@@ -182,10 +188,10 @@ impl MultiServer {
         options: MultiOptions,
     ) -> Result<Arc<Self>> {
         let running = Arc::new(AtomicBool::new(true));
-        
+
         // Создаём lobby для приёма подключений
         let lobby = Lobby::create(base_name)?;
-        
+
         // Создаём слоты
         let slots: RwLock<Vec<Mutex<ClientSlot>>> = RwLock::new(Vec::new());
         {
@@ -200,7 +206,7 @@ impl MultiServer {
                 }));
             }
         }
-        
+
         let server = Arc::new(Self {
             base_name: base_name.to_owned(),
             lobby,
@@ -211,7 +217,7 @@ impl MultiServer {
             handler,
             options,
         });
-        
+
         // Запускаем worker thread
         let server_clone = server.clone();
         let handle = thread::Builder::new()
@@ -221,31 +227,33 @@ impl MultiServer {
                 code: e.raw_os_error().unwrap_or(-1) as u32,
                 context: "spawn multi worker",
             })?;
-        
+
         *server.worker_handle.lock().unwrap() = Some(handle);
-        
+
         Ok(server)
     }
 
     /// Отправка сообщения конкретному клиенту
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
         let slots = self.slots.read().unwrap();
-        let slot_mutex = slots.get(client_id as usize).ok_or(ShmError::NotConnected)?;
+        let slot_mutex = slots
+            .get(client_id as usize)
+            .ok_or(ShmError::NotConnected)?;
         let slot = slot_mutex.lock().unwrap();
-        
+
         if !slot.connected {
             return Err(ShmError::NotConnected);
         }
-        
+
         slot.server.send_to_client(data)?;
         Ok(())
     }
-    
+
     /// Отправка сообщения всем подключённым клиентам
     pub fn broadcast(&self, data: &[u8]) -> Result<u32> {
         let slots = self.slots.read().unwrap();
         let mut sent_count = 0u32;
-        
+
         for slot_mutex in slots.iter() {
             let slot = slot_mutex.lock().unwrap();
             if slot.connected {
@@ -254,62 +262,71 @@ impl MultiServer {
                 }
             }
         }
-        
+
         Ok(sent_count)
     }
-    
+
     /// Принудительное отключение клиента
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
         let slots = self.slots.read().unwrap();
-        let slot_mutex = slots.get(client_id as usize).ok_or(ShmError::NotConnected)?;
+        let slot_mutex = slots
+            .get(client_id as usize)
+            .ok_or(ShmError::NotConnected)?;
         let mut slot = slot_mutex.lock().unwrap();
-        
+
         if slot.connected {
             slot.connected = false;
             drop(slot);
             self.handler.on_client_disconnect(client_id);
         }
-        
+
         Ok(())
     }
-    
+
     /// Получение списка подключённых клиентов
     pub fn connected_clients(&self) -> Vec<u32> {
         let slots = self.slots.read().unwrap();
-        slots.iter()
+        slots
+            .iter()
             .filter_map(|slot_mutex| {
                 let slot = slot_mutex.lock().unwrap();
-                if slot.connected { Some(slot.id) } else { None }
+                if slot.connected {
+                    Some(slot.id)
+                } else {
+                    None
+                }
             })
             .collect()
     }
-    
+
     /// Количество подключённых клиентов
     pub fn client_count(&self) -> u32 {
         let slots = self.slots.read().unwrap();
-        slots.iter()
+        slots
+            .iter()
             .filter(|slot_mutex| slot_mutex.lock().unwrap().connected)
             .count() as u32
     }
-    
+
     /// Проверка подключения конкретного клиента
     pub fn is_client_connected(&self, client_id: u32) -> bool {
         let slots = self.slots.read().unwrap();
-        slots.get(client_id as usize)
+        slots
+            .get(client_id as usize)
             .map(|slot_mutex| slot_mutex.lock().unwrap().connected)
             .unwrap_or(false)
     }
-    
+
     /// Остановка сервера
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
     }
-    
+
     /// Базовое имя канала
     pub fn base_name(&self) -> &str {
         &self.base_name
     }
-    
+
     /// Получение имени канала для конкретного слота
     pub fn channel_name(&self, slot_id: u32) -> Option<String> {
         if slot_id < self.max_clients {
@@ -330,32 +347,38 @@ impl MultiServer {
         }
         None
     }
-    
+
     /// Worker loop — обрабатывает lobby и слоты
     fn worker_loop(&self) {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
-        
+
         while self.running.load(Ordering::Acquire) {
             // Собираем handles для ожидания
             let mut wait_handles: Vec<isize> = Vec::new();
             let mut handle_to_event: Vec<EventSource> = Vec::new();
-            
+
             // Lobby connect_req — всегда слушаем
-            wait_handles.push(self.lobby.events().connect_req.raw_handle());
+            // Lobby всегда использует named events (не anonymous)
+            let lobby_events = self.lobby.events();
+            wait_handles.push(lobby_events.connect_req.raw_handle());
             handle_to_event.push(EventSource::LobbyConnect);
-            
+
             // Слоты
             {
                 let slots = self.slots.read().unwrap();
                 for slot_mutex in slots.iter() {
                     let slot = slot_mutex.lock().unwrap();
-                    let events = slot.server.events();
-                    
+                    // Anonymous режим не поддерживается в multi-mode
+                    let events = slot
+                        .server
+                        .events()
+                        .expect("Anonymous mode not supported in multi-mode");
+
                     if slot.connected {
                         // Данные от клиента
                         wait_handles.push(events.c2s.data.raw_handle());
                         handle_to_event.push(EventSource::SlotData(slot.id));
-                        
+
                         // Disconnect
                         wait_handles.push(events.disconnect.raw_handle());
                         handle_to_event.push(EventSource::SlotDisconnect(slot.id));
@@ -366,7 +389,7 @@ impl MultiServer {
                     }
                 }
             }
-            
+
             // Ожидаем любое событие
             match win::wait_any(&wait_handles, Some(self.options.poll_timeout)) {
                 Ok(Some(index)) => {
@@ -394,43 +417,50 @@ impl MultiServer {
             EventSource::SlotDisconnect(slot_id) => self.handle_slot_disconnect(*slot_id),
         }
     }
-    
+
     /// Обработка подключения через lobby
     fn handle_lobby_connect(&self) {
         let control = self.lobby.view().control_block();
         let client_state = control.client_state.load(Ordering::Acquire);
-        
+
         if client_state != HANDSHAKE_CLIENT_HELLO {
             return;
         }
-        
+
         // Находим свободный слот
         let slot_id = self.find_free_slot().unwrap_or(SLOT_ID_NO_SLOT);
-        
+
         // Записываем slot_id в reserved[0]
         control.reserved[RESERVED_SLOT_ID_INDEX].store(slot_id, Ordering::Release);
-        
+
         // Обновляем состояние
-        control.server_state.store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        
+        control
+            .server_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+
         // Отправляем ACK
+        // Lobby всегда использует named events (не anonymous)
         let _ = self.lobby.events().connect_ack.set();
-        
+
         // Сбрасываем состояние lobby для следующего клиента
-        control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
-        control.server_state.store(HANDSHAKE_IDLE, Ordering::Release);
+        control
+            .client_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        control
+            .server_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
     }
-    
+
     /// Обработка подключения к слоту (после lobby)
     fn handle_slot_connect(&self, slot_id: u32) {
         let slots = self.slots.read().unwrap();
         if let Some(slot_mutex) = slots.get(slot_id as usize) {
             let mut slot = slot_mutex.lock().unwrap();
-            
+
             if slot.connected {
                 return; // Уже подключён
             }
-            
+
             // Выполняем handshake
             match Self::do_slot_handshake(&mut slot.server) {
                 Ok(()) => {
@@ -452,26 +482,26 @@ impl MultiServer {
         if server.is_connected() {
             return Err(ShmError::AlreadyConnected);
         }
-        
+
         let view = server.view();
         let control = view.control_block();
         let client_state = control.client_state.load(Ordering::Acquire);
-        
+
         if client_state != HANDSHAKE_CLIENT_HELLO {
             return Err(ShmError::HandshakeFailed);
         }
-        
+
         // Сбрасываем буферы
         let current_gen = control.generation.load(Ordering::Acquire);
         let new_generation = current_gen.wrapping_add(1);
-        
+
         unsafe {
             (&*view.ring_header_a()).reset(new_generation);
             (&*view.ring_header_b()).reset(new_generation);
         }
-        
+
         control.generation.store(new_generation, Ordering::Release);
-        
+
         unsafe {
             (&*view.ring_header_a())
                 .handshake_state
@@ -480,16 +510,25 @@ impl MultiServer {
                 .handshake_state
                 .store(HANDSHAKE_SERVER_READY, Ordering::Release);
         }
-        
-        control.server_state.store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        control.client_state.store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        
-        server.events().connect_ack.set()?;
+
+        control
+            .server_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        control
+            .client_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+
+        // Anonymous режим не поддерживается в multi-mode
+        server
+            .events()
+            .expect("Anonymous mode not supported in multi-mode")
+            .connect_ack
+            .set()?;
         server.set_connected(true);
-        
+
         Ok(())
     }
-    
+
     /// Обработка отключения клиента
     fn handle_slot_disconnect(&self, slot_id: u32) {
         let was_connected = {
@@ -504,54 +543,68 @@ impl MultiServer {
                 false
             }
         };
-        
+
         if was_connected {
             self.handler.on_client_disconnect(slot_id);
         }
     }
-    
-    /// Получение сообщений от слота
+
+    /// Получение сообщений от слота (batch)
     fn receive_from_slot(&self, slot_id: u32, buffer: &mut Vec<u8>) {
-        let slots = self.slots.read().unwrap();
-        if let Some(slot_mutex) = slots.get(slot_id as usize) {
-            let slot = slot_mutex.lock().unwrap();
-            if !slot.connected {
-                return;
-            }
-            
-            for _ in 0..self.options.recv_batch {
-                match slot.server.receive_from_client(buffer) {
-                    Ok(len) => {
-                        let data = buffer[..len].to_vec();
-                        drop(slot);
-                        drop(slots);
-                        self.handler.on_message(slot_id, &data);
-                        return;
-                    }
-                    Err(ShmError::QueueEmpty) => break,
-                    Err(err) => {
-                        drop(slot);
-                        drop(slots);
-                        self.handler.on_error(Some(slot_id), err);
-                        return;
+        // Собираем все сообщения под lock-ом
+        let mut messages: Vec<Vec<u8>> = Vec::new();
+        let mut error: Option<ShmError> = None;
+
+        {
+            let slots = self.slots.read().unwrap();
+            if let Some(slot_mutex) = slots.get(slot_id as usize) {
+                let slot = slot_mutex.lock().unwrap();
+                if !slot.connected {
+                    return;
+                }
+
+                for _ in 0..self.options.recv_batch {
+                    match slot.server.receive_from_client(buffer) {
+                        Ok(len) => {
+                            messages.push(buffer[..len].to_vec());
+                        }
+                        Err(ShmError::QueueEmpty) => break,
+                        Err(err) => {
+                            error = Some(err);
+                            break;
+                        }
                     }
                 }
             }
         }
+
+        // Отдаём handler-у без lock-а
+        for data in &messages {
+            self.handler.on_message(slot_id, data);
+        }
+
+        if let Some(err) = error {
+            self.handler.on_error(Some(slot_id), err);
+        }
     }
-    
+
     /// Проверка всех слотов на данные
     fn poll_all_slots(&self, buffer: &mut Vec<u8>) {
         let slot_ids: Vec<u32> = {
             let slots = self.slots.read().unwrap();
-            slots.iter()
+            slots
+                .iter()
                 .filter_map(|slot_mutex| {
                     let slot = slot_mutex.lock().unwrap();
-                    if slot.connected { Some(slot.id) } else { None }
+                    if slot.connected {
+                        Some(slot.id)
+                    } else {
+                        None
+                    }
                 })
                 .collect()
         };
-        
+
         for slot_id in slot_ids {
             self.receive_from_slot(slot_id, buffer);
         }
@@ -580,6 +633,7 @@ enum EventSource {
 // MultiClient — клиент с автоматическим назначением слота
 // ============================================================================
 
+use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 enum ClientCommand {
@@ -597,7 +651,7 @@ pub struct MultiClient {
 
 impl MultiClient {
     /// Подключение к мультисерверу
-    /// 
+    ///
     /// Клиент автоматически:
     /// 1. Подключается к lobby (base_name)
     /// 2. Получает назначенный slot_id
@@ -610,11 +664,11 @@ impl MultiClient {
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let slot_id = Arc::new(AtomicU32::new(SLOT_ID_NO_SLOT));
-        
+
         let running_clone = running.clone();
         let slot_id_clone = slot_id.clone();
         let name = base_name.to_owned();
-        
+
         let handle = thread::Builder::new()
             .name(format!("xshm-multi-client-{}", base_name))
             .spawn(move || {
@@ -624,7 +678,7 @@ impl MultiClient {
                 code: e.raw_os_error().unwrap_or(-1) as u32,
                 context: "spawn multi client worker",
             })?;
-        
+
         Ok(Self {
             cmd_tx: tx,
             join: Mutex::new(Some(handle)),
@@ -632,7 +686,7 @@ impl MultiClient {
             slot_id,
         })
     }
-    
+
     /// Отправка сообщения серверу
     pub fn send(&self, data: &[u8]) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
@@ -642,17 +696,17 @@ impl MultiClient {
             .send(ClientCommand::Send(data.to_vec()))
             .map_err(|_| ShmError::NotReady)
     }
-    
+
     /// Получить назначенный slot_id (SLOT_ID_NO_SLOT если не подключён)
     pub fn slot_id(&self) -> u32 {
         self.slot_id.load(Ordering::Acquire)
     }
-    
+
     /// Проверка подключения
     pub fn is_connected(&self) -> bool {
         self.slot_id.load(Ordering::Acquire) != SLOT_ID_NO_SLOT
     }
-    
+
     /// Остановка клиента
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(ClientCommand::Shutdown);
@@ -679,7 +733,7 @@ fn client_worker(
     slot_id_out: Arc<AtomicU32>,
 ) {
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
-    
+
     while running.load(Ordering::Acquire) {
         // Шаг 1: Подключаемся к lobby и получаем slot_id
         let slot_id = match lobby_handshake(base_name, &options) {
@@ -692,7 +746,7 @@ fn client_worker(
                 continue;
             }
         };
-        
+
         if slot_id == SLOT_ID_NO_SLOT {
             handler.on_error(ShmError::NoFreeSlot);
             if !wait_delay(&running, options.poll_timeout) {
@@ -700,7 +754,7 @@ fn client_worker(
             }
             continue;
         }
-        
+
         // Шаг 2: Подключаемся к назначенному слоту
         let slot_name = format!("{}_{}", base_name, slot_id);
         let client = match SharedClient::connect(&slot_name, options.slot_timeout) {
@@ -713,37 +767,41 @@ fn client_worker(
                 continue;
             }
         };
-        
+
         slot_id_out.store(slot_id, Ordering::Release);
         handler.on_connect(slot_id);
-        
+
         // Шаг 3: Работаем с данными
+        // SharedClient всегда использует named events (не anonymous)
+        let client_events = client.events();
         let handles = [
-            client.events().disconnect.raw_handle(),
-            client.events().s2c.data.raw_handle(),
+            client_events.disconnect.raw_handle(),
+            client_events.s2c.data.raw_handle(),
         ];
-        
-        let mut send_queue: Vec<Vec<u8>> = Vec::new();
-        
+
+        let mut send_queue: VecDeque<Vec<u8>> = VecDeque::new();
+
         loop {
             if !running.load(Ordering::Acquire) {
                 break;
             }
-            
+
             // Обрабатываем команды
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
-                    ClientCommand::Send(data) => send_queue.push(data),
+                    ClientCommand::Send(data) => send_queue.push_back(data),
                     ClientCommand::Shutdown => {
                         running.store(false, Ordering::Release);
                     }
                 }
             }
-            
+
             // Отправляем данные
-            while let Some(data) = send_queue.first() {
+            while let Some(data) = send_queue.front() {
                 match client.send_to_server(data) {
-                    Ok(_) => { send_queue.remove(0); }
+                    Ok(_) => {
+                        send_queue.pop_front();
+                    }
                     Err(ShmError::QueueFull) => break,
                     Err(err) => {
                         handler.on_error(err);
@@ -751,7 +809,7 @@ fn client_worker(
                     }
                 }
             }
-            
+
             // Получаем данные
             loop {
                 match client.receive_from_server(&mut buffer) {
@@ -763,7 +821,7 @@ fn client_worker(
                     }
                 }
             }
-            
+
             // Ожидаем события
             match win::wait_any(&handles, Some(options.poll_timeout)) {
                 Ok(Some(0)) => {
@@ -784,7 +842,7 @@ fn client_worker(
                 }
             }
         }
-        
+
         if !wait_delay(&running, options.poll_timeout) {
             break;
         }
@@ -797,54 +855,46 @@ fn lobby_handshake(base_name: &str, options: &MultiClientOptions) -> Result<u32>
     let map_name = mapping_name(base_name);
     let mapping = Mapping::open(&map_name)?;
     let view = unsafe { SharedView::new(mapping.as_ptr()) };
-    
+
     // Открываем события
     let events = SharedEvents::open(base_name)?;
-    
+
     // Отправляем connect_req
     let control = view.control_block();
-    control.client_state.store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+    control
+        .client_state
+        .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
     events.connect_req.set()?;
-    
+
     // Ждём connect_ack
     if !events.connect_ack.wait(Some(options.lobby_timeout))? {
-        control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+        control
+            .client_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
         return Err(ShmError::Timeout);
     }
-    
+
     // Читаем slot_id из reserved[0]
     let slot_id = control.reserved[RESERVED_SLOT_ID_INDEX].load(Ordering::Acquire);
-    
-    // Сбрасываем состояние
-    control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
-    
-    Ok(slot_id)
-}
 
-fn wait_delay(running: &AtomicBool, delay: Duration) -> bool {
-    if delay.is_zero() {
-        return running.load(Ordering::Acquire);
-    }
-    let deadline = std::time::Instant::now() + delay;
-    while std::time::Instant::now() < deadline {
-        if !running.load(Ordering::Acquire) {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    running.load(Ordering::Acquire)
+    // Сбрасываем состояние
+    control
+        .client_state
+        .store(HANDSHAKE_IDLE, Ordering::Release);
+
+    Ok(slot_id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     struct TestHandler {
         connects: AtomicU32,
         disconnects: AtomicU32,
         messages: AtomicU32,
     }
-    
+
     impl TestHandler {
         fn new() -> Self {
             Self {
@@ -854,7 +904,7 @@ mod tests {
             }
         }
     }
-    
+
     impl MultiHandler for TestHandler {
         fn on_client_connect(&self, _client_id: u32) {
             self.connects.fetch_add(1, Ordering::Relaxed);
@@ -866,7 +916,7 @@ mod tests {
             self.messages.fetch_add(1, Ordering::Relaxed);
         }
     }
-    
+
     #[test]
     fn test_multi_server_start() {
         let handler = Arc::new(TestHandler::new());

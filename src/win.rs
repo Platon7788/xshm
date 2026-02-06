@@ -15,22 +15,40 @@ use std::time::Duration;
 use crate::error::{Result, ShmError};
 use crate::layout::shared_mapping_size;
 use crate::ntapi::{
-    // Types
-    HANDLE, NTSTATUS, OBJECT_ATTRIBUTES, PVOID, LARGE_INTEGER,
-    NullDaclSecurityDescriptor,
-    // Constants
-    STATUS_SUCCESS, STATUS_TIMEOUT,
-    OBJ_CASE_INSENSITIVE,
-    SECTION_ALL_ACCESS, PAGE_READWRITE, SEC_COMMIT, VIEW_UNMAP,
-    EVENT_ALL_ACCESS, SYNCHRONIZATION_EVENT,
-    WAIT_ANY,
+    duration_to_nt_timeout,
     // Functions
-    NtClose, NtCreateEvent, NtOpenEvent, NtSetEvent,
-    NtWaitForSingleObject, NtWaitForMultipleObjects,
-    NtCreateSection, NtOpenSection, NtMapViewOfSection, NtUnmapViewOfSection,
-    NT_CURRENT_PROCESS,
+    NtClose,
+    NtCreateEvent,
+    NtCreateSection,
+    NtMapViewOfSection,
     // Helpers
-    NtName, duration_to_nt_timeout,
+    NtName,
+    NtOpenEvent,
+    NtOpenSection,
+    NtSetEvent,
+    NtUnmapViewOfSection,
+    NtWaitForMultipleObjects,
+    NtWaitForSingleObject,
+    NullDaclSecurityDescriptor,
+    EVENT_ALL_ACCESS,
+    // Types
+    HANDLE,
+    LARGE_INTEGER,
+    NTSTATUS,
+    NT_CURRENT_PROCESS,
+    OBJECT_ATTRIBUTES,
+    OBJ_CASE_INSENSITIVE,
+    PAGE_READWRITE,
+    PVOID,
+    SECTION_ALL_ACCESS,
+    SEC_COMMIT,
+    // Constants
+    STATUS_SUCCESS,
+    STATUS_TIMEOUT,
+    SYNCHRONIZATION_EVENT,
+    UNICODE_STRING,
+    VIEW_UNMAP,
+    WAIT_ANY,
 };
 
 // ============================================================================
@@ -94,11 +112,8 @@ impl EventHandle {
     pub fn create(name: &str) -> Result<Self> {
         let mut nt_name = NtName::new(name);
         let mut sd = NullDaclSecurityDescriptor::new();
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE,
-            sd.as_ptr(),
-        );
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
 
         let mut handle: HANDLE = null_mut();
 
@@ -125,21 +140,12 @@ impl EventHandle {
     /// Открытие события через NtOpenEvent
     pub fn open(name: &str) -> Result<Self> {
         let mut nt_name = NtName::new(name);
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE,
-            null_mut(),
-        );
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
 
         let mut handle: HANDLE = null_mut();
 
-        let status = unsafe {
-            NtOpenEvent(
-                &mut handle,
-                EVENT_ALL_ACCESS,
-                &mut obj_attr,
-            )
-        };
+        let status = unsafe { NtOpenEvent(&mut handle, EVENT_ALL_ACCESS, &mut obj_attr) };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtOpenEvent"));
@@ -154,9 +160,7 @@ impl EventHandle {
     /// Сигнализация через NtSetEvent
     pub fn set(&self) -> Result<()> {
         let mut previous_state: i32 = 0;
-        let status = unsafe {
-            NtSetEvent(self.handle.raw(), &mut previous_state)
-        };
+        let status = unsafe { NtSetEvent(self.handle.raw(), &mut previous_state) };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtSetEvent"));
@@ -213,19 +217,21 @@ unsafe impl Send for Mapping {}
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
-    /// Создание секции через NtCreateSection с NULL DACL
-    pub fn create(name: &str) -> Result<Self> {
+    /// Получить raw HANDLE секции (для передачи в kernel driver)
+    pub fn section_handle(&self) -> isize {
+        self._handle.as_isize()
+    }
+
+    /// Внутренний метод создания секции (общая логика для named и anonymous)
+    fn create_internal(object_name: *mut UNICODE_STRING, name_for_storage: String) -> Result<Self> {
         let size = shared_mapping_size();
-        let mut nt_name = NtName::new(name);
         let mut sd = NullDaclSecurityDescriptor::new();
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE,
-            sd.as_ptr(),
-        );
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, sd.as_ptr());
 
         let mut section_handle: HANDLE = null_mut();
-        let mut max_size = LARGE_INTEGER { QuadPart: size as i64 };
+        let mut max_size = LARGE_INTEGER {
+            QuadPart: size as i64,
+        };
 
         let status = unsafe {
             NtCreateSection(
@@ -240,7 +246,20 @@ impl Mapping {
         };
 
         if status != STATUS_SUCCESS {
-            return Err(status_to_error(status, "NtCreateSection"));
+            let context = if object_name.is_null() {
+                "NtCreateSection (anonymous)"
+            } else {
+                "NtCreateSection"
+            };
+            return Err(status_to_error(status, context));
+        }
+
+        // Проверка: Handle не должен быть NULL
+        if section_handle.is_null() {
+            return Err(status_to_error(
+                0xC0000008u32 as i32,
+                "NtCreateSection returned NULL handle",
+            ));
         }
 
         let handle = Handle(section_handle);
@@ -265,36 +284,60 @@ impl Mapping {
         };
 
         if status != STATUS_SUCCESS {
-            return Err(status_to_error(status, "NtMapViewOfSection"));
+            let context = if object_name.is_null() {
+                "NtMapViewOfSection (anonymous)"
+            } else {
+                "NtMapViewOfSection"
+            };
+            return Err(status_to_error(status, context));
         }
 
         Ok(Mapping {
             _handle: handle,
             view: base_address as *mut u8,
             _size: size,
-            _name: name.to_owned(),
+            _name: name_for_storage,
         })
+    }
+
+    /// Создание секции через NtCreateSection с NULL DACL
+    pub fn create(name: &str) -> Result<Self> {
+        let mut nt_name = NtName::new(name);
+        Self::create_internal(nt_name.as_ptr(), name.to_owned())
+    }
+
+    /// Создание anonymous секции без имени (только через handle)
+    ///
+    /// Anonymous section не имеет имени в глобальном namespace и доступна
+    /// только через handle. Идеально для передачи handle в kernel driver.
+    ///
+    /// **ВАЖНО:** Это НЕ то же самое, что `create("")` (пустая строка).
+    ///
+    /// **Технические детали:**
+    /// - `create("")` → `NtName::new("")` → `to_nt_path("")` → `"\\BaseNamedObjects\\"`
+    ///   → создается `UNICODE_STRING` с валидным указателем → **именованная секция**
+    /// - `create_anonymous()` → передает `null_mut()` в `OBJECT_ATTRIBUTES.ObjectName`
+    ///   → Windows NT API видит `ObjectName = NULL` → **anonymous section**
+    ///
+    /// Windows NT API интерпретирует только `ObjectName = NULL` в `OBJECT_ATTRIBUTES`
+    /// как anonymous (unnamed) объект. Пустой `UNICODE_STRING` (даже с `Length = 0`)
+    /// все равно является указателем на структуру, а не NULL, поэтому создаст
+    /// именованную секцию (которая, вероятно, завершится ошибкой из-за невалидного имени).
+    pub fn create_anonymous() -> Result<Self> {
+        Self::create_internal(null_mut(), String::new())
     }
 
     /// Открытие секции через NtOpenSection
     pub fn open(name: &str) -> Result<Self> {
         let size = shared_mapping_size();
         let mut nt_name = NtName::new(name);
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE,
-            null_mut(),
-        );
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
 
         let mut section_handle: HANDLE = null_mut();
 
-        let status = unsafe {
-            NtOpenSection(
-                &mut section_handle,
-                SECTION_ALL_ACCESS,
-                &mut obj_attr,
-            )
-        };
+        let status =
+            unsafe { NtOpenSection(&mut section_handle, SECTION_ALL_ACCESS, &mut obj_attr) };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtOpenSection"));

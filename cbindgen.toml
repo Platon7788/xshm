@@ -45,4 +45,5 @@ exclude = [
     "NT_CURRENT_PROCESS",
     "SECURITY_DESCRIPTOR_REVISION",
 ]
+# Явно включаем EventHandles для экспорта (EventHandles не исключается, поэтому будет экспортирован)
 

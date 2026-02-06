@@ -95,6 +95,14 @@ typedef enum shm_direction_t {
   SHM_DIR_CLIENT_TO_SERVER = 1,
 } shm_direction_t;
 
+/**
+ * Raw handles событий для передачи в kernel driver
+ *
+ * Handles представлены как `isize` для совместимости с Windows HANDLE типом.
+ * Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
+ */
+typedef struct EventHandles EventHandles;
+
 typedef struct shm_auto_options_t {
   uint32_t wait_timeout_ms;
   uint32_t reconnect_delay_ms;
@@ -291,6 +299,22 @@ enum shm_error_t shm_client_send(ClientHandle *handle, const void *data, uint32_
 enum shm_error_t shm_client_receive(ClientHandle *handle, void *buffer, uint32_t *size);
 
 enum shm_error_t shm_client_poll(ClientHandle *handle, uint32_t timeout_ms);
+
+/**
+ * Получить event handles для передачи в kernel driver
+ *
+ * Возвращает структуру с raw handles (isize) для event-driven IPC.
+ * Для anonymous серверов (без событий) возвращает handles с нулевыми значениями.
+ *
+ * # Parameters
+ * - `handle`: Handle сервера
+ * - `out`: Указатель на структуру для записи handles (может быть NULL)
+ *
+ * # Returns
+ * true если handles успешно получены, false при ошибке
+ */
+bool shm_server_get_event_handles(ServerHandle *handle,
+                                  struct EventHandles *out);
 
 /**
  * Получить опции по умолчанию

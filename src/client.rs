@@ -2,8 +2,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::constants::{
-    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, MAX_MESSAGE_SIZE,
-    MIN_MESSAGE_SIZE, SHARED_MAGIC, SHARED_VERSION,
+    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, SHARED_MAGIC, SHARED_VERSION,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -29,7 +28,7 @@ impl SharedClient {
         let map_name = mapping_name(name);
         let mapping = Mapping::open(&map_name)?;
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
-        
+
         // Проверка magic и version для валидации shared memory
         let control = view.control_block();
         if control.magic != SHARED_MAGIC {
@@ -38,7 +37,7 @@ impl SharedClient {
         if control.version != SHARED_VERSION {
             return Err(ShmError::HandshakeFailed);
         }
-        
+
         let events = SharedEvents::open(name)?;
 
         view.control_block()
@@ -140,12 +139,6 @@ impl SharedClient {
 
     pub fn send_to_server(&self, payload: &[u8]) -> Result<WriteOutcome> {
         self.ensure_connected()?;
-        if payload.len() < MIN_MESSAGE_SIZE {
-            return Err(ShmError::MessageTooSmall);
-        }
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(ShmError::MessageTooLarge);
-        }
         let result = self.ring_tx.write_message(payload)?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();

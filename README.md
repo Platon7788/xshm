@@ -2,7 +2,16 @@
 
 High-performance bidirectional IPC library using shared memory with lock-free SPSC ring buffers. Written in Rust with FFI support for C/C++.
 
-**Author:** Platon
+**Version**: 0.3.0  
+**Author:** Platon  
+**Status**: ✅ **PRODUCTION READY**
+
+## 🆕 What's New in v0.3.0
+
+- ✅ **Event Handles API**: New `shm_server_get_event_handles()` function for kernel driver integration
+- ✅ **EventHandles Structure**: Exported `shm_event_handles_t` structure in C API
+- ✅ **Kernel Driver Support**: Full support for passing event handles to kernel drivers (e.g., SPF_V4)
+- ✅ **Anonymous Server**: Support for handle-only servers without named events
 
 ## Features
 
@@ -239,9 +248,36 @@ fn main() -> Result<()> {
 ### Headers
 
 ```c
-#include "xshm_server.h"   // Server side
-#include "xshm_client.h"   // Client side
+#include "xshm.h"          // Main header (includes all APIs)
+#include "xshm_server.h"   // Server side (optional, included in xshm.h)
+#include "xshm_client.h"   // Client side (optional, included in xshm.h)
 ```
+
+### Getting Event Handles for Kernel Driver
+
+**New in v0.3.0**: Get event handles from server for passing to kernel driver:
+
+```c
+#include "xshm.h"
+
+ServerHandle* server = shm_server_start(&config, NULL);
+
+// Get event handles for kernel driver
+shm_event_handles_t event_handles = {0};
+if (shm_server_get_event_handles(server, &event_handles)) {
+    // Pass handles to kernel driver via IOCTL
+    // event_handles.s2c_data - Server→Client data event (user signals driver)
+    // event_handles.c2s_data - Client→Server data event (driver signals user)
+    
+    // Example: Pass to SPF_V4 driver
+    request.ShmDataEventHandle = (HANDLE)event_handles.s2c_data;
+    request.ShmSpaceEventHandle = (HANDLE)event_handles.c2s_data;
+} else {
+    // Anonymous server - no events available, use polling mode
+}
+```
+
+**Note**: For anonymous servers (`SharedServer::start_anonymous()`), this function returns `false` and handles are zero. Use polling mode in this case.
 
 ### Linking
 
@@ -365,6 +401,39 @@ int main(void) {
 | `MAX_MESSAGE_SIZE` | 65535 | Max message size (bytes) |
 | `MIN_MESSAGE_SIZE` | 2 | Min message size (bytes) |
 
+## Event Handles for Kernel Drivers
+
+**New in v0.3.0**: Get event handles from server for passing to kernel drivers:
+
+```c
+#include "xshm.h"
+
+ServerHandle* server = shm_server_start(&config, NULL);
+
+// Get event handles
+shm_event_handles_t event_handles = {0};
+if (shm_server_get_event_handles(server, &event_handles)) {
+    // event_handles.s2c_data - Server→Client data event
+    // event_handles.c2s_data - Client→Server data event
+    // Pass to kernel driver via IOCTL
+} else {
+    // Anonymous server - no events, use polling mode
+}
+```
+
+**Rust API**:
+```rust
+use xshm::{SharedServer, EventHandles};
+
+let server = SharedServer::start("MyChannel")?;
+if let Some(handles) = server.get_event_handles() {
+    // handles.s2c_data - Server→Client data event
+    // handles.c2s_data - Client→Server data event
+}
+```
+
+**Note**: For anonymous servers (`SharedServer::start_anonymous()`), `get_event_handles()` returns `None` (no named events created). Use polling mode in this case.
+
 ## Limitations
 
 - **SPSC**: Strictly one producer and one consumer per channel
@@ -372,6 +441,7 @@ int main(void) {
 - **Windows only**: Uses direct NT API calls
 - **Admin required**: Named kernel objects require elevated privileges
 - **Message size**: 2 to 65535 bytes
+- **Anonymous servers**: No event handles available (polling mode only)
 
 ## Project Structure
 

@@ -1,4 +1,7 @@
 /target
 /.kiro
+/.cargo
 Cargo.lock
 /x_core
+/Docs
+CLAUDE.md

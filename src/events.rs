@@ -19,6 +19,21 @@ pub struct SharedEvents {
     pub disconnect: EventHandle,
 }
 
+/// Raw handles событий для передачи в kernel driver
+/// 
+/// Handles представлены как `isize` для совместимости с Windows HANDLE типом.
+/// Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
+#[derive(Debug, Clone, Copy)]
+pub struct EventHandles {
+    /// Server→Client data event handle (s2c.data)
+    /// User-mode сигнализирует когда данные доступны для чтения драйвером
+    pub s2c_data: isize,
+    
+    /// Client→Server data event handle (c2s.data)
+    /// Driver сигнализирует когда данные доступны для чтения user-mode
+    pub c2s_data: isize,
+}
+
 impl SharedEvents {
     pub fn create(base: &str) -> Result<Self> {
         Ok(Self {
@@ -62,6 +77,20 @@ impl SharedEvents {
                 EVENT_DISCONNECT_SUFFIX,
             ))?,
         })
+    }
+
+    /// Получить raw handles событий для передачи в kernel driver
+    /// 
+    /// Возвращает структуру с raw handles (isize) для:
+    /// - s2c_data: Server→Client data event (user signals when data available for driver)
+    /// - c2s_data: Client→Server data event (driver signals when data available for user)
+    /// 
+    /// Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
+    pub fn get_event_handles(&self) -> EventHandles {
+        EventHandles {
+            s2c_data: self.s2c.data.raw_handle(),
+            c2s_data: self.c2s.data.raw_handle(),
+        }
     }
 
     pub fn open(base: &str) -> Result<Self> {

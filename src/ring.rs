@@ -43,12 +43,10 @@ impl RingBuffer {
         self.storage.as_ptr()
     }
 
-    #[allow(dead_code)]
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
-    #[allow(dead_code)]
     pub fn reset(&self, generation: u32) {
         self.header().reset(generation);
     }
@@ -120,7 +118,7 @@ impl RingBuffer {
         let new_read = read.wrapping_add(total as u32);
 
         header.read_pos.store(new_read, Ordering::Release);
-        header.message_count.fetch_sub(1, Ordering::Release);
+        header.message_count.fetch_sub(1, Ordering::AcqRel);
         header.drop_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -170,10 +168,10 @@ impl RingBuffer {
             // Это гарантирует, что reader увидит count > 0 когда видит новый write_pos
             // На x86/x64 TSO это безопасно, но порядок операций всё равно важен
             let prev_count = header.message_count.fetch_add(1, Ordering::AcqRel);
-            
+
             let new_write = write.wrapping_add(total_required);
             header.write_pos.store(new_write, Ordering::Release);
-            
+
             if prev_count == 0 {
                 header.sequence.fetch_add(1, Ordering::Relaxed);
             }
@@ -212,12 +210,12 @@ impl RingBuffer {
 
         let total = MESSAGE_HEADER_SIZE + msg_len;
         let new_read = read.wrapping_add(total as u32);
-        
+
         // ВАЖНО: сначала обновляем read_pos, потом уменьшаем message_count
         // Симметрично write_message для корректной синхронизации
         header.read_pos.store(new_read, Ordering::Release);
         let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
-        
+
         if prev_count <= 1 {
             header.sequence.fetch_add(1, Ordering::Relaxed);
         }
@@ -229,7 +227,6 @@ impl RingBuffer {
         self.header().message_count.load(Ordering::Acquire)
     }
 
-    #[allow(dead_code)]
     pub fn drop_count(&self) -> u32 {
         self.header().drop_count.load(Ordering::Acquire)
     }

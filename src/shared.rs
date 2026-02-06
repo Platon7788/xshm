@@ -20,8 +20,8 @@ impl SharedView {
         unsafe { &*(self.base.as_ptr() as *const ControlBlock) }
     }
 
-    pub fn control_block_mut(&self) -> &mut ControlBlock {
-        unsafe { &mut *(self.base.as_ptr() as *mut ControlBlock) }
+    pub fn control_block_ptr(&self) -> *mut ControlBlock {
+        self.base.as_ptr() as *mut ControlBlock
     }
 
     pub fn ring_header_a(&self) -> *mut RingHeader {

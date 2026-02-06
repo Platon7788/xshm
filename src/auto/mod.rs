@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
@@ -10,6 +10,7 @@ use crate::client::SharedClient;
 use crate::constants::MAX_MESSAGE_SIZE;
 use crate::error::{Result, ShmError};
 use crate::server::SharedServer;
+use crate::wait_delay;
 use crate::win::{self};
 
 fn map_spawn_error(err: std::io::Error, context: &'static str) -> ShmError {
@@ -195,10 +196,14 @@ fn server_worker(
 ) {
     let send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+    // Anonymous режим не поддерживается в auto-mode
+    let server_events = server
+        .events()
+        .expect("Anonymous mode not supported in auto-mode");
     let handles = [
-        server.events().disconnect.raw_handle(),
-        server.events().c2s.data.raw_handle(),
-        server.events().s2c.space.raw_handle(),
+        server_events.disconnect.raw_handle(),
+        server_events.c2s.data.raw_handle(),
+        server_events.s2c.space.raw_handle(),
     ];
 
     let mut connected = false;
@@ -365,10 +370,12 @@ fn client_worker(
         };
 
         handler.on_connect();
+        // SharedClient всегда использует named events (не anonymous)
+        let client_events = client.events();
         let handles = [
-            client.events().disconnect.raw_handle(),
-            client.events().s2c.data.raw_handle(),
-            client.events().c2s.space.raw_handle(),
+            client_events.disconnect.raw_handle(),
+            client_events.s2c.data.raw_handle(),
+            client_events.c2s.space.raw_handle(),
         ];
 
         loop {
@@ -416,20 +423,6 @@ fn client_worker(
             break;
         }
     }
-}
-
-fn wait_delay(running: &AtomicBool, delay: Duration) -> bool {
-    if delay.is_zero() {
-        return running.load(Ordering::Acquire);
-    }
-    let deadline = Instant::now() + delay;
-    while Instant::now() < deadline {
-        if !running.load(Ordering::Acquire) {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    running.load(Ordering::Acquire)
 }
 
 fn drain_commands(

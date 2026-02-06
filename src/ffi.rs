@@ -128,10 +128,12 @@ fn to_rust_str(ptr: *const c_char) -> Result<String> {
 struct ServerState {
     inner: SharedServer,
     callbacks: Option<shm_callbacks_t>,
+    recv_buffer: Vec<u8>,
 }
 
 struct ClientState {
     inner: SharedClient,
+    recv_buffer: Vec<u8>,
 }
 
 pub type ServerHandle = c_void;
@@ -467,6 +469,7 @@ pub extern "C" fn shm_server_start(
         Ok(server) => Box::into_raw(Box::new(ServerState {
             inner: server,
             callbacks,
+            recv_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
         })) as *mut ServerHandle,
         Err(err) => {
             let code: shm_error_t = err.into();
@@ -556,20 +559,19 @@ pub extern "C" fn shm_server_receive(
     if handle.is_null() || buffer.is_null() || size.is_null() {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
-    let state = unsafe { &*server_state_from(handle) };
+    let state = unsafe { &mut *server_state_from(handle) };
     let capacity = unsafe { *size } as usize;
     if capacity == 0 {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
-    let mut storage = Vec::with_capacity(MAX_MESSAGE_SIZE);
-    match state.inner.receive_from_client(&mut storage) {
+    match state.inner.receive_from_client(&mut state.recv_buffer) {
         Ok(len) => {
             if len > capacity {
                 return shm_error_t::SHM_ERROR_MEMORY;
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(storage.as_ptr(), buffer as *mut u8, len);
+                std::ptr::copy_nonoverlapping(state.recv_buffer.as_ptr(), buffer as *mut u8, len);
                 *size = len as u32;
             }
             shm_error_t::SHM_SUCCESS
@@ -619,7 +621,10 @@ pub extern "C" fn shm_client_connect(
                     on_connect(cb.user_data);
                 }
             }
-            Box::into_raw(Box::new(ClientState { inner: client })) as *mut ClientHandle
+            Box::into_raw(Box::new(ClientState {
+                inner: client,
+                recv_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
+            })) as *mut ClientHandle
         }
         Err(err) => {
             if !callbacks.is_null() {
@@ -679,20 +684,19 @@ pub extern "C" fn shm_client_receive(
     if handle.is_null() || buffer.is_null() || size.is_null() {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
-    let state = unsafe { &*client_state_from(handle) };
+    let state = unsafe { &mut *client_state_from(handle as *mut ClientHandle) };
     let capacity = unsafe { *size } as usize;
     if capacity == 0 {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
-    let mut storage = Vec::with_capacity(MAX_MESSAGE_SIZE);
-    match state.inner.receive_from_server(&mut storage) {
+    match state.inner.receive_from_server(&mut state.recv_buffer) {
         Ok(len) => {
             if len > capacity {
                 return shm_error_t::SHM_ERROR_MEMORY;
             }
             unsafe {
-                std::ptr::copy_nonoverlapping(storage.as_ptr(), buffer as *mut u8, len);
+                std::ptr::copy_nonoverlapping(state.recv_buffer.as_ptr(), buffer as *mut u8, len);
                 *size = len as u32;
             }
             shm_error_t::SHM_SUCCESS
@@ -716,5 +720,42 @@ pub extern "C" fn shm_client_poll(handle: *mut ClientHandle, timeout_ms: u32) ->
         Ok(true) => shm_error_t::SHM_SUCCESS,
         Ok(false) => shm_error_t::SHM_ERROR_TIMEOUT,
         Err(err) => err.into(),
+    }
+}
+
+/// Получить event handles для передачи в kernel driver
+///
+/// Возвращает структуру с raw handles (isize) для event-driven IPC.
+/// Для anonymous серверов (без событий) возвращает handles с нулевыми значениями.
+///
+/// # Parameters
+/// - `handle`: Handle сервера
+/// - `out`: Указатель на структуру для записи handles (может быть NULL)
+///
+/// # Returns
+/// true если handles успешно получены, false при ошибке
+#[unsafe(no_mangle)]
+pub extern "C" fn shm_server_get_event_handles(
+    handle: *mut ServerHandle,
+    out: *mut crate::events::EventHandles,
+) -> bool {
+    if handle.is_null() || out.is_null() {
+        return false;
+    }
+    let state = unsafe { &*server_state_from(handle) };
+    if let Some(handles) = state.inner.get_event_handles() {
+        unsafe {
+            *out = handles;
+        }
+        true
+    } else {
+        // Anonymous сервер - возвращаем нулевые handles
+        unsafe {
+            *out = crate::events::EventHandles {
+                s2c_data: 0,
+                c2s_data: 0,
+            };
+        }
+        false
     }
 }
