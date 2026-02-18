@@ -385,7 +385,7 @@ fn client_worker(
 
             drain_commands(&send_queue, &cmd_rx, &options, &running);
             process_send_queue(
-                &mut client,
+                &client,
                 &send_queue,
                 &handler,
                 &stats,

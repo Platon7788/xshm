@@ -5,6 +5,7 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(dead_code)]
+#![allow(clippy::upper_case_acronyms)]
 
 use core::ffi::c_void;
 
@@ -71,11 +72,7 @@ pub struct OBJECT_ATTRIBUTES {
 }
 
 impl OBJECT_ATTRIBUTES {
-    pub fn new(
-        name: *mut UNICODE_STRING,
-        attributes: ULONG,
-        security_descriptor: PVOID,
-    ) -> Self {
+    pub fn new(name: *mut UNICODE_STRING, attributes: ULONG, security_descriptor: PVOID) -> Self {
         Self {
             Length: core::mem::size_of::<OBJECT_ATTRIBUTES>() as ULONG,
             RootDirectory: core::ptr::null_mut(),
@@ -136,22 +133,24 @@ impl NullDaclSecurityDescriptor {
     /// Создаёт SECURITY_DESCRIPTOR с NULL DACL (полный доступ для всех)
     /// Использует RtlCreateSecurityDescriptor и RtlSetDaclSecurityDescriptor
     pub fn new() -> Self {
-        use super::funcs::{RtlCreateSecurityDescriptor, RtlSetDaclSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION};
-        
+        use super::funcs::{
+            RtlCreateSecurityDescriptor, RtlSetDaclSecurityDescriptor, SECURITY_DESCRIPTOR_REVISION,
+        };
+
         let mut sd = SECURITY_DESCRIPTOR::new();
-        
+
         unsafe {
             // Инициализируем SD
             let _ = RtlCreateSecurityDescriptor(&mut sd, SECURITY_DESCRIPTOR_REVISION);
             // Устанавливаем NULL DACL
             let _ = RtlSetDaclSecurityDescriptor(
                 &mut sd,
-                1,                        // DaclPresent = TRUE
-                core::ptr::null_mut(),    // Dacl = NULL (full access)
-                0,                        // DaclDefaulted = FALSE
+                1,                     // DaclPresent = TRUE
+                core::ptr::null_mut(), // Dacl = NULL (full access)
+                0,                     // DaclDefaulted = FALSE
             );
         }
-        
+
         Self { sd }
     }
 
@@ -199,7 +198,7 @@ pub const EVENT_ALL_ACCESS: ACCESS_MASK = 0x001F0003;
 
 /// SynchronizationEvent - auto-reset event
 pub const SYNCHRONIZATION_EVENT: ULONG = 1;
-/// NotificationEvent - manual-reset event  
+/// NotificationEvent - manual-reset event
 pub const NOTIFICATION_EVENT: ULONG = 0;
 
 // ============================================================================

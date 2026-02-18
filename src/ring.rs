@@ -116,7 +116,7 @@ impl RingBuffer {
 
         let idx = self.mask_index(read);
         let msg_len = unsafe { self.read_u16(idx) } as usize;
-        if msg_len < MIN_MESSAGE_SIZE || msg_len > MAX_MESSAGE_SIZE {
+        if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
             // Corrupted ring buffer -- reset read_pos to write_pos to recover
             header.read_pos.store(write, Ordering::Release);
             header.message_count.store(0, Ordering::Release);
@@ -201,14 +201,19 @@ impl RingBuffer {
         let read = header.read_pos.load(Ordering::Acquire);
         let idx = self.mask_index(read);
         let msg_len = unsafe { self.read_u16(idx) } as usize;
-        if msg_len < MIN_MESSAGE_SIZE || msg_len > MAX_MESSAGE_SIZE {
+        if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
             return Err(ShmError::Corrupted);
         }
 
         // SAFETY: clear + reserve guarantees capacity >= msg_len
         out.clear();
         out.reserve(msg_len);
-        debug_assert!(out.capacity() >= msg_len, "reserve failed: cap {} < msg_len {}", out.capacity(), msg_len);
+        debug_assert!(
+            out.capacity() >= msg_len,
+            "reserve failed: cap {} < msg_len {}",
+            out.capacity(),
+            msg_len
+        );
         unsafe {
             out.set_len(msg_len);
             self.copy_from_wrapped(

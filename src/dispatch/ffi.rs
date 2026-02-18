@@ -23,7 +23,6 @@ use super::{
 #[repr(C)]
 pub struct shm_dispatch_registration_t {
     pub pid: u32,
-    pub bits: u8,
     pub revision: u16,
     pub name: *const c_char,
 }
@@ -33,13 +32,7 @@ pub struct shm_dispatch_registration_t {
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_callbacks_t {
     pub on_client_connect: Option<
-        extern "C" fn(
-            client_id: u32,
-            pid: u32,
-            bits: u8,
-            name: *const c_char,
-            user_data: *mut c_void,
-        ),
+        extern "C" fn(client_id: u32, pid: u32, name: *const c_char, user_data: *mut c_void),
     >,
     pub on_client_disconnect: Option<extern "C" fn(client_id: u32, user_data: *mut c_void)>,
     pub on_message: Option<
@@ -143,7 +136,6 @@ impl DispatchHandler for FfiDispatchHandler {
             cb(
                 client_id,
                 info.pid,
-                info.bits,
                 name_cstr.as_ptr(),
                 self.callbacks.user_data,
             );
@@ -208,7 +200,9 @@ impl DispatchClientHandler for FfiDispatchClientHandler {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn to_rust_str(ptr: *const c_char) -> Option<String> {
+/// # Safety
+/// `ptr` must be a valid null-terminated C string or null.
+unsafe fn to_rust_str(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
     }
@@ -216,7 +210,9 @@ fn to_rust_str(ptr: *const c_char) -> Option<String> {
     Some(cstr.to_string_lossy().into_owned())
 }
 
-fn to_dispatch_options(ptr: *const shm_dispatch_options_t) -> DispatchOptions {
+/// # Safety
+/// `ptr` must be a valid pointer to `shm_dispatch_options_t` or null.
+unsafe fn to_dispatch_options(ptr: *const shm_dispatch_options_t) -> DispatchOptions {
     if ptr.is_null() {
         return DispatchOptions::default();
     }
@@ -229,7 +225,11 @@ fn to_dispatch_options(ptr: *const shm_dispatch_options_t) -> DispatchOptions {
     }
 }
 
-fn to_dispatch_client_options(ptr: *const shm_dispatch_client_options_t) -> DispatchClientOptions {
+/// # Safety
+/// `ptr` must be a valid pointer to `shm_dispatch_client_options_t` or null.
+unsafe fn to_dispatch_client_options(
+    ptr: *const shm_dispatch_client_options_t,
+) -> DispatchClientOptions {
     if ptr.is_null() {
         return DispatchClientOptions::default();
     }
@@ -246,28 +246,29 @@ fn to_dispatch_client_options(ptr: *const shm_dispatch_client_options_t) -> Disp
 
 // ─── Server FFI ──────────────────────────────────────────────────────────────
 
+/// # Safety
+/// All pointers must be valid or null where documented. `name` must be a valid C string.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_server_start(
+pub unsafe extern "C" fn shm_dispatch_server_start(
     name: *const c_char,
     callbacks: *const shm_dispatch_callbacks_t,
     options: *const shm_dispatch_options_t,
 ) -> *mut DispatchServerHandle {
-    let name_str = match to_rust_str(name) {
+    let name_str = match unsafe { to_rust_str(name) } {
         Some(n) => n,
         None => return null_mut(),
     };
 
-    let callbacks_val = if callbacks.is_null() {
+    if callbacks.is_null() {
         return null_mut();
-    } else {
-        unsafe { *callbacks }
-    };
+    }
+    let callbacks_val = unsafe { *callbacks };
 
     let handler = Arc::new(FfiDispatchHandler {
         callbacks: callbacks_val,
     });
 
-    let opts = to_dispatch_options(options);
+    let opts = unsafe { to_dispatch_options(options) };
 
     match DispatchServer::start(&name_str, handler, opts) {
         Ok(inner) => {
@@ -282,8 +283,10 @@ pub extern "C" fn shm_dispatch_server_start(
     }
 }
 
+/// # Safety
+/// `handle` must be a valid DispatchServerHandle. `data` must point to `size` bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_server_send_to(
+pub unsafe extern "C" fn shm_dispatch_server_send_to(
     handle: *mut DispatchServerHandle,
     client_id: u32,
     data: *const c_void,
@@ -300,8 +303,10 @@ pub extern "C" fn shm_dispatch_server_send_to(
     }
 }
 
+/// # Safety
+/// `handle` must be valid. `data` must point to `size` bytes. `sent_count` may be null.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_server_broadcast(
+pub unsafe extern "C" fn shm_dispatch_server_broadcast(
     handle: *mut DispatchServerHandle,
     data: *const c_void,
     size: u32,
@@ -315,9 +320,7 @@ pub extern "C" fn shm_dispatch_server_broadcast(
     match state.inner.broadcast(slice) {
         Ok(count) => {
             if !sent_count.is_null() {
-                unsafe {
-                    *sent_count = count;
-                }
+                unsafe { *sent_count = count };
             }
             shm_error_t::SHM_SUCCESS
         }
@@ -325,8 +328,12 @@ pub extern "C" fn shm_dispatch_server_broadcast(
     }
 }
 
+/// # Safety
+/// `handle` must be a valid DispatchServerHandle or null.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_server_client_count(handle: *const DispatchServerHandle) -> u32 {
+pub unsafe extern "C" fn shm_dispatch_server_client_count(
+    handle: *const DispatchServerHandle,
+) -> u32 {
     if handle.is_null() {
         return 0;
     }
@@ -334,8 +341,10 @@ pub extern "C" fn shm_dispatch_server_client_count(handle: *const DispatchServer
     state.inner.client_count()
 }
 
+/// # Safety
+/// `handle` must be a valid DispatchServerHandle or null. Consumes the handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_server_stop(handle: *mut DispatchServerHandle) {
+pub unsafe extern "C" fn shm_dispatch_server_stop(handle: *mut DispatchServerHandle) {
     if handle.is_null() {
         return;
     }
@@ -346,14 +355,16 @@ pub extern "C" fn shm_dispatch_server_stop(handle: *mut DispatchServerHandle) {
 
 // ─── Client FFI ──────────────────────────────────────────────────────────────
 
+/// # Safety
+/// All pointers must be valid. `name` and `reg.name` must be valid C strings.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_client_connect(
+pub unsafe extern "C" fn shm_dispatch_client_connect(
     name: *const c_char,
     reg: *const shm_dispatch_registration_t,
     callbacks: *const shm_dispatch_client_callbacks_t,
     options: *const shm_dispatch_client_options_t,
 ) -> *mut DispatchClientHandle {
-    let name_str = match to_rust_str(name) {
+    let name_str = match unsafe { to_rust_str(name) } {
         Some(n) => n,
         None => return null_mut(),
     };
@@ -363,10 +374,9 @@ pub extern "C" fn shm_dispatch_client_connect(
     }
 
     let reg_val = unsafe { &*reg };
-    let proc_name = to_rust_str(reg_val.name).unwrap_or_default();
+    let proc_name = unsafe { to_rust_str(reg_val.name) }.unwrap_or_default();
     let registration = ClientRegistration {
         pid: reg_val.pid,
-        bits: reg_val.bits,
         revision: reg_val.revision,
         name: proc_name,
     };
@@ -375,7 +385,7 @@ pub extern "C" fn shm_dispatch_client_connect(
     let handler = Arc::new(FfiDispatchClientHandler {
         callbacks: callbacks_val,
     });
-    let opts = to_dispatch_client_options(options);
+    let opts = unsafe { to_dispatch_client_options(options) };
 
     match DispatchClient::connect(&name_str, registration, handler, opts) {
         Ok(inner) => {
@@ -390,8 +400,10 @@ pub extern "C" fn shm_dispatch_client_connect(
     }
 }
 
+/// # Safety
+/// `handle` must be a valid DispatchClientHandle. `data` must point to `size` bytes.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_client_send(
+pub unsafe extern "C" fn shm_dispatch_client_send(
     handle: *mut DispatchClientHandle,
     data: *const c_void,
     size: u32,
@@ -407,8 +419,10 @@ pub extern "C" fn shm_dispatch_client_send(
     }
 }
 
+/// # Safety
+/// `handle` must be a valid DispatchClientHandle or null. Consumes the handle.
 #[unsafe(no_mangle)]
-pub extern "C" fn shm_dispatch_client_stop(handle: *mut DispatchClientHandle) {
+pub unsafe extern "C" fn shm_dispatch_client_stop(handle: *mut DispatchClientHandle) {
     if handle.is_null() {
         return;
     }

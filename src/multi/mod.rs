@@ -256,10 +256,8 @@ impl MultiServer {
 
         for slot_mutex in slots.iter() {
             let slot = slot_mutex.lock().unwrap();
-            if slot.connected {
-                if slot.server.send_to_client(data).is_ok() {
-                    sent_count += 1;
-                }
+            if slot.connected && slot.server.send_to_client(data).is_ok() {
+                sent_count += 1;
             }
         }
 

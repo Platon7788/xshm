@@ -1,4 +1,8 @@
 //! FFI-интерфейс совместимый с существующей C-библиотекой.
+//!
+//! All public functions in this module accept raw pointers from C callers.
+//! The `not_unsafe_ptr_arg_deref` lint is suppressed at the module level
+//! because every FFI function validates its pointer arguments before use.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};

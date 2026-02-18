@@ -119,11 +119,7 @@ typedef void DispatchServerHandle;
  * Server-side callbacks.
  */
 typedef struct shm_dispatch_callbacks_t {
-  void (*on_client_connect)(uint32_t client_id,
-                            uint32_t pid,
-                            uint8_t bits,
-                            const char *name,
-                            void *user_data);
+  void (*on_client_connect)(uint32_t client_id, uint32_t pid, const char *name, void *user_data);
   void (*on_client_disconnect)(uint32_t client_id, void *user_data);
   void (*on_message)(uint32_t client_id, const void *data, uint32_t size, void *user_data);
   void (*on_error)(int32_t client_id, enum shm_error_t error, void *user_data);
@@ -147,7 +143,6 @@ typedef void DispatchClientHandle;
  */
 typedef struct shm_dispatch_registration_t {
   uint32_t pid;
-  uint8_t bits;
   uint16_t revision;
   const char *name;
 } shm_dispatch_registration_t;
@@ -323,33 +318,65 @@ typedef void MultiClientHandle;
 extern "C" {
 #endif // __cplusplus
 
+/**
+ * # Safety
+ * All pointers must be valid or null where documented. `name` must be a valid C string.
+ */
 DispatchServerHandle *shm_dispatch_server_start(const char *name,
                                                 const struct shm_dispatch_callbacks_t *callbacks,
                                                 const struct shm_dispatch_options_t *options);
 
+/**
+ * # Safety
+ * `handle` must be a valid DispatchServerHandle. `data` must point to `size` bytes.
+ */
 enum shm_error_t shm_dispatch_server_send_to(DispatchServerHandle *handle,
                                              uint32_t client_id,
                                              const void *data,
                                              uint32_t size);
 
+/**
+ * # Safety
+ * `handle` must be valid. `data` must point to `size` bytes. `sent_count` may be null.
+ */
 enum shm_error_t shm_dispatch_server_broadcast(DispatchServerHandle *handle,
                                                const void *data,
                                                uint32_t size,
                                                uint32_t *sent_count);
 
+/**
+ * # Safety
+ * `handle` must be a valid DispatchServerHandle or null.
+ */
 uint32_t shm_dispatch_server_client_count(const DispatchServerHandle *handle);
 
+/**
+ * # Safety
+ * `handle` must be a valid DispatchServerHandle or null. Consumes the handle.
+ */
 void shm_dispatch_server_stop(DispatchServerHandle *handle);
 
+/**
+ * # Safety
+ * All pointers must be valid. `name` and `reg.name` must be valid C strings.
+ */
 DispatchClientHandle *shm_dispatch_client_connect(const char *name,
                                                   const struct shm_dispatch_registration_t *reg,
                                                   const struct shm_dispatch_client_callbacks_t *callbacks,
                                                   const struct shm_dispatch_client_options_t *options);
 
+/**
+ * # Safety
+ * `handle` must be a valid DispatchClientHandle. `data` must point to `size` bytes.
+ */
 enum shm_error_t shm_dispatch_client_send(DispatchClientHandle *handle,
                                           const void *data,
                                           uint32_t size);
 
+/**
+ * # Safety
+ * `handle` must be a valid DispatchClientHandle or null. Consumes the handle.
+ */
 void shm_dispatch_client_stop(DispatchClientHandle *handle);
 
 struct shm_dispatch_options_t shm_dispatch_options_default(void);

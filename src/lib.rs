@@ -13,7 +13,9 @@ mod win;
 
 pub mod auto;
 pub mod dispatch;
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod ffi;
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod multi;
 
 // Внутренний модуль - не экспортируется в C API

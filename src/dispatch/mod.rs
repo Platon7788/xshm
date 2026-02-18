@@ -5,7 +5,7 @@
 //! ```text
 //! DispatchServer("NxT")        ← single lobby, accepts all clients
 //!     ↓
-//! Client connects to lobby → sends RegistrationRequest {pid, bits, name}
+//! Client connects to lobby → sends RegistrationRequest {pid, revision, name}
 //!     ↓
 //! Server creates AutoServer("NxT_a7f3b2c1") → sends RegistrationResponse
 //!     ↓
@@ -38,7 +38,6 @@ pub use protocol::{RegistrationRequest, RegistrationResponse};
 #[derive(Debug, Clone)]
 pub struct ClientRegistration {
     pub pid: u32,
-    pub bits: u8,
     pub revision: u16,
     pub name: String,
 }
@@ -86,7 +85,7 @@ pub struct DispatchOptions {
     pub channel_connect_timeout: Duration,
     /// Worker loop poll interval.
     pub poll_timeout: Duration,
-    /// Messages to process per batch.
+    /// Messages to process per batch on each client channel.
     pub recv_batch: usize,
 }
 
@@ -110,7 +109,7 @@ pub struct DispatchClientOptions {
     pub response_timeout: Duration,
     /// Timeout for connecting to dedicated channel.
     pub channel_timeout: Duration,
-    /// Worker loop poll interval.
+    /// Worker loop poll interval on dedicated channel.
     pub poll_timeout: Duration,
     /// Messages to process per batch.
     pub recv_batch: usize,
@@ -135,12 +134,11 @@ impl Default for DispatchClientOptions {
 
 /// Active client on a dedicated channel.
 struct DispatchedClient {
-    #[allow(dead_code)]
     server: AutoServer,
-    #[allow(dead_code)]
     info: ClientRegistration,
-    #[allow(dead_code)]
     channel_name: String,
+    /// Set to true when disconnect has been handled (prevents double-notify).
+    disconnected: AtomicBool,
 }
 
 /// Shared client map accessible from both server and proxy handlers.
@@ -151,7 +149,7 @@ pub struct DispatchServer {
     base_name: String,
     clients: ClientMap,
     running: Arc<AtomicBool>,
-    next_client_id: AtomicU32,
+    next_client_id: Arc<AtomicU32>,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
     handler: Arc<dyn DispatchHandler>,
     options: DispatchOptions,
@@ -170,7 +168,7 @@ impl DispatchServer {
             base_name: name.to_owned(),
             clients: Arc::new(RwLock::new(HashMap::new())),
             running,
-            next_client_id: AtomicU32::new(1),
+            next_client_id: Arc::new(AtomicU32::new(1)),
             worker_handle: Mutex::new(None),
             handler,
             options,
@@ -179,7 +177,7 @@ impl DispatchServer {
         let server_clone = server.clone();
         let name_owned = name.to_owned();
         let handle = thread::Builder::new()
-            .name(format!("xshm-dispatch-{}", name))
+            .name(format!("xshm-dispatch-{name}"))
             .spawn(move || server_clone.worker_loop(&name_owned))
             .map_err(|e| ShmError::WindowsError {
                 code: e.raw_os_error().unwrap_or(-1) as u32,
@@ -214,6 +212,8 @@ impl DispatchServer {
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
         let removed = self.clients.write().unwrap().remove(&client_id);
         if let Some(client) = removed {
+            // Mark as disconnected so AutoProxyHandler won't double-notify
+            client.disconnected.store(true, Ordering::Release);
             client.server.stop();
             self.handler.on_client_disconnect(client_id);
             Ok(())
@@ -237,6 +237,24 @@ impl DispatchServer {
         self.clients.read().unwrap().contains_key(&client_id)
     }
 
+    /// Get registration info for a client.
+    pub fn client_info(&self, client_id: u32) -> Option<ClientRegistration> {
+        self.clients
+            .read()
+            .unwrap()
+            .get(&client_id)
+            .map(|c| c.info.clone())
+    }
+
+    /// Get channel name for a client.
+    pub fn client_channel(&self, client_id: u32) -> Option<String> {
+        self.clients
+            .read()
+            .unwrap()
+            .get(&client_id)
+            .map(|c| c.channel_name.clone())
+    }
+
     /// Stop the dispatch server and all client channels.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
@@ -247,25 +265,28 @@ impl DispatchServer {
         &self.base_name
     }
 
-    /// Generate a unique channel name with random suffix.
+    /// Generate a unique channel name with cryptographic-quality random suffix.
     fn generate_channel_name(&self) -> String {
-        let id = self.next_client_id.load(Ordering::Relaxed);
-        let random = {
-            // Simple PRNG using thread ID + time for uniqueness
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64;
-            let thread_id = thread::current().id();
-            let hash = t
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(format!("{:?}", thread_id).len() as u64);
-            hash ^ (id as u64)
-        };
-        format!("{}_{:08x}", self.base_name, random as u32)
+        // Use multiple entropy sources for uniqueness
+        let time_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+
+        let counter = self.next_client_id.load(Ordering::Relaxed) as u64;
+
+        // PCG-style mixing: time XOR counter, then xorshift + multiply
+        let mut state = time_nanos ^ (counter.wrapping_mul(0x517cc1b727220a95));
+        state ^= state >> 17;
+        state = state.wrapping_mul(0xbf58476d1ce4e5b9);
+        state ^= state >> 31;
+        state = state.wrapping_mul(0x94d049bb133111eb);
+        state ^= state >> 32;
+
+        format!("{}_{:016x}", self.base_name, state)
     }
 
-    /// Main worker loop — handles lobby connections and routes messages.
+    /// Main worker loop — accepts clients through the lobby one at a time.
     fn worker_loop(&self, base_name: &str) {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
@@ -284,7 +305,6 @@ impl DispatchServer {
 
             // Inner loop: accept clients sequentially through the lobby
             while self.running.load(Ordering::Acquire) {
-                // Wait for a client to connect to lobby
                 match lobby_server.wait_for_client(Some(self.options.poll_timeout)) {
                     Ok(()) => {
                         // Client connected — process registration
@@ -295,12 +315,11 @@ impl DispatchServer {
                     }
                     Err(ShmError::Timeout) => continue,
                     Err(ShmError::AlreadyConnected) => {
-                        // Shouldn't happen, but reset and continue
                         lobby_server.mark_disconnected();
                     }
                     Err(err) => {
                         self.handler.on_error(None, err);
-                        break; // Recreate lobby
+                        break; // Recreate lobby on serious error
                     }
                 }
             }
@@ -308,8 +327,10 @@ impl DispatchServer {
 
         // Shutdown: stop all client channels
         let mut clients = self.clients.write().unwrap();
-        for (_, client) in clients.drain() {
+        for (id, client) in clients.drain() {
+            client.disconnected.store(true, Ordering::Release);
             client.server.stop();
+            self.handler.on_client_disconnect(id);
         }
     }
 
@@ -323,6 +344,10 @@ impl DispatchServer {
                 return;
             }
 
+            if !self.running.load(Ordering::Acquire) {
+                return;
+            }
+
             match lobby.receive_from_client(buffer) {
                 Ok(len) => match protocol::decode_request(&buffer[..len]) {
                     Ok(req) => break req,
@@ -332,7 +357,6 @@ impl DispatchServer {
                     }
                 },
                 Err(ShmError::QueueEmpty) => {
-                    // Poll for data
                     let _ = lobby.poll_client(Some(Duration::from_millis(10)));
                     continue;
                 }
@@ -348,21 +372,18 @@ impl DispatchServer {
 
         let info = ClientRegistration {
             pid: request.pid,
-            bits: request.bits,
             revision: request.revision,
             name: request.name.clone(),
         };
 
         // Create AutoServer for this client's dedicated channel
         let connect_signal = Arc::new((Mutex::new(false), Condvar::new()));
-        let disconnect_signal = Arc::new(AtomicBool::new(false));
 
         let proxy_handler = Arc::new(AutoProxyHandler {
             client_id,
             handler: self.handler.clone(),
+            clients: Arc::clone(&self.clients),
             connect_signal: connect_signal.clone(),
-            disconnect_clients: Arc::clone(&self.clients),
-            disconnect_signal: disconnect_signal.clone(),
         });
 
         let auto_options = AutoOptions {
@@ -376,7 +397,6 @@ impl DispatchServer {
             Ok(s) => s,
             Err(err) => {
                 self.handler.on_error(None, err);
-                // Send rejection to client
                 let reject = protocol::encode_response(&RegistrationResponse {
                     status: protocol::STATUS_REJECTED,
                     client_id: 0,
@@ -400,30 +420,32 @@ impl DispatchServer {
             return;
         }
 
-        // Signal lobby data available
-        let _ = lobby.events().map(|e| e.s2c.data.set());
+        // Signal lobby data available so client can read
+        if let Some(events) = lobby.events() {
+            let _ = events.s2c.data.set();
+        }
 
-        // Wait for client to connect to dedicated channel
+        // Wait for client to connect to dedicated channel (signaled by AutoProxyHandler)
         let (lock, cvar) = &*connect_signal;
-        let mut connected = lock.lock().unwrap();
+        let connected = lock.lock().unwrap();
         let timeout = self.options.channel_connect_timeout;
-        let result = cvar.wait_timeout(connected, timeout).unwrap();
-        connected = result.0;
+        let (connected, result) = cvar.wait_timeout(connected, timeout).unwrap();
+        let client_connected = *connected;
+        drop(connected);
 
-        if !*connected {
-            // Client didn't connect in time
+        if !client_connected || result.timed_out() {
             auto_server.stop();
             return;
         }
-        drop(connected);
 
-        // Register client
+        // Register client in the shared map
         self.clients.write().unwrap().insert(
             client_id,
             DispatchedClient {
                 server: auto_server,
                 info: info.clone(),
                 channel_name,
+                disconnected: AtomicBool::new(false),
             },
         );
 
@@ -445,13 +467,13 @@ impl Drop for DispatchServer {
 struct AutoProxyHandler {
     client_id: u32,
     handler: Arc<dyn DispatchHandler>,
+    clients: ClientMap,
     connect_signal: Arc<(Mutex<bool>, Condvar)>,
-    disconnect_clients: ClientMap,
-    disconnect_signal: Arc<AtomicBool>,
 }
 
 impl AutoHandler for AutoProxyHandler {
     fn on_connect(&self) {
+        // Signal the lobby worker that the client has connected to its channel
         let (lock, cvar) = &*self.connect_signal;
         let mut connected = lock.lock().unwrap();
         *connected = true;
@@ -459,20 +481,27 @@ impl AutoHandler for AutoProxyHandler {
     }
 
     fn on_disconnect(&self) {
-        if self
-            .disconnect_signal
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            // Remove from clients map and notify handler
-            let removed = self
-                .disconnect_clients
-                .write()
-                .unwrap()
-                .remove(&self.client_id);
-            if removed.is_some() {
-                self.handler.on_client_disconnect(self.client_id);
+        // Check if already handled (e.g. by disconnect_client())
+        let removed = {
+            let mut clients = self.clients.write().unwrap();
+            if let Some(client) = clients.get(&self.client_id) {
+                if client
+                    .disconnected
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    clients.remove(&self.client_id);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
+        };
+
+        if removed {
+            self.handler.on_client_disconnect(self.client_id);
         }
     }
 
@@ -487,142 +516,37 @@ impl AutoHandler for AutoProxyHandler {
 
 // ─── DispatchClient ──────────────────────────────────────────────────────────
 
-use std::sync::mpsc::{self, Receiver, Sender};
-
-enum ClientCommand {
-    Send(Vec<u8>),
-    Shutdown,
-}
-
 /// Client that connects to a DispatchServer, registers, and communicates
 /// on a dynamically assigned channel.
+///
+/// Lifecycle: connect once → register → get channel → communicate → stop.
+/// Does NOT reconnect automatically — if disconnected, create a new client.
 pub struct DispatchClient {
-    cmd_tx: Sender<ClientCommand>,
-    join: Mutex<Option<JoinHandle<()>>>,
+    auto_client: Mutex<Option<AutoClient>>,
     running: Arc<AtomicBool>,
-    client_id: Arc<AtomicU32>,
-    channel_name: Arc<Mutex<String>>,
+    client_id: u32,
+    channel_name: String,
 }
 
 impl DispatchClient {
     /// Connect to a dispatch server, register, and start communicating.
+    ///
+    /// This is a blocking call — it performs the lobby handshake synchronously,
+    /// then spawns the dedicated channel via AutoClient.
     pub fn connect(
         name: &str,
         registration: ClientRegistration,
         handler: Arc<dyn DispatchClientHandler>,
         options: DispatchClientOptions,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel();
-        let running = Arc::new(AtomicBool::new(true));
-        let client_id = Arc::new(AtomicU32::new(0));
-        let channel_name = Arc::new(Mutex::new(String::new()));
-
-        let running_clone = running.clone();
-        let client_id_clone = client_id.clone();
-        let channel_name_clone = channel_name.clone();
-        let base_name = name.to_owned();
-
-        let handle = thread::Builder::new()
-            .name(format!("xshm-dispatch-client-{}", name))
-            .spawn(move || {
-                dispatch_client_worker(
-                    &base_name,
-                    registration,
-                    handler,
-                    options,
-                    rx,
-                    running_clone,
-                    client_id_clone,
-                    channel_name_clone,
-                );
-            })
-            .map_err(|e| ShmError::WindowsError {
-                code: e.raw_os_error().unwrap_or(-1) as u32,
-                context: "spawn dispatch client worker",
-            })?;
-
-        Ok(Self {
-            cmd_tx: tx,
-            join: Mutex::new(Some(handle)),
-            running,
-            client_id,
-            channel_name,
-        })
-    }
-
-    /// Send a message to the server on the dedicated channel.
-    pub fn send(&self, data: &[u8]) -> Result<()> {
-        if !self.running.load(Ordering::Acquire) {
-            return Err(ShmError::NotReady);
-        }
-        self.cmd_tx
-            .send(ClientCommand::Send(data.to_vec()))
-            .map_err(|_| ShmError::NotReady)
-    }
-
-    /// Get the assigned client ID (0 if not yet registered).
-    pub fn client_id(&self) -> u32 {
-        self.client_id.load(Ordering::Acquire)
-    }
-
-    /// Get the assigned channel name (empty if not yet registered).
-    pub fn channel_name(&self) -> String {
-        self.channel_name.lock().unwrap().clone()
-    }
-
-    /// Check if connected to the dedicated channel.
-    pub fn is_connected(&self) -> bool {
-        self.client_id.load(Ordering::Acquire) != 0
-    }
-
-    /// Stop the client.
-    pub fn stop(&self) {
-        let _ = self.cmd_tx.send(ClientCommand::Shutdown);
-    }
-}
-
-impl Drop for DispatchClient {
-    fn drop(&mut self) {
-        self.running.store(false, Ordering::Release);
-        let _ = self.cmd_tx.send(ClientCommand::Shutdown);
-        if let Some(handle) = self.join.lock().unwrap().take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-// ─── Client worker ───────────────────────────────────────────────────────────
-
-fn dispatch_client_worker(
-    base_name: &str,
-    registration: ClientRegistration,
-    handler: Arc<dyn DispatchClientHandler>,
-    options: DispatchClientOptions,
-    cmd_rx: Receiver<ClientCommand>,
-    running: Arc<AtomicBool>,
-    client_id_out: Arc<AtomicU32>,
-    channel_name_out: Arc<Mutex<String>>,
-) {
-    let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
-
-    while running.load(Ordering::Acquire) {
-        // Phase 1: Connect to lobby and register
+        // Phase 1: Connect to lobby and register (blocking)
+        let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
         let (assigned_id, assigned_channel) =
-            match lobby_register(base_name, &registration, &options, &mut buffer) {
-                Ok(result) => result,
-                Err(err) => {
-                    handler.on_error(err);
-                    if !wait_delay(&running, options.poll_timeout) {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-        client_id_out.store(assigned_id, Ordering::Release);
-        *channel_name_out.lock().unwrap() = assigned_channel.clone();
+            lobby_register(name, &registration, &options, &mut buffer)?;
 
         // Phase 2: Connect to dedicated channel via AutoClient
+        let running = Arc::new(AtomicBool::new(true));
+
         let client_handler = Arc::new(DispatchClientProxy {
             handler: handler.clone(),
         });
@@ -635,53 +559,66 @@ fn dispatch_client_worker(
             ..AutoOptions::default()
         };
 
-        let auto_client = match AutoClient::connect(&assigned_channel, client_handler, auto_options)
-        {
-            Ok(c) => c,
-            Err(err) => {
-                handler.on_error(err);
-                client_id_out.store(0, Ordering::Release);
-                if !wait_delay(&running, options.poll_timeout) {
-                    break;
-                }
-                continue;
-            }
-        };
+        let auto_client = AutoClient::connect(&assigned_channel, client_handler, auto_options)?;
 
         handler.on_connect(assigned_id, &assigned_channel);
 
-        // Phase 3: Forward commands to auto client
-        loop {
-            if !running.load(Ordering::Acquire) {
-                break;
-            }
+        Ok(Self {
+            auto_client: Mutex::new(Some(auto_client)),
+            running,
+            client_id: assigned_id,
+            channel_name: assigned_channel,
+        })
+    }
 
-            match cmd_rx.recv_timeout(options.poll_timeout) {
-                Ok(ClientCommand::Send(data)) => {
-                    if let Err(err) = auto_client.send(&data) {
-                        handler.on_error(err);
-                    }
-                }
-                Ok(ClientCommand::Shutdown) => {
-                    running.store(false, Ordering::Release);
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    running.store(false, Ordering::Release);
-                    break;
-                }
-            }
+    /// Send a message to the server on the dedicated channel.
+    pub fn send(&self, data: &[u8]) -> Result<()> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(ShmError::NotReady);
         }
+        let guard = self.auto_client.lock().unwrap();
+        match guard.as_ref() {
+            Some(client) => client.send(data),
+            None => Err(ShmError::NotConnected),
+        }
+    }
 
-        auto_client.stop();
-        client_id_out.store(0, Ordering::Release);
+    /// Get the assigned client ID.
+    pub fn client_id(&self) -> u32 {
+        self.client_id
+    }
 
-        if !wait_delay(&running, options.poll_timeout) {
-            break;
+    /// Get the assigned channel name.
+    pub fn channel_name(&self) -> &str {
+        &self.channel_name
+    }
+
+    /// Check if connected to the dedicated channel.
+    pub fn is_connected(&self) -> bool {
+        self.running.load(Ordering::Acquire) && self.auto_client.lock().unwrap().is_some()
+    }
+
+    /// Stop the client and disconnect.
+    pub fn stop(&self) {
+        self.running.store(false, Ordering::Release);
+        let mut guard = self.auto_client.lock().unwrap();
+        if let Some(client) = guard.take() {
+            client.stop();
         }
     }
 }
+
+impl Drop for DispatchClient {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Release);
+        let mut guard = self.auto_client.lock().unwrap();
+        if let Some(client) = guard.take() {
+            client.stop();
+        }
+    }
+}
+
+// ─── Lobby registration (blocking) ──────────────────────────────────────────
 
 /// Perform lobby registration: connect, send request, read response.
 fn lobby_register(
@@ -690,17 +627,18 @@ fn lobby_register(
     options: &DispatchClientOptions,
     buffer: &mut Vec<u8>,
 ) -> Result<(u32, String)> {
-    // Connect to lobby
     let client = SharedClient::connect(base_name, options.lobby_timeout)?;
 
     // Send registration request
     let request = protocol::encode_request(&RegistrationRequest {
         pid: registration.pid,
-        bits: registration.bits,
         revision: registration.revision,
         name: registration.name.clone(),
     });
     client.send_to_server(&request)?;
+
+    // Signal data available for server
+    let _ = client.events().c2s.data.set();
 
     // Wait for response
     let start = std::time::Instant::now();
@@ -836,7 +774,6 @@ mod tests {
         let client_handler = Arc::new(TestClientHandler::new());
         let registration = ClientRegistration {
             pid: 12345,
-            bits: 32,
             revision: 1,
             name: "test.exe".into(),
         };
@@ -849,9 +786,9 @@ mod tests {
         )
         .expect("client connect");
 
-        // Wait for connection
+        // Wait for server to register the client
         let start = std::time::Instant::now();
-        while !client_handler.connected.load(Ordering::Relaxed)
+        while server_handler.connects.load(Ordering::Relaxed) == 0
             && start.elapsed() < Duration::from_secs(5)
         {
             thread::sleep(Duration::from_millis(50));
@@ -877,6 +814,117 @@ mod tests {
 
         // Cleanup
         client.stop();
+        thread::sleep(Duration::from_millis(200));
+        server.stop();
+    }
+
+    #[test]
+    fn dispatch_disconnect_no_double_notify() {
+        let name = format!("TEST_DISPATCH_DC_{}", std::process::id());
+
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server =
+            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
+                .expect("server start");
+
+        thread::sleep(Duration::from_millis(100));
+
+        let client_handler = Arc::new(TestClientHandler::new());
+        let registration = ClientRegistration {
+            pid: 99999,
+            revision: 1,
+            name: "dc_test.exe".into(),
+        };
+
+        let client = DispatchClient::connect(
+            &name,
+            registration,
+            client_handler.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+
+        // Wait for connection
+        let start = std::time::Instant::now();
+        while server.client_count() == 0 && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(server.client_count(), 1);
+
+        // Server-side disconnect
+        let clients = server.connected_clients();
+        server
+            .disconnect_client(clients[0])
+            .expect("disconnect_client");
+
+        thread::sleep(Duration::from_millis(300));
+
+        // Should only see exactly 1 disconnect (not double)
+        assert_eq!(server_handler.disconnects.load(Ordering::Relaxed), 1);
+
+        client.stop();
+        server.stop();
+    }
+
+    #[test]
+    fn dispatch_multiple_clients() {
+        let name = format!("TEST_DISPATCH_MC_{}", std::process::id());
+
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server =
+            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
+                .expect("server start");
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Connect 3 clients sequentially
+        let mut clients = Vec::new();
+        for i in 0..3u32 {
+            let handler = Arc::new(TestClientHandler::new());
+            let reg = ClientRegistration {
+                pid: 1000 + i,
+                revision: 1,
+                name: format!("client_{i}.exe"),
+            };
+            let client = DispatchClient::connect(
+                &name,
+                reg,
+                handler.clone(),
+                DispatchClientOptions::default(),
+            )
+            .expect("client connect");
+            clients.push((client, handler));
+
+            // Wait for server to register this client
+            let expected = i + 1;
+            let start = std::time::Instant::now();
+            while server.client_count() < expected && start.elapsed() < Duration::from_secs(5) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+
+        assert_eq!(server.client_count(), 3);
+        assert_eq!(server_handler.connects.load(Ordering::Relaxed), 3);
+
+        // All clients can send messages
+        for (client, _) in &clients {
+            client.send(b"ping").expect("send");
+        }
+        thread::sleep(Duration::from_millis(300));
+        assert!(server_handler.messages.load(Ordering::Relaxed) >= 3);
+
+        // Broadcast
+        let sent = server.broadcast(b"pong").expect("broadcast");
+        assert_eq!(sent, 3);
+        thread::sleep(Duration::from_millis(300));
+        for (_, handler) in &clients {
+            assert!(handler.messages.load(Ordering::Relaxed) >= 1);
+        }
+
+        // Cleanup
+        for (client, _) in &clients {
+            client.stop();
+        }
         thread::sleep(Duration::from_millis(200));
         server.stop();
     }
