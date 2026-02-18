@@ -77,27 +77,32 @@ fn stress_server_to_client() {
         let mut recv_buf = Vec::new();
         let mut expected = 0u32;
         let start = Instant::now();
+        let mut done = false;
 
-        loop {
+        while !done {
             if start.elapsed() > Duration::from_secs(5) {
                 return Err(ShmError::Timeout);
             }
             if client.poll_server(Some(Duration::from_millis(10)))? {
-                match client.receive_from_server(&mut recv_buf) {
-                    Ok(len) => {
-                        if &recv_buf[..len] == b"END" {
-                            break;
+                // Drain all available messages after a successful poll
+                loop {
+                    match client.receive_from_server(&mut recv_buf) {
+                        Ok(len) => {
+                            if &recv_buf[..len] == b"END" {
+                                done = true;
+                                break;
+                            }
+                            assert!(len >= 4, "message too short: {len}");
+                            let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
+                            assert_eq!(
+                                value, expected,
+                                "out of order message: got {value}, expected {expected}"
+                            );
+                            expected += 1;
                         }
-                        assert!(len >= 4, "message too short: {len}");
-                        let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
-                        assert_eq!(
-                            value, expected,
-                            "out of order message: got {value}, expected {expected}"
-                        );
-                        expected += 1;
+                        Err(ShmError::QueueEmpty) => break,
+                        Err(err) => return Err(err),
                     }
-                    Err(ShmError::QueueEmpty) => {}
-                    Err(err) => return Err(err),
                 }
             } else {
                 thread::sleep(MIN_SLEEP);
@@ -136,27 +141,32 @@ fn stress_client_to_server() {
             let mut recv_buf = Vec::new();
             let mut expected = 0u32;
             let start = Instant::now();
+            let mut done = false;
 
-            loop {
+            while !done {
                 if start.elapsed() > Duration::from_secs(5) {
                     return Err(ShmError::Timeout);
                 }
                 if server.poll_client(Some(Duration::from_millis(10)))? {
-                    match server.receive_from_client(&mut recv_buf) {
-                        Ok(len) => {
-                            if &recv_buf[..len] == b"END" {
-                                break;
+                    // Drain all available messages after a successful poll
+                    loop {
+                        match server.receive_from_client(&mut recv_buf) {
+                            Ok(len) => {
+                                if &recv_buf[..len] == b"END" {
+                                    done = true;
+                                    break;
+                                }
+                                assert!(len >= 4);
+                                let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
+                                assert_eq!(
+                                    value, expected,
+                                    "out of order message: got {value}, expected {expected}"
+                                );
+                                expected += 1;
                             }
-                            assert!(len >= 4);
-                            let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
-                            assert_eq!(
-                                value, expected,
-                                "out of order message: got {value}, expected {expected}"
-                            );
-                            expected += 1;
+                            Err(ShmError::QueueEmpty) => break,
+                            Err(err) => return Err(err),
                         }
-                        Err(ShmError::QueueEmpty) => {}
-                        Err(err) => return Err(err),
                     }
                 } else {
                     thread::sleep(MIN_SLEEP);

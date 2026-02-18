@@ -283,7 +283,7 @@ impl DispatchServer {
         state = state.wrapping_mul(0x94d049bb133111eb);
         state ^= state >> 32;
 
-        format!("{}_{:016x}", self.base_name, state)
+        format!("{:016x}", state)
     }
 
     /// Main worker loop — accepts clients through the lobby one at a time.

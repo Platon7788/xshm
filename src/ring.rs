@@ -108,27 +108,37 @@ impl RingBuffer {
 
     fn discard_oldest(&self) -> Result<()> {
         let header = self.header();
-        let read = header.read_pos.load(Ordering::Acquire);
-        let write = header.write_pos.load(Ordering::Acquire);
-        if read == write {
-            return Err(ShmError::QueueEmpty);
-        }
 
-        let idx = self.mask_index(read);
-        let msg_len = unsafe { self.read_u16(idx) } as usize;
-        if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
-            // Corrupted ring buffer -- reset read_pos to write_pos to recover
-            header.read_pos.store(write, Ordering::Release);
-            header.message_count.store(0, Ordering::Release);
-            return Err(ShmError::Corrupted);
-        }
-        let total = MESSAGE_HEADER_SIZE + msg_len;
-        let new_read = read.wrapping_add(total as u32);
+        loop {
+            let read = header.read_pos.load(Ordering::Acquire);
+            let write = header.write_pos.load(Ordering::Acquire);
+            if read == write {
+                return Err(ShmError::QueueEmpty);
+            }
 
-        header.read_pos.store(new_read, Ordering::Release);
-        header.message_count.fetch_sub(1, Ordering::AcqRel);
-        header.drop_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
+            let idx = self.mask_index(read);
+            let msg_len = unsafe { self.read_u16(idx) } as usize;
+            if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
+                // Corrupted ring buffer -- reset read_pos to write_pos to recover
+                header.read_pos.store(write, Ordering::Release);
+                header.message_count.store(0, Ordering::Release);
+                return Err(ShmError::Corrupted);
+            }
+            let total = MESSAGE_HEADER_SIZE + msg_len;
+            let new_read = read.wrapping_add(total as u32);
+
+            // CAS to avoid racing with read_message on the reader side
+            if header
+                .read_pos
+                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                header.message_count.fetch_sub(1, Ordering::AcqRel);
+                header.drop_count.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            // CAS failed — reader moved read_pos, retry with fresh values
+        }
     }
 
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
@@ -193,48 +203,60 @@ impl RingBuffer {
 
     pub fn read_message(&self, out: &mut Vec<u8>) -> Result<usize> {
         let header = self.header();
-        let count = header.message_count.load(Ordering::Acquire);
-        if count == 0 {
-            return Err(ShmError::QueueEmpty);
-        }
 
-        let read = header.read_pos.load(Ordering::Acquire);
-        let idx = self.mask_index(read);
-        let msg_len = unsafe { self.read_u16(idx) } as usize;
-        if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
-            return Err(ShmError::Corrupted);
-        }
+        loop {
+            let count = header.message_count.load(Ordering::Acquire);
+            if count == 0 {
+                return Err(ShmError::QueueEmpty);
+            }
 
-        // SAFETY: clear + reserve guarantees capacity >= msg_len
-        out.clear();
-        out.reserve(msg_len);
-        debug_assert!(
-            out.capacity() >= msg_len,
-            "reserve failed: cap {} < msg_len {}",
-            out.capacity(),
-            msg_len
-        );
-        unsafe {
-            out.set_len(msg_len);
-            self.copy_from_wrapped(
-                (idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize),
-                out.as_mut_slice(),
+            let read = header.read_pos.load(Ordering::Acquire);
+            let idx = self.mask_index(read);
+            let msg_len = unsafe { self.read_u16(idx) } as usize;
+            if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
+                return Err(ShmError::Corrupted);
+            }
+
+            let total = MESSAGE_HEADER_SIZE + msg_len;
+            let new_read = read.wrapping_add(total as u32);
+
+            // CAS to avoid racing with discard_oldest on the writer side
+            if header
+                .read_pos
+                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                // discard_oldest moved read_pos, retry
+                continue;
+            }
+
+            // We own this message slot now — copy data out
+            // SAFETY: clear + reserve guarantees capacity >= msg_len
+            out.clear();
+            out.reserve(msg_len);
+            debug_assert!(
+                out.capacity() >= msg_len,
+                "reserve failed: cap {} < msg_len {}",
+                out.capacity(),
+                msg_len
             );
+            unsafe {
+                out.set_len(msg_len);
+                self.copy_from_wrapped(
+                    (idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize),
+                    out.as_mut_slice(),
+                );
+            }
+
+            // read_pos already updated via CAS above
+            let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
+
+            if prev_count <= 1 {
+                header.sequence.fetch_add(1, Ordering::Relaxed);
+            }
+
+            return Ok(msg_len);
         }
-
-        let total = MESSAGE_HEADER_SIZE + msg_len;
-        let new_read = read.wrapping_add(total as u32);
-
-        // ВАЖНО: сначала обновляем read_pos, потом уменьшаем message_count
-        // Симметрично write_message для корректной синхронизации
-        header.read_pos.store(new_read, Ordering::Release);
-        let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
-
-        if prev_count <= 1 {
-            header.sequence.fetch_add(1, Ordering::Relaxed);
-        }
-
-        Ok(msg_len)
     }
 
     pub fn message_count(&self) -> u32 {
