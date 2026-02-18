@@ -12,6 +12,7 @@ mod shared;
 mod win;
 
 pub mod auto;
+pub mod dispatch;
 pub mod ffi;
 pub mod multi;
 
@@ -20,6 +21,10 @@ pub(crate) mod ntapi;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
+pub use dispatch::{
+    ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
+    DispatchHandler, DispatchOptions, DispatchServer,
+};
 pub use error::{Result, ShmError};
 pub use events::EventHandles;
 pub use multi::{

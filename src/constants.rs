@@ -9,7 +9,7 @@ pub const RING_CAPACITY: usize = 2 * 1024 * 1024;
 pub const RING_MASK: u32 = (RING_CAPACITY as u32) - 1;
 
 /// Максимальное количество сообщений в очереди.
-pub const MAX_MESSAGES: u32 = 250;
+pub const MAX_MESSAGES: u32 = 500;
 /// Максимальный размер одного сообщения.
 pub const MAX_MESSAGE_SIZE: usize = 65_535;
 /// Минимальный размер сообщения.

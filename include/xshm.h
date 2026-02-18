@@ -34,7 +34,7 @@
 /**
  * Максимальное количество сообщений в очереди.
  */
-#define MAX_MESSAGES 250
+#define MAX_MESSAGES 500
 
 /**
  * Максимальный размер одного сообщения.
@@ -71,6 +71,16 @@
 #define SLOT_ID_NO_SLOT 4294967295
 
 /**
+ * Response status: success.
+ */
+#define STATUS_OK 0
+
+/**
+ * Response status: server rejected the connection.
+ */
+#define STATUS_REJECTED 1
+
+/**
  * Максимальное количество клиентов по умолчанию
  */
 #define DEFAULT_MAX_CLIENTS 20
@@ -102,6 +112,68 @@ typedef enum shm_direction_t {
  * Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
  */
 typedef struct EventHandles EventHandles;
+
+typedef void DispatchServerHandle;
+
+/**
+ * Server-side callbacks.
+ */
+typedef struct shm_dispatch_callbacks_t {
+  void (*on_client_connect)(uint32_t client_id,
+                            uint32_t pid,
+                            uint8_t bits,
+                            const char *name,
+                            void *user_data);
+  void (*on_client_disconnect)(uint32_t client_id, void *user_data);
+  void (*on_message)(uint32_t client_id, const void *data, uint32_t size, void *user_data);
+  void (*on_error)(int32_t client_id, enum shm_error_t error, void *user_data);
+  void *user_data;
+} shm_dispatch_callbacks_t;
+
+/**
+ * Server options.
+ */
+typedef struct shm_dispatch_options_t {
+  uint32_t lobby_timeout_ms;
+  uint32_t channel_connect_timeout_ms;
+  uint32_t poll_timeout_ms;
+  uint32_t recv_batch;
+} shm_dispatch_options_t;
+
+typedef void DispatchClientHandle;
+
+/**
+ * Registration info passed from C client.
+ */
+typedef struct shm_dispatch_registration_t {
+  uint32_t pid;
+  uint8_t bits;
+  uint16_t revision;
+  const char *name;
+} shm_dispatch_registration_t;
+
+/**
+ * Client-side callbacks.
+ */
+typedef struct shm_dispatch_client_callbacks_t {
+  void (*on_connect)(uint32_t client_id, const char *channel_name, void *user_data);
+  void (*on_disconnect)(void *user_data);
+  void (*on_message)(const void *data, uint32_t size, void *user_data);
+  void (*on_error)(enum shm_error_t error, void *user_data);
+  void *user_data;
+} shm_dispatch_client_callbacks_t;
+
+/**
+ * Client options.
+ */
+typedef struct shm_dispatch_client_options_t {
+  uint32_t lobby_timeout_ms;
+  uint32_t response_timeout_ms;
+  uint32_t channel_timeout_ms;
+  uint32_t poll_timeout_ms;
+  uint32_t recv_batch;
+  uint32_t max_send_queue;
+} shm_dispatch_client_options_t;
 
 typedef struct shm_auto_options_t {
   uint32_t wait_timeout_ms;
@@ -250,6 +322,39 @@ typedef void MultiClientHandle;
 #ifdef __cplusplus
 extern "C" {
 #endif // __cplusplus
+
+DispatchServerHandle *shm_dispatch_server_start(const char *name,
+                                                const struct shm_dispatch_callbacks_t *callbacks,
+                                                const struct shm_dispatch_options_t *options);
+
+enum shm_error_t shm_dispatch_server_send_to(DispatchServerHandle *handle,
+                                             uint32_t client_id,
+                                             const void *data,
+                                             uint32_t size);
+
+enum shm_error_t shm_dispatch_server_broadcast(DispatchServerHandle *handle,
+                                               const void *data,
+                                               uint32_t size,
+                                               uint32_t *sent_count);
+
+uint32_t shm_dispatch_server_client_count(const DispatchServerHandle *handle);
+
+void shm_dispatch_server_stop(DispatchServerHandle *handle);
+
+DispatchClientHandle *shm_dispatch_client_connect(const char *name,
+                                                  const struct shm_dispatch_registration_t *reg,
+                                                  const struct shm_dispatch_client_callbacks_t *callbacks,
+                                                  const struct shm_dispatch_client_options_t *options);
+
+enum shm_error_t shm_dispatch_client_send(DispatchClientHandle *handle,
+                                          const void *data,
+                                          uint32_t size);
+
+void shm_dispatch_client_stop(DispatchClientHandle *handle);
+
+struct shm_dispatch_options_t shm_dispatch_options_default(void);
+
+struct shm_dispatch_client_options_t shm_dispatch_client_options_default(void);
 
 struct shm_auto_options_t shm_auto_options_default(void);
 

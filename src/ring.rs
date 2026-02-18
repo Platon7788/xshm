@@ -43,10 +43,12 @@ impl RingBuffer {
         self.storage.as_ptr()
     }
 
+    #[allow(dead_code)]
     pub fn capacity(&self) -> u32 {
         self.capacity
     }
 
+    #[allow(dead_code)]
     pub fn reset(&self, generation: u32) {
         self.header().reset(generation);
     }
@@ -114,6 +116,12 @@ impl RingBuffer {
 
         let idx = self.mask_index(read);
         let msg_len = unsafe { self.read_u16(idx) } as usize;
+        if msg_len < MIN_MESSAGE_SIZE || msg_len > MAX_MESSAGE_SIZE {
+            // Corrupted ring buffer -- reset read_pos to write_pos to recover
+            header.read_pos.store(write, Ordering::Release);
+            header.message_count.store(0, Ordering::Release);
+            return Err(ShmError::Corrupted);
+        }
         let total = MESSAGE_HEADER_SIZE + msg_len;
         let new_read = read.wrapping_add(total as u32);
 
@@ -197,9 +205,10 @@ impl RingBuffer {
             return Err(ShmError::Corrupted);
         }
 
-        if out.capacity() < msg_len {
-            out.reserve(msg_len - out.capacity());
-        }
+        // SAFETY: clear + reserve guarantees capacity >= msg_len
+        out.clear();
+        out.reserve(msg_len);
+        debug_assert!(out.capacity() >= msg_len, "reserve failed: cap {} < msg_len {}", out.capacity(), msg_len);
         unsafe {
             out.set_len(msg_len);
             self.copy_from_wrapped(
@@ -227,6 +236,7 @@ impl RingBuffer {
         self.header().message_count.load(Ordering::Acquire)
     }
 
+    #[allow(dead_code)]
     pub fn drop_count(&self) -> u32 {
         self.header().drop_count.load(Ordering::Acquire)
     }
