@@ -52,6 +52,32 @@ static inline shm_multi_client_callbacks_t xshm_multi_client_callbacks_default(v
     return shm_multi_client_callbacks_default();
 }
 
+// ============================================================================
+// Dispatch client helpers
+// ============================================================================
+
+// Note: Types shm_dispatch_client_options_t, shm_dispatch_client_callbacks_t,
+// shm_dispatch_registration_t, DispatchClientHandle and all shm_dispatch_client_*
+// functions are declared in xshm.h
+
+static inline shm_dispatch_client_callbacks_t xshm_dispatch_client_callbacks_default(void) {
+    shm_dispatch_client_callbacks_t cb;
+    cb.on_connect = 0;
+    cb.on_disconnect = 0;
+    cb.on_message = 0;
+    cb.on_error = 0;
+    cb.user_data = 0;
+    return cb;
+}
+
+static inline shm_dispatch_registration_t xshm_dispatch_registration(uint32_t pid, uint16_t revision, const char *name) {
+    shm_dispatch_registration_t reg;
+    reg.pid = pid;
+    reg.revision = revision;
+    reg.name = name;
+    return reg;
+}
+
 #ifdef __cplusplus
 }
 #endif

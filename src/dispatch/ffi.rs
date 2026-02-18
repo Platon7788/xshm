@@ -32,7 +32,13 @@ pub struct shm_dispatch_registration_t {
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_callbacks_t {
     pub on_client_connect: Option<
-        extern "C" fn(client_id: u32, pid: u32, name: *const c_char, user_data: *mut c_void),
+        extern "C" fn(
+            client_id: u32,
+            pid: u32,
+            revision: u16,
+            name: *const c_char,
+            user_data: *mut c_void,
+        ),
     >,
     pub on_client_disconnect: Option<extern "C" fn(client_id: u32, user_data: *mut c_void)>,
     pub on_message: Option<
@@ -136,6 +142,7 @@ impl DispatchHandler for FfiDispatchHandler {
             cb(
                 client_id,
                 info.pid,
+                info.revision,
                 name_cstr.as_ptr(),
                 self.callbacks.user_data,
             );

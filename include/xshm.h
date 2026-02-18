@@ -119,7 +119,11 @@ typedef void DispatchServerHandle;
  * Server-side callbacks.
  */
 typedef struct shm_dispatch_callbacks_t {
-  void (*on_client_connect)(uint32_t client_id, uint32_t pid, const char *name, void *user_data);
+  void (*on_client_connect)(uint32_t client_id,
+                            uint32_t pid,
+                            uint16_t revision,
+                            const char *name,
+                            void *user_data);
   void (*on_client_disconnect)(uint32_t client_id, void *user_data);
   void (*on_message)(uint32_t client_id, const void *data, uint32_t size, void *user_data);
   void (*on_error)(int32_t client_id, enum shm_error_t error, void *user_data);

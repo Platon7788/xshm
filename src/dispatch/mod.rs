@@ -336,10 +336,19 @@ impl DispatchServer {
 
     /// Handle a single client in the lobby: read registration, create channel, respond.
     fn handle_lobby_client(&self, lobby: &mut SharedServer, buffer: &mut Vec<u8>) {
-        // Read registration request (poll with timeout)
+        let events = match lobby.events() {
+            Some(e) => e,
+            None => {
+                self.handler.on_error(None, ShmError::NotReady);
+                return;
+            }
+        };
+
+        // Wait for registration data via c2s.data event (event-driven, no polling)
         let start = std::time::Instant::now();
         let request = loop {
-            if start.elapsed() >= self.options.lobby_timeout {
+            let remaining = self.options.lobby_timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
                 self.handler.on_error(None, ShmError::Timeout);
                 return;
             }
@@ -348,6 +357,7 @@ impl DispatchServer {
                 return;
             }
 
+            // Try to read first — data may already be in the buffer
             match lobby.receive_from_client(buffer) {
                 Ok(len) => match protocol::decode_request(&buffer[..len]) {
                     Ok(req) => break req,
@@ -357,7 +367,9 @@ impl DispatchServer {
                     }
                 },
                 Err(ShmError::QueueEmpty) => {
-                    let _ = lobby.poll_client(Some(Duration::from_millis(10)));
+                    // Block on event — wakes when client writes data
+                    let wait_time = remaining.min(self.options.poll_timeout);
+                    let _ = events.c2s.data.wait(Some(wait_time));
                     continue;
                 }
                 Err(err) => {
@@ -637,16 +649,19 @@ fn lobby_register(
     });
     client.send_to_server(&request)?;
 
-    // Signal data available for server
+    // Signal data available for server via event
     let _ = client.events().c2s.data.set();
 
-    // Wait for response
+    // Wait for response via s2c.data event (event-driven, no polling)
+    let events = client.events();
     let start = std::time::Instant::now();
     loop {
-        if start.elapsed() >= options.response_timeout {
+        let remaining = options.response_timeout.saturating_sub(start.elapsed());
+        if remaining.is_zero() {
             return Err(ShmError::Timeout);
         }
 
+        // Try to read first — data may already be in the buffer
         match client.receive_from_server(buffer) {
             Ok(len) => {
                 let response = protocol::decode_response(&buffer[..len])?;
@@ -658,7 +673,11 @@ fn lobby_register(
                 return Ok((response.client_id, response.channel_name));
             }
             Err(ShmError::QueueEmpty) => {
-                let _ = client.poll_server(Some(Duration::from_millis(10)));
+                // Block on event — wakes when server writes response
+                let _ = events
+                    .s2c
+                    .data
+                    .wait(Some(remaining.min(options.poll_timeout)));
                 continue;
             }
             Err(err) => return Err(err),

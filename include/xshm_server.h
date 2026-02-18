@@ -56,6 +56,23 @@ static inline shm_multi_callbacks_t xshm_multi_callbacks_default(void) {
     return shm_multi_callbacks_default();
 }
 
+// ============================================================================
+// Dispatch server helpers
+// ============================================================================
+
+// Note: Types shm_dispatch_options_t, shm_dispatch_callbacks_t,
+// DispatchServerHandle and all shm_dispatch_server_* functions are declared in xshm.h
+
+static inline shm_dispatch_callbacks_t xshm_dispatch_callbacks_default(void) {
+    shm_dispatch_callbacks_t cb;
+    cb.on_client_connect = 0;
+    cb.on_client_disconnect = 0;
+    cb.on_message = 0;
+    cb.on_error = 0;
+    cb.user_data = 0;
+    return cb;
+}
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif
