@@ -1,25 +1,28 @@
 //! Мультиклиентный сервер для xShm.
 //!
 //! Позволяет одному серверу обслуживать до N клиентов одновременно.
-//! Клиент подключается к базовому имени, сервер автоматически назначает слот.
+//! Клиент САМ захватывает свободный слот (lock-free claim) — без
+//! централизованного lobby.
 //!
-//! # Архитектура
+//! # Архитектура (конкурентный захват слотов)
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                      MultiServer                            │
-//! │                   "BaseName" (base_name)                    │
 //! ├─────────────────────────────────────────────────────────────┤
-//! │  Lobby: "BaseName" — принимает connect_req от клиентов      │
-//! │         → находит свободный слот                            │
-//! │         → записывает slot_id в shared memory                │
-//! │         → отправляет connect_ack                            │
+//! │  Нет lobby. N независимых сегментов-слотов BaseName_0..N-1.  │
+//! │  Клиент пробегает слоты и атомарно захватывает свободный:    │
+//! │    CAS reserved[0]: CLAIM_FREE -> token (на сегменте слота)  │
+//! │  Победитель CAS делает обычный handshake SharedClient.       │
 //! ├─────────────────────────────────────────────────────────────┤
-//! │  Slot 0: SharedServer "BaseName_0" ←→ Client A             │
-//! │  Slot 1: SharedServer "BaseName_1" ←→ Client B             │
-//! │  Slot 2: (свободен)                                        │
+//! │  Slot 0: SharedServer "BaseName_0" ←→ Client A  (claim=tA)  │
+//! │  Slot 1: SharedServer "BaseName_1" ←→ Client B  (claim=tB)  │
+//! │  Slot 2: (свободен, claim=CLAIM_FREE)                       │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! N клиентов подключаются ПОЛНОСТЬЮ КОНКУРЕНТНО: CAS на разной памяти,
+//! без общего состояния, без coalescing событий, без коллизий слотов.
 
 mod ffi;
 
@@ -46,7 +49,8 @@ use crate::win::{self, Mapping};
 pub const DEFAULT_MAX_CLIENTS: u32 = 20;
 
 /// Жёсткий предел: NtWaitForMultipleObjects поддерживает максимум 64 хендла.
-/// worker ждёт 1 (lobby) + до 2 на подключённый слот => 1 + 2*N <= 64 => N <= 31.
+/// worker ждёт до 2 хендлов на подключённый слот => 2*N <= 64 => N <= 32;
+/// берём 31 с запасом.
 pub const MAX_MULTI_CLIENTS: u32 = 31;
 
 /// Таймаут, после которого «зависшая» резервация слота освобождается
@@ -111,7 +115,7 @@ impl Default for MultiOptions {
 /// Опции для MultiClient
 #[derive(Clone)]
 pub struct MultiClientOptions {
-    /// Таймаут подключения к lobby
+    /// (Не используется после перехода на claim-протокол; сохранено для ABI.)
     pub lobby_timeout: Duration,
     /// Таймаут подключения к слоту
     pub slot_timeout: Duration,
@@ -369,7 +373,7 @@ impl MultiServer {
         }
     }
 
-    /// Worker loop — обрабатывает lobby и слоты
+    /// Worker loop — обслуживает слоты (захват / данные / отключение).
     fn worker_loop(&self) {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
@@ -402,7 +406,7 @@ impl MultiServer {
                         wait_handles.push(events.disconnect.raw_handle());
                         handle_to_event.push(EventSource::SlotDisconnect(slot.id));
                     } else {
-                        // Ожидаем connect_req на слоте (после lobby handshake)
+                        // Ожидаем connect_req на слоте (клиент захватил слот и подключается)
                         wait_handles.push(events.connect_req.raw_handle());
                         handle_to_event.push(EventSource::SlotConnect(slot.id));
                     }
@@ -646,9 +650,9 @@ impl MultiClient {
     /// Подключение к мультисерверу
     ///
     /// Клиент автоматически:
-    /// 1. Подключается к lobby (base_name)
-    /// 2. Получает назначенный slot_id
-    /// 3. Переподключается к слоту (base_name_N)
+    /// 1. Пробегает слоты base_name_0.. и атомарно захватывает свободный (CAS)
+    /// 2. Выполняет обычный handshake с захваченным слотом
+    /// 3. При потере связи — повторяет захват свободного слота
     pub fn connect(
         base_name: &str,
         handler: Arc<dyn MultiClientHandler>,
