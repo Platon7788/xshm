@@ -45,4 +45,7 @@ pub enum ShmError {
     /// Нет свободных слотов на мультиклиентном сервере.
     #[error("no free slots available on multi-client server")]
     NoFreeSlot,
+    /// Некорректная конфигурация (например, недопустимое число клиентов).
+    #[error("invalid configuration: {0}")]
+    InvalidConfig(&'static str),
 }

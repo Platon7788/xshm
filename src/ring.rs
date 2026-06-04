@@ -5,7 +5,7 @@
 //! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
 
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
@@ -119,9 +119,10 @@ impl RingBuffer {
             let idx = self.mask_index(read);
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
-                // Corrupted ring buffer -- reset read_pos to write_pos to recover
-                header.read_pos.store(write, Ordering::Release);
-                header.message_count.store(0, Ordering::Release);
+                // Повреждённая длина в слоте. Не трогаем общий message_count
+                // деструктивно (его двигает и reader). Сигналим Corrupted —
+                // вызывающий код решает (auto-mode трактует как fatal -> reconnect,
+                // что сбросит буферы через handshake/generation).
                 return Err(ShmError::Corrupted);
             }
             let total = MESSAGE_HEADER_SIZE + msg_len;
@@ -214,32 +215,26 @@ impl RingBuffer {
             let idx = self.mask_index(read);
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
+                // Длина могла быть «порвана» перезаписью producer-а. Если read_pos
+                // уже сдвинулся — это гонка перезаписи, повторяем. Иначе буфер
+                // действительно повреждён.
+                if header.read_pos.load(Ordering::Acquire) != read {
+                    continue;
+                }
                 return Err(ShmError::Corrupted);
             }
 
             let total = MESSAGE_HEADER_SIZE + msg_len;
             let new_read = read.wrapping_add(total as u32);
 
-            // CAS to avoid racing with discard_oldest on the writer side
-            if header
-                .read_pos
-                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // discard_oldest moved read_pos, retry
-                continue;
-            }
-
-            // We own this message slot now — copy data out
-            // SAFETY: clear + reserve guarantees capacity >= msg_len
+            // ОПТИМИСТИЧНОЕ копирование ДО фиксации read_pos (seqlock-паттерн).
+            // Если producer перезапишет слот во время копирования, CAS ниже
+            // провалится, и мы отбросим эту (потенциально битую) копию.
+            // SAFETY: clear + reserve гарантируют capacity >= msg_len; copy_from_wrapped
+            // читает строго в пределах кольца (wrap по модулю capacity).
             out.clear();
             out.reserve(msg_len);
-            debug_assert!(
-                out.capacity() >= msg_len,
-                "reserve failed: cap {} < msg_len {}",
-                out.capacity(),
-                msg_len
-            );
+            debug_assert!(out.capacity() >= msg_len);
             unsafe {
                 out.set_len(msg_len);
                 self.copy_from_wrapped(
@@ -248,9 +243,23 @@ impl RingBuffer {
                 );
             }
 
-            // read_pos already updated via CAS above
-            let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
+            // Барьер компилятора: копирование не должно «переехать» НИЖЕ CAS,
+            // иначе валидация теряет смысл. На x86 успешный lock cmpxchg также
+            // даёт аппаратный барьер.
+            compiler_fence(Ordering::Release);
 
+            // Фиксация: атомарно забираем слот. Провал => producer сдвинул read_pos
+            // (перезапись/конкурентный discard) => скопированные байты невалидны,
+            // повторяем с актуальными значениями.
+            if header
+                .read_pos
+                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
             if prev_count <= 1 {
                 header.sequence.fetch_add(1, Ordering::Relaxed);
             }
@@ -270,5 +279,150 @@ impl RingBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.message_count() == 0
+    }
+}
+
+#[cfg(test)]
+mod overflow_race_tests {
+    use super::*;
+    use crate::layout::RingHeader;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Владелец сырой выровненной памяти под один RingHeader + RING_CAPACITY.
+    struct RingMem {
+        ptr: *mut u8,
+        layout: Layout,
+    }
+    unsafe impl Send for RingMem {}
+    unsafe impl Sync for RingMem {}
+    impl Drop for RingMem {
+        fn drop(&mut self) {
+            // SAFETY: ptr/layout получены из alloc_zeroed в make_ring.
+            unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    fn make_ring() -> (RingBuffer, RingMem) {
+        let header_size = std::mem::size_of::<RingHeader>();
+        let total = header_size + RING_CAPACITY;
+        let layout = Layout::from_size_align(total, 64).unwrap();
+        // SAFETY: ненулевой размер; зануление валидно для AtomicU32 полей.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "alloc failed");
+        let header = ptr as *mut RingHeader;
+        // SAFETY: ptr выровнен на 64 и указывает на зануленный RingHeader.
+        unsafe { (*header).reset(1) };
+        // SAFETY: data сразу за заголовком, в пределах выделения.
+        let data = unsafe { ptr.add(header_size) };
+        // SAFETY: header и data валидны, не пересекаются, живут пока жив RingMem.
+        let ring = unsafe { RingBuffer::new(header, data) };
+        (ring, RingMem { ptr, layout })
+    }
+
+    // Большие сообщения: ~34 сообщения заполняют 2 МБ кольца ПО БАЙТАМ
+    // (а не по счётчику MAX_MESSAGES=500). Torn-read возможен только в
+    // байт-заполненном режиме, где write_pos & MASK == read_pos & MASK и
+    // producer физически перезаписывает слот, который читает consumer.
+    // С маленькими сообщениями переполнение наступает по счётчику задолго
+    // до байтового, write далеко впереди read, и гонка не открывается.
+    const PAYLOAD: usize = 60_000;
+    // seq-маркеры в трёх точках сообщения. Если producer перезапишет слот
+    // в середине копирования, маркеры начала/середины/конца разойдутся.
+    const MARK0: usize = 0;
+    const MARK1: usize = PAYLOAD / 2;
+    const MARK2: usize = PAYLOAD - 4;
+
+    /// Проставить seq в три маркера переиспользуемого буфера (без аллокаций
+    /// в горячем цикле — producer должен быть быстрым, чтобы успевать
+    /// перезаписывать слот во время копирования consumer-ом).
+    fn stamp(buf: &mut [u8], seq: u32) {
+        let s = seq.to_le_bytes();
+        buf[MARK0..MARK0 + 4].copy_from_slice(&s);
+        buf[MARK1..MARK1 + 4].copy_from_slice(&s);
+        buf[MARK2..MARK2 + 4].copy_from_slice(&s);
+    }
+
+    /// Err, если сообщение «порвано»: маркеры начала/середины/конца не совпали.
+    // Примечание: `use super::*` втягивает crate-овый `Result<T>` (ошибка = ShmError),
+    // поэтому здесь используем полностью квалифицированный std-Result для String-ошибки.
+    fn check(msg: &[u8]) -> std::result::Result<(), String> {
+        if msg.len() != PAYLOAD {
+            return Err(format!("bad len {}", msg.len()));
+        }
+        let m0 = u32::from_le_bytes([msg[MARK0], msg[MARK0 + 1], msg[MARK0 + 2], msg[MARK0 + 3]]);
+        let m1 = u32::from_le_bytes([msg[MARK1], msg[MARK1 + 1], msg[MARK1 + 2], msg[MARK1 + 3]]);
+        let m2 = u32::from_le_bytes([msg[MARK2], msg[MARK2 + 1], msg[MARK2 + 2], msg[MARK2 + 3]]);
+        if m0 != m1 || m0 != m2 {
+            return Err(format!("torn: m0={m0} m1={m1} m2={m2}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_does_not_tear_messages() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
+
+        let producer = {
+            let ring = ring.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                // Переиспользуемый буфер: producer на полной скорости держит
+                // кольцо байт-заполненным, постоянно перезаписывая старое.
+                let mut buf = vec![0u8; PAYLOAD];
+                let mut seq: u32 = 1;
+                while !stop.load(O::Acquire) {
+                    stamp(&mut buf, seq);
+                    let _ = ring.write_message(&buf); // overwrite разрешён
+                    seq = seq.wrapping_add(1);
+                }
+            })
+        };
+
+        let consumer = {
+            let ring = ring.clone();
+            let stop = stop.clone();
+            let torn = torn.clone();
+            let reads = reads.clone();
+            thread::spawn(move || {
+                let mut out = Vec::with_capacity(PAYLOAD);
+                while !stop.load(O::Acquire) {
+                    match ring.read_message(&mut out) {
+                        Ok(_) => {
+                            if check(&out).is_err() {
+                                torn.fetch_add(1, O::AcqRel);
+                            }
+                            reads.fetch_add(1, O::AcqRel);
+                            // Лёгкая задержка: consumer чуть медленнее producer-а
+                            // -> кольцо остаётся заполненным -> producer пишет
+                            // ровно в слот, который мы читаем.
+                            for _ in 0..400 {
+                                std::hint::spin_loop();
+                            }
+                        }
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+            })
+        };
+
+        thread::sleep(std::time::Duration::from_millis(800));
+        stop.store(true, O::Release);
+        producer.join().unwrap();
+        consumer.join().unwrap();
+
+        let reads = reads.load(O::Acquire);
+        let torn = torn.load(O::Acquire);
+        assert!(reads > 0, "consumer не прочитал ни одного сообщения");
+        assert_eq!(
+            torn, 0,
+            "обнаружены порванные сообщения: {torn} (из {reads} прочитанных)"
+        );
     }
 }

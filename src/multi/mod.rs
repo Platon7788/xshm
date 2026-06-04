@@ -28,7 +28,7 @@ pub use ffi::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::client::SharedClient;
 use crate::constants::{
@@ -45,6 +45,14 @@ use crate::win::{self, Mapping};
 
 /// Максимальное количество клиентов по умолчанию
 pub const DEFAULT_MAX_CLIENTS: u32 = 20;
+
+/// Жёсткий предел: NtWaitForMultipleObjects поддерживает максимум 64 хендла.
+/// worker ждёт 1 (lobby) + до 2 на подключённый слот => 1 + 2*N <= 64 => N <= 31.
+pub const MAX_MULTI_CLIENTS: u32 = 31;
+
+/// Таймаут, после которого «зависшая» резервация слота освобождается
+/// (клиент получил slot_id, но не подключился к слоту).
+const RESERVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Callback-интерфейс для обработки событий мультиклиентного сервера
 pub trait MultiHandler: Send + Sync + 'static {
@@ -130,6 +138,10 @@ struct ClientSlot {
     id: u32,
     server: SharedServer,
     connected: bool,
+    /// Слот назначен клиенту через lobby, но handshake на слоте ещё не завершён.
+    reserved: bool,
+    /// Момент резервации — для reclaim протухших резерваций.
+    reserved_at: Option<Instant>,
 }
 
 /// Lobby — принимает подключения и назначает слоты
@@ -187,6 +199,12 @@ impl MultiServer {
         handler: Arc<dyn MultiHandler>,
         options: MultiOptions,
     ) -> Result<Arc<Self>> {
+        if options.max_clients == 0 || options.max_clients > MAX_MULTI_CLIENTS {
+            return Err(ShmError::InvalidConfig(
+                "max_clients must be in 1..=31 (NtWaitForMultipleObjects limit)",
+            ));
+        }
+
         let running = Arc::new(AtomicBool::new(true));
 
         // Создаём lobby для приёма подключений
@@ -203,6 +221,8 @@ impl MultiServer {
                     id: slot_id,
                     server,
                     connected: false,
+                    reserved: false,
+                    reserved_at: None,
                 }));
             }
         }
@@ -274,6 +294,10 @@ impl MultiServer {
 
         if slot.connected {
             slot.connected = false;
+            // Явно снимаем резервацию (у подключённого слота она и так снята,
+            // но делаем инвариант явным и устойчивым к будущим правкам).
+            slot.reserved = false;
+            slot.reserved_at = None;
             drop(slot);
             self.handler.on_client_disconnect(client_id);
         }
@@ -334,16 +358,35 @@ impl MultiServer {
         }
     }
 
-    /// Найти свободный слот
-    fn find_free_slot(&self) -> Option<u32> {
+    /// Атомарно найти свободный слот и СРАЗУ зарезервировать его.
+    /// Гарантирует, что два конкурентных подключения не получат один slot_id.
+    fn reserve_free_slot(&self) -> Option<u32> {
         let slots = self.slots.read().unwrap();
         for slot_mutex in slots.iter() {
-            let slot = slot_mutex.lock().unwrap();
-            if !slot.connected {
+            let mut slot = slot_mutex.lock().unwrap();
+            if !slot.connected && !slot.reserved {
+                slot.reserved = true;
+                slot.reserved_at = Some(Instant::now());
                 return Some(slot.id);
             }
         }
         None
+    }
+
+    /// Освободить протухшие резервации (клиент не дошёл до слота за RESERVE_TIMEOUT).
+    fn reclaim_stale_reservations(&self) {
+        let slots = self.slots.read().unwrap();
+        for slot_mutex in slots.iter() {
+            let mut slot = slot_mutex.lock().unwrap();
+            if slot.reserved && !slot.connected {
+                if let Some(t) = slot.reserved_at {
+                    if t.elapsed() >= RESERVE_TIMEOUT {
+                        slot.reserved = false;
+                        slot.reserved_at = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Worker loop — обрабатывает lobby и слоты
@@ -351,6 +394,11 @@ impl MultiServer {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
         while self.running.load(Ordering::Acquire) {
+            // Освобождаем протухшие резервации в начале каждой итерации —
+            // детерминированный верхний предел жизни «зависшей» резервации
+            // (RESERVE_TIMEOUT), независимо от того, приходят события или нет.
+            self.reclaim_stale_reservations();
+
             // Собираем handles для ожидания
             let mut wait_handles: Vec<isize> = Vec::new();
             let mut handle_to_event: Vec<EventSource> = Vec::new();
@@ -396,7 +444,8 @@ impl MultiServer {
                     }
                 }
                 Ok(None) => {
-                    // Timeout — проверяем все слоты на данные
+                    // Timeout — собираем данные со всех слотов (reclaim уже
+                    // выполнен в начале итерации).
                     self.poll_all_slots(&mut buffer);
                 }
                 Err(err) => {
@@ -426,7 +475,7 @@ impl MultiServer {
         }
 
         // Находим свободный слот
-        let slot_id = self.find_free_slot().unwrap_or(SLOT_ID_NO_SLOT);
+        let slot_id = self.reserve_free_slot().unwrap_or(SLOT_ID_NO_SLOT);
 
         // Записываем slot_id в reserved[0]
         control.reserved[RESERVED_SLOT_ID_INDEX].store(slot_id, Ordering::Release);
@@ -463,13 +512,17 @@ impl MultiServer {
             match Self::do_slot_handshake(&mut slot.server) {
                 Ok(()) => {
                     slot.connected = true;
+                    slot.reserved = false;
+                    slot.reserved_at = None;
                     let id = slot.id;
                     drop(slot);
                     drop(slots);
                     self.handler.on_client_connect(id);
                 }
                 Err(_) => {
-                    // Handshake не удался
+                    // Handshake не удался — освобождаем резервацию сразу.
+                    slot.reserved = false;
+                    slot.reserved_at = None;
                 }
             }
         }
@@ -535,6 +588,8 @@ impl MultiServer {
                 let mut slot = slot_mutex.lock().unwrap();
                 let was = slot.connected;
                 slot.connected = false;
+                slot.reserved = false;
+                slot.reserved_at = None;
                 slot.server.mark_disconnected();
                 was
             } else {
@@ -847,40 +902,42 @@ fn client_worker(
     }
 }
 
-/// Handshake с lobby для получения slot_id
+/// Handshake с lobby для получения slot_id.
+///
+/// ВНИМАНИЕ: lobby — единый shared-сегмент. Конкурентные подключения нескольких
+/// клиентов сериализуются сервером по одному; auto-reset `connect_ack` может
+/// «съесть» сигнал при гонке, поэтому здесь ограниченный retry в пределах
+/// lobby_timeout. Для массовых одновременных подключений используйте паузу/
+/// очередь на стороне клиентов (или DispatchServer с выделенными каналами).
 fn lobby_handshake(base_name: &str, options: &MultiClientOptions) -> Result<u32> {
-    // Открываем lobby mapping
     let map_name = mapping_name(base_name);
     let mapping = Mapping::open(&map_name)?;
     let view = unsafe { SharedView::new(mapping.as_ptr()) };
-
-    // Открываем события
     let events = SharedEvents::open(base_name)?;
-
-    // Отправляем connect_req
     let control = view.control_block();
-    control
-        .client_state
-        .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
-    events.connect_req.set()?;
 
-    // Ждём connect_ack
-    if !events.connect_ack.wait(Some(options.lobby_timeout))? {
+    let deadline = Instant::now() + options.lobby_timeout;
+    loop {
+        if Instant::now() >= deadline {
+            control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+            return Err(ShmError::Timeout);
+        }
+
         control
             .client_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        return Err(ShmError::Timeout);
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        events.connect_req.set()?;
+
+        // Ждём ACK куском, не дольше остатка дедлайна.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(100));
+        if events.connect_ack.wait(Some(wait))? {
+            let slot_id = control.reserved[RESERVED_SLOT_ID_INDEX].load(Ordering::Acquire);
+            control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+            return Ok(slot_id);
+        }
+        // ACK не пришёл (возможно coalescing) — повторяем HELLO.
     }
-
-    // Читаем slot_id из reserved[0]
-    let slot_id = control.reserved[RESERVED_SLOT_ID_INDEX].load(Ordering::Acquire);
-
-    // Сбрасываем состояние
-    control
-        .client_state
-        .store(HANDSHAKE_IDLE, Ordering::Release);
-
-    Ok(slot_id)
 }
 
 #[cfg(test)]

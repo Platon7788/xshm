@@ -43,18 +43,11 @@ pub struct shm_multi_callbacks_t {
     /// Вызывается при отключении клиента
     pub on_client_disconnect: Option<extern "C" fn(client_id: u32, user_data: *mut c_void)>,
     /// Вызывается при получении сообщения
-    pub on_message: Option<extern "C" fn(
-        client_id: u32,
-        data: *const c_void,
-        size: u32,
-        user_data: *mut c_void,
-    )>,
+    pub on_message: Option<
+        extern "C" fn(client_id: u32, data: *const c_void, size: u32, user_data: *mut c_void),
+    >,
     /// Вызывается при ошибке (client_id = u32::MAX для общих ошибок)
-    pub on_error: Option<extern "C" fn(
-        client_id: u32,
-        error: shm_error_t,
-        user_data: *mut c_void,
-    )>,
+    pub on_error: Option<extern "C" fn(client_id: u32, error: shm_error_t, user_data: *mut c_void)>,
     /// Пользовательские данные, передаются во все callbacks
     pub user_data: *mut c_void,
 }
@@ -400,11 +393,7 @@ pub extern "C" fn shm_multi_server_channel_name(
             if !buffer.is_null() && buffer_size > 0 {
                 let copy_len = std::cmp::min(len, (buffer_size - 1) as usize);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        name_bytes.as_ptr(),
-                        buffer as *mut u8,
-                        copy_len,
-                    );
+                    std::ptr::copy_nonoverlapping(name_bytes.as_ptr(), buffer as *mut u8, copy_len);
                     *buffer.add(copy_len) = 0; // null-terminator
                 }
             }
@@ -436,8 +425,8 @@ pub extern "C" fn shm_multi_server_stop(handle: *mut MultiServerHandle) {
 // MultiClient FFI
 // ============================================================================
 
-use crate::multi::{MultiClient, MultiClientHandler, MultiClientOptions};
 use crate::constants::SLOT_ID_NO_SLOT;
+use crate::multi::{MultiClient, MultiClientHandler, MultiClientOptions};
 
 /// Опции для мультиклиента
 #[repr(C)]

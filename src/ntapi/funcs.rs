@@ -17,6 +17,15 @@ extern "system" {
     /// Закрытие handle
     pub fn NtClose(Handle: HANDLE) -> NTSTATUS;
 
+    /// Запрос информации о процессе (используем ProcessSessionInformation)
+    pub fn NtQueryInformationProcess(
+        ProcessHandle: HANDLE,
+        ProcessInformationClass: ULONG,
+        ProcessInformation: PVOID,
+        ProcessInformationLength: ULONG,
+        ReturnLength: *mut ULONG,
+    ) -> NTSTATUS;
+
     // ========================================================================
     // Event operations
     // ========================================================================
@@ -40,16 +49,10 @@ extern "system" {
     ) -> NTSTATUS;
 
     /// Установка события в сигнальное состояние
-    pub fn NtSetEvent(
-        EventHandle: HANDLE,
-        PreviousState: *mut i32,
-    ) -> NTSTATUS;
+    pub fn NtSetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
 
     /// Сброс события
-    pub fn NtResetEvent(
-        EventHandle: HANDLE,
-        PreviousState: *mut i32,
-    ) -> NTSTATUS;
+    pub fn NtResetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
 
     // ========================================================================
     // Wait operations
@@ -115,10 +118,7 @@ extern "system" {
     ) -> NTSTATUS;
 
     /// Размаппинг секции
-    pub fn NtUnmapViewOfSection(
-        ProcessHandle: HANDLE,
-        BaseAddress: PVOID,
-    ) -> NTSTATUS;
+    pub fn NtUnmapViewOfSection(ProcessHandle: HANDLE, BaseAddress: PVOID) -> NTSTATUS;
 
     // ========================================================================
     // Security Descriptor helpers (Rtl* functions)

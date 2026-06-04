@@ -134,8 +134,17 @@ impl AutoServer {
         let join_stats = stats.clone();
         let join_handler = handler.clone();
         let name_str = name.to_owned();
-        let join = thread::Builder::new()
-            .name(format!("xshm-auto-server-{}", name))
+        // Thread name in debug only (opaque short tag `xsa-{name}` so
+        // local traces still line up with the segment), anonymous in
+        // release so Process Explorer / Process Hacker doesn't surface
+        // "xshm-auto-server-…" as a flashing signpost on the host process.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsa-{}", name));
+        }
+        let join = builder
             .spawn(move || {
                 server_worker(
                     &name_str,
@@ -241,7 +250,7 @@ fn server_worker(
             ChannelKind::ServerToClient,
         );
 
-        process_receive_queue(
+        let outcome = process_receive_queue(
             server,
             &handler,
             &stats,
@@ -249,6 +258,16 @@ fn server_worker(
             options.recv_batch,
             ChannelKind::ClientToServer,
         );
+        if outcome.fatal {
+            handler.on_disconnect();
+            server.mark_disconnected();
+            connected = false;
+            continue;
+        }
+        if outcome.more_pending {
+            // Ещё есть данные — не блокируемся, сразу следующий проход.
+            continue;
+        }
 
         match win::wait_any(&handles, Some(options.wait_timeout)) {
             Ok(Some(0)) => {
@@ -391,7 +410,7 @@ fn client_worker(
                 &stats,
                 ChannelKind::ClientToServer,
             );
-            process_receive_queue(
+            let outcome = process_receive_queue(
                 &client,
                 &handler,
                 &stats,
@@ -399,6 +418,14 @@ fn client_worker(
                 options.recv_batch,
                 ChannelKind::ServerToClient,
             );
+            if outcome.fatal {
+                handler.on_disconnect();
+                client.mark_disconnected();
+                break;
+            }
+            if outcome.more_pending {
+                continue;
+            }
 
             match win::wait_any(&handles, Some(options.wait_timeout)) {
                 Ok(Some(0)) => {
@@ -480,6 +507,15 @@ fn process_send_queue<E>(
     }
 }
 
+/// Результат обработки приёмной очереди за один проход.
+struct ReceiveOutcome {
+    /// Фатальная ошибка — соединение надо сбросить.
+    fatal: bool,
+    /// Батч упёрся в лимит, в кольце вероятно ещё есть данные — не спать.
+    more_pending: bool,
+}
+
+/// Обрабатывает до `batch` сообщений за вызов.
 fn process_receive_queue<R>(
     endpoint: &R,
     handler: &Arc<dyn AutoHandler>,
@@ -487,27 +523,42 @@ fn process_receive_queue<R>(
     buffer: &mut Vec<u8>,
     batch: usize,
     direction: ChannelKind,
-) where
+) -> ReceiveOutcome
+where
     R: ReceiveEndpoint,
 {
+    let mut drained = false;
     for _ in 0..batch.max(1) {
         match endpoint.read(buffer) {
             Ok(len) => {
                 stats.received_messages.fetch_add(1, Ordering::Relaxed);
                 handler.on_message(direction, &buffer[..len]);
             }
-            Err(ShmError::QueueEmpty) => break,
-            Err(err @ ShmError::NotConnected)
-            | Err(err @ ShmError::NotReady)
-            | Err(err @ ShmError::Timeout) => {
-                handler.on_error(err.clone());
+            Err(ShmError::QueueEmpty) => {
+                drained = true;
                 break;
+            }
+            Err(ShmError::NotConnected) | Err(ShmError::NotReady) | Err(ShmError::Timeout) => {
+                drained = true;
+                break;
+            }
+            Err(ref err @ ShmError::Corrupted) => {
+                handler.on_error(err.clone());
+                return ReceiveOutcome {
+                    fatal: true,
+                    more_pending: false,
+                };
             }
             Err(err) => {
                 handler.on_error(err.clone());
+                drained = true;
                 break;
             }
         }
+    }
+    ReceiveOutcome {
+        fatal: false,
+        more_pending: !drained,
     }
 }
 
