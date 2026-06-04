@@ -893,40 +893,42 @@ fn client_worker(
     }
 }
 
-/// Handshake с lobby для получения slot_id
+/// Handshake с lobby для получения slot_id.
+///
+/// ВНИМАНИЕ: lobby — единый shared-сегмент. Конкурентные подключения нескольких
+/// клиентов сериализуются сервером по одному; auto-reset `connect_ack` может
+/// «съесть» сигнал при гонке, поэтому здесь ограниченный retry в пределах
+/// lobby_timeout. Для массовых одновременных подключений используйте паузу/
+/// очередь на стороне клиентов (или DispatchServer с выделенными каналами).
 fn lobby_handshake(base_name: &str, options: &MultiClientOptions) -> Result<u32> {
-    // Открываем lobby mapping
     let map_name = mapping_name(base_name);
     let mapping = Mapping::open(&map_name)?;
     let view = unsafe { SharedView::new(mapping.as_ptr()) };
-
-    // Открываем события
     let events = SharedEvents::open(base_name)?;
-
-    // Отправляем connect_req
     let control = view.control_block();
-    control
-        .client_state
-        .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
-    events.connect_req.set()?;
 
-    // Ждём connect_ack
-    if !events.connect_ack.wait(Some(options.lobby_timeout))? {
+    let deadline = Instant::now() + options.lobby_timeout;
+    loop {
+        if Instant::now() >= deadline {
+            control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+            return Err(ShmError::Timeout);
+        }
+
         control
             .client_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        return Err(ShmError::Timeout);
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        events.connect_req.set()?;
+
+        // Ждём ACK куском, не дольше остатка дедлайна.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait = remaining.min(Duration::from_millis(100));
+        if events.connect_ack.wait(Some(wait))? {
+            let slot_id = control.reserved[RESERVED_SLOT_ID_INDEX].load(Ordering::Acquire);
+            control.client_state.store(HANDSHAKE_IDLE, Ordering::Release);
+            return Ok(slot_id);
+        }
+        // ACK не пришёл (возможно coalescing) — повторяем HELLO.
     }
-
-    // Читаем slot_id из reserved[0]
-    let slot_id = control.reserved[RESERVED_SLOT_ID_INDEX].load(Ordering::Acquire);
-
-    // Сбрасываем состояние
-    control
-        .client_state
-        .store(HANDSHAKE_IDLE, Ordering::Release);
-
-    Ok(slot_id)
 }
 
 #[cfg(test)]
