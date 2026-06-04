@@ -17,6 +17,15 @@ extern "system" {
     /// Закрытие handle
     pub fn NtClose(Handle: HANDLE) -> NTSTATUS;
 
+    /// Запрос информации о процессе (используем ProcessSessionInformation)
+    pub fn NtQueryInformationProcess(
+        ProcessHandle: HANDLE,
+        ProcessInformationClass: ULONG,
+        ProcessInformation: PVOID,
+        ProcessInformationLength: ULONG,
+        ReturnLength: *mut ULONG,
+    ) -> NTSTATUS;
+
     // ========================================================================
     // Event operations
     // ========================================================================

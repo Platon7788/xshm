@@ -166,6 +166,18 @@ impl Default for NullDaclSecurityDescriptor {
 }
 
 // ============================================================================
+// Process information (для session id)
+// ============================================================================
+
+/// PROCESSINFOCLASS::ProcessSessionInformation
+pub const PROCESS_SESSION_INFORMATION_CLASS: ULONG = 24;
+
+#[repr(C)]
+pub struct PROCESS_SESSION_INFORMATION {
+    pub SessionId: ULONG,
+}
+
+// ============================================================================
 // Константы NTSTATUS
 // ============================================================================
 
