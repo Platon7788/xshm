@@ -77,6 +77,7 @@ impl From<ShmError> for shm_error_t {
             ShmError::AlreadyConnected => shm_error_t::SHM_ERROR_EXISTS,
             ShmError::HandshakeFailed | ShmError::Corrupted => shm_error_t::SHM_ERROR_PROTOCOL,
             ShmError::WindowsError { .. } => shm_error_t::SHM_ERROR_ACCESS,
+            ShmError::InvalidConfig(_) => shm_error_t::SHM_ERROR_INVALID_PARAM,
             ShmError::NoFreeSlot => shm_error_t::SHM_ERROR_NO_SLOT,
         }
     }
