@@ -3,7 +3,7 @@ use std::path::PathBuf;
 fn main() {
     // Линковка системных библиотек для Windows
     println!("cargo:rustc-link-lib=ntdll");
-    
+
     println!("cargo:rerun-if-changed=src/ffi.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");

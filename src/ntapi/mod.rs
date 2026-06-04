@@ -10,11 +10,11 @@
 //! - Линкер резолвит адреса при загрузке модуля
 //! - Минимальный overhead
 
-pub mod types;
 pub mod funcs;
 pub mod helpers;
+pub mod types;
 
 // Реэкспорт для удобства
-pub use types::*;
 pub use funcs::*;
 pub use helpers::*;
+pub use types::*;

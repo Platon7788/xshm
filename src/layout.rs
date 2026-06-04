@@ -61,10 +61,17 @@ impl Default for ControlBlock {
             server_state: AtomicU32::new(HANDSHAKE_IDLE),
             client_state: AtomicU32::new(HANDSHAKE_IDLE),
             reserved: [
-                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-                AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-                AtomicU32::new(0), AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
+                AtomicU32::new(0),
             ],
         }
     }

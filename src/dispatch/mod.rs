@@ -176,8 +176,17 @@ impl DispatchServer {
 
         let server_clone = server.clone();
         let name_owned = name.to_owned();
-        let handle = thread::Builder::new()
-            .name(format!("xshm-dispatch-{name}"))
+        // Thread name in debug only (opaque short tag `xsd-{name}` so
+        // local traces still line up with the segment), anonymous in
+        // release so Process Explorer / Process Hacker doesn't surface
+        // "xshm-dispatch-…" as a flashing signpost on the host process.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsd-{name}"));
+        }
+        let handle = builder
             .spawn(move || server_clone.worker_loop(&name_owned))
             .map_err(|e| ShmError::WindowsError {
                 code: e.raw_os_error().unwrap_or(-1) as u32,
