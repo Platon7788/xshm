@@ -34,7 +34,13 @@ pub const HANDSHAKE_IDLE: u32 = 0;
 pub const HANDSHAKE_CLIENT_HELLO: u32 = 1;
 pub const HANDSHAKE_SERVER_READY: u32 = 2;
 
-/// Индекс в reserved[] для передачи slot_id при multi-client handshake.
-pub const RESERVED_SLOT_ID_INDEX: usize = 0;
 /// Специальное значение: нет свободных слотов.
 pub const SLOT_ID_NO_SLOT: u32 = 0xFFFF_FFFF;
+
+/// Индекс в reserved[] СЕГМЕНТА СЛОТА для атомарного захвата слота multi-клиентом.
+/// Хранит токен захватившего клиента; `CLAIM_FREE` (0) = слот свободен.
+/// Захват выполняется через `compare_exchange(CLAIM_FREE -> token)` — это даёт
+/// конкурентное, lock-free распределение слотов без централизованного lobby.
+pub const RESERVED_CLAIM_INDEX: usize = 0;
+/// Значение «слот свободен» для claim.
+pub const CLAIM_FREE: u32 = 0;

@@ -61,14 +61,22 @@
 #define HANDSHAKE_SERVER_READY 2
 
 /**
- * Индекс в reserved[] для передачи slot_id при multi-client handshake.
- */
-#define RESERVED_SLOT_ID_INDEX 0
-
-/**
  * Специальное значение: нет свободных слотов.
  */
 #define SLOT_ID_NO_SLOT 4294967295
+
+/**
+ * Индекс в reserved[] СЕГМЕНТА СЛОТА для атомарного захвата слота multi-клиентом.
+ * Хранит токен захватившего клиента; `CLAIM_FREE` (0) = слот свободен.
+ * Захват выполняется через `compare_exchange(CLAIM_FREE -> token)` — это даёт
+ * конкурентное, lock-free распределение слотов без централизованного lobby.
+ */
+#define RESERVED_CLAIM_INDEX 0
+
+/**
+ * Значение «слот свободен» для claim.
+ */
+#define CLAIM_FREE 0
 
 /**
  * Response status: success.
@@ -87,7 +95,8 @@
 
 /**
  * Жёсткий предел: NtWaitForMultipleObjects поддерживает максимум 64 хендла.
- * worker ждёт 1 (lobby) + до 2 на подключённый слот => 1 + 2*N <= 64 => N <= 31.
+ * worker ждёт до 2 хендлов на подключённый слот => 2*N <= 64 => N <= 32;
+ * берём 31 с запасом.
  */
 #define MAX_MULTI_CLIENTS 31
 
