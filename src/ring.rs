@@ -322,30 +322,41 @@ mod overflow_race_tests {
         (ring, RingMem { ptr, layout })
     }
 
-    const PAYLOAD: usize = 256;
+    // Большие сообщения: ~34 сообщения заполняют 2 МБ кольца ПО БАЙТАМ
+    // (а не по счётчику MAX_MESSAGES=500). Torn-read возможен только в
+    // байт-заполненном режиме, где write_pos & MASK == read_pos & MASK и
+    // producer физически перезаписывает слот, который читает consumer.
+    // С маленькими сообщениями переполнение наступает по счётчику задолго
+    // до байтового, write далеко впереди read, и гонка не открывается.
+    const PAYLOAD: usize = 60_000;
+    // seq-маркеры в трёх точках сообщения. Если producer перезапишет слот
+    // в середине копирования, маркеры начала/середины/конца разойдутся.
+    const MARK0: usize = 0;
+    const MARK1: usize = PAYLOAD / 2;
+    const MARK2: usize = PAYLOAD - 4;
 
-    fn fill(seq: u32) -> Vec<u8> {
-        let mut buf = vec![0u8; PAYLOAD];
-        buf[0..4].copy_from_slice(&seq.to_le_bytes());
-        for (k, b) in buf[4..].iter_mut().enumerate() {
-            *b = (seq as usize).wrapping_add(k) as u8;
-        }
-        buf
+    /// Проставить seq в три маркера переиспользуемого буфера (без аллокаций
+    /// в горячем цикле — producer должен быть быстрым, чтобы успевать
+    /// перезаписывать слот во время копирования consumer-ом).
+    fn stamp(buf: &mut [u8], seq: u32) {
+        let s = seq.to_le_bytes();
+        buf[MARK0..MARK0 + 4].copy_from_slice(&s);
+        buf[MARK1..MARK1 + 4].copy_from_slice(&s);
+        buf[MARK2..MARK2 + 4].copy_from_slice(&s);
     }
 
-    /// Err, если сообщение «порвано» (смешаны байты двух разных записей).
+    /// Err, если сообщение «порвано»: маркеры начала/середины/конца не совпали.
     // Примечание: `use super::*` втягивает crate-овый `Result<T>` (ошибка = ShmError),
     // поэтому здесь используем полностью квалифицированный std-Result для String-ошибки.
     fn check(msg: &[u8]) -> std::result::Result<(), String> {
         if msg.len() != PAYLOAD {
             return Err(format!("bad len {}", msg.len()));
         }
-        let seq = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
-        for (k, &b) in msg[4..].iter().enumerate() {
-            let exp = (seq as usize).wrapping_add(k) as u8;
-            if b != exp {
-                return Err(format!("torn seq={seq} at {k}: {b}!={exp}"));
-            }
+        let m0 = u32::from_le_bytes([msg[MARK0], msg[MARK0 + 1], msg[MARK0 + 2], msg[MARK0 + 3]]);
+        let m1 = u32::from_le_bytes([msg[MARK1], msg[MARK1 + 1], msg[MARK1 + 2], msg[MARK1 + 3]]);
+        let m2 = u32::from_le_bytes([msg[MARK2], msg[MARK2 + 1], msg[MARK2 + 2], msg[MARK2 + 3]]);
+        if m0 != m1 || m0 != m2 {
+            return Err(format!("torn: m0={m0} m1={m1} m2={m2}"));
         }
         Ok(())
     }
@@ -356,15 +367,19 @@ mod overflow_race_tests {
         let ring = Arc::new(ring);
         let stop = Arc::new(AtomicBool::new(false));
         let torn = Arc::new(AtomicU64::new(0));
+        let reads = Arc::new(AtomicU64::new(0));
 
         let producer = {
             let ring = ring.clone();
             let stop = stop.clone();
             thread::spawn(move || {
-                let mut seq: u32 = 0;
+                // Переиспользуемый буфер: producer на полной скорости держит
+                // кольцо байт-заполненным, постоянно перезаписывая старое.
+                let mut buf = vec![0u8; PAYLOAD];
+                let mut seq: u32 = 1;
                 while !stop.load(O::Acquire) {
-                    let msg = fill(seq);
-                    let _ = ring.write_message(&msg); // overwrite разрешён
+                    stamp(&mut buf, seq);
+                    let _ = ring.write_message(&buf); // overwrite разрешён
                     seq = seq.wrapping_add(1);
                 }
             })
@@ -374,34 +389,40 @@ mod overflow_race_tests {
             let ring = ring.clone();
             let stop = stop.clone();
             let torn = torn.clone();
+            let reads = reads.clone();
             thread::spawn(move || {
                 let mut out = Vec::with_capacity(PAYLOAD);
-                let mut reads: u64 = 0;
                 while !stop.load(O::Acquire) {
                     match ring.read_message(&mut out) {
                         Ok(_) => {
                             if check(&out).is_err() {
                                 torn.fetch_add(1, O::AcqRel);
                             }
-                            reads += 1;
-                            if reads % 64 == 0 {
-                                // периодически отстаём -> провоцируем overflow
-                                thread::yield_now();
+                            reads.fetch_add(1, O::AcqRel);
+                            // Лёгкая задержка: consumer чуть медленнее producer-а
+                            // -> кольцо остаётся заполненным -> producer пишет
+                            // ровно в слот, который мы читаем.
+                            for _ in 0..400 {
+                                std::hint::spin_loop();
                             }
                         }
                         Err(_) => thread::yield_now(),
                     }
                 }
-                reads
             })
         };
 
-        thread::sleep(std::time::Duration::from_millis(500));
+        thread::sleep(std::time::Duration::from_millis(800));
         stop.store(true, O::Release);
         producer.join().unwrap();
-        let _reads = consumer.join().unwrap();
+        consumer.join().unwrap();
 
+        let reads = reads.load(O::Acquire);
         let torn = torn.load(O::Acquire);
-        assert_eq!(torn, 0, "обнаружены порванные сообщения: {torn}");
+        assert!(reads > 0, "consumer не прочитал ни одного сообщения");
+        assert_eq!(
+            torn, 0,
+            "обнаружены порванные сообщения: {torn} (из {reads} прочитанных)"
+        );
     }
 }
