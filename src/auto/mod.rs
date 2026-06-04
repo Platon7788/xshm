@@ -250,7 +250,7 @@ fn server_worker(
             ChannelKind::ServerToClient,
         );
 
-        let fatal = process_receive_queue(
+        let outcome = process_receive_queue(
             server,
             &handler,
             &stats,
@@ -258,10 +258,14 @@ fn server_worker(
             options.recv_batch,
             ChannelKind::ClientToServer,
         );
-        if fatal {
+        if outcome.fatal {
             handler.on_disconnect();
             server.mark_disconnected();
             connected = false;
+            continue;
+        }
+        if outcome.more_pending {
+            // Ещё есть данные — не блокируемся, сразу следующий проход.
             continue;
         }
 
@@ -406,7 +410,7 @@ fn client_worker(
                 &stats,
                 ChannelKind::ClientToServer,
             );
-            let fatal = process_receive_queue(
+            let outcome = process_receive_queue(
                 &client,
                 &handler,
                 &stats,
@@ -414,10 +418,13 @@ fn client_worker(
                 options.recv_batch,
                 ChannelKind::ServerToClient,
             );
-            if fatal {
+            if outcome.fatal {
                 handler.on_disconnect();
                 client.mark_disconnected();
                 break;
+            }
+            if outcome.more_pending {
+                continue;
             }
 
             match win::wait_any(&handles, Some(options.wait_timeout)) {
@@ -500,7 +507,15 @@ fn process_send_queue<E>(
     }
 }
 
-/// Returns `true` if a fatal error occurred and the connection should be dropped.
+/// Результат обработки приёмной очереди за один проход.
+struct ReceiveOutcome {
+    /// Фатальная ошибка — соединение надо сбросить.
+    fatal: bool,
+    /// Батч упёрся в лимит, в кольце вероятно ещё есть данные — не спать.
+    more_pending: bool,
+}
+
+/// Обрабатывает до `batch` сообщений за вызов.
 fn process_receive_queue<R>(
     endpoint: &R,
     handler: &Arc<dyn AutoHandler>,
@@ -508,31 +523,43 @@ fn process_receive_queue<R>(
     buffer: &mut Vec<u8>,
     batch: usize,
     direction: ChannelKind,
-) -> bool
+) -> ReceiveOutcome
 where
     R: ReceiveEndpoint,
 {
+    let mut drained = false;
     for _ in 0..batch.max(1) {
         match endpoint.read(buffer) {
             Ok(len) => {
                 stats.received_messages.fetch_add(1, Ordering::Relaxed);
                 handler.on_message(direction, &buffer[..len]);
             }
-            Err(ShmError::QueueEmpty) => break,
+            Err(ShmError::QueueEmpty) => {
+                drained = true;
+                break;
+            }
             Err(ShmError::NotConnected) | Err(ShmError::NotReady) | Err(ShmError::Timeout) => {
+                drained = true;
                 break;
             }
             Err(ref err @ ShmError::Corrupted) => {
                 handler.on_error(err.clone());
-                return true; // fatal — disconnect
+                return ReceiveOutcome {
+                    fatal: true,
+                    more_pending: false,
+                };
             }
             Err(err) => {
                 handler.on_error(err.clone());
+                drained = true;
                 break;
             }
         }
     }
-    false
+    ReceiveOutcome {
+        fatal: false,
+        more_pending: !drained,
+    }
 }
 
 trait SendEndpoint {
