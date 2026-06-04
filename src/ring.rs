@@ -272,3 +272,127 @@ impl RingBuffer {
         self.message_count() == 0
     }
 }
+
+#[cfg(test)]
+mod overflow_race_tests {
+    use super::*;
+    use crate::layout::RingHeader;
+    use std::alloc::{alloc_zeroed, dealloc, Layout};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+    use std::sync::Arc;
+    use std::thread;
+
+    /// Владелец сырой выровненной памяти под один RingHeader + RING_CAPACITY.
+    struct RingMem {
+        ptr: *mut u8,
+        layout: Layout,
+    }
+    unsafe impl Send for RingMem {}
+    unsafe impl Sync for RingMem {}
+    impl Drop for RingMem {
+        fn drop(&mut self) {
+            // SAFETY: ptr/layout получены из alloc_zeroed в make_ring.
+            unsafe { dealloc(self.ptr, self.layout) };
+        }
+    }
+
+    fn make_ring() -> (RingBuffer, RingMem) {
+        let header_size = std::mem::size_of::<RingHeader>();
+        let total = header_size + RING_CAPACITY;
+        let layout = Layout::from_size_align(total, 64).unwrap();
+        // SAFETY: ненулевой размер; зануление валидно для AtomicU32 полей.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        assert!(!ptr.is_null(), "alloc failed");
+        let header = ptr as *mut RingHeader;
+        // SAFETY: ptr выровнен на 64 и указывает на зануленный RingHeader.
+        unsafe { (*header).reset(1) };
+        // SAFETY: data сразу за заголовком, в пределах выделения.
+        let data = unsafe { ptr.add(header_size) };
+        // SAFETY: header и data валидны, не пересекаются, живут пока жив RingMem.
+        let ring = unsafe { RingBuffer::new(header, data) };
+        (ring, RingMem { ptr, layout })
+    }
+
+    const PAYLOAD: usize = 256;
+
+    fn fill(seq: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; PAYLOAD];
+        buf[0..4].copy_from_slice(&seq.to_le_bytes());
+        for (k, b) in buf[4..].iter_mut().enumerate() {
+            *b = (seq as usize).wrapping_add(k) as u8;
+        }
+        buf
+    }
+
+    /// Err, если сообщение «порвано» (смешаны байты двух разных записей).
+    // Примечание: `use super::*` втягивает crate-овый `Result<T>` (ошибка = ShmError),
+    // поэтому здесь используем полностью квалифицированный std-Result для String-ошибки.
+    fn check(msg: &[u8]) -> std::result::Result<(), String> {
+        if msg.len() != PAYLOAD {
+            return Err(format!("bad len {}", msg.len()));
+        }
+        let seq = u32::from_le_bytes([msg[0], msg[1], msg[2], msg[3]]);
+        for (k, &b) in msg[4..].iter().enumerate() {
+            let exp = (seq as usize).wrapping_add(k) as u8;
+            if b != exp {
+                return Err(format!("torn seq={seq} at {k}: {b}!={exp}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_does_not_tear_messages() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        let stop = Arc::new(AtomicBool::new(false));
+        let torn = Arc::new(AtomicU64::new(0));
+
+        let producer = {
+            let ring = ring.clone();
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let mut seq: u32 = 0;
+                while !stop.load(O::Acquire) {
+                    let msg = fill(seq);
+                    let _ = ring.write_message(&msg); // overwrite разрешён
+                    seq = seq.wrapping_add(1);
+                }
+            })
+        };
+
+        let consumer = {
+            let ring = ring.clone();
+            let stop = stop.clone();
+            let torn = torn.clone();
+            thread::spawn(move || {
+                let mut out = Vec::with_capacity(PAYLOAD);
+                let mut reads: u64 = 0;
+                while !stop.load(O::Acquire) {
+                    match ring.read_message(&mut out) {
+                        Ok(_) => {
+                            if check(&out).is_err() {
+                                torn.fetch_add(1, O::AcqRel);
+                            }
+                            reads += 1;
+                            if reads % 64 == 0 {
+                                // периодически отстаём -> провоцируем overflow
+                                thread::yield_now();
+                            }
+                        }
+                        Err(_) => thread::yield_now(),
+                    }
+                }
+                reads
+            })
+        };
+
+        thread::sleep(std::time::Duration::from_millis(500));
+        stop.store(true, O::Release);
+        producer.join().unwrap();
+        let _reads = consumer.join().unwrap();
+
+        let torn = torn.load(O::Acquire);
+        assert_eq!(torn, 0, "обнаружены порванные сообщения: {torn}");
+    }
+}
