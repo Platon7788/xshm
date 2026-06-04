@@ -119,9 +119,10 @@ impl RingBuffer {
             let idx = self.mask_index(read);
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
-                // Corrupted ring buffer -- reset read_pos to write_pos to recover
-                header.read_pos.store(write, Ordering::Release);
-                header.message_count.store(0, Ordering::Release);
+                // Повреждённая длина в слоте. Не трогаем общий message_count
+                // деструктивно (его двигает и reader). Сигналим Corrupted —
+                // вызывающий код решает (auto-mode трактует как fatal -> reconnect,
+                // что сбросит буферы через handshake/generation).
                 return Err(ShmError::Corrupted);
             }
             let total = MESSAGE_HEADER_SIZE + msg_len;
