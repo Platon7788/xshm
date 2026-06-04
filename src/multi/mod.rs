@@ -294,6 +294,10 @@ impl MultiServer {
 
         if slot.connected {
             slot.connected = false;
+            // Явно снимаем резервацию (у подключённого слота она и так снята,
+            // но делаем инвариант явным и устойчивым к будущим правкам).
+            slot.reserved = false;
+            slot.reserved_at = None;
             drop(slot);
             self.handler.on_client_disconnect(client_id);
         }
@@ -390,6 +394,11 @@ impl MultiServer {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
         while self.running.load(Ordering::Acquire) {
+            // Освобождаем протухшие резервации в начале каждой итерации —
+            // детерминированный верхний предел жизни «зависшей» резервации
+            // (RESERVE_TIMEOUT), независимо от того, приходят события или нет.
+            self.reclaim_stale_reservations();
+
             // Собираем handles для ожидания
             let mut wait_handles: Vec<isize> = Vec::new();
             let mut handle_to_event: Vec<EventSource> = Vec::new();
@@ -435,8 +444,8 @@ impl MultiServer {
                     }
                 }
                 Ok(None) => {
-                    // Timeout — освобождаем протухшие резервации и собираем данные.
-                    self.reclaim_stale_reservations();
+                    // Timeout — собираем данные со всех слотов (reclaim уже
+                    // выполнен в начале итерации).
                     self.poll_all_slots(&mut buffer);
                 }
                 Err(err) => {

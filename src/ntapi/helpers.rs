@@ -54,6 +54,12 @@ fn session_local_path(name: &str) -> String {
 ///   сессии; в сессии 0 -> `\BaseNamedObjects\X`)
 /// - `"X"`          -> session-local (как `Local\X`)
 /// - `"\\..."`      -> уже NT путь, возвращается как есть
+///
+/// ВНИМАНИЕ (смена поведения относительно v<=0.3.0): раньше и `Local\`, и имена
+/// без префикса уходили в ГЛОБАЛЬНЫЙ `\BaseNamedObjects`. Теперь они session-local.
+/// Для IPC МЕЖДУ сессиями (например, служба в сессии 0 <-> процесс на десктопе)
+/// обе стороны должны явно использовать префикс `Global\` (и иметь
+/// SeCreateGlobalPrivilege для создания глобальных объектов).
 pub fn to_nt_path(name: &str) -> String {
     if let Some(stripped) = name.strip_prefix("Global\\") {
         format!("\\BaseNamedObjects\\{stripped}")
