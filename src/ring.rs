@@ -5,7 +5,7 @@
 //! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
 
 use std::ptr::NonNull;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{compiler_fence, Ordering};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
@@ -214,32 +214,26 @@ impl RingBuffer {
             let idx = self.mask_index(read);
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
+                // Длина могла быть «порвана» перезаписью producer-а. Если read_pos
+                // уже сдвинулся — это гонка перезаписи, повторяем. Иначе буфер
+                // действительно повреждён.
+                if header.read_pos.load(Ordering::Acquire) != read {
+                    continue;
+                }
                 return Err(ShmError::Corrupted);
             }
 
             let total = MESSAGE_HEADER_SIZE + msg_len;
             let new_read = read.wrapping_add(total as u32);
 
-            // CAS to avoid racing with discard_oldest on the writer side
-            if header
-                .read_pos
-                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-            {
-                // discard_oldest moved read_pos, retry
-                continue;
-            }
-
-            // We own this message slot now — copy data out
-            // SAFETY: clear + reserve guarantees capacity >= msg_len
+            // ОПТИМИСТИЧНОЕ копирование ДО фиксации read_pos (seqlock-паттерн).
+            // Если producer перезапишет слот во время копирования, CAS ниже
+            // провалится, и мы отбросим эту (потенциально битую) копию.
+            // SAFETY: clear + reserve гарантируют capacity >= msg_len; copy_from_wrapped
+            // читает строго в пределах кольца (wrap по модулю capacity).
             out.clear();
             out.reserve(msg_len);
-            debug_assert!(
-                out.capacity() >= msg_len,
-                "reserve failed: cap {} < msg_len {}",
-                out.capacity(),
-                msg_len
-            );
+            debug_assert!(out.capacity() >= msg_len);
             unsafe {
                 out.set_len(msg_len);
                 self.copy_from_wrapped(
@@ -248,9 +242,23 @@ impl RingBuffer {
                 );
             }
 
-            // read_pos already updated via CAS above
-            let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
+            // Барьер компилятора: копирование не должно «переехать» НИЖЕ CAS,
+            // иначе валидация теряет смысл. На x86 успешный lock cmpxchg также
+            // даёт аппаратный барьер.
+            compiler_fence(Ordering::Release);
 
+            // Фиксация: атомарно забираем слот. Провал => producer сдвинул read_pos
+            // (перезапись/конкурентный discard) => скопированные байты невалидны,
+            // повторяем с актуальными значениями.
+            if header
+                .read_pos
+                .compare_exchange(read, new_read, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                continue;
+            }
+
+            let prev_count = header.message_count.fetch_sub(1, Ordering::AcqRel);
             if prev_count <= 1 {
                 header.sequence.fetch_add(1, Ordering::Relaxed);
             }
