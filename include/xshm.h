@@ -85,6 +85,12 @@
  */
 #define DEFAULT_MAX_CLIENTS 20
 
+/**
+ * Жёсткий предел: NtWaitForMultipleObjects поддерживает максимум 64 хендла.
+ * worker ждёт 1 (lobby) + до 2 на подключённый слот => 1 + 2*N <= 64 => N <= 31.
+ */
+#define MAX_MULTI_CLIENTS 31
+
 typedef enum shm_error_t {
   SHM_SUCCESS = 0,
   SHM_ERROR_INVALID_PARAM = -1,

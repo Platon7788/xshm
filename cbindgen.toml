@@ -44,6 +44,8 @@ exclude = [
     "WAIT_ALL",
     "NT_CURRENT_PROCESS",
     "SECURITY_DESCRIPTOR_REVISION",
+    "PROCESS_SESSION_INFORMATION_CLASS",
+    "PROCESS_SESSION_INFORMATION",
 ]
 # Явно включаем EventHandles для экспорта (EventHandles не исключается, поэтому будет экспортирован)
 

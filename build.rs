@@ -5,6 +5,9 @@ fn main() {
     println!("cargo:rustc-link-lib=ntdll");
 
     println!("cargo:rerun-if-changed=src/ffi.rs");
+    println!("cargo:rerun-if-changed=src/multi/ffi.rs");
+    println!("cargo:rerun-if-changed=src/dispatch/ffi.rs");
+    println!("cargo:rerun-if-changed=src/dispatch/protocol.rs");
     println!("cargo:rerun-if-changed=cbindgen.toml");
     let crate_dir = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
     let header_dir = PathBuf::from(&crate_dir).join("include");
