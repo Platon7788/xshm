@@ -348,3 +348,123 @@ fn test_multi_client_reconnect() {
 
     println!("[TEST] Client reconnect: PASSED");
 }
+
+/// Главный тест конкурентного захвата слотов: N клиентов подключаются
+/// ОДНОВРЕМЕННО (через барьер) и обязаны получить N РАЗНЫХ слотов.
+/// Это проверяет lock-free claim-протокол под реальной гонкой.
+#[test]
+fn test_multi_concurrent_connect_storm() {
+    let base_name = unique_name("STORM");
+    const N: u32 = 8;
+
+    let server_handler = Arc::new(TestServerHandler::new());
+    let server = MultiServer::start(
+        &base_name,
+        server_handler.clone(),
+        MultiOptions {
+            max_clients: N,
+            ..Default::default()
+        },
+    )
+    .expect("MultiServer start");
+
+    thread::sleep(Duration::from_millis(100));
+
+    // Барьер: все N клиентов стартуют почти одновременно -> максимум гонки.
+    let barrier = Arc::new(std::sync::Barrier::new(N as usize));
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let base = base_name.clone();
+        let b = barrier.clone();
+        handles.push(thread::spawn(move || {
+            b.wait();
+            let ch = Arc::new(TestClientHandler::new());
+            let client = MultiClient::connect(&base, ch.clone(), MultiClientOptions::default())
+                .expect("connect");
+            let ok = ch.wait_for_connect(Duration::from_secs(10));
+            let slot = ch.slot_id.load(Ordering::Acquire);
+            (client, ok, slot)
+        }));
+    }
+    let results: Vec<(MultiClient, bool, u32)> =
+        handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    for (i, (_c, ok, _s)) in results.iter().enumerate() {
+        assert!(*ok, "client {i} should connect under concurrent storm");
+    }
+
+    // Все слоты различны и покрывают ровно 0..N.
+    let mut slots: Vec<u32> = results.iter().map(|(_, _, s)| *s).collect();
+    slots.sort();
+    let expected: Vec<u32> = (0..N).collect();
+    assert_eq!(
+        slots, expected,
+        "конкурентные клиенты обязаны получить УНИКАЛЬНЫЕ слоты"
+    );
+
+    assert!(
+        server_handler.wait_for_connects(N, Duration::from_secs(5)),
+        "server should see all {N} clients"
+    );
+    assert_eq!(server.client_count(), N);
+
+    println!("[TEST] Concurrent connect storm: PASSED ({N} unique slots)");
+    drop(results); // отключаем всех
+}
+
+/// Oversubscription: клиентов больше, чем слотов. Сервер обязан заполнить
+/// ровно N слотов и НИКОГДА не выдать слот двум клиентам.
+#[test]
+fn test_multi_oversubscription() {
+    let base_name = unique_name("OVERSUB");
+    const N: u32 = 4;
+    const TOTAL: u32 = N + 3;
+
+    let server_handler = Arc::new(TestServerHandler::new());
+    let server = MultiServer::start(
+        &base_name,
+        server_handler.clone(),
+        MultiOptions {
+            max_clients: N,
+            ..Default::default()
+        },
+    )
+    .expect("MultiServer start");
+
+    thread::sleep(Duration::from_millis(100));
+
+    let barrier = Arc::new(std::sync::Barrier::new(TOTAL as usize));
+    let mut handles = Vec::new();
+    for _ in 0..TOTAL {
+        let base = base_name.clone();
+        let b = barrier.clone();
+        handles.push(thread::spawn(move || {
+            b.wait();
+            let ch = Arc::new(TestClientHandler::new());
+            // Лишние клиенты будут получать NoFreeSlot и продолжать ретраи —
+            // держим их живыми, чтобы проверить, что они НЕ занимают слот.
+            MultiClient::connect(&base, ch, MultiClientOptions::default()).expect("connect")
+        }));
+    }
+    let clients: Vec<MultiClient> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    thread::sleep(Duration::from_millis(500)); // даём всем устаканиться
+
+    assert_eq!(
+        server.client_count(),
+        N,
+        "ровно N слотов занято, переподписка не создаёт лишних подключений"
+    );
+
+    // Занятые слоты — ровно 0..N, без дублей.
+    let mut connected = server.connected_clients();
+    connected.sort();
+    assert_eq!(
+        connected,
+        (0..N).collect::<Vec<_>>(),
+        "каждый слот занят максимум одним клиентом"
+    );
+
+    println!("[TEST] Oversubscription: PASSED (filled {N}, no double-assignment)");
+    drop(clients);
+}

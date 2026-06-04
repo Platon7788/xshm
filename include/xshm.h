@@ -61,14 +61,22 @@
 #define HANDSHAKE_SERVER_READY 2
 
 /**
- * Индекс в reserved[] для передачи slot_id при multi-client handshake.
- */
-#define RESERVED_SLOT_ID_INDEX 0
-
-/**
  * Специальное значение: нет свободных слотов.
  */
 #define SLOT_ID_NO_SLOT 4294967295
+
+/**
+ * Индекс в reserved[] СЕГМЕНТА СЛОТА для атомарного захвата слота multi-клиентом.
+ * Хранит токен захватившего клиента; `CLAIM_FREE` (0) = слот свободен.
+ * Захват выполняется через `compare_exchange(CLAIM_FREE -> token)` — это даёт
+ * конкурентное, lock-free распределение слотов без централизованного lobby.
+ */
+#define RESERVED_CLAIM_INDEX 0
+
+/**
+ * Значение «слот свободен» для claim.
+ */
+#define CLAIM_FREE 0
 
 /**
  * Response status: success.
