@@ -5,3 +5,8 @@ Cargo.lock
 /x_core
 /Docs
 CLAUDE.md
+
+# Локальные инструменты/артефакты (ruflo / claude-flow / claude code)
+/.claude
+/.claude-flow
+/.mcp.json
