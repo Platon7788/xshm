@@ -339,24 +339,41 @@ impl MultiServer {
             .store(CLAIM_FREE, Ordering::Release);
     }
 
-    /// Освободить «зависшие» захваты: клиент захватил слот (claim != FREE), но
-    /// не завершил handshake за RESERVE_TIMEOUT (например, упал между claim и
-    /// connect). Сервер возвращает такой слот в оборот.
+    /// Возвращает в оборот «зависшие» и «осиротевшие» слоты.
     ///
-    /// Инвариант: RESERVE_TIMEOUT должен быть заметно больше клиентского
-    /// slot_timeout, иначе сервер может отнять слот у клиента, который ещё
-    /// легитимно подключается. (10с >> дефолтных 5с slot_timeout.)
-    fn reclaim_stale_claims(&self) {
+    /// - **non-connected** с непустым claim дольше `RESERVE_TIMEOUT` — клиент упал
+    ///   между claim и connect; сбрасываем claim в FREE.
+    /// - **connected**, но claim уже снят клиентом — «осиротевший» слот. Инвариант:
+    ///   живой подключённый клиент держит свой claim (token), и сбрасывает его лишь
+    ///   при отключении (под slot-lock сервера, вместе с `connected=false`). Поэтому
+    ///   `claim == FREE` на `connected`-слоте возможно ТОЛЬКО в одном случае:
+    ///   abandoned-handshake — сервер завершил handshake ровно когда клиент отвалился
+    ///   по таймауту, снял claim и ушёл, не оставив disconnect-события. Такой слот
+    ///   никогда не получит данные/disconnect, поэтому форсированно отключаем его.
+    ///
+    /// Возвращает id осиротевших connected-слотов — их отключение (`handle_slot_disconnect`)
+    /// выполняется ВНЕ блокировок, чтобы не дёргать handler под lock-ом.
+    ///
+    /// Инвариант: `RESERVE_TIMEOUT` заметно больше клиентского `slot_timeout`
+    /// (10с >> дефолтных 5с), иначе сервер мог бы отнять слот у легитимно
+    /// подключающегося клиента.
+    #[must_use]
+    fn reclaim_stale_claims(&self) -> Vec<u32> {
+        let mut orphaned = Vec::new();
         let slots = self.slots.read().unwrap();
         for slot_mutex in slots.iter() {
             let mut slot = slot_mutex.lock().unwrap();
-            if slot.connected {
-                // Подключённый слот — claim легитимен.
-                slot.claim_seen_at = None;
-                continue;
-            }
             let claim = slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
                 .load(Ordering::Acquire);
+            if slot.connected {
+                if claim == CLAIM_FREE {
+                    orphaned.push(slot.id); // осиротевший слот — отключим вне lock-а
+                } else {
+                    slot.claim_seen_at = None; // живой клиент держит claim
+                }
+                continue;
+            }
+            // non-connected: reclaim протухшего захвата.
             if claim == CLAIM_FREE {
                 slot.claim_seen_at = None;
             } else {
@@ -371,6 +388,7 @@ impl MultiServer {
                 }
             }
         }
+        orphaned
     }
 
     /// Worker loop — обслуживает слоты (захват / данные / отключение).
@@ -378,9 +396,11 @@ impl MultiServer {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
         while self.running.load(Ordering::Acquire) {
-            // Освобождаем «зависшие» захваты в начале каждой итерации —
-            // детерминированный верхний предел жизни такого claim (RESERVE_TIMEOUT).
-            self.reclaim_stale_claims();
+            // Освобождаем «зависшие» захваты и осиротевшие слоты в начале каждой
+            // итерации. Отключение осиротевших — вне блокировок (handler без lock-а).
+            for slot_id in self.reclaim_stale_claims() {
+                self.handle_slot_disconnect(slot_id);
+            }
 
             // Собираем handles для ожидания
             let mut wait_handles: Vec<isize> = Vec::new();
@@ -951,5 +971,50 @@ mod tests {
         assert!(server.is_ok());
         let server = server.unwrap();
         assert_eq!(server.client_count(), 0);
+    }
+
+    /// Детерминированная проверка обнаружения «осиротевшего» слота
+    /// (abandoned-handshake): connected=true, но claim снят клиентом.
+    /// `reclaim_stale_claims` обязан вернуть такой слот для отключения.
+    #[test]
+    fn reclaim_detects_orphaned_connected_slot() {
+        let name = format!("TEST_MULTI_ORPHAN_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(
+            &name,
+            handler,
+            MultiOptions {
+                max_clients: 2,
+                ..Default::default()
+            },
+        )
+        .expect("start");
+
+        // Останавливаем worker и ДЕТЕРМИНИРОВАННО дожидаемся его выхода,
+        // чтобы он не конкурировал за reclaim, пока мы готовим состояние.
+        server.stop();
+        if let Some(h) = server.worker_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
+        // Симулируем осиротевший слот 0: handshake «завершён» (connected=true),
+        // но claim снят клиентом (reserved[0] = CLAIM_FREE). Слот 1 — свободен.
+        {
+            let slots = server.slots.read().unwrap();
+            let mut slot0 = slots[0].lock().unwrap();
+            slot0.connected = true;
+            slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+                .store(CLAIM_FREE, Ordering::Release);
+        }
+
+        let orphaned = server.reclaim_stale_claims();
+        assert_eq!(
+            orphaned,
+            vec![0],
+            "осиротевший connected-слот (claim=FREE) должен быть обнаружен"
+        );
+
+        // Слот 1 (connected=false, claim=FREE) НЕ должен попасть в осиротевшие.
+        assert!(!orphaned.contains(&1));
     }
 }
