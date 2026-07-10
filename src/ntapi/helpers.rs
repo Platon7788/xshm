@@ -7,6 +7,7 @@ use std::os::windows::ffi::OsStrExt;
 
 use super::funcs::{NtQueryInformationProcess, NT_CURRENT_PROCESS};
 use super::types::*;
+use crate::error::{Result, ShmError};
 
 // ============================================================================
 // NT Path conversion
@@ -93,14 +94,31 @@ pub struct NtName {
     unicode: UNICODE_STRING,
 }
 
+/// Максимальное число UTF-16 единиц (без null-терминатора) в имени, которое
+/// ещё помещается в `UNICODE_STRING.Length`/`MaximumLength` (оба `u16`,
+/// `MaximumLength = Length + 2`): `units*2 + 2 <= u16::MAX`.
+const MAX_NT_NAME_UNITS: usize = (u16::MAX as usize - 2) / 2;
+
 impl NtName {
-    /// Создание NtName из строки
+    /// Создание NtName из строки.
     ///
-    /// Автоматически конвертирует в NT путь и UTF-16
-    pub fn new(name: &str) -> Self {
+    /// Автоматически конвертирует в NT путь и UTF-16. Возвращает ошибку,
+    /// если итоговое имя (после конвертации в NT путь) не помещается в
+    /// `UNICODE_STRING.Length` (u16) -- раньше это молча заворачивалось
+    /// (`as u16`), давая NT укороченную длину при полностью записанном
+    /// длинном буфере, т.е. рассинхронизацию Length/Buffer.
+    pub fn new(name: &str) -> Result<Self> {
         let nt_path = to_nt_path(name);
         let wide = to_wide(&nt_path);
-        let byte_len = ((wide.len() - 1) * 2) as u16; // без null-терминатора
+        let units = wide.len() - 1; // без null-терминатора
+
+        if units > MAX_NT_NAME_UNITS {
+            return Err(ShmError::InvalidConfig(
+                "object name too long for UNICODE_STRING (max ~32766 UTF-16 units)",
+            ));
+        }
+
+        let byte_len = (units * 2) as u16;
 
         let mut result = Self {
             wide,
@@ -113,7 +131,7 @@ impl NtName {
 
         // Теперь wide на своём месте, можно взять указатель
         result.unicode.Buffer = result.wide.as_ptr() as *mut u16;
-        result
+        Ok(result)
     }
 
     /// Получить указатель на UNICODE_STRING для передачи в NT функции
@@ -144,9 +162,28 @@ pub fn is_timeout(status: NTSTATUS) -> bool {
 
 /// Конвертация Duration в NT timeout (100-наносекундные интервалы)
 ///
-/// Возвращает отрицательное значение для относительного timeout
+/// Возвращает отрицательное значение для относительного timeout.
+///
+/// Два граничных случая, которые нельзя обрабатывать наивным `as i64`:
+/// - Экстремально большой `Duration` (`as_nanos()/100 > i64::MAX`) насыщаем
+///   до `i64::MAX`, а не даём знаковому биту завернуться -- иначе итоговое
+///   значение стало бы положительным, а NT трактует положительный timeout
+///   как АБСОЛЮТНЫЙ момент времени (эпоха 1601 г.), а не относительный.
+/// - Ненулевой, но короче одного кванта (100нс) `Duration` округляем вверх
+///   до -1 (минимум один квант ожидания), а не до 0 -- 0 NT трактует как
+///   «вернуться немедленно» (poll), что превратило бы ожидание в busy-poll.
+///   Явный `Duration::ZERO` по-прежнему даёт 0 (осознанный poll вызывающего).
 pub fn duration_to_nt_timeout(duration: std::time::Duration) -> i64 {
-    -((duration.as_nanos() / 100) as i64)
+    let units_100ns = duration.as_nanos() / 100;
+    if units_100ns == 0 {
+        if duration.is_zero() {
+            0
+        } else {
+            -1
+        }
+    } else {
+        -(units_100ns.min(i64::MAX as u128) as i64)
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +214,56 @@ mod tests {
     #[test]
     fn no_prefix_is_session_scoped() {
         assert_eq!(to_nt_path("Foo"), to_nt_path("Local\\Foo"));
+    }
+
+    #[test]
+    fn duration_zero_is_immediate_poll() {
+        assert_eq!(duration_to_nt_timeout(std::time::Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn duration_shorter_than_one_quantum_rounds_up_not_down_to_zero() {
+        // 50нс < 100нс кванта -- не должно превратиться в 0 (busy-poll).
+        assert_eq!(
+            duration_to_nt_timeout(std::time::Duration::from_nanos(50)),
+            -1
+        );
+    }
+
+    #[test]
+    fn duration_normal_value_converts_exactly() {
+        // 1мс = 10_000 * 100нс.
+        assert_eq!(
+            duration_to_nt_timeout(std::time::Duration::from_millis(1)),
+            -10_000
+        );
+    }
+
+    #[test]
+    fn nt_name_rejects_pathologically_long_name() {
+        let huge_name = "A".repeat(MAX_NT_NAME_UNITS + 100);
+        match NtName::new(&huge_name) {
+            Err(ShmError::InvalidConfig(_)) => {}
+            _ => panic!("must reject overlong name with InvalidConfig"),
+        }
+    }
+
+    #[test]
+    fn nt_name_accepts_name_at_the_limit() {
+        // to_nt_path добавляет префикс (`\Sessions\<sid>\BaseNamedObjects\` или
+        // `\BaseNamedObjects\`), поэтому берём запас под него.
+        let prefix_budget = 64;
+        let name = "A".repeat(MAX_NT_NAME_UNITS - prefix_budget);
+        assert!(NtName::new(&name).is_ok());
+    }
+
+    #[test]
+    fn duration_extreme_saturates_instead_of_flipping_sign() {
+        let huge = std::time::Duration::from_secs(u64::MAX);
+        let result = duration_to_nt_timeout(huge);
+        // Обязано остаться отрицательным (относительный timeout), не завернуться
+        // в положительное значение (которое NT истолковал бы как абсолютное).
+        assert!(result < 0, "must stay negative (relative), got {result}");
+        assert_eq!(result, -(i64::MAX));
     }
 }

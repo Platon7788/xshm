@@ -178,6 +178,25 @@ pub struct PROCESS_SESSION_INFORMATION {
 }
 
 // ============================================================================
+// CLIENT_ID / NtOpenProcess (для liveness-проверки процесса по PID)
+// ============================================================================
+
+/// CLIENT_ID -- идентифицирует процесс/поток для NtOpenProcess/NtOpenThread.
+/// UniqueProcess -- это PID, но передаётся как HANDLE-подобное значение
+/// (см. `PsGetProcessId`/`ClientId` в WDK) -- отсюда тип HANDLE, а не ULONG.
+#[repr(C)]
+pub struct CLIENT_ID {
+    pub UniqueProcess: HANDLE,
+    pub UniqueThread: HANDLE,
+}
+
+/// Достаточно для WaitForSingleObject (определить, жив ли процесс) и не
+/// требует повышенных привилегий -- в отличие от PROCESS_ALL_ACCESS.
+pub const PROCESS_QUERY_LIMITED_INFORMATION: ACCESS_MASK = 0x1000;
+/// Право на ожидание сигнального состояния процесса (завершение).
+pub const PROCESS_SYNCHRONIZE: ACCESS_MASK = 0x0010_0000;
+
+// ============================================================================
 // Константы NTSTATUS
 // ============================================================================
 

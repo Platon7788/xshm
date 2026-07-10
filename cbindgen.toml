@@ -28,6 +28,7 @@ exclude = [
     "SECURITY_DESCRIPTOR",
     "NullDaclSecurityDescriptor",
     "NtName",
+    "CLIENT_ID",
     # Константы
     "STATUS_SUCCESS",
     "STATUS_TIMEOUT",
@@ -46,6 +47,8 @@ exclude = [
     "SECURITY_DESCRIPTOR_REVISION",
     "PROCESS_SESSION_INFORMATION_CLASS",
     "PROCESS_SESSION_INFORMATION",
+    "PROCESS_QUERY_LIMITED_INFORMATION",
+    "PROCESS_SYNCHRONIZE",
 ]
 # Явно включаем EventHandles для экспорта (EventHandles не исключается, поэтому будет экспортирован)
 

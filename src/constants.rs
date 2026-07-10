@@ -44,3 +44,10 @@ pub const SLOT_ID_NO_SLOT: u32 = 0xFFFF_FFFF;
 pub const RESERVED_CLAIM_INDEX: usize = 0;
 /// Значение «слот свободен» для claim.
 pub const CLAIM_FREE: u32 = 0;
+
+/// Индекс в reserved[] СЕГМЕНТА СЛОТА для PID процесса, захватившего claim.
+/// Записывается клиентом сразу после успешного CAS в `try_claim_slot`.
+/// Сервер использует его для liveness-проверки connected-слотов: клиент,
+/// упавший ПОСЛЕ завершения handshake (но не освободивший claim), иначе
+/// навсегда лишает сервер слота — событий от мёртвого процесса не будет.
+pub const RESERVED_OWNER_PID_INDEX: usize = 1;

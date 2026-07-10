@@ -8,6 +8,7 @@ use std::ptr::null_mut;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::constants::MAX_MESSAGE_SIZE;
 use crate::error::ShmError;
 use crate::ffi::shm_error_t;
 use crate::multi::{MultiHandler, MultiOptions, MultiServer, DEFAULT_MAX_CLIENTS};
@@ -215,7 +216,7 @@ pub extern "C" fn shm_multi_server_send_to(
     data: *const c_void,
     size: u32,
 ) -> shm_error_t {
-    if handle.is_null() || data.is_null() || size == 0 {
+    if handle.is_null() || data.is_null() || size == 0 || size as usize > MAX_MESSAGE_SIZE {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
@@ -245,7 +246,7 @@ pub extern "C" fn shm_multi_server_broadcast(
     size: u32,
     sent_count: *mut u32,
 ) -> shm_error_t {
-    if handle.is_null() || data.is_null() || size == 0 {
+    if handle.is_null() || data.is_null() || size == 0 || size as usize > MAX_MESSAGE_SIZE {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
@@ -432,23 +433,24 @@ use crate::multi::{MultiClient, MultiClientHandler, MultiClientOptions};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_multi_client_options_t {
-    /// Таймаут подключения к lobby в мс (по умолчанию 5000)
-    pub lobby_timeout_ms: u32,
     /// Таймаут подключения к слоту в мс (по умолчанию 5000)
     pub slot_timeout_ms: u32,
     /// Таймаут ожидания событий в мс (по умолчанию 50)
     pub poll_timeout_ms: u32,
     /// Количество сообщений за один цикл (по умолчанию 32)
     pub recv_batch: u32,
+    /// Максимум неотправленных сообщений во внутренней очереди перед сбросом
+    /// самого старого (по умолчанию 256)
+    pub max_send_queue: u32,
 }
 
 impl Default for shm_multi_client_options_t {
     fn default() -> Self {
         Self {
-            lobby_timeout_ms: 5000,
             slot_timeout_ms: 5000,
             poll_timeout_ms: 50,
             recv_batch: 32,
+            max_send_queue: 256,
         }
     }
 }
@@ -463,6 +465,8 @@ pub struct shm_multi_client_callbacks_t {
     pub on_disconnect: Option<extern "C" fn(user_data: *mut c_void)>,
     /// Вызывается при получении сообщения от сервера
     pub on_message: Option<extern "C" fn(data: *const c_void, size: u32, user_data: *mut c_void)>,
+    /// Вызывается при переполнении внутренней send-очереди (`max_send_queue`)
+    pub on_overflow: Option<extern "C" fn(dropped: u32, user_data: *mut c_void)>,
     /// Вызывается при ошибке
     pub on_error: Option<extern "C" fn(error: shm_error_t, user_data: *mut c_void)>,
     /// Пользовательские данные
@@ -475,6 +479,7 @@ impl Default for shm_multi_client_callbacks_t {
             on_connect: None,
             on_disconnect: None,
             on_message: None,
+            on_overflow: None,
             on_error: None,
             user_data: null_mut(),
         }
@@ -512,6 +517,12 @@ impl MultiClientHandler for FfiMultiClientHandler {
                 data.len() as u32,
                 self.callbacks.user_data,
             );
+        }
+    }
+
+    fn on_overflow(&self, dropped: u32) {
+        if let Some(cb) = self.callbacks.on_overflow {
+            cb(dropped, self.callbacks.user_data);
         }
     }
 
@@ -576,10 +587,10 @@ pub extern "C" fn shm_multi_client_connect(
     } else {
         let o = unsafe { *options };
         MultiClientOptions {
-            lobby_timeout: Duration::from_millis(o.lobby_timeout_ms as u64),
             slot_timeout: Duration::from_millis(o.slot_timeout_ms as u64),
             poll_timeout: Duration::from_millis(o.poll_timeout_ms as u64),
             recv_batch: o.recv_batch as usize,
+            max_send_queue: o.max_send_queue as usize,
         }
     };
 
@@ -619,7 +630,7 @@ pub extern "C" fn shm_multi_client_send(
     data: *const c_void,
     size: u32,
 ) -> shm_error_t {
-    if handle.is_null() || data.is_null() || size == 0 {
+    if handle.is_null() || data.is_null() || size == 0 || size as usize > MAX_MESSAGE_SIZE {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 

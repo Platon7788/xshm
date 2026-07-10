@@ -26,6 +26,17 @@ extern "system" {
         ReturnLength: *mut ULONG,
     ) -> NTSTATUS;
 
+    /// Открытие процесса по PID (через CLIENT_ID.UniqueProcess).
+    ///
+    /// ObjectAttributes с ObjectName = NULL: процессы не именованные объекты
+    /// BaseNamedObjects, идентифицируются только через ClientId.
+    pub fn NtOpenProcess(
+        ProcessHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        ClientId: *mut CLIENT_ID,
+    ) -> NTSTATUS;
+
     // ========================================================================
     // Event operations
     // ========================================================================

@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crate::client::SharedClient;
 use crate::constants::{
     CLAIM_FREE, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_SERVER_READY, MAX_MESSAGE_SIZE,
-    RESERVED_CLAIM_INDEX, SHARED_MAGIC, SHARED_VERSION, SLOT_ID_NO_SLOT,
+    RESERVED_CLAIM_INDEX, RESERVED_OWNER_PID_INDEX, SHARED_MAGIC, SHARED_VERSION, SLOT_ID_NO_SLOT,
 };
 use crate::error::{Result, ShmError};
 use crate::naming::mapping_name;
@@ -56,6 +56,21 @@ pub const MAX_MULTI_CLIENTS: u32 = 31;
 /// Таймаут, после которого «зависшая» резервация слота освобождается
 /// (клиент получил slot_id, но не подключился к слоту).
 const RESERVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Гарантированный запас между эффективным клиентским `slot_timeout` и
+/// серверным `RESERVE_TIMEOUT`. Клиент обязан сам отвалиться по таймауту и
+/// освободить claim РАНЬШЕ, чем сервер сочтёт его протухшим и заберёт claim
+/// силой — иначе сервер может отнять слот у ещё легитимно ожидающего
+/// клиента (аудит 2026-07-10). `slot_timeout` из `MultiClientOptions`
+/// клампится этим запасом в `client_worker`, независимо от того, что задал
+/// вызывающий (FFI не ограничивает `slot_timeout_ms` сверху).
+const RESERVE_SAFETY_MARGIN: Duration = Duration::from_secs(2);
+
+/// Throttle для liveness-проверки процесса-владельца connected-слота
+/// (`NtOpenProcess` + `NtWaitForSingleObject`) — не на каждой итерации
+/// worker loop (которая крутится с интервалом `poll_timeout`, по умолчанию
+/// 50мс), а не чаще этого периода.
+const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Callback-интерфейс для обработки событий мультиклиентного сервера
 pub trait MultiHandler: Send + Sync + 'static {
@@ -84,6 +99,10 @@ pub trait MultiClientHandler: Send + Sync + 'static {
 
     /// Вызывается при получении сообщения от сервера
     fn on_message(&self, data: &[u8]);
+
+    /// Вызывается при переполнении внутренней send-очереди (`max_send_queue`):
+    /// `dropped` — сколько старых неотправленных сообщений вытеснено новыми.
+    fn on_overflow(&self, _dropped: u32) {}
 
     /// Вызывается при ошибке
     fn on_error(&self, err: ShmError) {
@@ -115,23 +134,25 @@ impl Default for MultiOptions {
 /// Опции для MultiClient
 #[derive(Clone)]
 pub struct MultiClientOptions {
-    /// (Не используется после перехода на claim-протокол; сохранено для ABI.)
-    pub lobby_timeout: Duration,
     /// Таймаут подключения к слоту
     pub slot_timeout: Duration,
     /// Таймаут ожидания событий
     pub poll_timeout: Duration,
     /// Количество сообщений за один цикл
     pub recv_batch: usize,
+    /// Максимум неотправленных сообщений во внутренней очереди перед сбросом
+    /// самого старого (overwrite-семантика, как у `AutoOptions.max_send_queue`).
+    /// Без этого предела очередь росла бы неограниченно, если пир завис/тормозит.
+    pub max_send_queue: usize,
 }
 
 impl Default for MultiClientOptions {
     fn default() -> Self {
         Self {
-            lobby_timeout: Duration::from_secs(5),
             slot_timeout: Duration::from_secs(5),
             poll_timeout: Duration::from_millis(50),
             recv_batch: 32,
+            max_send_queue: 256,
         }
     }
 }
@@ -141,9 +162,14 @@ struct ClientSlot {
     id: u32,
     server: SharedServer,
     connected: bool,
-    /// Момент, когда сервер ВПЕРВЫЕ увидел непустой claim на этом (ещё не
-    /// подключённом) слоте — для reclaim «зависших» захватов, чей клиент
-    /// захватил слот, но не завершил handshake за RESERVE_TIMEOUT.
+    /// Двойное назначение (различается по `connected`):
+    /// - **non-connected**: момент, когда сервер ВПЕРВЫЕ увидел непустой
+    ///   claim на этом ещё не подключённом слоте — для reclaim «зависших»
+    ///   захватов, чей клиент захватил слот, но не завершил handshake за
+    ///   `RESERVE_TIMEOUT`.
+    /// - **connected**: момент ПОСЛЕДНЕЙ liveness-проверки процесса-владельца
+    ///   (throttle, чтобы не дёргать `NtOpenProcess` на каждой итерации
+    ///   worker loop — см. `LIVENESS_CHECK_INTERVAL`).
     claim_seen_at: Option<Instant>,
 }
 
@@ -314,9 +340,23 @@ impl MultiServer {
             .unwrap_or(false)
     }
 
-    /// Остановка сервера
+    /// Остановка сервера.
+    ///
+    /// Синхронно дожидается выхода worker-потока перед возвратом — после
+    /// return ни один callback (`on_message`/`on_client_connect`/`on_error`)
+    /// больше не будет вызван. Это критично для FFI: C-вызывающий код может
+    /// сразу освободить `user_data`/callback-структуры сразу после возврата.
+    /// Идемпотентна: повторный вызов — no-op (`worker_handle` уже `None`).
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
+        // `.join()` вызывается потоком-владельцем handle (не worker-потоком —
+        // stop() никогда не вызывается изнутри worker_loop), поэтому это не
+        // self-join. К моменту, когда Drop for MultiServer возьмёт тот же
+        // Mutex, handle уже будет None (взят через .take() здесь) — Drop
+        // не будет пытаться повторно join'ить уже завершённый поток.
+        if let Some(handle) = self.worker_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 
     /// Базовое имя канала
@@ -343,22 +383,34 @@ impl MultiServer {
     ///
     /// - **non-connected** с непустым claim дольше `RESERVE_TIMEOUT` — клиент упал
     ///   между claim и connect; сбрасываем claim в FREE.
-    /// - **connected**, но claim уже снят клиентом — «осиротевший» слот. Инвариант:
-    ///   живой подключённый клиент держит свой claim (token), и сбрасывает его лишь
-    ///   при отключении (под slot-lock сервера, вместе с `connected=false`). Поэтому
-    ///   `claim == FREE` на `connected`-слоте возможно ТОЛЬКО в одном случае:
-    ///   abandoned-handshake — сервер завершил handshake ровно когда клиент отвалился
-    ///   по таймауту, снял claim и ушёл, не оставив disconnect-события. Такой слот
-    ///   никогда не получит данные/disconnect, поэтому форсированно отключаем его.
+    /// - **connected**, но claim уже снят клиентом — «осиротевший» слот
+    ///   (abandoned-handshake): сервер завершил handshake ровно когда клиент
+    ///   отвалился по таймауту, снял claim и ушёл, не оставив disconnect-события.
+    /// - **connected**, claim всё ещё держит клиент, но процесс-владелец
+    ///   (PID из `RESERVED_OWNER_PID_INDEX`) подтверждённо мёртв — клиент упал
+    ///   ПОСЛЕ завершения handshake, не освободив claim. Без этой проверки
+    ///   такой слот был бы потерян НАВСЕГДА: от мёртвого процесса не придёт
+    ///   ни данных, ни disconnect-события, а claim!=FREE означало бы «живой»
+    ///   для остальной логики. Проверяется не чаще `LIVENESS_CHECK_INTERVAL`
+    ///   (throttle — `NtOpenProcess` дороже atomic load).
     ///
-    /// Возвращает id осиротевших connected-слотов — их отключение (`handle_slot_disconnect`)
-    /// выполняется ВНЕ блокировок, чтобы не дёргать handler под lock-ом.
+    /// В обоих connected-случаях слот никогда не получит данные/disconnect
+    /// сам по себе, поэтому форсированно отключаем его.
     ///
-    /// Инвариант: `RESERVE_TIMEOUT` заметно больше клиентского `slot_timeout`
-    /// (10с >> дефолтных 5с), иначе сервер мог бы отнять слот у легитимно
-    /// подключающегося клиента.
+    /// Возвращает `(slot_id, ожидаемый_claim)` для осиротевших connected-слотов
+    /// — их отключение (`handle_orphaned_slot_disconnect`) выполняется ВНЕ
+    /// блокировок, чтобы не дёргать handler под lock-ом. Между этим вызовом и
+    /// фактической обработкой слот теоретически может измениться (новый
+    /// клиент успел захватить свободный claim, или сам умерший клиент каким-то
+    /// образом всё же откликнулся) — `handle_orphaned_slot_disconnect`
+    /// повторно проверяет claim через CAS(ожидаемый -> FREE) перед мутацией
+    /// состояния, поэтому такой слот просто пропускается, а не затирается.
+    ///
+    /// Инвариант обеспечен принудительно (см. `client_worker`): клиентский
+    /// `slot_timeout` всегда клампится ниже `RESERVE_TIMEOUT`, иначе сервер
+    /// мог бы отнять слот у легитимно подключающегося клиента.
     #[must_use]
-    fn reclaim_stale_claims(&self) -> Vec<u32> {
+    fn reclaim_stale_claims(&self) -> Vec<(u32, u32)> {
         let mut orphaned = Vec::new();
         let slots = self.slots.read().unwrap();
         for slot_mutex in slots.iter() {
@@ -367,9 +419,26 @@ impl MultiServer {
                 .load(Ordering::Acquire);
             if slot.connected {
                 if claim == CLAIM_FREE {
-                    orphaned.push(slot.id); // осиротевший слот — отключим вне lock-а
-                } else {
-                    slot.claim_seen_at = None; // живой клиент держит claim
+                    orphaned.push((slot.id, CLAIM_FREE)); // abandoned-handshake
+                    continue;
+                }
+                // Живой claim на connected-слоте: троттлим liveness-проверку
+                // процесса-владельца вместо детекции по событиям (их не будет,
+                // если процесс мёртв).
+                let should_check = match slot.claim_seen_at {
+                    None => true,
+                    Some(last_check) => last_check.elapsed() >= LIVENESS_CHECK_INTERVAL,
+                };
+                if should_check {
+                    slot.claim_seen_at = Some(Instant::now());
+                    let owner_pid = slot.server.view().control_block().reserved
+                        [RESERVED_OWNER_PID_INDEX]
+                        .load(Ordering::Acquire);
+                    if !win::is_process_alive(owner_pid) {
+                        // Подтверждено: процесс-владелец завершился, claim
+                        // (ещё) не FREE -- ожидаем именно текущее значение.
+                        orphaned.push((slot.id, claim));
+                    }
                 }
                 continue;
             }
@@ -398,8 +467,8 @@ impl MultiServer {
         while self.running.load(Ordering::Acquire) {
             // Освобождаем «зависшие» захваты и осиротевшие слоты в начале каждой
             // итерации. Отключение осиротевших — вне блокировок (handler без lock-а).
-            for slot_id in self.reclaim_stale_claims() {
-                self.handle_slot_disconnect(slot_id);
+            for (slot_id, expected_claim) in self.reclaim_stale_claims() {
+                self.handle_orphaned_slot_disconnect(slot_id, expected_claim);
             }
 
             // Собираем handles для ожидания
@@ -543,7 +612,11 @@ impl MultiServer {
         Ok(())
     }
 
-    /// Обработка отключения клиента
+    /// Обработка явного отключения клиента (disconnect-событие от клиента,
+    /// который сам себя идентифицировал сигналом — заведомо ещё владеет
+    /// claim, никто другой не мог его перехватить, т.к. claim != FREE всё
+    /// это время). Освобождаем claim безусловно — это безопасно именно
+    /// потому, что claim не мог перейти к новому клиенту, пока не стал FREE.
     fn handle_slot_disconnect(&self, slot_id: u32) {
         let was_connected = {
             let slots = self.slots.read().unwrap();
@@ -559,6 +632,55 @@ impl MultiServer {
             } else {
                 false
             }
+        };
+
+        if was_connected {
+            self.handler.on_client_disconnect(slot_id);
+        }
+    }
+
+    /// Отключение осиротевшего слота, обнаруженного `reclaim_stale_claims`:
+    /// либо abandoned-handshake (claim был `CLAIM_FREE`), либо подтверждённо
+    /// мёртвый процесс-владелец (claim — его последний известный token).
+    /// В обоих случаях `expected_claim` — это ЗНАЧЕНИЕ claim, увиденное в
+    /// момент детекции.
+    ///
+    /// Между детекцией и этим вызовом могло пройти время: если claim успел
+    /// измениться (новый клиент захватил освободившийся слот, либо — в
+    /// теории — «мёртвый» процесс всё же откликнулся), безусловная мутация
+    /// затёрла бы легитимное состояние (см. аудит 2026-07-10, находка
+    /// "unconditional store race"). Поэтому `claim == expected_claim`
+    /// проверяется и одновременно фиксируется ОДНИМ атомарным
+    /// `compare_exchange(expected_claim, CLAIM_FREE)`: если он проваливается
+    /// — слот уже не тот, что мы считали осиротевшим, пропускаем без единой
+    /// мутации остального состояния.
+    fn handle_orphaned_slot_disconnect(&self, slot_id: u32, expected_claim: u32) {
+        let was_connected = {
+            let slots = self.slots.read().unwrap();
+            let Some(slot_mutex) = slots.get(slot_id as usize) else {
+                return;
+            };
+            let mut slot = slot_mutex.lock().unwrap();
+
+            if !slot.connected {
+                return; // уже обработан (например явным disconnect-событием)
+            }
+
+            let claim_field =
+                &slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+            if claim_field
+                .compare_exchange(expected_claim, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+            {
+                return; // claim изменился — состояние слота уже не то, что при детекции
+            }
+
+            // claim атомарно переведён в FREE выше (или уже был FREE и остался
+            // им) -- освобождать его повторно не нужно.
+            slot.connected = false;
+            slot.claim_seen_at = None;
+            slot.server.mark_disconnected();
+            true
         };
 
         if was_connected {
@@ -740,6 +862,29 @@ impl Drop for MultiClient {
     }
 }
 
+/// Клампит клиентский `slot_timeout` ниже `RESERVE_TIMEOUT` с запасом
+/// `RESERVE_SAFETY_MARGIN` — иначе при достаточно большом вызывающим-заданном
+/// `slot_timeout` (FFI не ограничивает его сверху) сервер мог бы счесть
+/// клиента протухшим и отдать слот другому раньше, чем клиент сам отвалится
+/// по своему таймауту.
+fn clamp_slot_timeout(requested: Duration) -> Duration {
+    requested.min(RESERVE_TIMEOUT.saturating_sub(RESERVE_SAFETY_MARGIN))
+}
+
+/// Кладёт сообщение во внутреннюю send-очередь MultiClient, вытесняя самое
+/// старое при переполнении (`max_send_queue`) вместо неограниченного роста.
+/// Возвращает `true`, если пришлось вытеснить старое сообщение (переполнение).
+fn push_with_cap(queue: &mut VecDeque<Vec<u8>>, data: Vec<u8>, max_send_queue: usize) -> bool {
+    let overflowed = if queue.len() >= max_send_queue {
+        queue.pop_front();
+        true
+    } else {
+        false
+    };
+    queue.push_back(data);
+    overflowed
+}
+
 /// Worker для MultiClient
 fn client_worker(
     base_name: &str,
@@ -750,6 +895,8 @@ fn client_worker(
     slot_id_out: Arc<AtomicU32>,
 ) {
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+
+    let effective_slot_timeout = clamp_slot_timeout(options.slot_timeout);
 
     while running.load(Ordering::Acquire) {
         // Шаг 1: атомарно захватываем свободный слот (без централизованного lobby).
@@ -765,7 +912,7 @@ fn client_worker(
         };
 
         // Шаг 2: подключаемся к захваченному слоту обычным handshake.
-        let client = match SharedClient::connect(&slot_name, options.slot_timeout) {
+        let client = match SharedClient::connect(&slot_name, effective_slot_timeout) {
             Ok(c) => c,
             Err(err) => {
                 // Не подключились — освобождаем захваченный слот (best-effort;
@@ -800,7 +947,11 @@ fn client_worker(
             // Обрабатываем команды
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
-                    ClientCommand::Send(data) => send_queue.push_back(data),
+                    ClientCommand::Send(data) => {
+                        if push_with_cap(&mut send_queue, data, options.max_send_queue) {
+                            handler.on_overflow(1);
+                        }
+                    }
                     ClientCommand::Shutdown => {
                         running.store(false, Ordering::Release);
                     }
@@ -866,15 +1017,32 @@ fn client_worker(
     }
 }
 
-/// Процесс-локальный счётчик токенов захвата. Для корректности взаимного
-/// исключения важно лишь, что токен != CLAIM_FREE; pid подмешивается для
-/// диагностики (видно, какой процесс держит слот).
+/// Процесс-локальный счётчик попыток захвата (гарантирует, что в пределах
+/// одного процесса токены не повторяются, пока живёт процесс).
 static CLAIM_TOKEN_COUNTER: AtomicU32 = AtomicU32::new(1);
 
+/// Генерирует токен захвата, устойчивый к ABA между процессами.
+///
+/// Раньше токен строился как `pid<<8 ^ n` — как только процесс-локальный
+/// счётчик `n` превышал 255, XOR начинал портить биты pid, и токен мог
+/// совпасть с токеном другого процесса. Из-за этого устаревший (уже
+/// неактуальный) вызов `release_claim` с таким совпавшим токеном мог
+/// CAS-ом освободить ЖИВОЙ claim чужого процесса (аудит 2026-07-10).
+///
+/// `RandomState` (std, без внешних зависимостей) на каждый вызов `new()`
+/// сидируется свежей ОС-энтропией — смешивая её с pid и процесс-локальным
+/// счётчиком, получаем токен, практически уникальный и внутри процесса,
+/// и между процессами (в отличие от детерминированной XOR-схемы).
 fn next_claim_token() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
     let n = CLAIM_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
-    let token = pid.wrapping_shl(8) ^ n;
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u32(pid);
+    hasher.write_u32(n);
+    let token = hasher.finish() as u32;
     if token == CLAIM_FREE {
         1
     } else {
@@ -896,6 +1064,14 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
     let claimed = control.reserved[RESERVED_CLAIM_INDEX]
         .compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
+    if claimed {
+        // Публикуем свой PID для liveness-проверки сервером (см.
+        // RESERVED_OWNER_PID_INDEX) -- пишем СРАЗУ после успешного захвата,
+        // Release гарантирует, что сервер, увидевший claim (Acquire), увидит
+        // и корректный PID, а не мусор/значение от предыдущего владельца.
+        control.reserved[RESERVED_OWNER_PID_INDEX]
+            .store(std::process::id(), Ordering::Release);
+    }
     Ok(claimed)
     // mapping размапится здесь; захваченный claim остаётся в shared memory.
 }
@@ -904,8 +1080,12 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
 fn release_claim(slot_name: &str, token: u32) {
     if let Ok(mapping) = Mapping::open(&mapping_name(slot_name)) {
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
-        let _ = view.control_block().reserved[RESERVED_CLAIM_INDEX]
-            .compare_exchange(token, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire);
+        let _ = view.control_block().reserved[RESERVED_CLAIM_INDEX].compare_exchange(
+            token,
+            CLAIM_FREE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
     }
 }
 
@@ -964,6 +1144,70 @@ mod tests {
         }
     }
 
+    /// Регрессия (аудит 2026-07-10): FFI не ограничивал slot_timeout_ms
+    /// сверху, позволяя caller-у задать значение >= RESERVE_TIMEOUT, из-за
+    /// чего сервер мог отнять слот у ещё легитимно подключающегося клиента.
+    #[test]
+    fn clamp_slot_timeout_stays_below_reserve_timeout_with_margin() {
+        // Большой запрошенный timeout — клампится с запасом.
+        let clamped = clamp_slot_timeout(Duration::from_secs(9999));
+        assert!(clamped < RESERVE_TIMEOUT);
+        assert!(clamped <= RESERVE_TIMEOUT.saturating_sub(RESERVE_SAFETY_MARGIN));
+
+        // Запрошенный timeout ровно на границе RESERVE_TIMEOUT — тоже клампится.
+        let clamped_at_boundary = clamp_slot_timeout(RESERVE_TIMEOUT);
+        assert!(clamped_at_boundary < RESERVE_TIMEOUT);
+
+        // Маленький (дефолтный) timeout — не трогается, он и так безопасен.
+        let small = Duration::from_secs(5);
+        assert_eq!(clamp_slot_timeout(small), small);
+    }
+
+    /// Регрессия (аудит API 2026-07-10): раньше `MultiClient` не имел
+    /// `max_send_queue` вообще -- внутренняя send-очередь росла неограниченно,
+    /// если пир завис/тормозит. Теперь при достижении лимита самое старое
+    /// сообщение вытесняется (overwrite-семантика, как у `AutoOptions`).
+    #[test]
+    fn push_with_cap_evicts_oldest_and_reports_overflow() {
+        let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
+
+        assert!(!push_with_cap(&mut queue, b"a".to_vec(), 2));
+        assert!(!push_with_cap(&mut queue, b"b".to_vec(), 2));
+        assert_eq!(queue.len(), 2);
+
+        // Очередь на пределе -- третья вставка вытесняет самую старую ("a").
+        let overflowed = push_with_cap(&mut queue, b"c".to_vec(), 2);
+        assert!(overflowed);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), [
+            b"b".as_slice(),
+            b"c".as_slice()
+        ]);
+    }
+
+    /// Регрессия (аудит 2026-07-10): токены захвата не должны предсказуемо
+    /// повторяться/коллизировать (старая схема `pid<<8 ^ n` гарантированно
+    /// коллизировала между процессами при n >= 256) и никогда не должны
+    /// совпадать с CLAIM_FREE.
+    #[test]
+    fn claim_tokens_are_never_free_and_practically_unique() {
+        use std::collections::HashSet;
+
+        let tokens: HashSet<u32> = (0..1000).map(|_| next_claim_token()).collect();
+
+        assert!(
+            !tokens.contains(&CLAIM_FREE),
+            "next_claim_token() никогда не должен вернуть CLAIM_FREE"
+        );
+        // При случайной 32-битной генерации 1000 значений коллизии
+        // практически исключены (день рождений: ~1e-4 при 2^32 пространстве).
+        assert_eq!(
+            tokens.len(),
+            1000,
+            "токены из 1000 последовательных вызовов должны быть различны"
+        );
+    }
+
     #[test]
     fn test_multi_server_start() {
         let handler = Arc::new(TestHandler::new());
@@ -971,6 +1215,128 @@ mod tests {
         assert!(server.is_ok());
         let server = server.unwrap();
         assert_eq!(server.client_count(), 0);
+    }
+
+    /// `stop()` обязан синхронно дождаться выхода worker-потока: после
+    /// возврата `worker_handle` должен быть `None` (взят и заджойнен), иначе
+    /// C-вызывающий код может освободить `user_data` до того как worker
+    /// перестал дёргать callbacks (UAF), а Drop потом попытался бы
+    /// повторно/self-join'ить уже неактуальный handle.
+    #[test]
+    fn stop_synchronously_joins_worker() {
+        let name = format!("TEST_MULTI_STOP_JOIN_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(&name, handler, MultiOptions::default()).expect("start");
+
+        server.stop();
+
+        assert!(
+            server.worker_handle.lock().unwrap().is_none(),
+            "stop() должен забрать и заджойнить worker_handle синхронно"
+        );
+
+        // Повторный stop() — идемпотентен, не паникует и не виснет.
+        server.stop();
+    }
+
+    /// Регрессия на High-баг из аудита 2026-07-10: клиент, упавший ПОСЛЕ
+    /// завершения handshake (claim НЕ снят, connected=true), должен быть
+    /// обнаружен через liveness-проверку РЕАЛЬНО мёртвого процесса-владельца
+    /// и попасть в orphaned — иначе слот терялся бы навсегда.
+    #[test]
+    fn reclaim_detects_connected_slot_with_dead_owner_process() {
+        let name = format!("TEST_MULTI_DEAD_OWNER_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(
+            &name,
+            handler,
+            MultiOptions {
+                max_clients: 1,
+                ..Default::default()
+            },
+        )
+        .expect("start");
+
+        server.stop();
+        if let Some(h) = server.worker_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
+        // Реальный завершившийся процесс -- гарантированно мёртвый PID.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn short-lived child process");
+        let dead_pid = child.id();
+        child.wait().expect("wait for child exit");
+
+        const STALE_TOKEN: u32 = 0xDEAD_0001;
+        {
+            let slots = server.slots.read().unwrap();
+            let mut slot0 = slots[0].lock().unwrap();
+            slot0.connected = true;
+            slot0.claim_seen_at = None; // форсируем немедленную liveness-проверку
+            let control = slot0.server.view().control_block();
+            control.reserved[RESERVED_CLAIM_INDEX].store(STALE_TOKEN, Ordering::Release);
+            control.reserved[RESERVED_OWNER_PID_INDEX].store(dead_pid, Ordering::Release);
+        }
+
+        // is_process_alive может не сразу увидеть завершение (см. запас в
+        // win::tests::exited_process_is_detected_as_dead) -- ретраим.
+        let mut orphaned = Vec::new();
+        for _ in 0..50 {
+            orphaned = server.reclaim_stale_claims();
+            if !orphaned.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert_eq!(
+            orphaned,
+            vec![(0, STALE_TOKEN)],
+            "connected-слот с claim от мёртвого процесса должен быть обнаружен"
+        );
+    }
+
+    /// Контрольная проверка: connected-слот с claim от ЖИВОГО процесса (наш
+    /// собственный) НЕ должен попасть в orphaned — иначе liveness-проверка
+    /// отключала бы легитимно работающих клиентов (false positive).
+    #[test]
+    fn reclaim_does_not_flag_connected_slot_with_alive_owner_process() {
+        let name = format!("TEST_MULTI_ALIVE_OWNER_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(
+            &name,
+            handler,
+            MultiOptions {
+                max_clients: 1,
+                ..Default::default()
+            },
+        )
+        .expect("start");
+
+        server.stop();
+        if let Some(h) = server.worker_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
+        {
+            let slots = server.slots.read().unwrap();
+            let mut slot0 = slots[0].lock().unwrap();
+            slot0.connected = true;
+            slot0.claim_seen_at = None; // форсируем немедленную liveness-проверку
+            let control = slot0.server.view().control_block();
+            control.reserved[RESERVED_CLAIM_INDEX].store(0xABCD_0001, Ordering::Release);
+            control.reserved[RESERVED_OWNER_PID_INDEX]
+                .store(std::process::id(), Ordering::Release);
+        }
+
+        let orphaned = server.reclaim_stale_claims();
+        assert!(
+            orphaned.is_empty(),
+            "connected-слот с живым процессом-владельцем не должен считаться осиротевшим"
+        );
     }
 
     /// Детерминированная проверка обнаружения «осиротевшего» слота
@@ -1010,11 +1376,104 @@ mod tests {
         let orphaned = server.reclaim_stale_claims();
         assert_eq!(
             orphaned,
-            vec![0],
+            vec![(0, CLAIM_FREE)],
             "осиротевший connected-слот (claim=FREE) должен быть обнаружен"
         );
 
         // Слот 1 (connected=false, claim=FREE) НЕ должен попасть в осиротевшие.
-        assert!(!orphaned.contains(&1));
+        assert!(!orphaned.iter().any(|&(id, _)| id == 1));
+    }
+
+    /// Регрессия на race "unconditional store race" (аудит 2026-07-10):
+    /// если между обнаружением orphaned-слота и его обработкой новый клиент
+    /// успел легитимно захватить слот (CAS FREE->token), обработка НЕ должна
+    /// затирать его claim/connected — слот должен быть просто пропущен.
+    #[test]
+    fn handle_orphaned_slot_disconnect_does_not_clobber_racing_new_claim() {
+        let name = format!("TEST_MULTI_ORPHAN_RACE_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(
+            &name,
+            handler,
+            MultiOptions {
+                max_clients: 1,
+                ..Default::default()
+            },
+        )
+        .expect("start");
+
+        server.stop();
+        if let Some(h) = server.worker_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
+        const RACING_TOKEN: u32 = 0xDEAD_BEEF;
+
+        // Слот 0: помечен как «осиротевший» (connected=true, claim=FREE) —
+        // это состояние, с которым reclaim_stale_claims уже вернул бы его.
+        // Затем СИМУЛИРУЕМ гонку: новый клиент успел захватить слот ДО того,
+        // как обработчик до него добрался (claim теперь != FREE).
+        {
+            let slots = server.slots.read().unwrap();
+            let mut slot0 = slots[0].lock().unwrap();
+            slot0.connected = true;
+            let claim_field =
+                &slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+            claim_field.store(CLAIM_FREE, Ordering::Release);
+            claim_field
+                .compare_exchange(CLAIM_FREE, RACING_TOKEN, Ordering::AcqRel, Ordering::Acquire)
+                .expect("simulated racing claim must succeed");
+        }
+
+        server.handle_orphaned_slot_disconnect(0, CLAIM_FREE);
+
+        let slots = server.slots.read().unwrap();
+        let slot0 = slots[0].lock().unwrap();
+        assert!(
+            slot0.connected,
+            "connected не должен быть сброшен — новый клиент уже владеет слотом"
+        );
+        let claim_after = slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+            .load(Ordering::Acquire);
+        assert_eq!(
+            claim_after, RACING_TOKEN,
+            "claim нового клиента не должен быть затёрт обратно в FREE"
+        );
+    }
+
+    /// Контрольная проверка: без гонки (claim реально всё ещё FREE)
+    /// `handle_orphaned_slot_disconnect` обязан нормально отключить слот.
+    #[test]
+    fn handle_orphaned_slot_disconnect_disconnects_when_still_free() {
+        let name = format!("TEST_MULTI_ORPHAN_NOSRACE_{}", std::process::id());
+        let handler = Arc::new(TestHandler::new());
+        let server = MultiServer::start(
+            &name,
+            handler,
+            MultiOptions {
+                max_clients: 1,
+                ..Default::default()
+            },
+        )
+        .expect("start");
+
+        server.stop();
+        if let Some(h) = server.worker_handle.lock().unwrap().take() {
+            let _ = h.join();
+        }
+
+        {
+            let slots = server.slots.read().unwrap();
+            let mut slot0 = slots[0].lock().unwrap();
+            slot0.connected = true;
+            slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+                .store(CLAIM_FREE, Ordering::Release);
+        }
+
+        server.handle_orphaned_slot_disconnect(0, CLAIM_FREE);
+
+        let slots = server.slots.read().unwrap();
+        let slot0 = slots[0].lock().unwrap();
+        assert!(!slot0.connected, "слот должен быть отключён — claim реально FREE");
     }
 }
