@@ -12,7 +12,7 @@ extern "C" {
 // ============================================================================
 
 static inline shm_endpoint_config_t xshm_server_config(const char *name) {
-    shm_endpoint_config_t cfg = {name, 0u};
+    shm_endpoint_config_t cfg = {name};
     return cfg;
 }
 
