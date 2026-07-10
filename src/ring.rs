@@ -62,45 +62,76 @@ impl RingBuffer {
         (pos & RING_MASK) as usize
     }
 
+    /// # Safety
+    /// `index + data.len() <= capacity` (вызывающий код обязан гарантировать
+    /// отсутствие выхода за пределы `storage`; сам `copy_into` этого не
+    /// проверяет -- проверки границ выполняются в `copy_into_wrapped` через
+    /// модульную арифметику до вызова).
     unsafe fn copy_into(&self, index: usize, data: &[u8]) {
+        // SAFETY: storage валиден на всё время жизни self (гарантия
+        // конструктора RingBuffer::new); index+data.len() <= capacity --
+        // инвариант вызывающей стороны (см. doc выше).
         unsafe {
             let ptr = self.data_ptr().add(index);
             ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
         }
     }
 
+    /// # Safety
+    /// `index + dst.len() <= capacity` (см. `copy_into`).
     unsafe fn copy_from(&self, index: usize, dst: &mut [u8]) {
+        // SAFETY: storage валиден на всё время жизни self; index+dst.len()
+        // <= capacity -- инвариант вызывающей стороны (см. doc выше).
         unsafe {
             let ptr = self.data_ptr().add(index);
             dst.copy_from_slice(std::slice::from_raw_parts(ptr, dst.len()));
         }
     }
 
+    /// # Safety
+    /// `index < capacity` (читает 2 байта начиная с `index`, с wrap-around
+    /// через `copy_from_wrapped`, поэтому сам `index` не обязан оставлять
+    /// место под оба байта без переноса).
     unsafe fn read_u16(&self, index: usize) -> u16 {
         let mut buf = [0u8; 2];
+        // SAFETY: copy_from_wrapped сам обеспечивает wrap-around в пределах
+        // capacity -- единственное требование к index описано в doc выше.
         unsafe { self.copy_from_wrapped(index, &mut buf) };
         u16::from_le_bytes(buf)
     }
 
+    /// # Safety
+    /// `data.len() <= capacity` (иначе один и тот же байт будет записан
+    /// дважды при переносе через границу кольца; вызывающий код -- ring.rs
+    /// сам, всегда после проверки `total_required <= self.capacity` в
+    /// `write_message`).
     unsafe fn copy_into_wrapped(&self, start: usize, data: &[u8]) {
         let capacity = self.capacity as usize;
         let start = start % capacity;
         let first = capacity - start;
         if data.len() <= first {
+            // SAFETY: start+data.len() <= capacity -- проверено веткой if.
             unsafe { self.copy_into(start, data) };
         } else {
+            // SAFETY: обе части (`first` и остаток) укладываются в
+            // [0, capacity) по построению (start+first == capacity).
             unsafe { self.copy_into(start, &data[..first]) };
             unsafe { self.copy_into(0, &data[first..]) };
         }
     }
 
+    /// # Safety
+    /// `dst.len() <= capacity` (см. `copy_into_wrapped`).
     unsafe fn copy_from_wrapped(&self, start: usize, dst: &mut [u8]) {
         let capacity = self.capacity as usize;
         let start = start % capacity;
         let first = capacity - start;
         if dst.len() <= first {
+            // SAFETY: start+dst.len() <= capacity -- проверено веткой if.
             unsafe { self.copy_from(start, dst) };
         } else {
+            // SAFETY: обе части укладываются в [0, capacity) по построению
+            // (start+first == capacity), как и в copy_into_wrapped.
             unsafe { self.copy_from(start, &mut dst[..first]) };
             unsafe { self.copy_from(0, &mut dst[first..]) };
         }
@@ -117,6 +148,7 @@ impl RingBuffer {
             }
 
             let idx = self.mask_index(read);
+            // SAFETY: idx = read & RING_MASK всегда < capacity (mask_index).
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
                 // Повреждённая длина в слоте. Не трогаем общий message_count
@@ -177,6 +209,10 @@ impl RingBuffer {
             let idx = self.mask_index(write);
             let len_le = (payload.len() as u16).to_le_bytes();
             let flags = 0u16.to_le_bytes();
+            // SAFETY: каждый вызов copy_into_wrapped пишет <= capacity байт
+            // (len_le/flags -- по 2 байта, payload -- не более MAX_MESSAGE_SIZE,
+            // и total_required = MESSAGE_HEADER_SIZE+payload.len() уже
+            // проверен против self.capacity веткой availability-проверки выше).
             unsafe {
                 self.copy_into_wrapped(idx, &len_le);
                 self.copy_into_wrapped((idx + 2) & (RING_MASK as usize), &flags);
@@ -213,6 +249,7 @@ impl RingBuffer {
 
             let read = header.read_pos.load(Ordering::Acquire);
             let idx = self.mask_index(read);
+            // SAFETY: idx = read & RING_MASK всегда < capacity (mask_index).
             let msg_len = unsafe { self.read_u16(idx) } as usize;
             if !(MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE).contains(&msg_len) {
                 // Длина могла быть «порвана» перезаписью producer-а. Если read_pos
