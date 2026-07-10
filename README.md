@@ -1,18 +1,35 @@
-# xShm – Cross-process Shared Memory IPC (Windows)
+<div align="center">
 
-High-performance bidirectional IPC library using shared memory with lock-free SPSC ring buffers. Written in Rust with FFI support for C/C++.
+# xShm
 
-**Version**: 0.6.0
-**Author:** Platon
-**Status**: ✅ **PRODUCTION READY**
+**High-performance cross-process shared memory IPC for Windows**
+
+Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. Rust core, first-class C/C++ FFI.
+
+<p>
+  <img alt="version" src="https://img.shields.io/badge/version-0.6.0-blue">
+  <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
+  <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
+  <img alt="status" src="https://img.shields.io/badge/status-production--ready-brightgreen">
+</p>
+
+<p>
+  <a href="README.md"><img alt="English" src="https://img.shields.io/badge/lang-English-2f81f7"></a>
+  <a href="README.ru.md"><img alt="Русский" src="https://img.shields.io/badge/lang-Русский-lightgrey"></a>
+</p>
+
+</div>
+
+---
 
 ## 🆕 What's New in v0.6.0
 
-- ✅ **Dispatch mode**: a fifth mode (`DispatchServer`/`DispatchClient`) — one lobby + a dynamic per-client channel, no fixed upper bound on client count (unlike Multi-client's fixed slots)
-- ✅ **Multi-client redesign**: the central lobby segment is gone. Clients now concurrently claim a free slot via lock-free CAS on the slot's own memory — fully parallel connects, no shared contention point
-- ✅ **Hardening pass**: torn-read protection under ring overflow, dead/orphaned slot detection (liveness-checks the owning process), synchronous `stop()` (no more use-after-free through FFI on teardown), bounded send queues everywhere (`MultiClient` previously had none)
-- ✅ **API cleanup** (breaking, pre-1.0): dropped dead fields (`shm_endpoint_config_t.buffer_bytes`, `MultiClientOptions.lobby_timeout`), unified naming across modes (`poll_timeout`, `channel_name`), dropped the auto-generated `XSHM_`/`XSHM_SEG_` name prefix — the caller now fully owns the visible NT object name
-- ✅ **No admin privileges required**: named objects are session-scoped (`Local\` → `\Sessions\<id>\BaseNamedObjects\`), not global — elevated rights are only needed if you explicitly opt into `Global\`
+- ✅ **Dispatch mode** — a fifth mode (`DispatchServer`/`DispatchClient`): one lobby + a dynamic per-client channel, no fixed upper bound on client count
+- ✅ **Multi-client redesign** — the central lobby segment is gone. Clients now concurrently claim a free slot via lock-free CAS on the slot's own memory — fully parallel connects, no shared contention point
+- ✅ **Hardening pass** — torn-read protection under ring overflow, dead/orphaned slot detection (liveness-checks the owning process), synchronous `stop()` (no more use-after-free through FFI on teardown), bounded send queues everywhere
+- ✅ **API cleanup** (breaking, pre-1.0) — dropped dead fields, unified naming across modes (`poll_timeout`, `channel_name`), dropped the auto-generated name prefix — the caller now fully owns the visible NT object name
+- ✅ **No admin privileges required** — named objects are session-scoped by default; elevated rights are only needed if you explicitly opt into `Global\`
 
 ## Features
 
@@ -22,62 +39,84 @@ High-performance bidirectional IPC library using shared memory with lock-free SP
 - Clean start guarantee: buffers reset on each new connection with generation tracking
 - Ready-to-use C headers (`xshm.h`, `xshm_server.h`, `xshm_client.h`) with helper functions
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`), automatic reconnect
-- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (31) clients via lock-free concurrent slot claim (no central lobby, no fixed-count upper bound negotiation)
-- **Dispatch mode**: single lobby + dynamic per-client channel, no fixed slot count at all — trades a small per-registration handshake for unbounded client count
+- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (31) clients via lock-free concurrent slot claim
+- **Dispatch mode**: single lobby + dynamic per-client channel, no fixed slot count at all
 - **Direct NT API**: static linking with ntdll.dll, no external dependencies
 - **Static CRT**: TLS and CRT statically linked, no runtime DLL dependencies
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      FFI Layer (ffi.rs, multi/ffi.rs,        │
-│                              dispatch/ffi.rs)                │
-│              C-compatible API for external languages        │
-├─────────────────────────────────────────────────────────────┤
-│    Auto Layer (auto/)     │   Multi Layer   │  Dispatch      │
-│  Background worker        │   (multi/)      │  Layer         │
-│  threads with callbacks   │  N slots, each   │  (dispatch/)   │
-│                            │  with SPSC       │  lobby + N    │
-│                            │  channel,        │  dynamic Auto │
-│                            │  concurrent CAS   │  channels     │
-│                            │  claim            │               │
-├─────────────────────────────────────────────────────────────┤
-│              Endpoint Layer (server.rs, client.rs)          │
-│            Synchronous server and client API                │
-├─────────────────────────────────────────────────────────────┤
-│                   Ring Buffer (ring.rs)                     │
-│              Lock-free SPSC ring buffer                     │
-├─────────────────────────────────────────────────────────────┤
-│              Shared Memory Layout (layout.rs)               │
-│         ControlBlock + RingHeader + Data regions             │
-├─────────────────────────────────────────────────────────────┤
-│                  Platform Layer (ntapi/, win.rs)            │
-│         Direct NT API calls via #[link(name = "ntdll")]     │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    App["Your application (Rust or C/C++)"]
+    App --> FFI["C FFI — ffi.rs / multi/ffi.rs / dispatch/ffi.rs"]
+    App -. direct Rust API .-> Auto
+    App -. direct Rust API .-> Multi
+    App -. direct Rust API .-> Dispatch
+
+    FFI --> Auto["Auto — auto/mod.rs<br/>worker thread + reconnect"]
+    FFI --> Multi["Multi-client — multi/mod.rs<br/>fixed slots, lock-free claim"]
+    FFI --> Dispatch["Dispatch — dispatch/mod.rs<br/>lobby + dynamic channels"]
+
+    Dispatch -. reuses .-> Auto
+
+    Auto --> Endpoint["Endpoint — server.rs / client.rs<br/>SharedServer / SharedClient"]
+    Multi --> Endpoint
+
+    Endpoint --> Ring["ring.rs<br/>lock-free SPSC ring buffer"]
+    Ring --> Layout["layout.rs / shared.rs<br/>ControlBlock + RingHeader"]
+    Layout --> Platform["win.rs + ntapi/<br/>direct NT API (ntdll.dll)"]
 ```
 
 ## Memory Layout
 
+Each channel is a single Named (or anonymous) Section, mapped into both processes' address space:
+
+```mermaid
+flowchart LR
+    CB["ControlBlock<br/>64 B<br/>magic · version · generation<br/>server_state · client_state"]
+    RHA["RingHeader A<br/>64 B"]
+    RBA["RingBuffer A<br/>2 MB<br/>Server → Client"]
+    RHB["RingHeader B<br/>64 B"]
+    RBB["RingBuffer B<br/>2 MB<br/>Client → Server"]
+    CB --> RHA --> RBA --> RHB --> RBB
 ```
-┌────────────────────────────────────────────────────────────┐
-│                    ControlBlock (64 bytes)                 │
-│  magic | version | generation | server_state | client_state│
-├────────────────────────────────────────────────────────────┤
-│                   RingHeader A (64 bytes)                  │
-│  write_pos | read_pos | message_count | drop_count | ...   │
-├────────────────────────────────────────────────────────────┤
-│                   Ring Buffer A (2 MB)                     │
-│              Server → Client messages                      │
-├────────────────────────────────────────────────────────────┤
-│                   RingHeader B (64 bytes)                  │
-│  write_pos | read_pos | message_count | drop_count | ...   │
-├────────────────────────────────────────────────────────────┤
-│                   Ring Buffer B (2 MB)                     │
-│              Client → Server messages                      │
-└────────────────────────────────────────────────────────────┘
-Total: ~4 MB + headers
+
+Total: ~4 MB + headers, computed by `shared_mapping_size()`.
+
+## How a Connection Is Established
+
+```mermaid
+sequenceDiagram
+    participant S as Server
+    participant C as Client
+
+    S->>S: NtCreateSection + NtMapViewOfSection
+    S->>S: ControlBlock::reset()
+    S->>S: wait_for_client() — blocks on connect_req
+
+    C->>C: NtOpenSection, verify magic/version
+    C->>S: client_state = CLIENT_HELLO
+    C->>S: signal connect_req
+
+    S->>S: sees CLIENT_HELLO → reset ring headers
+    S->>S: generation += 1
+    S->>C: server_state = SERVER_READY
+    S->>C: signal connect_ack
+
+    C->>C: verify SERVER_READY, adopt generation
+    Note over S,C: connection established — both sides build ring buffers
 ```
+
+## Choosing a Mode
+
+| | Single-client | Auto | Multi-client | Dispatch |
+|---|:---:|:---:|:---:|:---:|
+| Clients per server | 1 | 1 | up to 31 (fixed slots) | unbounded |
+| Threading | none — caller-driven | background worker | background worker per slot | lobby worker + per-client worker |
+| Reconnect | manual | automatic | automatic (re-claim) | automatic |
+| Connect cost | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 lobby round-trip + 1 handshake |
+| Best for | simplest pairwise IPC, driver integration | one peer, needs resilience | known/bounded fleet size | fleet size unknown ahead of time |
 
 ## Requirements
 
@@ -188,7 +227,29 @@ fn main() -> Result<()> {
 ### Multi-client mode (Rust)
 
 Fixed pool of slots (default 20, hard cap 31). Clients concurrently claim a
-free slot via lock-free CAS — no central lobby, no negotiation round-trip.
+free slot via lock-free CAS — no central lobby, no negotiation round-trip:
+
+```mermaid
+sequenceDiagram
+    participant A as Client A
+    participant B as Client B
+    participant S0 as Slot 0 (shared memory)
+    participant S1 as Slot 1 (shared memory)
+
+    par Client A claims a slot
+        A->>S0: CAS reserved[CLAIM]: FREE → token_A
+        S0-->>A: success — slot 0 claimed
+    and Client B claims a slot
+        B->>S0: CAS reserved[CLAIM]: FREE → token_B
+        S0-->>B: fail — already token_A
+        B->>S1: CAS reserved[CLAIM]: FREE → token_B
+        S1-->>B: success — slot 1 claimed
+    end
+
+    A->>S0: SharedClient::connect() — standard handshake
+    B->>S1: SharedClient::connect() — standard handshake
+    Note over A,B: fully parallel — no shared lobby, no coordination point
+```
 
 ```rust
 use std::sync::Arc;
@@ -324,31 +385,8 @@ fn main() -> Result<()> {
 #include "xshm_client.h"   // Client side (optional, included in xshm.h)
 ```
 
-### Getting Event Handles for Kernel Driver
-
-Get event handles from server for passing to kernel driver:
-
-```c
-#include "xshm.h"
-
-ServerHandle* server = shm_server_start(&config, NULL);
-
-// Get event handles for kernel driver
-shm_event_handles_t event_handles = {0};
-if (shm_server_get_event_handles(server, &event_handles)) {
-    // Pass handles to kernel driver via IOCTL
-    // event_handles.s2c_data - Server→Client data event (user signals driver)
-    // event_handles.c2s_data - Client→Server data event (driver signals user)
-
-    // Example: Pass to SPF_V4 driver
-    request.ShmDataEventHandle = (HANDLE)event_handles.s2c_data;
-    request.ShmSpaceEventHandle = (HANDLE)event_handles.c2s_data;
-} else {
-    // Anonymous server - no events available, use polling mode
-}
-```
-
-**Note**: For anonymous servers (`SharedServer::start_anonymous()`), this function returns `false` and handles are zero. Use polling mode in this case.
+Event handles for kernel driver integration are covered separately in
+[Event Handles for Kernel Drivers](#event-handles-for-kernel-drivers) below.
 
 ### Linking
 
@@ -515,21 +553,26 @@ int main(void) {
 
 ## Event Handles for Kernel Drivers
 
-Get event handles from server for passing to kernel drivers:
+Any named server can hand out its raw NT event handles so a kernel driver
+can wait on them directly (event-driven, no polling) instead of going
+through the FFI/Rust API for every notification.
 
+**C API**:
 ```c
 #include "xshm.h"
 
 ServerHandle* server = shm_server_start(&config, NULL);
 
-// Get event handles
 shm_event_handles_t event_handles = {0};
 if (shm_server_get_event_handles(server, &event_handles)) {
-    // event_handles.s2c_data - Server→Client data event
-    // event_handles.c2s_data - Client→Server data event
-    // Pass to kernel driver via IOCTL
+    // event_handles.s2c_data - Server→Client data event (user signals driver)
+    // event_handles.c2s_data - Client→Server data event (driver signals user)
+
+    // Example: pass to a kernel driver via IOCTL
+    request.ShmDataEventHandle = (HANDLE)event_handles.s2c_data;
+    request.ShmSpaceEventHandle = (HANDLE)event_handles.c2s_data;
 } else {
-    // Anonymous server - no events, use polling mode
+    // Anonymous server - no events available, use polling mode
 }
 ```
 
@@ -544,7 +587,9 @@ if let Some(handles) = server.get_event_handles() {
 }
 ```
 
-**Note**: For anonymous servers (`SharedServer::start_anonymous()`), `get_event_handles()` returns `None` (no named events created). Use polling mode in this case.
+**Note**: For anonymous servers (`SharedServer::start_anonymous()`), this
+returns `false`/`None` — no named events are created. Use polling mode in
+that case.
 
 ## Limitations
 
