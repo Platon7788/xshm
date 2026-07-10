@@ -1,14 +1,14 @@
-//! Binary protocol for dispatch lobby handshake.
+//! Бинарный протокол для handshake в dispatch-лобби.
 //!
-//! Minimal binary encoding — no serde dependency.
-//! Messages are exchanged over the lobby SharedServer ring buffers.
+//! Минимальное бинарное кодирование — без зависимости от serde.
+//! Сообщения передаются через ring buffer'ы lobby SharedServer.
 
 use crate::error::{Result, ShmError};
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Константы ────────────────────────────────────────────────────────────────
 
 const DISPATCH_MAGIC: u32 = 0x4449_5350; // 'DISP'
-const DISPATCH_VERSION: u8 = 2; // v2: removed bits field
+const DISPATCH_VERSION: u8 = 2; // v2: убрано поле bits
 
 const MSG_TYPE_REQUEST: u8 = 1;
 const MSG_TYPE_RESPONSE: u8 = 2;
@@ -16,16 +16,16 @@ const MSG_TYPE_RESPONSE: u8 = 2;
 const MAX_NAME_LEN: usize = 64;
 const MAX_CHANNEL_NAME_LEN: usize = 64;
 
-/// Response status: success.
+/// Статус ответа: успех.
 pub const STATUS_OK: u8 = 0;
-/// Response status: server rejected the connection.
+/// Статус ответа: сервер отклонил подключение.
 pub const STATUS_REJECTED: u8 = 1;
 
-// ─── Registration request (client → server) ─────────────────────────────────
+// ─── Запрос регистрации (клиент → сервер) ───────────────────────────────────
 
-/// Data sent by client during lobby registration.
+/// Данные, отправляемые клиентом во время регистрации в лобби.
 ///
-/// Fields: process name, PID, revision.
+/// Поля: имя процесса, PID, ревизия.
 #[derive(Debug, Clone)]
 pub struct RegistrationRequest {
     pub pid: u32,
@@ -33,7 +33,7 @@ pub struct RegistrationRequest {
     pub name: String,
 }
 
-/// Encode a registration request into bytes.
+/// Кодирует запрос регистрации в байты.
 ///
 /// Layout (v2):
 /// ```text
@@ -43,7 +43,7 @@ pub struct RegistrationRequest {
 /// [6..10]  pid: u32 LE
 /// [10..12] revision: u16 LE
 /// [12..13] name_len: u8
-/// [13..]   name: UTF-8 bytes (max 64)
+/// [13..]   name: UTF-8 байты (максимум 64)
 /// ```
 pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
     let name_bytes = req.name.as_bytes();
@@ -62,7 +62,7 @@ pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
     buf
 }
 
-/// Decode a registration request from bytes.
+/// Декодирует запрос регистрации из байтов.
 pub fn decode_request(data: &[u8]) -> Result<RegistrationRequest> {
     if data.len() < 13 {
         return Err(ShmError::MessageTooSmall);
@@ -100,9 +100,9 @@ pub fn decode_request(data: &[u8]) -> Result<RegistrationRequest> {
     })
 }
 
-// ─── Registration response (server → client) ────────────────────────────────
+// ─── Ответ регистрации (сервер → клиент) ────────────────────────────────────
 
-/// Data sent by server after processing registration.
+/// Данные, отправляемые сервером после обработки регистрации.
 #[derive(Debug, Clone)]
 pub struct RegistrationResponse {
     pub status: u8,
@@ -110,7 +110,7 @@ pub struct RegistrationResponse {
     pub channel_name: String,
 }
 
-/// Encode a registration response into bytes.
+/// Кодирует ответ регистрации в байты.
 ///
 /// Layout (v2):
 /// ```text
@@ -120,7 +120,7 @@ pub struct RegistrationResponse {
 /// [6..7]   status: u8
 /// [7..11]  client_id: u32 LE
 /// [11..12] channel_name_len: u8
-/// [12..]   channel_name: UTF-8 bytes (max 64)
+/// [12..]   channel_name: UTF-8 байты (максимум 64)
 /// ```
 pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
     let name_bytes = resp.channel_name.as_bytes();
@@ -139,7 +139,7 @@ pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
     buf
 }
 
-/// Decode a registration response from bytes.
+/// Декодирует ответ регистрации из байтов.
 pub fn decode_response(data: &[u8]) -> Result<RegistrationResponse> {
     if data.len() < 12 {
         return Err(ShmError::MessageTooSmall);
@@ -210,7 +210,7 @@ mod tests {
 
     #[test]
     fn request_max_name() {
-        let long_name = "A".repeat(100); // longer than MAX_NAME_LEN
+        let long_name = "A".repeat(100); // длиннее MAX_NAME_LEN
         let req = RegistrationRequest {
             pid: 42,
             revision: 1,

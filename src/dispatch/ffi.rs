@@ -1,6 +1,6 @@
-//! C FFI for dispatch server and client.
+//! C FFI для dispatch-сервера и клиента.
 //!
-//! Follows the same patterns as `crate::ffi` and `crate::multi::ffi`.
+//! Следует тем же паттернам, что и `crate::ffi` и `crate::multi::ffi`.
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
@@ -17,9 +17,9 @@ use super::{
     DispatchHandler, DispatchOptions, DispatchServer,
 };
 
-// ─── FFI types ───────────────────────────────────────────────────────────────
+// ─── Типы FFI ────────────────────────────────────────────────────────────────
 
-/// Registration info passed from C client.
+/// Данные регистрации, передаваемые от C-клиента.
 #[repr(C)]
 pub struct shm_dispatch_registration_t {
     pub pid: u32,
@@ -27,7 +27,7 @@ pub struct shm_dispatch_registration_t {
     pub name: *const c_char,
 }
 
-/// Server-side callbacks.
+/// Callbacks на стороне сервера.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_callbacks_t {
@@ -48,7 +48,7 @@ pub struct shm_dispatch_callbacks_t {
     pub user_data: *mut c_void,
 }
 
-/// Client-side callbacks.
+/// Callbacks на стороне клиента.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_client_callbacks_t {
@@ -60,7 +60,7 @@ pub struct shm_dispatch_client_callbacks_t {
     pub user_data: *mut c_void,
 }
 
-/// Server options.
+/// Настройки сервера.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_options_t {
@@ -81,7 +81,7 @@ impl Default for shm_dispatch_options_t {
     }
 }
 
-/// Client options.
+/// Настройки клиента.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_dispatch_client_options_t {
@@ -106,7 +106,7 @@ impl Default for shm_dispatch_client_options_t {
     }
 }
 
-// ─── Internal state ──────────────────────────────────────────────────────────
+// ─── Внутреннее состояние ─────────────────────────────────────────────────────
 
 pub type DispatchServerHandle = c_void;
 pub type DispatchClientHandle = c_void;
@@ -133,12 +133,12 @@ struct FfiDispatchClientHandler {
     callbacks: shm_dispatch_client_callbacks_t,
 }
 
-// ─── Handler implementations ─────────────────────────────────────────────────
+// ─── Реализации handler'ов ────────────────────────────────────────────────────
 
 impl DispatchHandler for FfiDispatchHandler {
     fn on_client_connect(&self, client_id: u32, info: &ClientRegistration) {
         if let Some(cb) = self.callbacks.on_client_connect {
-            let name_cstr = std::ffi::CString::new(info.name.as_str()).unwrap_or_default();
+            let name_cstr = to_c_string_lossy(info.name.as_str());
             cb(
                 client_id,
                 info.pid,
@@ -177,7 +177,7 @@ impl DispatchHandler for FfiDispatchHandler {
 impl DispatchClientHandler for FfiDispatchClientHandler {
     fn on_connect(&self, client_id: u32, channel_name: &str) {
         if let Some(cb) = self.callbacks.on_connect {
-            let name_cstr = std::ffi::CString::new(channel_name).unwrap_or_default();
+            let name_cstr = to_c_string_lossy(channel_name);
             cb(client_id, name_cstr.as_ptr(), self.callbacks.user_data);
         }
     }
@@ -205,10 +205,10 @@ impl DispatchClientHandler for FfiDispatchClientHandler {
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Вспомогательные функции ──────────────────────────────────────────────────
 
 /// # Safety
-/// `ptr` must be a valid null-terminated C string or null.
+/// `ptr` обязан быть валидной null-terminated C-строкой либо null.
 unsafe fn to_rust_str(ptr: *const c_char) -> Option<String> {
     if ptr.is_null() {
         return None;
@@ -217,8 +217,29 @@ unsafe fn to_rust_str(ptr: *const c_char) -> Option<String> {
     Some(cstr.to_string_lossy().into_owned())
 }
 
+/// Конвертирует Rust-строку в `CString` для передачи в callback, устойчиво
+/// к embedded NUL-байтам -- усекает по первому NUL вместо потери всей строки.
+///
+/// `CString::new` проваливается целиком при embedded NUL; раньше на этот
+/// случай делался `.unwrap_or_default()`, что тихо отдавало C-колбэку ПУСТУЮ
+/// строку вместо реального (потенциально пришедшего от клиента по проводу)
+/// имени. C-строка всё равно не может представить байты после NUL, так что
+/// усечение там -- честный best-effort, а не дополнительная потеря данных.
+fn to_c_string_lossy(s: &str) -> std::ffi::CString {
+    match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        Err(e) => {
+            let nul_pos = e.nul_position();
+            let bytes = e.into_vec();
+            // bytes[..nul_pos] по определению NulError не содержит NUL,
+            // поэтому CString::new здесь не может провалиться повторно.
+            std::ffi::CString::new(&bytes[..nul_pos]).unwrap_or_default()
+        }
+    }
+}
+
 /// # Safety
-/// `ptr` must be a valid pointer to `shm_dispatch_options_t` or null.
+/// `ptr` обязан быть валидным указателем на `shm_dispatch_options_t` либо null.
 unsafe fn to_dispatch_options(ptr: *const shm_dispatch_options_t) -> DispatchOptions {
     if ptr.is_null() {
         return DispatchOptions::default();
@@ -233,7 +254,7 @@ unsafe fn to_dispatch_options(ptr: *const shm_dispatch_options_t) -> DispatchOpt
 }
 
 /// # Safety
-/// `ptr` must be a valid pointer to `shm_dispatch_client_options_t` or null.
+/// `ptr` обязан быть валидным указателем на `shm_dispatch_client_options_t` либо null.
 unsafe fn to_dispatch_client_options(
     ptr: *const shm_dispatch_client_options_t,
 ) -> DispatchClientOptions {
@@ -251,10 +272,11 @@ unsafe fn to_dispatch_client_options(
     }
 }
 
-// ─── Server FFI ──────────────────────────────────────────────────────────────
+// ─── FFI сервера ─────────────────────────────────────────────────────────────
 
 /// # Safety
-/// All pointers must be valid or null where documented. `name` must be a valid C string.
+/// Все указатели обязаны быть валидны либо null там, где это задокументировано.
+/// `name` обязан быть валидной C-строкой.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_server_start(
     name: *const c_char,
@@ -291,7 +313,7 @@ pub unsafe extern "C" fn shm_dispatch_server_start(
 }
 
 /// # Safety
-/// `handle` must be a valid DispatchServerHandle. `data` must point to `size` bytes.
+/// `handle` обязан быть валидным DispatchServerHandle. `data` обязан указывать на `size` байт.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_server_send_to(
     handle: *mut DispatchServerHandle,
@@ -311,7 +333,7 @@ pub unsafe extern "C" fn shm_dispatch_server_send_to(
 }
 
 /// # Safety
-/// `handle` must be valid. `data` must point to `size` bytes. `sent_count` may be null.
+/// `handle` обязан быть валидным. `data` обязан указывать на `size` байт. `sent_count` может быть null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_server_broadcast(
     handle: *mut DispatchServerHandle,
@@ -336,7 +358,7 @@ pub unsafe extern "C" fn shm_dispatch_server_broadcast(
 }
 
 /// # Safety
-/// `handle` must be a valid DispatchServerHandle or null.
+/// `handle` обязан быть валидным DispatchServerHandle либо null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_server_client_count(
     handle: *const DispatchServerHandle,
@@ -349,21 +371,29 @@ pub unsafe extern "C" fn shm_dispatch_server_client_count(
 }
 
 /// # Safety
-/// `handle` must be a valid DispatchServerHandle or null. Consumes the handle.
+/// `handle` обязан быть валидным DispatchServerHandle либо null. Поглощает handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_server_stop(handle: *mut DispatchServerHandle) {
     if handle.is_null() {
         return;
     }
     unsafe {
-        drop(Box::from_raw(handle as *mut DispatchServerState));
+        let state = Box::from_raw(handle as *mut DispatchServerState);
+        // Раньше .stop() тут вообще не вызывался: lobby worker держит
+        // собственный клон Arc<DispatchServer>, поэтому простой drop(state)
+        // оставлял worker-поток работать вечно (некому было сказать
+        // остановиться) -- перманентная утечка потока/ресурсов, плюс риск
+        // UAF, если C-вызывающий код освобождает user_data сразу после
+        // этого вызова, считая сервер остановленным.
+        state.inner.stop();
+        // state drops здесь, освобождая остальное
     }
 }
 
-// ─── Client FFI ──────────────────────────────────────────────────────────────
+// ─── FFI клиента ─────────────────────────────────────────────────────────────
 
 /// # Safety
-/// All pointers must be valid. `name` and `reg.name` must be valid C strings.
+/// Все указатели обязаны быть валидны. `name` и `reg.name` обязаны быть валидными C-строками.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_client_connect(
     name: *const c_char,
@@ -408,7 +438,7 @@ pub unsafe extern "C" fn shm_dispatch_client_connect(
 }
 
 /// # Safety
-/// `handle` must be a valid DispatchClientHandle. `data` must point to `size` bytes.
+/// `handle` обязан быть валидным DispatchClientHandle. `data` обязан указывать на `size` байт.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_client_send(
     handle: *mut DispatchClientHandle,
@@ -427,7 +457,7 @@ pub unsafe extern "C" fn shm_dispatch_client_send(
 }
 
 /// # Safety
-/// `handle` must be a valid DispatchClientHandle or null. Consumes the handle.
+/// `handle` обязан быть валидным DispatchClientHandle либо null. Поглощает handle.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn shm_dispatch_client_stop(handle: *mut DispatchClientHandle) {
     if handle.is_null() {
@@ -446,4 +476,33 @@ pub extern "C" fn shm_dispatch_options_default() -> shm_dispatch_options_t {
 #[unsafe(no_mangle)]
 pub extern "C" fn shm_dispatch_client_options_default() -> shm_dispatch_client_options_t {
     shm_dispatch_client_options_t::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия (аудит 2026-07-10): embedded NUL раньше приводил к тому,
+    /// что C-колбэк получал ПУСТУЮ строку (`CString::new(...).unwrap_or_default()`).
+    /// Теперь -- усечение по первому NUL, сохраняя всё, что было до него.
+    #[test]
+    fn to_c_string_lossy_truncates_at_first_nul_instead_of_going_empty() {
+        let with_nul = "before\0after";
+        let result = to_c_string_lossy(with_nul);
+        assert_eq!(result.to_str().unwrap(), "before");
+        assert_ne!(result.to_str().unwrap(), "", "не должно тихо стать пустым");
+    }
+
+    #[test]
+    fn to_c_string_lossy_passes_through_clean_string() {
+        let clean = "normal_name.exe";
+        let result = to_c_string_lossy(clean);
+        assert_eq!(result.to_str().unwrap(), clean);
+    }
+
+    #[test]
+    fn to_c_string_lossy_handles_leading_nul() {
+        let result = to_c_string_lossy("\0anything");
+        assert_eq!(result.to_str().unwrap(), "");
+    }
 }

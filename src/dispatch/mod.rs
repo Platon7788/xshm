@@ -1,17 +1,17 @@
-//! Dispatch server — central lobby with dynamic per-client channels.
+//! Dispatch-сервер — единое лобби с динамическими каналами на каждого клиента.
 //!
-//! # Architecture
+//! # Архитектура
 //!
 //! ```text
-//! DispatchServer("NxT")        ← single lobby, accepts all clients
+//! DispatchServer("NxT")        ← единственное лобби, принимает всех клиентов
 //!     ↓
-//! Client connects to lobby → sends RegistrationRequest {pid, revision, name}
+//! Клиент подключается к лобби → отправляет RegistrationRequest {pid, revision, name}
 //!     ↓
-//! Server creates AutoServer("NxT_a7f3b2c1") → sends RegistrationResponse
+//! Сервер создаёт AutoServer("NxT_a7f3b2c1") → отправляет RegistrationResponse
 //!     ↓
-//! Client disconnects from lobby → connects to "NxT_a7f3b2c1" via AutoClient
+//! Клиент отключается от лобби → подключается к "NxT_a7f3b2c1" через AutoClient
 //!     ↓
-//! 1:1 communication on dedicated channel
+//! Обмен 1:1 на выделенном канале
 //! ```
 
 pub mod ffi;
@@ -34,7 +34,7 @@ pub use protocol::{RegistrationRequest, RegistrationResponse};
 
 // ─── Public types ────────────────────────────────────────────────────────────
 
-/// Client registration data received during lobby handshake.
+/// Данные регистрации клиента, полученные во время handshake в лобби.
 #[derive(Debug, Clone)]
 pub struct ClientRegistration {
     pub pid: u32,
@@ -42,50 +42,50 @@ pub struct ClientRegistration {
     pub name: String,
 }
 
-/// Callback interface for DispatchServer events.
+/// Callback-интерфейс для событий DispatchServer.
 pub trait DispatchHandler: Send + Sync + 'static {
-    /// Called when a client has registered and connected to its dedicated channel.
+    /// Вызывается, когда клиент зарегистрировался и подключился к своему выделенному каналу.
     fn on_client_connect(&self, client_id: u32, info: &ClientRegistration);
 
-    /// Called when a client disconnects from its dedicated channel.
+    /// Вызывается при отключении клиента от выделенного канала.
     fn on_client_disconnect(&self, client_id: u32);
 
-    /// Called when a message is received from a client on its dedicated channel.
+    /// Вызывается при получении сообщения от клиента по выделенному каналу.
     fn on_message(&self, client_id: u32, data: &[u8]);
 
-    /// Called on error (client_id = None for general errors).
+    /// Вызывается при ошибке (client_id = None для общих ошибок).
     fn on_error(&self, client_id: Option<u32>, err: ShmError) {
         let _ = (client_id, err);
     }
 }
 
-/// Callback interface for DispatchClient events.
+/// Callback-интерфейс для событий DispatchClient.
 pub trait DispatchClientHandler: Send + Sync + 'static {
-    /// Called when successfully connected to dedicated channel.
+    /// Вызывается при успешном подключении к выделенному каналу.
     fn on_connect(&self, client_id: u32, channel_name: &str);
 
-    /// Called when disconnected from dedicated channel.
+    /// Вызывается при отключении от выделенного канала.
     fn on_disconnect(&self);
 
-    /// Called when a message is received from the server.
+    /// Вызывается при получении сообщения от сервера.
     fn on_message(&self, data: &[u8]);
 
-    /// Called on error.
+    /// Вызывается при ошибке.
     fn on_error(&self, err: ShmError) {
         let _ = err;
     }
 }
 
-/// Options for DispatchServer.
+/// Настройки DispatchServer.
 #[derive(Clone)]
 pub struct DispatchOptions {
-    /// Timeout for reading registration data from lobby after handshake.
+    /// Таймаут чтения данных регистрации из лобби после handshake.
     pub lobby_timeout: Duration,
-    /// Timeout for client to connect to its dedicated channel after registration.
+    /// Таймаут подключения клиента к выделенному каналу после регистрации.
     pub channel_connect_timeout: Duration,
-    /// Worker loop poll interval.
+    /// Интервал опроса в worker loop.
     pub poll_timeout: Duration,
-    /// Messages to process per batch on each client channel.
+    /// Количество сообщений за один цикл на каждом клиентском канале.
     pub recv_batch: usize,
 }
 
@@ -100,20 +100,20 @@ impl Default for DispatchOptions {
     }
 }
 
-/// Options for DispatchClient.
+/// Настройки DispatchClient.
 #[derive(Clone)]
 pub struct DispatchClientOptions {
-    /// Timeout for lobby connection.
+    /// Таймаут подключения к лобби.
     pub lobby_timeout: Duration,
-    /// Timeout for reading registration response from lobby.
+    /// Таймаут чтения ответа регистрации из лобби.
     pub response_timeout: Duration,
-    /// Timeout for connecting to dedicated channel.
+    /// Таймаут подключения к выделенному каналу.
     pub channel_timeout: Duration,
-    /// Worker loop poll interval on dedicated channel.
+    /// Интервал опроса в worker loop на выделенном канале.
     pub poll_timeout: Duration,
-    /// Messages to process per batch.
+    /// Количество сообщений за один цикл.
     pub recv_batch: usize,
-    /// Max queued messages before dropping oldest.
+    /// Максимум сообщений в очереди перед сбросом самого старого.
     pub max_send_queue: usize,
 }
 
@@ -132,31 +132,36 @@ impl Default for DispatchClientOptions {
 
 // ─── DispatchServer ──────────────────────────────────────────────────────────
 
-/// Active client on a dedicated channel.
+/// Активный клиент на выделенном канале.
 struct DispatchedClient {
     server: AutoServer,
     info: ClientRegistration,
     channel_name: String,
-    /// Set to true when disconnect has been handled (prevents double-notify).
+    /// Устанавливается в true, когда отключение уже обработано (предотвращает двойное уведомление).
     disconnected: AtomicBool,
 }
 
-/// Shared client map accessible from both server and proxy handlers.
+/// Общая карта клиентов, доступная и серверу, и proxy-обработчикам.
 type ClientMap = Arc<RwLock<HashMap<u32, DispatchedClient>>>;
 
-/// Central dispatch server — one lobby, dynamic per-client channels.
+/// Центральный dispatch-сервер — одно лобби, динамические каналы на клиента.
 pub struct DispatchServer {
     base_name: String,
     clients: ClientMap,
     running: Arc<AtomicBool>,
     next_client_id: Arc<AtomicU32>,
     worker_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Потоки, ожидающие подключения клиента к выделенному каналу (см.
+    /// `handle_lobby_client`) -- обязаны быть заджойнены в `stop()` ДО
+    /// возврата, иначе `on_client_connect` мог бы выстрелить уже после того,
+    /// как C-вызывающий код счёл сервер остановленным и освободил user_data.
+    pending_connects: Mutex<Vec<JoinHandle<()>>>,
     handler: Arc<dyn DispatchHandler>,
     options: DispatchOptions,
 }
 
 impl DispatchServer {
-    /// Start the dispatch server with a lobby on the given base name.
+    /// Запускает dispatch-сервер с лобби на заданном базовом имени.
     pub fn start(
         name: &str,
         handler: Arc<dyn DispatchHandler>,
@@ -170,16 +175,17 @@ impl DispatchServer {
             running,
             next_client_id: Arc::new(AtomicU32::new(1)),
             worker_handle: Mutex::new(None),
+            pending_connects: Mutex::new(Vec::new()),
             handler,
             options,
         });
 
         let server_clone = server.clone();
         let name_owned = name.to_owned();
-        // Thread name in debug only (opaque short tag `xsd-{name}` so
-        // local traces still line up with the segment), anonymous in
-        // release so Process Explorer / Process Hacker doesn't surface
-        // "xshm-dispatch-…" as a flashing signpost on the host process.
+        // Имя потока только в debug (короткий непрозрачный тег `xsd-{name}`,
+        // чтобы локальные трейсы совпадали с сегментом), анонимно в release,
+        // чтобы Process Explorer / Process Hacker не показывал
+        // "xshm-dispatch-…" как заметный маркер в хост-процессе.
         #[cfg_attr(not(debug_assertions), allow(unused_mut))]
         let mut builder = thread::Builder::new();
         #[cfg(debug_assertions)]
@@ -198,14 +204,14 @@ impl DispatchServer {
         Ok(server)
     }
 
-    /// Send a message to a specific client.
+    /// Отправляет сообщение конкретному клиенту.
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
         let clients = self.clients.read().unwrap();
         let client = clients.get(&client_id).ok_or(ShmError::NotConnected)?;
         client.server.send(data)
     }
 
-    /// Broadcast a message to all connected clients.
+    /// Рассылает сообщение всем подключённым клиентам.
     pub fn broadcast(&self, data: &[u8]) -> Result<u32> {
         let clients = self.clients.read().unwrap();
         let mut sent = 0u32;
@@ -217,11 +223,11 @@ impl DispatchServer {
         Ok(sent)
     }
 
-    /// Disconnect a specific client and destroy its channel.
+    /// Отключает конкретного клиента и уничтожает его канал.
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
         let removed = self.clients.write().unwrap().remove(&client_id);
         if let Some(client) = removed {
-            // Mark as disconnected so AutoProxyHandler won't double-notify
+            // Помечаем как отключённого, чтобы AutoProxyHandler не уведомил повторно
             client.disconnected.store(true, Ordering::Release);
             client.server.stop();
             self.handler.on_client_disconnect(client_id);
@@ -231,22 +237,22 @@ impl DispatchServer {
         }
     }
 
-    /// Get list of connected client IDs.
+    /// Возвращает список ID подключённых клиентов.
     pub fn connected_clients(&self) -> Vec<u32> {
         self.clients.read().unwrap().keys().copied().collect()
     }
 
-    /// Get number of connected clients.
+    /// Возвращает количество подключённых клиентов.
     pub fn client_count(&self) -> u32 {
         self.clients.read().unwrap().len() as u32
     }
 
-    /// Check if a specific client is connected.
+    /// Проверяет, подключён ли конкретный клиент.
     pub fn is_client_connected(&self, client_id: u32) -> bool {
         self.clients.read().unwrap().contains_key(&client_id)
     }
 
-    /// Get registration info for a client.
+    /// Возвращает данные регистрации клиента.
     pub fn client_info(&self, client_id: u32) -> Option<ClientRegistration> {
         self.clients
             .read()
@@ -255,8 +261,9 @@ impl DispatchServer {
             .map(|c| c.info.clone())
     }
 
-    /// Get channel name for a client.
-    pub fn client_channel(&self, client_id: u32) -> Option<String> {
+    /// Возвращает имя канала клиента. Названо `channel_name` (не `client_channel`)
+    /// для единообразия с `MultiServer::channel_name` (0.6.0, аудит API).
+    pub fn channel_name(&self, client_id: u32) -> Option<String> {
         self.clients
             .read()
             .unwrap()
@@ -264,43 +271,80 @@ impl DispatchServer {
             .map(|c| c.channel_name.clone())
     }
 
-    /// Stop the dispatch server and all client channels.
+    /// Останавливает dispatch-сервер и все клиентские каналы.
+    ///
+    /// Синхронно дожидается выхода lobby worker-потока И всех "pending
+    /// connect" потоков (см. `handle_lobby_client`) перед возвратом — после
+    /// return ни один callback (`on_client_connect`/`on_message`/`on_error`/…)
+    /// больше не будет вызван. Критично для FFI: C-вызывающий код может
+    /// освободить `user_data` сразу после возврата. Идемпотентна (повторный
+    /// вызов — no-op, обе очереди handle-ов уже опустошены).
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
+        // Джойнится потоком-владельцем Self (не самим worker'ом — stop()
+        // не вызывается изнутри worker_loop), поэтому не self-join. Тот же
+        // фикс, что и для MultiServer::stop() (аудит 2026-07-10): worker
+        // держит собственный клон Arc<Self>, поэтому расчёт только на Drop
+        // гонял бы точно так же.
+        if let Some(handle) = self.worker_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        // Lobby worker уже остановлен -> новых pending-connect потоков не
+        // появится, можно безопасно забрать и заджойнить все существующие.
+        // Каждый из них проверяет `running` и завершится быстро (не будет
+        // ждать полный channel_connect_timeout), т.к. running уже false.
+        let pending: Vec<_> = self.pending_connects.lock().unwrap().drain(..).collect();
+        for handle in pending {
+            let _ = handle.join();
+        }
     }
 
-    /// Base name of the dispatch server.
+    /// Базовое имя dispatch-сервера.
     pub fn base_name(&self) -> &str {
         &self.base_name
     }
 
-    /// Generate a unique channel name with cryptographic-quality random suffix.
+    /// Генерирует уникальное И непредсказуемое имя выделенного канала.
+    ///
+    /// Раньше имя строилось детерминированно из `time_nanos XOR counter`
+    /// (с SplitMix64-подобным domainMixing) и заявлялось в докстринге как
+    /// "cryptographic-quality" -- заявление было НЕВЕРНЫМ: оба входа
+    /// наблюдаемы враждебным локальным процессом (`client_id`/`counter`
+    /// приходит клиенту открытым текстом в `RegistrationResponse`; момент
+    /// регистрации оценивается по факту с точностью до миллисекунд) --
+    /// перебор ~10^6 кандидатов по узкому временному окну тривиален.
+    /// Squatting-риск: чужой процесс заранее вычисляет будущее имя и создаёт
+    /// секцию с этим именем ПЕРВЫМ (`NtCreateSection`), либо срывая канал
+    /// легитимному серверу, либо подставляя себя как "сервер" ничего не
+    /// подозревающему клиенту. Актуально даже при NULL DACL — это риск не
+    /// про чтение чужих данных (то и так открыто), а про то, кто первым
+    /// займёт имя (аудит 2026-07-10).
+    ///
+    /// Фикс: `RandomState` (std, без внешних зависимостей) сидируется свежей
+    /// ОС-энтропией на КАЖДЫЙ вызов — атакующему больше не из чего вычислить
+    /// имя заранее, в отличие от детерминированной time/counter-схемы.
     fn generate_channel_name(&self) -> String {
-        // Use multiple entropy sources for uniqueness
-        let time_nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos() as u64;
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
 
         let counter = self.next_client_id.load(Ordering::Relaxed) as u64;
-
-        // PCG-style mixing: time XOR counter, then xorshift + multiply
-        let mut state = time_nanos ^ (counter.wrapping_mul(0x517cc1b727220a95));
-        state ^= state >> 17;
-        state = state.wrapping_mul(0xbf58476d1ce4e5b9);
-        state ^= state >> 31;
-        state = state.wrapping_mul(0x94d049bb133111eb);
-        state ^= state >> 32;
-
-        format!("{:016x}", state)
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(counter);
+        format!("{:016x}", hasher.finish())
     }
 
-    /// Main worker loop — accepts clients through the lobby one at a time.
+    /// Главный worker loop — принимает клиентов через лобби.
+    ///
+    /// Сам lobby-handshake (single-client протокол) неизбежно последователен,
+    /// но обрабатывается быстро (только чтение регистрации + ответ). Ожидание
+    /// подключения клиента к его выделенному каналу (до `channel_connect_timeout`,
+    /// по умолчанию 30с) вынесено в отдельный поток (см. `handle_lobby_client`),
+    /// поэтому один медленный клиент больше не блокирует регистрацию остальных.
     fn worker_loop(&self, base_name: &str) {
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
         while self.running.load(Ordering::Acquire) {
-            // Create lobby (or recreate on failure)
+            // Создаём лобби (или пересоздаём при ошибке)
             let mut lobby_server = match SharedServer::start(base_name) {
                 Ok(s) => s,
                 Err(err) => {
@@ -312,14 +356,14 @@ impl DispatchServer {
                 }
             };
 
-            // Inner loop: accept clients sequentially through the lobby
+            // Внутренний цикл: последовательный приём клиентов через лобби
             while self.running.load(Ordering::Acquire) {
                 match lobby_server.wait_for_client(Some(self.options.poll_timeout)) {
                     Ok(()) => {
-                        // Client connected — process registration
+                        // Клиент подключился — обрабатываем регистрацию
                         self.handle_lobby_client(&mut lobby_server, &mut buffer);
 
-                        // Reset lobby for next client
+                        // Сбрасываем лобби для следующего клиента
                         lobby_server.mark_disconnected();
                     }
                     Err(ShmError::Timeout) => continue,
@@ -328,13 +372,13 @@ impl DispatchServer {
                     }
                     Err(err) => {
                         self.handler.on_error(None, err);
-                        break; // Recreate lobby on serious error
+                        break; // Пересоздаём лобби при серьёзной ошибке
                     }
                 }
             }
         }
 
-        // Shutdown: stop all client channels
+        // Остановка: закрываем все клиентские каналы
         let mut clients = self.clients.write().unwrap();
         for (id, client) in clients.drain() {
             client.disconnected.store(true, Ordering::Release);
@@ -343,7 +387,14 @@ impl DispatchServer {
         }
     }
 
-    /// Handle a single client in the lobby: read registration, create channel, respond.
+    /// Обрабатывает одного клиента в лобби: читает регистрацию, создаёт канал, отвечает.
+    ///
+    /// Возвращается СРАЗУ после отправки ответа клиенту (не дожидаясь его
+    /// подключения к выделенному каналу) — вызывающий код (`worker_loop`)
+    /// тут же сбрасывает лобби и готов принимать следующего клиента.
+    /// Ожидание фактического подключения к каналу (до `channel_connect_timeout`)
+    /// и регистрация в `self.clients` вынесены в отдельный поток, чтобы не
+    /// сериализовать всех клиентов через самый медленный из них.
     fn handle_lobby_client(&self, lobby: &mut SharedServer, buffer: &mut Vec<u8>) {
         let events = match lobby.events() {
             Some(e) => e,
@@ -353,7 +404,7 @@ impl DispatchServer {
             }
         };
 
-        // Wait for registration data via c2s.data event (event-driven, no polling)
+        // Ожидаем данные регистрации через событие c2s.data (по событию, без опроса)
         let start = std::time::Instant::now();
         let request = loop {
             let remaining = self.options.lobby_timeout.saturating_sub(start.elapsed());
@@ -366,7 +417,7 @@ impl DispatchServer {
                 return;
             }
 
-            // Try to read first — data may already be in the buffer
+            // Сначала пробуем прочитать — данные могли уже оказаться в буфере
             match lobby.receive_from_client(buffer) {
                 Ok(len) => match protocol::decode_request(&buffer[..len]) {
                     Ok(req) => break req,
@@ -376,7 +427,7 @@ impl DispatchServer {
                     }
                 },
                 Err(ShmError::QueueEmpty) => {
-                    // Block on event — wakes when client writes data
+                    // Блокируемся на событии — просыпаемся, когда клиент запишет данные
                     let wait_time = remaining.min(self.options.poll_timeout);
                     let _ = events.c2s.data.wait(Some(wait_time));
                     continue;
@@ -397,7 +448,7 @@ impl DispatchServer {
             name: request.name.clone(),
         };
 
-        // Create AutoServer for this client's dedicated channel
+        // Создаём AutoServer для выделенного канала этого клиента
         let connect_signal = Arc::new((Mutex::new(false), Condvar::new()));
 
         let proxy_handler = Arc::new(AutoProxyHandler {
@@ -409,7 +460,7 @@ impl DispatchServer {
 
         let auto_options = AutoOptions {
             connect_timeout: self.options.channel_connect_timeout,
-            wait_timeout: self.options.poll_timeout,
+            poll_timeout: self.options.poll_timeout,
             recv_batch: self.options.recv_batch,
             ..AutoOptions::default()
         };
@@ -428,7 +479,7 @@ impl DispatchServer {
             }
         };
 
-        // Send channel assignment to client via lobby
+        // Отправляем клиенту назначенный канал через лобби
         let response = protocol::encode_response(&RegistrationResponse {
             status: protocol::STATUS_OK,
             client_id,
@@ -441,36 +492,75 @@ impl DispatchServer {
             return;
         }
 
-        // Signal lobby data available so client can read
+        // Сигналим о доступности данных в лобби, чтобы клиент мог их прочитать
         if let Some(events) = lobby.events() {
             let _ = events.s2c.data.set();
         }
 
-        // Wait for client to connect to dedicated channel (signaled by AutoProxyHandler)
-        let (lock, cvar) = &*connect_signal;
-        let connected = lock.lock().unwrap();
-        let timeout = self.options.channel_connect_timeout;
-        let (connected, result) = cvar.wait_timeout(connected, timeout).unwrap();
-        let client_connected = *connected;
-        drop(connected);
+        // Ожидание подключения к выделенному каналу (до channel_connect_timeout,
+        // по умолчанию 30с) и регистрация в self.clients — в ОТДЕЛЬНОМ потоке,
+        // а не на потоке лобби: иначе один медленный/зависший клиент блокировал
+        // бы регистрацию всех последующих на весь channel_connect_timeout.
+        // handle_lobby_client (и, соответственно, worker_loop) возвращается
+        // сразу после этого — лобби готово к следующему клиенту немедленно.
+        let handler = self.handler.clone();
+        let clients_map = Arc::clone(&self.clients);
+        let running = Arc::clone(&self.running);
+        let channel_connect_timeout = self.options.channel_connect_timeout;
+        let poll_timeout = self.options.poll_timeout;
+        let join_handle = thread::spawn(move || {
+            let (lock, cvar) = &*connect_signal;
+            let deadline = std::time::Instant::now() + channel_connect_timeout;
 
-        if !client_connected || result.timed_out() {
-            auto_server.stop();
-            return;
-        }
+            // Опрашиваем короткими интервалами (не одним долгим wait_timeout),
+            // чтобы вовремя заметить остановку сервера -- иначе stop() мог бы
+            // ждать этот поток до 30с, а хуже того, on_client_connect мог бы
+            // выстрелить УЖЕ ПОСЛЕ того, как stop() вернулся бы без этой
+            // проверки (аудит 2026-07-10: тот же класс UAF-гонки, что и в
+            // shm_multi_server_stop/shm_dispatch_server_stop).
+            let client_connected = loop {
+                if !running.load(Ordering::Acquire) {
+                    break false;
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break false;
+                }
+                let guard = lock.lock().unwrap();
+                if *guard {
+                    break true;
+                }
+                let (guard, _) = cvar.wait_timeout(guard, remaining.min(poll_timeout)).unwrap();
+                if *guard {
+                    break true;
+                }
+                drop(guard);
+            };
 
-        // Register client in the shared map
-        self.clients.write().unwrap().insert(
-            client_id,
-            DispatchedClient {
-                server: auto_server,
-                info: info.clone(),
-                channel_name,
-                disconnected: AtomicBool::new(false),
-            },
-        );
+            if !client_connected || !running.load(Ordering::Acquire) {
+                auto_server.stop();
+                return;
+            }
 
-        self.handler.on_client_connect(client_id, &info);
+            clients_map.write().unwrap().insert(
+                client_id,
+                DispatchedClient {
+                    server: auto_server,
+                    info: info.clone(),
+                    channel_name,
+                    disconnected: AtomicBool::new(false),
+                },
+            );
+
+            handler.on_client_connect(client_id, &info);
+        });
+
+        // Регистрируем handle для join'а в stop(); заодно вычищаем уже
+        // завершившиеся записи, чтобы вектор не рос неограниченно на
+        // долгоживущем сервере с большим потоком регистраций.
+        let mut pending = self.pending_connects.lock().unwrap();
+        pending.retain(|h| !h.is_finished());
+        pending.push(join_handle);
     }
 }
 
@@ -478,6 +568,10 @@ impl Drop for DispatchServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         if let Some(handle) = self.worker_handle.lock().unwrap().take() {
+            let _ = handle.join();
+        }
+        let pending: Vec<_> = self.pending_connects.lock().unwrap().drain(..).collect();
+        for handle in pending {
             let _ = handle.join();
         }
     }
@@ -494,7 +588,7 @@ struct AutoProxyHandler {
 
 impl AutoHandler for AutoProxyHandler {
     fn on_connect(&self) {
-        // Signal the lobby worker that the client has connected to its channel
+        // Сигналим worker-потоку лобби, что клиент подключился к своему каналу
         let (lock, cvar) = &*self.connect_signal;
         let mut connected = lock.lock().unwrap();
         *connected = true;
@@ -502,7 +596,16 @@ impl AutoHandler for AutoProxyHandler {
     }
 
     fn on_disconnect(&self) {
-        // Check if already handled (e.g. by disconnect_client())
+        // Проверяем, не обработано ли уже (например, через disconnect_client())
+        //
+        // ВАЖНО: `clients.remove(...)` результат обязательно привязывается к
+        // переменной (`removed`), а не дропается тут же внутри блока с
+        // write-логом. `on_disconnect` вызывается СИНХРОННО из worker-потока
+        // САМОГО AutoServer'а этого клиента; удаляемый `DispatchedClient`
+        // содержит этот же `AutoServer` (поле `server`), а его `Drop`
+        // синхронно джойнит свой `worker_handle` -- т.е. текущий поток. Дропни
+        // мы его прямо здесь (тем более всё ещё под логом) -- self-join
+        // deadlock, лог остаётся захваченным навсегда (аудит 2026-07-10).
         let removed = {
             let mut clients = self.clients.write().unwrap();
             if let Some(client) = clients.get(&self.client_id) {
@@ -511,17 +614,21 @@ impl AutoHandler for AutoProxyHandler {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
                     .is_ok()
                 {
-                    clients.remove(&self.client_id);
-                    true
+                    clients.remove(&self.client_id)
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
-        };
+        }; // write-лог освобождён здесь; `removed` (если Some) ещё жив,
+           // AutoServer внутри него ещё НЕ дропнут.
 
-        if removed {
+        if let Some(dispatched_client) = removed {
+            // Фактический Drop (и его синхронный join) переносим на ОТДЕЛЬНЫЙ
+            // поток -- он не является worker-потоком этого AutoServer, поэтому
+            // join там безопасен и не self-join'ится.
+            thread::spawn(move || drop(dispatched_client));
             self.handler.on_client_disconnect(self.client_id);
         }
     }
@@ -537,11 +644,12 @@ impl AutoHandler for AutoProxyHandler {
 
 // ─── DispatchClient ──────────────────────────────────────────────────────────
 
-/// Client that connects to a DispatchServer, registers, and communicates
-/// on a dynamically assigned channel.
+/// Клиент, подключающийся к DispatchServer, регистрирующийся и общающийся
+/// по динамически назначенному каналу.
 ///
-/// Lifecycle: connect once → register → get channel → communicate → stop.
-/// Does NOT reconnect automatically — if disconnected, create a new client.
+/// Жизненный цикл: подключение один раз → регистрация → получение канала →
+/// обмен данными → остановка. НЕ переподключается автоматически — при
+/// отключении нужно создать нового клиента.
 pub struct DispatchClient {
     auto_client: Mutex<Option<AutoClient>>,
     running: Arc<AtomicBool>,
@@ -550,22 +658,22 @@ pub struct DispatchClient {
 }
 
 impl DispatchClient {
-    /// Connect to a dispatch server, register, and start communicating.
+    /// Подключается к dispatch-серверу, регистрируется и начинает обмен данными.
     ///
-    /// This is a blocking call — it performs the lobby handshake synchronously,
-    /// then spawns the dedicated channel via AutoClient.
+    /// Это блокирующий вызов — синхронно выполняет handshake в лобби, затем
+    /// поднимает выделенный канал через AutoClient.
     pub fn connect(
         name: &str,
         registration: ClientRegistration,
         handler: Arc<dyn DispatchClientHandler>,
         options: DispatchClientOptions,
     ) -> Result<Self> {
-        // Phase 1: Connect to lobby and register (blocking)
+        // Фаза 1: подключение к лобби и регистрация (блокирующая)
         let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
         let (assigned_id, assigned_channel) =
             lobby_register(name, &registration, &options, &mut buffer)?;
 
-        // Phase 2: Connect to dedicated channel via AutoClient
+        // Фаза 2: подключение к выделенному каналу через AutoClient
         let running = Arc::new(AtomicBool::new(true));
 
         let client_handler = Arc::new(DispatchClientProxy {
@@ -574,7 +682,7 @@ impl DispatchClient {
 
         let auto_options = AutoOptions {
             connect_timeout: options.channel_timeout,
-            wait_timeout: options.poll_timeout,
+            poll_timeout: options.poll_timeout,
             max_send_queue: options.max_send_queue,
             recv_batch: options.recv_batch,
             ..AutoOptions::default()
@@ -592,7 +700,7 @@ impl DispatchClient {
         })
     }
 
-    /// Send a message to the server on the dedicated channel.
+    /// Отправляет сообщение серверу по выделенному каналу.
     pub fn send(&self, data: &[u8]) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(ShmError::NotReady);
@@ -604,22 +712,22 @@ impl DispatchClient {
         }
     }
 
-    /// Get the assigned client ID.
+    /// Возвращает назначенный ID клиента.
     pub fn client_id(&self) -> u32 {
         self.client_id
     }
 
-    /// Get the assigned channel name.
+    /// Возвращает имя назначенного канала.
     pub fn channel_name(&self) -> &str {
         &self.channel_name
     }
 
-    /// Check if connected to the dedicated channel.
+    /// Проверяет подключение к выделенному каналу.
     pub fn is_connected(&self) -> bool {
         self.running.load(Ordering::Acquire) && self.auto_client.lock().unwrap().is_some()
     }
 
-    /// Stop the client and disconnect.
+    /// Останавливает клиента и отключается.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
         let mut guard = self.auto_client.lock().unwrap();
@@ -639,9 +747,9 @@ impl Drop for DispatchClient {
     }
 }
 
-// ─── Lobby registration (blocking) ──────────────────────────────────────────
+// ─── Регистрация в лобби (блокирующая) ──────────────────────────────────────
 
-/// Perform lobby registration: connect, send request, read response.
+/// Выполняет регистрацию в лобби: подключение, отправка запроса, чтение ответа.
 fn lobby_register(
     base_name: &str,
     registration: &ClientRegistration,
@@ -650,7 +758,7 @@ fn lobby_register(
 ) -> Result<(u32, String)> {
     let client = SharedClient::connect(base_name, options.lobby_timeout)?;
 
-    // Send registration request
+    // Отправляем запрос на регистрацию
     let request = protocol::encode_request(&RegistrationRequest {
         pid: registration.pid,
         revision: registration.revision,
@@ -658,10 +766,10 @@ fn lobby_register(
     });
     client.send_to_server(&request)?;
 
-    // Signal data available for server via event
+    // Сигналим серверу о наличии данных через событие
     let _ = client.events().c2s.data.set();
 
-    // Wait for response via s2c.data event (event-driven, no polling)
+    // Ожидаем ответ через событие s2c.data (по событию, без опроса)
     let events = client.events();
     let start = std::time::Instant::now();
     loop {
@@ -670,19 +778,19 @@ fn lobby_register(
             return Err(ShmError::Timeout);
         }
 
-        // Try to read first — data may already be in the buffer
+        // Сначала пробуем прочитать — данные могли уже оказаться в буфере
         match client.receive_from_server(buffer) {
             Ok(len) => {
                 let response = protocol::decode_response(&buffer[..len])?;
                 if response.status != protocol::STATUS_OK {
                     return Err(ShmError::HandshakeFailed);
                 }
-                // Drop client — disconnects from lobby
+                // Дропаем client — отключаемся от лобби
                 drop(client);
                 return Ok((response.client_id, response.channel_name));
             }
             Err(ShmError::QueueEmpty) => {
-                // Block on event — wakes when server writes response
+                // Блокируемся на событии — просыпаемся, когда сервер запишет ответ
                 let _ = events
                     .s2c
                     .data
@@ -694,7 +802,7 @@ fn lobby_register(
     }
 }
 
-/// Proxy handler that forwards AutoClient events to DispatchClientHandler.
+/// Proxy-обработчик, пересылающий события AutoClient в DispatchClientHandler.
 struct DispatchClientProxy {
     handler: Arc<dyn DispatchClientHandler>,
 }
@@ -777,6 +885,28 @@ mod tests {
         }
     }
 
+    /// Регрессия (аудит 2026-07-10, тот же класс, что и в multi/): stop()
+    /// обязан синхронно дождаться выхода lobby worker-потока, иначе
+    /// FFI-обёртка (shm_dispatch_server_stop) не может гарантировать, что
+    /// callbacks перестали дёргаться до освобождения user_data.
+    #[test]
+    fn stop_synchronously_joins_worker() {
+        let handler = Arc::new(TestServerHandler::new());
+        let name = format!("TEST_DISPATCH_STOP_JOIN_{}", std::process::id());
+        let server =
+            DispatchServer::start(&name, handler, DispatchOptions::default()).expect("start");
+
+        server.stop();
+
+        assert!(
+            server.worker_handle.lock().unwrap().is_none(),
+            "stop() должен забрать и заджойнить worker_handle синхронно"
+        );
+
+        // Повторный stop() — идемпотентен, не паникует и не виснет.
+        server.stop();
+    }
+
     #[test]
     fn dispatch_server_start_stop() {
         let handler = Arc::new(TestServerHandler::new());
@@ -814,7 +944,7 @@ mod tests {
         )
         .expect("client connect");
 
-        // Wait for server to register the client
+        // Ждём, пока сервер зарегистрирует клиента
         let start = std::time::Instant::now();
         while server_handler.connects.load(Ordering::Relaxed) == 0
             && start.elapsed() < Duration::from_secs(5)
@@ -828,19 +958,19 @@ mod tests {
         assert!(client.client_id() > 0);
         assert_eq!(server.client_count(), 1);
 
-        // Send message from client to server
+        // Отправляем сообщение от клиента серверу
         client.send(b"hello").expect("client send");
         thread::sleep(Duration::from_millis(200));
         assert!(server_handler.messages.load(Ordering::Relaxed) >= 1);
 
-        // Send message from server to client
+        // Отправляем сообщение от сервера клиенту
         let clients = server.connected_clients();
         assert_eq!(clients.len(), 1);
         server.send_to(clients[0], b"world").expect("server send");
         thread::sleep(Duration::from_millis(200));
         assert!(client_handler.messages.load(Ordering::Relaxed) >= 1);
 
-        // Cleanup
+        // Очистка
         client.stop();
         thread::sleep(Duration::from_millis(200));
         server.stop();
@@ -872,14 +1002,14 @@ mod tests {
         )
         .expect("client connect");
 
-        // Wait for connection
+        // Ждём подключения
         let start = std::time::Instant::now();
         while server.client_count() == 0 && start.elapsed() < Duration::from_secs(5) {
             thread::sleep(Duration::from_millis(50));
         }
         assert_eq!(server.client_count(), 1);
 
-        // Server-side disconnect
+        // Отключение со стороны сервера
         let clients = server.connected_clients();
         server
             .disconnect_client(clients[0])
@@ -887,7 +1017,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(300));
 
-        // Should only see exactly 1 disconnect (not double)
+        // Должно быть ровно 1 отключение (не двойное)
         assert_eq!(server_handler.disconnects.load(Ordering::Relaxed), 1);
 
         client.stop();
@@ -905,7 +1035,7 @@ mod tests {
 
         thread::sleep(Duration::from_millis(100));
 
-        // Connect 3 clients sequentially
+        // Подключаем 3 клиентов последовательно
         let mut clients = Vec::new();
         for i in 0..3u32 {
             let handler = Arc::new(TestClientHandler::new());
@@ -923,7 +1053,7 @@ mod tests {
             .expect("client connect");
             clients.push((client, handler));
 
-            // Wait for server to register this client
+            // Ждём, пока сервер зарегистрирует этого клиента
             let expected = i + 1;
             let start = std::time::Instant::now();
             while server.client_count() < expected && start.elapsed() < Duration::from_secs(5) {
@@ -934,14 +1064,14 @@ mod tests {
         assert_eq!(server.client_count(), 3);
         assert_eq!(server_handler.connects.load(Ordering::Relaxed), 3);
 
-        // All clients can send messages
+        // Все клиенты могут отправлять сообщения
         for (client, _) in &clients {
             client.send(b"ping").expect("send");
         }
         thread::sleep(Duration::from_millis(300));
         assert!(server_handler.messages.load(Ordering::Relaxed) >= 3);
 
-        // Broadcast
+        // Рассылка
         let sent = server.broadcast(b"pong").expect("broadcast");
         assert_eq!(sent, 3);
         thread::sleep(Duration::from_millis(300));
@@ -949,11 +1079,164 @@ mod tests {
             assert!(handler.messages.load(Ordering::Relaxed) >= 1);
         }
 
-        // Cleanup
+        // Очистка
         for (client, _) in &clients {
             client.stop();
         }
         thread::sleep(Duration::from_millis(200));
+        server.stop();
+    }
+
+    /// Регрессия на self-join deadlock (аудит 2026-07-10): когда клиент
+    /// отключается, `AutoProxyHandler::on_disconnect` (вызывается ИЗ
+    /// собственного worker-потока AutoServer этого канала) раньше делал
+    /// `clients.remove(&id)` без привязки результата к переменной -- временное
+    /// значение `DispatchedClient` (содержащее `AutoServer`) дропалось тут же,
+    /// ВСЁ ЕЩЁ под write-логом `clients`. `Drop for AutoServer` синхронно
+    /// джойнит свой `worker_handle` -- а это и есть текущий поток, self-join
+    /// навсегда, лог остаётся захваченным. `DispatchServer::stop()` (которая
+    /// теперь синхронно джойнит lobby worker) потом виснет НАВСЕГДА на том же
+    /// логе в shutdown-секции `worker_loop`. Раньше это было незаметно, т.к.
+    /// stop() не джойнил и никто не ждал зависший поток.
+    #[test]
+    fn stop_does_not_deadlock_after_client_disconnects() {
+        let name = format!("TEST_DISPATCH_NODEADLOCK_{}", std::process::id());
+
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server =
+            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
+                .expect("server start");
+
+        thread::sleep(Duration::from_millis(100));
+
+        let client_handler = Arc::new(TestClientHandler::new());
+        let registration = ClientRegistration {
+            pid: 55555,
+            revision: 1,
+            name: "deadlock_test.exe".into(),
+        };
+        let client = DispatchClient::connect(
+            &name,
+            registration,
+            client_handler.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+
+        let start = std::time::Instant::now();
+        while server.client_count() == 0 && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(server.client_count(), 1);
+
+        // Клиент отключается сам (не через disconnect_client) -- именно этот
+        // путь триггерит AutoProxyHandler::on_disconnect ИЗНУТРИ AutoServer'а.
+        client.stop();
+        thread::sleep(Duration::from_millis(300));
+
+        // Если это виснет (таймаут теста) -- деадлок вернулся.
+        server.stop();
+    }
+
+    /// Регрессия на concurrency-фикс лобби (аудит 2026-07-10): раньше один
+    /// клиент, зарегистрировавшийся в лобби, но так и не подключившийся к
+    /// выделенному каналу, блокировал ВСЕХ последующих на весь
+    /// `channel_connect_timeout` (единственный worker-поток лобби был занят
+    /// Condvar-ожиданием этого клиента). Теперь ожидание вынесено в отдельный
+    /// поток, и лобби свободно для следующего клиента сразу после ответа.
+    #[test]
+    fn stalled_client_does_not_block_subsequent_registrations() {
+        let name = format!("TEST_DISPATCH_CONCURRENT_{}", std::process::id());
+
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server = DispatchServer::start(
+            &name,
+            server_handler.clone(),
+            DispatchOptions {
+                // Заметно длиннее, чем должна занять регистрация клиента B --
+                // если бы лобби всё ещё было последовательным, тест бы либо
+                // завис на это время, либо B зарегистрировался бы только
+                // спустя ~5с.
+                channel_connect_timeout: Duration::from_secs(5),
+                ..Default::default()
+            },
+        )
+        .expect("server start");
+
+        thread::sleep(Duration::from_millis(100));
+
+        // Клиент A: только lobby-регистрация, БЕЗ подключения к выделенному
+        // каналу -- симулирует зависшего/медленного клиента.
+        let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+        let reg_a = ClientRegistration {
+            pid: 111,
+            revision: 1,
+            name: "stalled.exe".into(),
+        };
+        let (_id_a, _channel_a) =
+            lobby_register(&name, &reg_a, &DispatchClientOptions::default(), &mut buffer)
+                .expect("client A lobby_register");
+        // Намеренно НЕ вызываем AutoClient::connect для client A -- канал
+        // остаётся неподключённым до истечения channel_connect_timeout.
+
+        // Клиент B: полноценное подключение сразу после A.
+        let start = std::time::Instant::now();
+        let client_handler_b = Arc::new(TestClientHandler::new());
+        let reg_b = ClientRegistration {
+            pid: 222,
+            revision: 1,
+            name: "prompt.exe".into(),
+        };
+        let client_b = DispatchClient::connect(
+            &name,
+            reg_b,
+            client_handler_b.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client B connect");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "клиент B зарегистрировался за {elapsed:?} -- лобби всё ещё \
+             сериализуется через зависшего клиента A (channel_connect_timeout=5с)"
+        );
+
+        client_b.stop();
+        server.stop();
+    }
+
+    /// Регрессия (аудит 2026-07-10): имена каналов не должны предсказуемо
+    /// выводиться из известных клиенту входов (`client_id`/примерное время
+    /// регистрации) -- иначе враждебный локальный процесс мог бы вычислить
+    /// будущее имя заранее и захватить его первым (squatting). Прямая
+    /// непредсказуемость не тестируется юнит-тестом (нужен внешний
+    /// наблюдатель), но проверяем необходимое условие: практическая
+    /// уникальность на большом числе вызовов и корректный формат.
+    #[test]
+    fn channel_names_are_practically_unique() {
+        use std::collections::HashSet;
+
+        let name = format!("TEST_DISPATCH_CHNAME_{}", std::process::id());
+        let handler = Arc::new(TestServerHandler::new());
+        let server = DispatchServer::start(&name, handler, DispatchOptions::default())
+            .expect("server start");
+
+        let names: HashSet<String> = (0..1000).map(|_| server.generate_channel_name()).collect();
+
+        assert_eq!(
+            names.len(),
+            1000,
+            "1000 сгенерированных имён каналов должны быть различны"
+        );
+        for n in &names {
+            assert_eq!(n.len(), 16, "имя канала должно быть 16 hex-символов: {n}");
+            assert!(
+                n.chars().all(|c| c.is_ascii_hexdigit()),
+                "имя канала должно состоять только из hex-символов: {n}"
+            );
+        }
+
         server.stop();
     }
 }
