@@ -7,7 +7,7 @@
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::ptr::null_mut;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::auto::{
@@ -21,7 +21,6 @@ use crate::server::SharedServer;
 #[repr(C)]
 pub struct shm_endpoint_config_t {
     pub name: *const c_char,
-    pub buffer_bytes: u32,
 }
 
 #[repr(C)]
@@ -73,13 +72,216 @@ impl From<ShmError> for shm_error_t {
             ShmError::QueueFull => shm_error_t::SHM_ERROR_FULL,
             ShmError::Timeout => shm_error_t::SHM_ERROR_TIMEOUT,
             ShmError::NotReady => shm_error_t::SHM_ERROR_NOT_READY,
-            ShmError::NotConnected => shm_error_t::SHM_ERROR_NOT_READY,
+            ShmError::NotConnected => shm_error_t::SHM_ERROR_NOT_FOUND,
             ShmError::AlreadyConnected => shm_error_t::SHM_ERROR_EXISTS,
             ShmError::HandshakeFailed | ShmError::Corrupted => shm_error_t::SHM_ERROR_PROTOCOL,
             ShmError::WindowsError { .. } => shm_error_t::SHM_ERROR_ACCESS,
             ShmError::InvalidConfig(_) => shm_error_t::SHM_ERROR_INVALID_PARAM,
             ShmError::NoFreeSlot => shm_error_t::SHM_ERROR_NO_SLOT,
         }
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    /// NotConnected и NotReady раньше делили один shm_error_t (SHM_ERROR_NOT_READY),
+    /// теряя диагностическую разницу между «нет соединения» и «handshake ещё
+    /// не готов». Теперь у каждого свой код.
+    #[test]
+    fn not_connected_and_not_ready_have_distinct_codes() {
+        let not_connected: shm_error_t = ShmError::NotConnected.into();
+        let not_ready: shm_error_t = ShmError::NotReady.into();
+        assert_ne!(not_connected, not_ready);
+        assert_eq!(not_connected, shm_error_t::SHM_ERROR_NOT_FOUND);
+        assert_eq!(not_ready, shm_error_t::SHM_ERROR_NOT_READY);
+    }
+}
+
+#[cfg(test)]
+mod recv_cache_tests {
+    use super::*;
+    use std::ffi::CString;
+    use std::thread;
+    use std::time::Duration as StdDuration;
+
+    fn unique_name(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("XSHM_FFI_TEST_{}_{}_{}", tag, std::process::id(), n)
+    }
+
+    /// Раньше сообщение вычитывалось из ring buffer ДО проверки, помещается
+    /// ли оно в буфер C-вызывающего — при слишком малом буфере сообщение
+    /// терялось безвозвратно. Теперь оно кэшируется в RecvCache и отдаётся
+    /// повторным вызовом с достаточным буфером.
+    #[test]
+    fn receive_with_too_small_buffer_does_not_lose_message() {
+        let name = unique_name("RECVCACHE");
+        const MSG: &[u8] = b"hello world";
+
+        let server_thread = {
+            let name = name.clone();
+            thread::spawn(move || {
+                let name_c = CString::new(name).unwrap();
+                let config = shm_endpoint_config_t {
+                    name: name_c.as_ptr(),
+                };
+                let server = shm_server_start(&config, std::ptr::null());
+                assert!(!server.is_null());
+                assert_eq!(
+                    shm_server_wait_for_client(server, 5000),
+                    shm_error_t::SHM_SUCCESS
+                );
+                assert_eq!(
+                    shm_server_send(server, MSG.as_ptr() as *const c_void, MSG.len() as u32),
+                    shm_error_t::SHM_SUCCESS
+                );
+
+                // ждём "done" от клиента, прежде чем останавливать сервер
+                let mut recv_buf = [0u8; 16];
+                let start = std::time::Instant::now();
+                loop {
+                    assert!(start.elapsed() < StdDuration::from_secs(5), "timeout waiting for done");
+                    if shm_server_poll(server, 200) == shm_error_t::SHM_SUCCESS {
+                        let mut size = recv_buf.len() as u32;
+                        if shm_server_receive(
+                            server,
+                            recv_buf.as_mut_ptr() as *mut c_void,
+                            &mut size,
+                        ) == shm_error_t::SHM_SUCCESS
+                        {
+                            break;
+                        }
+                    }
+                }
+                shm_server_stop(server);
+            })
+        };
+
+        thread::sleep(StdDuration::from_millis(50));
+
+        let name_c = CString::new(name).unwrap();
+        let config = shm_endpoint_config_t {
+            name: name_c.as_ptr(),
+        };
+        let client = shm_client_connect(&config, std::ptr::null(), 5000);
+        assert!(!client.is_null());
+        assert_eq!(shm_client_poll(client, 5000), shm_error_t::SHM_SUCCESS);
+
+        // буфер слишком мал, чтобы вместить сообщение целиком
+        let mut small_buf = [0u8; 4];
+        let mut small_size = small_buf.len() as u32;
+        let result = shm_client_receive(
+            client,
+            small_buf.as_mut_ptr() as *mut c_void,
+            &mut small_size,
+        );
+        assert_eq!(result, shm_error_t::SHM_ERROR_MEMORY);
+
+        // повторный вызов с достаточным буфером должен вернуть ТО ЖЕ сообщение
+        // (не следующее и не пустоту) — доказывает, что оно не было потеряно
+        let mut big_buf = [0u8; 64];
+        let mut big_size = big_buf.len() as u32;
+        let result = shm_client_receive(client, big_buf.as_mut_ptr() as *mut c_void, &mut big_size);
+        assert_eq!(result, shm_error_t::SHM_SUCCESS);
+        assert_eq!(big_size as usize, MSG.len());
+        assert_eq!(&big_buf[..MSG.len()], MSG);
+
+        assert_eq!(
+            shm_client_send(client, b"done".as_ptr() as *const c_void, 4),
+            shm_error_t::SHM_SUCCESS
+        );
+        shm_client_disconnect(client);
+        server_thread.join().unwrap();
+    }
+
+    /// Конкурентный send с одного потока и receive с другого на одном handle
+    /// не должен приводить к панике/deadlock'у — оба пути теперь берут только
+    /// `&ServerState`, без конфликта `&` vs `&mut` через unsafe-границу FFI.
+    #[test]
+    fn concurrent_send_and_receive_on_same_handle_do_not_conflict() {
+        let name = unique_name("CONCURRENT");
+        const ITERATIONS: usize = 200;
+
+        let server_thread = {
+            let name = name.clone();
+            thread::spawn(move || {
+                let name_c = CString::new(name).unwrap();
+                let config = shm_endpoint_config_t {
+                    name: name_c.as_ptr(),
+                };
+                let server = shm_server_start(&config, std::ptr::null());
+                assert!(!server.is_null());
+                assert_eq!(
+                    shm_server_wait_for_client(server, 5000),
+                    shm_error_t::SHM_SUCCESS
+                );
+                server as usize
+            })
+        };
+
+        thread::sleep(StdDuration::from_millis(50));
+
+        let name_c = CString::new(name).unwrap();
+        let config = shm_endpoint_config_t {
+            name: name_c.as_ptr(),
+        };
+        let client = shm_client_connect(&config, std::ptr::null(), 5000);
+        assert!(!client.is_null());
+
+        let server = server_thread.join().unwrap() as *mut ServerHandle;
+        let server_addr = server as usize;
+
+        // поток A: сервер шлёт сообщения клиенту
+        let sender = thread::spawn(move || {
+            let server = server_addr as *mut ServerHandle;
+            for i in 0..ITERATIONS {
+                let msg = (i as u32).to_le_bytes();
+                loop {
+                    match shm_server_send(server, msg.as_ptr() as *const c_void, 4) {
+                        shm_error_t::SHM_SUCCESS => break,
+                        shm_error_t::SHM_ERROR_FULL => thread::sleep(StdDuration::from_micros(50)),
+                        other => panic!("unexpected send error: {other:?}"),
+                    }
+                }
+            }
+        });
+
+        // поток B: сервер параллельно опрашивает клиентские сообщения (их нет,
+        // важен сам факт конкурентного вызова receive и send на одном handle)
+        let receiver = thread::spawn(move || {
+            let server = server_addr as *mut ServerHandle;
+            let mut buf = [0u8; 16];
+            for _ in 0..ITERATIONS {
+                let mut size = buf.len() as u32;
+                let _ = shm_server_receive(server, buf.as_mut_ptr() as *mut c_void, &mut size);
+                thread::sleep(StdDuration::from_micros(50));
+            }
+        });
+
+        sender.join().unwrap();
+        receiver.join().unwrap();
+
+        let mut received = 0usize;
+        let start = std::time::Instant::now();
+        while received < ITERATIONS {
+            assert!(start.elapsed() < StdDuration::from_secs(5), "timeout draining");
+            if shm_client_poll(client, 200) == shm_error_t::SHM_SUCCESS {
+                let mut buf = [0u8; 16];
+                let mut size = buf.len() as u32;
+                if shm_client_receive(client, buf.as_mut_ptr() as *mut c_void, &mut size)
+                    == shm_error_t::SHM_SUCCESS
+                {
+                    received += 1;
+                }
+            }
+        }
+
+        shm_client_disconnect(client);
+        shm_server_stop(server);
     }
 }
 
@@ -94,7 +296,7 @@ pub enum shm_direction_t {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct shm_auto_options_t {
-    pub wait_timeout_ms: u32,
+    pub poll_timeout_ms: u32,
     pub reconnect_delay_ms: u32,
     pub connect_timeout_ms: u32,
     pub max_send_queue: u32,
@@ -104,7 +306,7 @@ pub struct shm_auto_options_t {
 impl Default for shm_auto_options_t {
     fn default() -> Self {
         Self {
-            wait_timeout_ms: 50,
+            poll_timeout_ms: 50,
             reconnect_delay_ms: 250,
             connect_timeout_ms: 2000,
             max_send_queue: 256,
@@ -130,15 +332,37 @@ fn to_rust_str(ptr: *const c_char) -> Result<String> {
     Ok(cstr.to_string_lossy().into_owned())
 }
 
+/// Буфер приёма с кэшем недоставленного сообщения.
+///
+/// Если сообщение вычитано из ring buffer, но буфер C-вызывающего оказался
+/// мал (`len > capacity`), сообщение уже необратимо удалено из ring —
+/// возвращать ошибку без сохранения означало бы потерю сообщения. Поэтому
+/// оно остаётся в `buffer`, а `pending_len` помечает его как недоставленное:
+/// следующий вызов receive сначала отдаёт его из кэша и только затем читает
+/// новое сообщение из ring buffer.
+struct RecvCache {
+    buffer: Vec<u8>,
+    pending_len: Option<usize>,
+}
+
+impl RecvCache {
+    fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
+            pending_len: None,
+        }
+    }
+}
+
 struct ServerState {
     inner: SharedServer,
     callbacks: Option<shm_callbacks_t>,
-    recv_buffer: Vec<u8>,
+    recv_cache: Mutex<RecvCache>,
 }
 
 struct ClientState {
     inner: SharedClient,
-    recv_buffer: Vec<u8>,
+    recv_cache: Mutex<RecvCache>,
 }
 
 pub type ServerHandle = c_void;
@@ -269,7 +493,7 @@ fn ffi_auto_options(ptr: *const shm_auto_options_t) -> AutoOptions {
     }
     let opts = unsafe { *ptr };
     AutoOptions {
-        wait_timeout: Duration::from_millis(opts.wait_timeout_ms as u64),
+        poll_timeout: Duration::from_millis(opts.poll_timeout_ms as u64),
         reconnect_delay: Duration::from_millis(opts.reconnect_delay_ms as u64),
         connect_timeout: Duration::from_millis(opts.connect_timeout_ms as u64),
         max_send_queue: opts.max_send_queue as usize,
@@ -474,7 +698,7 @@ pub extern "C" fn shm_server_start(
         Ok(server) => Box::into_raw(Box::new(ServerState {
             inner: server,
             callbacks,
-            recv_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
+            recv_cache: Mutex::new(RecvCache::new()),
         })) as *mut ServerHandle,
         Err(err) => {
             let code: shm_error_t = err.into();
@@ -564,25 +788,29 @@ pub extern "C" fn shm_server_receive(
     if handle.is_null() || buffer.is_null() || size.is_null() {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
-    let state = unsafe { &mut *server_state_from(handle) };
+    let state = unsafe { &*server_state_from(handle) };
     let capacity = unsafe { *size } as usize;
     if capacity == 0 {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
-    match state.inner.receive_from_client(&mut state.recv_buffer) {
-        Ok(len) => {
-            if len > capacity {
-                return shm_error_t::SHM_ERROR_MEMORY;
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(state.recv_buffer.as_ptr(), buffer as *mut u8, len);
-                *size = len as u32;
-            }
-            shm_error_t::SHM_SUCCESS
-        }
-        Err(err) => err.into(),
+    let mut cache = state.recv_cache.lock().unwrap();
+    let len = match cache.pending_len.take() {
+        Some(pending_len) => pending_len,
+        None => match state.inner.receive_from_client(&mut cache.buffer) {
+            Ok(len) => len,
+            Err(err) => return err.into(),
+        },
+    };
+    if len > capacity {
+        cache.pending_len = Some(len);
+        return shm_error_t::SHM_ERROR_MEMORY;
     }
+    unsafe {
+        std::ptr::copy_nonoverlapping(cache.buffer.as_ptr(), buffer as *mut u8, len);
+        *size = len as u32;
+    }
+    shm_error_t::SHM_SUCCESS
 }
 
 #[unsafe(no_mangle)]
@@ -628,7 +856,7 @@ pub extern "C" fn shm_client_connect(
             }
             Box::into_raw(Box::new(ClientState {
                 inner: client,
-                recv_buffer: Vec::with_capacity(MAX_MESSAGE_SIZE),
+                recv_cache: Mutex::new(RecvCache::new()),
             })) as *mut ClientHandle
         }
         Err(err) => {
@@ -689,25 +917,29 @@ pub extern "C" fn shm_client_receive(
     if handle.is_null() || buffer.is_null() || size.is_null() {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
-    let state = unsafe { &mut *client_state_from(handle as *mut ClientHandle) };
+    let state = unsafe { &*client_state_from(handle as *mut ClientHandle) };
     let capacity = unsafe { *size } as usize;
     if capacity == 0 {
         return shm_error_t::SHM_ERROR_INVALID_PARAM;
     }
 
-    match state.inner.receive_from_server(&mut state.recv_buffer) {
-        Ok(len) => {
-            if len > capacity {
-                return shm_error_t::SHM_ERROR_MEMORY;
-            }
-            unsafe {
-                std::ptr::copy_nonoverlapping(state.recv_buffer.as_ptr(), buffer as *mut u8, len);
-                *size = len as u32;
-            }
-            shm_error_t::SHM_SUCCESS
-        }
-        Err(err) => err.into(),
+    let mut cache = state.recv_cache.lock().unwrap();
+    let len = match cache.pending_len.take() {
+        Some(pending_len) => pending_len,
+        None => match state.inner.receive_from_server(&mut cache.buffer) {
+            Ok(len) => len,
+            Err(err) => return err.into(),
+        },
+    };
+    if len > capacity {
+        cache.pending_len = Some(len);
+        return shm_error_t::SHM_ERROR_MEMORY;
     }
+    unsafe {
+        std::ptr::copy_nonoverlapping(cache.buffer.as_ptr(), buffer as *mut u8, len);
+        *size = len as u32;
+    }
+    shm_error_t::SHM_SUCCESS
 }
 
 #[unsafe(no_mangle)]

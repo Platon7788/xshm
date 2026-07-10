@@ -18,12 +18,45 @@ fn map_spawn_error(err: std::io::Error, context: &'static str) -> ShmError {
     ShmError::WindowsError { code, context }
 }
 
+/// Джойнит worker-поток, если это безопасно; при self-join -- отпускает
+/// `JoinHandle` без блокировки.
+///
+/// Если `Drop for AutoServer`/`AutoClient` вызывается СИНХРОННО из
+/// собственного worker-потока (пользовательский `AutoHandler` дропает
+/// сервер/клиент прямо внутри своего же callback'а -- `on_disconnect`,
+/// `on_message` и т.п. вызываются ИМЕННО на worker-потоке), безусловный
+/// `handle.join()` был бы self-join deadlock: поток ждал бы сам себя
+/// навсегда (аудит 2026-07-10 -- тот же паттерн, что вызвал деадлок в
+/// `dispatch/`, но здесь он общий для любого потребителя `auto`, публичного
+/// модуля, а не только для одного места использования внутри библиотеки).
+///
+/// При обнаружении self-join `JoinHandle` просто дропается без join: поток
+/// уже видит `running=false` (устанавливается до этого вызова) и завершится
+/// сам -- безопасный detach силами ОС, не утечка (тред всё равно скоро
+/// вернёт управление и выйдет из своего цикла).
+fn join_unless_self(handle: JoinHandle<()>) {
+    if handle.thread().id() != thread::current().id() {
+        let _ = handle.join();
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
     ServerToClient,
     ClientToServer,
 }
 
+/// Callback-интерфейс `AutoServer`/`AutoClient`.
+///
+/// Все методы вызываются СИНХРОННО из собственного worker-потока
+/// `AutoServer`/`AutoClient`. Если реализация синхронно дропает тот же
+/// `AutoServer`/`AutoClient`, который её вызвал (например, извлекает его из
+/// общей коллекции и роняет прямо в callback'е), `Drop` НЕ будет ждать
+/// (`join()`) этот же worker-поток -- вместо самоблокировки поток просто
+/// открепляется (detach) и завершится самостоятельно чуть позже (аудит
+/// 2026-07-10). Это исключает deadlock, но означает, что к моменту
+/// возврата из `Drop` поток может быть ещё не завершён -- если нужна
+/// гарантия полного завершения, дропайте объект из ДРУГОГО потока.
 pub trait AutoHandler: Send + Sync + 'static {
     fn on_connect(&self) {}
     fn on_disconnect(&self) {}
@@ -35,7 +68,11 @@ pub trait AutoHandler: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct AutoOptions {
-    pub wait_timeout: Duration,
+    /// Интервал опроса в worker loop. Переименовано из `wait_timeout` (0.6.0)
+    /// для единообразия с `MultiOptions`/`DispatchOptions`, где то же самое
+    /// поле называется `poll_timeout` -- разнобой имён заставлял вручную
+    /// перекладывать значения при построении `AutoOptions` внутри `dispatch/`.
+    pub poll_timeout: Duration,
     pub reconnect_delay: Duration,
     pub connect_timeout: Duration,
     pub max_send_queue: usize,
@@ -45,7 +82,7 @@ pub struct AutoOptions {
 impl Default for AutoOptions {
     fn default() -> Self {
         Self {
-            wait_timeout: Duration::from_millis(50),
+            poll_timeout: Duration::from_millis(50),
             reconnect_delay: Duration::from_millis(250),
             connect_timeout: Duration::from_secs(2),
             max_send_queue: 256,
@@ -189,7 +226,7 @@ impl Drop for AutoServer {
         self.running.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
         if let Some(handle) = self.join.lock().unwrap().take() {
-            let _ = handle.join();
+            join_unless_self(handle);
         }
     }
 }
@@ -219,7 +256,7 @@ fn server_worker(
 
     while running.load(Ordering::Acquire) {
         if !connected {
-            match server.wait_for_client(Some(options.wait_timeout)) {
+            match server.wait_for_client(Some(options.poll_timeout)) {
                 Ok(_) => {
                     connected = true;
                     handler.on_connect();
@@ -269,7 +306,7 @@ fn server_worker(
             continue;
         }
 
-        match win::wait_any(&handles, Some(options.wait_timeout)) {
+        match win::wait_any(&handles, Some(options.poll_timeout)) {
             Ok(Some(0)) => {
                 handler.on_disconnect();
                 server.mark_disconnected();
@@ -360,7 +397,7 @@ impl Drop for AutoClient {
         self.running.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
         if let Some(handle) = self.join.lock().unwrap().take() {
-            let _ = handle.join();
+            join_unless_self(handle);
         }
     }
 }
@@ -427,7 +464,7 @@ fn client_worker(
                 continue;
             }
 
-            match win::wait_any(&handles, Some(options.wait_timeout)) {
+            match win::wait_any(&handles, Some(options.poll_timeout)) {
                 Ok(Some(0)) => {
                     handler.on_disconnect();
                     client.mark_disconnected();
@@ -591,5 +628,75 @@ impl SendEndpoint for SharedClient {
 impl ReceiveEndpoint for SharedClient {
     fn read(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.receive_from_server(buffer)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Handler, который в `on_disconnect` дропает контейнер, содержащий сам
+    /// `AutoServer` -- воспроизводит паттерн, который вызвал self-join
+    /// deadlock в `dispatch/` (аудит 2026-07-10, до фикса): callback
+    /// вызывается СИНХРОННО из собственного worker-потока `AutoServer`, и
+    /// если внутри него этот же `AutoServer` дропается, `Drop::drop` пытается
+    /// заджойнить `worker_handle`, которым и является текущий поток.
+    struct SelfDroppingHandler {
+        container: Arc<Mutex<Option<AutoServer>>>,
+        disconnect_returned: Arc<AtomicBool>,
+    }
+
+    impl AutoHandler for SelfDroppingHandler {
+        fn on_disconnect(&self) {
+            let taken = self.container.lock().unwrap().take();
+            drop(taken); // именно тут раньше был self-join deadlock
+            self.disconnect_returned.store(true, Ordering::Release);
+        }
+    }
+
+    struct NoopHandler;
+    impl AutoHandler for NoopHandler {}
+
+    /// Регрессия (аудит 2026-07-10): `Drop for AutoServer`/`AutoClient`
+    /// раньше безусловно джойнил `worker_handle` -- если Drop вызывается ИЗ
+    /// СОБСТВЕННОГО worker-потока (пользовательский `AutoHandler` синхронно
+    /// роняет `AutoServer` внутри своего же callback'а), это self-join
+    /// deadlock. `auto` -- публичный модуль, доступный любому внешнему
+    /// потребителю библиотеки, поэтому фикс должен быть в самом `Drop`, а не
+    /// полагаться на то, что каждый вызывающий код (как `dispatch/`) сам
+    /// не наступит на эти грабли.
+    #[test]
+    fn drop_from_own_worker_callback_does_not_self_join_deadlock() {
+        let name = format!("TEST_AUTO_SELFDROP_{}", std::process::id());
+        let container: Arc<Mutex<Option<AutoServer>>> = Arc::new(Mutex::new(None));
+        let disconnect_returned = Arc::new(AtomicBool::new(false));
+
+        let handler = Arc::new(SelfDroppingHandler {
+            container: container.clone(),
+            disconnect_returned: disconnect_returned.clone(),
+        });
+
+        let server = AutoServer::start(&name, handler, AutoOptions::default()).expect("start");
+        *container.lock().unwrap() = Some(server);
+
+        let client = AutoClient::connect(&name, Arc::new(NoopHandler), AutoOptions::default())
+            .expect("client connect");
+
+        // Даём клиенту время реально подключиться, прежде чем отключать.
+        thread::sleep(Duration::from_millis(200));
+        client.stop();
+
+        // Если self-join deadlock всё ещё существует, on_disconnect зависнет
+        // НАВСЕГДА внутри Drop for AutoServer, и флаг не станет true.
+        let start = std::time::Instant::now();
+        while !disconnect_returned.load(Ordering::Acquire)
+            && start.elapsed() < Duration::from_secs(10)
+        {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            disconnect_returned.load(Ordering::Acquire),
+            "on_disconnect не вернулся за 10с -- self-join deadlock"
+        );
     }
 }
