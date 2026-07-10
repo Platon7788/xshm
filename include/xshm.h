@@ -79,12 +79,21 @@
 #define CLAIM_FREE 0
 
 /**
- * Response status: success.
+ * Индекс в reserved[] СЕГМЕНТА СЛОТА для PID процесса, захватившего claim.
+ * Записывается клиентом сразу после успешного CAS в `try_claim_slot`.
+ * Сервер использует его для liveness-проверки connected-слотов: клиент,
+ * упавший ПОСЛЕ завершения handshake (но не освободивший claim), иначе
+ * навсегда лишает сервер слота — событий от мёртвого процесса не будет.
+ */
+#define RESERVED_OWNER_PID_INDEX 1
+
+/**
+ * Статус ответа: успех.
  */
 #define STATUS_OK 0
 
 /**
- * Response status: server rejected the connection.
+ * Статус ответа: сервер отклонил подключение.
  */
 #define STATUS_REJECTED 1
 
@@ -131,7 +140,7 @@ typedef struct EventHandles EventHandles;
 typedef void DispatchServerHandle;
 
 /**
- * Server-side callbacks.
+ * Callbacks на стороне сервера.
  */
 typedef struct shm_dispatch_callbacks_t {
   void (*on_client_connect)(uint32_t client_id,
@@ -146,7 +155,7 @@ typedef struct shm_dispatch_callbacks_t {
 } shm_dispatch_callbacks_t;
 
 /**
- * Server options.
+ * Настройки сервера.
  */
 typedef struct shm_dispatch_options_t {
   uint32_t lobby_timeout_ms;
@@ -158,7 +167,7 @@ typedef struct shm_dispatch_options_t {
 typedef void DispatchClientHandle;
 
 /**
- * Registration info passed from C client.
+ * Данные регистрации, передаваемые от C-клиента.
  */
 typedef struct shm_dispatch_registration_t {
   uint32_t pid;
@@ -167,7 +176,7 @@ typedef struct shm_dispatch_registration_t {
 } shm_dispatch_registration_t;
 
 /**
- * Client-side callbacks.
+ * Callbacks на стороне клиента.
  */
 typedef struct shm_dispatch_client_callbacks_t {
   void (*on_connect)(uint32_t client_id, const char *channel_name, void *user_data);
@@ -178,7 +187,7 @@ typedef struct shm_dispatch_client_callbacks_t {
 } shm_dispatch_client_callbacks_t;
 
 /**
- * Client options.
+ * Настройки клиента.
  */
 typedef struct shm_dispatch_client_options_t {
   uint32_t lobby_timeout_ms;
@@ -190,7 +199,7 @@ typedef struct shm_dispatch_client_options_t {
 } shm_dispatch_client_options_t;
 
 typedef struct shm_auto_options_t {
-  uint32_t wait_timeout_ms;
+  uint32_t poll_timeout_ms;
   uint32_t reconnect_delay_ms;
   uint32_t connect_timeout_ms;
   uint32_t max_send_queue;
@@ -201,7 +210,6 @@ typedef void AutoServerHandle;
 
 typedef struct shm_endpoint_config_t {
   const char *name;
-  uint32_t buffer_bytes;
 } shm_endpoint_config_t;
 
 typedef struct shm_callbacks_t {
@@ -285,10 +293,6 @@ typedef void MultiServerHandle;
  */
 typedef struct shm_multi_client_options_t {
   /**
-   * Таймаут подключения к lobby в мс (по умолчанию 5000)
-   */
-  uint32_t lobby_timeout_ms;
-  /**
    * Таймаут подключения к слоту в мс (по умолчанию 5000)
    */
   uint32_t slot_timeout_ms;
@@ -300,6 +304,11 @@ typedef struct shm_multi_client_options_t {
    * Количество сообщений за один цикл (по умолчанию 32)
    */
   uint32_t recv_batch;
+  /**
+   * Максимум неотправленных сообщений во внутренней очереди перед сбросом
+   * самого старого (по умолчанию 256)
+   */
+  uint32_t max_send_queue;
 } shm_multi_client_options_t;
 
 /**
@@ -318,6 +327,10 @@ typedef struct shm_multi_client_callbacks_t {
    * Вызывается при получении сообщения от сервера
    */
   void (*on_message)(const void *data, uint32_t size, void *user_data);
+  /**
+   * Вызывается при переполнении внутренней send-очереди (`max_send_queue`)
+   */
+  void (*on_overflow)(uint32_t dropped, void *user_data);
   /**
    * Вызывается при ошибке
    */
@@ -339,7 +352,8 @@ extern "C" {
 
 /**
  * # Safety
- * All pointers must be valid or null where documented. `name` must be a valid C string.
+ * Все указатели обязаны быть валидны либо null там, где это задокументировано.
+ * `name` обязан быть валидной C-строкой.
  */
 DispatchServerHandle *shm_dispatch_server_start(const char *name,
                                                 const struct shm_dispatch_callbacks_t *callbacks,
@@ -347,7 +361,7 @@ DispatchServerHandle *shm_dispatch_server_start(const char *name,
 
 /**
  * # Safety
- * `handle` must be a valid DispatchServerHandle. `data` must point to `size` bytes.
+ * `handle` обязан быть валидным DispatchServerHandle. `data` обязан указывать на `size` байт.
  */
 enum shm_error_t shm_dispatch_server_send_to(DispatchServerHandle *handle,
                                              uint32_t client_id,
@@ -356,7 +370,7 @@ enum shm_error_t shm_dispatch_server_send_to(DispatchServerHandle *handle,
 
 /**
  * # Safety
- * `handle` must be valid. `data` must point to `size` bytes. `sent_count` may be null.
+ * `handle` обязан быть валидным. `data` обязан указывать на `size` байт. `sent_count` может быть null.
  */
 enum shm_error_t shm_dispatch_server_broadcast(DispatchServerHandle *handle,
                                                const void *data,
@@ -365,19 +379,19 @@ enum shm_error_t shm_dispatch_server_broadcast(DispatchServerHandle *handle,
 
 /**
  * # Safety
- * `handle` must be a valid DispatchServerHandle or null.
+ * `handle` обязан быть валидным DispatchServerHandle либо null.
  */
 uint32_t shm_dispatch_server_client_count(const DispatchServerHandle *handle);
 
 /**
  * # Safety
- * `handle` must be a valid DispatchServerHandle or null. Consumes the handle.
+ * `handle` обязан быть валидным DispatchServerHandle либо null. Поглощает handle.
  */
 void shm_dispatch_server_stop(DispatchServerHandle *handle);
 
 /**
  * # Safety
- * All pointers must be valid. `name` and `reg.name` must be valid C strings.
+ * Все указатели обязаны быть валидны. `name` и `reg.name` обязаны быть валидными C-строками.
  */
 DispatchClientHandle *shm_dispatch_client_connect(const char *name,
                                                   const struct shm_dispatch_registration_t *reg,
@@ -386,7 +400,7 @@ DispatchClientHandle *shm_dispatch_client_connect(const char *name,
 
 /**
  * # Safety
- * `handle` must be a valid DispatchClientHandle. `data` must point to `size` bytes.
+ * `handle` обязан быть валидным DispatchClientHandle. `data` обязан указывать на `size` байт.
  */
 enum shm_error_t shm_dispatch_client_send(DispatchClientHandle *handle,
                                           const void *data,
@@ -394,7 +408,7 @@ enum shm_error_t shm_dispatch_client_send(DispatchClientHandle *handle,
 
 /**
  * # Safety
- * `handle` must be a valid DispatchClientHandle or null. Consumes the handle.
+ * `handle` обязан быть валидным DispatchClientHandle либо null. Поглощает handle.
  */
 void shm_dispatch_client_stop(DispatchClientHandle *handle);
 

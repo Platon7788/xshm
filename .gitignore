@@ -10,3 +10,5 @@ CLAUDE.md
 /.claude
 /.claude-flow
 /.mcp.json
+/.swarm
+/ruvector.db
