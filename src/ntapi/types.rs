@@ -2,9 +2,18 @@
 //!
 //! Минимальный набор типов без внешних зависимостей.
 
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(clippy::upper_case_acronyms)]
+#![expect(
+    non_camel_case_types,
+    reason = "имена типов NT API воспроизводятся дословно"
+)]
+#![expect(
+    non_snake_case,
+    reason = "имена полей NT-структур воспроизводятся дословно"
+)]
+#![expect(
+    clippy::upper_case_acronyms,
+    reason = "HANDLE/NTSTATUS/PVOID -- имена из NT API"
+)]
 
 use core::ffi::c_void;
 
@@ -71,9 +80,13 @@ pub struct OBJECT_ATTRIBUTES {
 }
 
 impl OBJECT_ATTRIBUTES {
-    pub fn new(name: *mut UNICODE_STRING, attributes: ULONG, security_descriptor: PVOID) -> Self {
+    pub const fn new(
+        name: *mut UNICODE_STRING,
+        attributes: ULONG,
+        security_descriptor: PVOID,
+    ) -> Self {
         Self {
-            Length: core::mem::size_of::<OBJECT_ATTRIBUTES>() as ULONG,
+            Length: size_of::<OBJECT_ATTRIBUTES>() as ULONG,
             RootDirectory: core::ptr::null_mut(),
             ObjectName: name,
             Attributes: attributes,
@@ -100,7 +113,7 @@ pub struct SECURITY_DESCRIPTOR {
 
 impl SECURITY_DESCRIPTOR {
     /// Создаёт пустой SECURITY_DESCRIPTOR
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             Revision: 0,
             Sbz1: 0,
@@ -112,7 +125,7 @@ impl SECURITY_DESCRIPTOR {
         }
     }
 
-    pub fn as_ptr(&mut self) -> PVOID {
+    pub const fn as_ptr(&mut self) -> PVOID {
         self as *mut _ as PVOID
     }
 }
@@ -138,6 +151,8 @@ impl NullDaclSecurityDescriptor {
 
         let mut sd = SECURITY_DESCRIPTOR::new();
 
+        // SAFETY: `sd` -- локальная структура нужного размера, живущая до конца
+        // функции; обе Rtl-функции только заполняют её поля по переданной ссылке.
         unsafe {
             // Инициализируем SD
             let _ = RtlCreateSecurityDescriptor(&mut sd, SECURITY_DESCRIPTOR_REVISION);
@@ -153,7 +168,7 @@ impl NullDaclSecurityDescriptor {
         Self { sd }
     }
 
-    pub fn as_ptr(&mut self) -> PVOID {
+    pub const fn as_ptr(&mut self) -> PVOID {
         self.sd.as_ptr()
     }
 }

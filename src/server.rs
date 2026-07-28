@@ -9,6 +9,7 @@ use crate::ring::{RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::Mapping;
 
+#[derive(Debug)]
 pub struct SharedServer {
     _mapping: Mapping,
     view: SharedView,
@@ -18,29 +19,36 @@ pub struct SharedServer {
     connected: bool,
 }
 
+// SAFETY: все поля либо владеющие (`Mapping`), либо синхронизируются через
+// атомарные операции в shared memory; привязки к потоку-создателю нет.
 unsafe impl Send for SharedServer {}
 
 impl SharedServer {
     pub fn start(name: &str) -> Result<Self> {
         let map_name = mapping_name(name);
         let mapping = Mapping::create(&map_name)?;
+        // SAFETY: `Mapping` только что создал отображение нужного размера и
+        // держит его живым, пока жив сам (а он переезжает в возвращаемую структуру).
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
 
-        // SAFETY: единственный владелец на этапе инициализации, алиасинга нет
+        // SAFETY: сегмент только что создан этим процессом, клиент к нему ещё не
+        // подключён (его handshake начинается позже), поэтому эксклюзивная ссылка
+        // на control block здесь не алиасится ни другим потоком, ни другим процессом.
         let control = unsafe { &mut *view.control_block_ptr() };
         control.reset();
         let generation = control.generation.load(Ordering::Relaxed);
 
-        unsafe {
-            let header_a = &*view.ring_header_a();
-            header_a.reset(generation);
-            let header_b = &*view.ring_header_b();
-            header_b.reset(generation);
-        }
+        let (header_a, header_b) = view.headers();
+        header_a.reset(generation);
+        header_b.reset(generation);
 
         let events = SharedEvents::create(name)?;
 
+        // SAFETY: указатели получены от `SharedView`, т.е. лежат внутри живого
+        // маппинга, выровнены по layout'у и не пересекаются между собой; маппинг
+        // переезжает в возвращаемую структуру и живёт не меньше колец.
         let ring_tx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
+        // SAFETY: см. выше (второе кольцо, другой диапазон того же маппинга).
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
 
         Ok(Self {
@@ -67,23 +75,28 @@ impl SharedServer {
     /// именованной секцией, а не anonymous. Поэтому нужна отдельная функция.
     pub fn start_anonymous() -> Result<Self> {
         let mapping = Mapping::create_anonymous()?;
+        // SAFETY: `Mapping` только что создал отображение нужного размера и
+        // держит его живым, пока жив сам (а он переезжает в возвращаемую структуру).
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
 
-        // SAFETY: единственный владелец на этапе инициализации, алиасинга нет
+        // SAFETY: сегмент только что создан этим процессом, клиент к нему ещё не
+        // подключён (его handshake начинается позже), поэтому эксклюзивная ссылка
+        // на control block здесь не алиасится ни другим потоком, ни другим процессом.
         let control = unsafe { &mut *view.control_block_ptr() };
         control.reset();
         let generation = control.generation.load(Ordering::Relaxed);
 
-        unsafe {
-            let header_a = &*view.ring_header_a();
-            header_a.reset(generation);
-            let header_b = &*view.ring_header_b();
-            header_b.reset(generation);
-        }
+        let (header_a, header_b) = view.headers();
+        header_a.reset(generation);
+        header_b.reset(generation);
 
         // Events не создаются для anonymous режима - используется polling
 
+        // SAFETY: указатели получены от `SharedView`, т.е. лежат внутри живого
+        // маппинга, выровнены по layout'у и не пересекаются между собой; маппинг
+        // переезжает в возвращаемую структуру и живёт не меньше колец.
         let ring_tx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
+        // SAFETY: см. выше (второе кольцо, другой диапазон того же маппинга).
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
 
         Ok(Self {
@@ -100,6 +113,7 @@ impl SharedServer {
     ///
     /// Возвращает `None` если сервер создан в anonymous режиме (без событий).
     /// В этом случае используется polling через `wait_for_client_noevent()`.
+    #[must_use]
     pub fn get_event_handles(&self) -> Option<crate::events::EventHandles> {
         self.events.as_ref().map(|e| e.get_event_handles())
     }
@@ -146,10 +160,10 @@ impl SharedServer {
                 break;
             }
 
-            if let Some(t) = timeout {
-                if start.elapsed() >= t {
-                    return Err(ShmError::Timeout);
-                }
+            if let Some(t) = timeout
+                && start.elapsed() >= t
+            {
+                return Err(ShmError::Timeout);
             }
 
             std::thread::sleep(Duration::from_millis(1));
@@ -169,24 +183,18 @@ impl SharedServer {
         let control = self.view.control_block();
         let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
 
-        // SAFETY: указатели заголовков валидны, пока жив `_mapping` (инвариант
-        // SharedView), а `&mut self` исключает конкурентный доступ с нашей стороны.
-        unsafe {
-            (*self.view.ring_header_a()).reset(new_generation);
-            (*self.view.ring_header_b()).reset(new_generation);
-        }
+        let (header_a, header_b) = self.view.headers();
+        header_a.reset(new_generation);
+        header_b.reset(new_generation);
 
         control.generation.store(new_generation, Ordering::Release);
 
-        // SAFETY: см. выше.
-        unsafe {
-            (*self.view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-            (*self.view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        }
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
         control
             .server_state
@@ -204,6 +212,7 @@ impl SharedServer {
         Ok(())
     }
 
+    #[must_use]
     pub const fn is_connected(&self) -> bool {
         self.connected
     }
@@ -212,28 +221,31 @@ impl SharedServer {
     ///
     /// ВАЖНО: Для anonymous режима возвращает None - события не создаются.
     /// Используйте только для named режима (SharedServer::start).
-    pub fn events(&self) -> Option<&SharedEvents> {
+    #[must_use]
+    pub const fn events(&self) -> Option<&SharedEvents> {
         self.events.as_ref()
     }
 
     /// Проверка, является ли сервер anonymous (без имени и events)
+    #[must_use]
     pub const fn is_anonymous(&self) -> bool {
         self.events.is_none()
     }
 
     /// Получить raw HANDLE секции для передачи в kernel driver
     /// ВАЖНО: Handle принадлежит Mapping, не закрывать вручную!
+    #[must_use]
     pub fn section_handle(&self) -> isize {
         self._mapping.section_handle()
     }
 
     /// Доступ к shared view (для внутреннего использования)
-    pub(crate) fn view(&self) -> &SharedView {
+    pub(crate) const fn view(&self) -> &SharedView {
         &self.view
     }
 
     /// Установка состояния подключения (для внутреннего использования)
-    pub(crate) fn set_connected(&mut self, connected: bool) {
+    pub(crate) const fn set_connected(&mut self, connected: bool) {
         self.connected = connected;
     }
 
@@ -249,17 +261,16 @@ impl SharedServer {
             .client_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
 
-        unsafe {
-            (&*self.view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-            (&*self.view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-        }
+        let (header_a, header_b) = self.view.headers();
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
     }
 
-    fn ensure_connected(&self) -> Result<()> {
+    const fn ensure_connected(&self) -> Result<()> {
         if !self.connected {
             Err(ShmError::NotConnected)
         } else {
@@ -271,10 +282,10 @@ impl SharedServer {
         self.ensure_connected()?;
         let result = self.ring_tx.write_message(payload)?;
         // Сигнализируем только если events доступны
-        if let Some(ref events) = self.events {
-            if result.was_empty {
-                let _ = events.s2c.data.set();
-            }
+        if let Some(ref events) = self.events
+            && result.was_empty
+        {
+            let _ = events.s2c.data.set();
         }
         Ok(result)
     }
@@ -283,10 +294,10 @@ impl SharedServer {
         self.ensure_connected()?;
         let len = self.ring_rx.read_message(buffer)?;
         // Сигнализируем только если events доступны
-        if let Some(ref events) = self.events {
-            if self.ring_rx.message_count() == 0 {
-                let _ = events.c2s.space.set();
-            }
+        if let Some(ref events) = self.events
+            && self.ring_rx.message_count() == 0
+        {
+            let _ = events.c2s.space.set();
         }
         Ok(len)
     }
@@ -313,18 +324,17 @@ impl Drop for SharedServer {
         control
             .client_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
-        unsafe {
-            (&*self.view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-            (&*self.view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-        }
-        if self.connected {
-            if let Some(ref events) = self.events {
-                let _ = events.disconnect.set();
-            }
+        let (header_a, header_b) = self.view.headers();
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        if self.connected
+            && let Some(ref events) = self.events
+        {
+            let _ = events.disconnect.set();
         }
     }
 }

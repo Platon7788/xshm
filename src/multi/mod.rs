@@ -107,7 +107,7 @@ pub trait MultiClientHandler: Send + Sync + 'static {
 }
 
 /// Опции для MultiServer
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MultiOptions {
     /// Максимальное количество одновременных клиентов
     pub max_clients: u32,
@@ -128,7 +128,7 @@ impl Default for MultiOptions {
 }
 
 /// Опции для MultiClient
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MultiClientOptions {
     /// Таймаут подключения к слоту
     pub slot_timeout: Duration,
@@ -210,7 +210,7 @@ impl MultiServer {
         {
             let mut slots_guard = slots.write().unwrap();
             for slot_id in 0..options.max_clients {
-                let channel_name = format!("{}_{}", base_name, slot_id);
+                let channel_name = format!("{base_name}_{slot_id}");
                 let server = SharedServer::start(&channel_name)?;
                 slots_guard.push(Mutex::new(ClientSlot {
                     id: slot_id,
@@ -316,11 +316,7 @@ impl MultiServer {
             .iter()
             .filter_map(|slot_mutex| {
                 let slot = slot_mutex.lock().unwrap();
-                if slot.connected {
-                    Some(slot.id)
-                } else {
-                    None
-                }
+                if slot.connected { Some(slot.id) } else { None }
             })
             .collect()
     }
@@ -583,21 +579,18 @@ impl MultiServer {
         let current_gen = control.generation.load(Ordering::Acquire);
         let new_generation = current_gen.wrapping_add(1);
 
-        unsafe {
-            (&*view.ring_header_a()).reset(new_generation);
-            (&*view.ring_header_b()).reset(new_generation);
-        }
+        let (header_a, header_b) = view.headers();
+        header_a.reset(new_generation);
+        header_b.reset(new_generation);
 
         control.generation.store(new_generation, Ordering::Release);
 
-        unsafe {
-            (&*view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-            (&*view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        }
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
         control
             .server_state
@@ -743,11 +736,7 @@ impl MultiServer {
                 .iter()
                 .filter_map(|slot_mutex| {
                     let slot = slot_mutex.lock().unwrap();
-                    if slot.connected {
-                        Some(slot.id)
-                    } else {
-                        None
-                    }
+                    if slot.connected { Some(slot.id) } else { None }
                 })
                 .collect()
         };
@@ -755,6 +744,19 @@ impl MultiServer {
         for slot_id in slot_ids {
             self.receive_from_slot(slot_id, buffer);
         }
+    }
+}
+
+impl std::fmt::Debug for MultiServer {
+    /// Ручная реализация: `handler` -- `Arc<dyn MultiHandler>`, у трейта нет
+    /// `Debug`. Печатаем то, что реально полезно в логах: имя и заполненность.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MultiServer")
+            .field("base_name", &self.base_name)
+            .field("max_clients", &self.max_clients)
+            .field("connected", &self.client_count())
+            .field("running", &self.running.load(Ordering::Acquire))
+            .finish_non_exhaustive()
     }
 }
 
@@ -769,7 +771,10 @@ impl Drop for MultiServer {
 
 /// Источник события для worker loop
 #[derive(Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "варианты различаются источником события на слоте, префикс Slot осознан"
+)]
 enum EventSource {
     SlotConnect(u32),
     SlotData(u32),
@@ -783,12 +788,14 @@ enum EventSource {
 use std::collections::VecDeque;
 use std::sync::mpsc::{self, Receiver, Sender};
 
+#[derive(Debug)]
 enum ClientCommand {
     Send(Vec<u8>),
     Shutdown,
 }
 
 /// Мультиклиент — подключается к базовому имени, получает слот автоматически
+#[derive(Debug)]
 pub struct MultiClient {
     cmd_tx: Sender<ClientCommand>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -1061,11 +1068,7 @@ fn next_claim_token() -> u32 {
     hasher.write_u32(pid);
     hasher.write_u32(n);
     let token = hasher.finish() as u32;
-    if token == CLAIM_FREE {
-        1
-    } else {
-        token
-    }
+    if token == CLAIM_FREE { 1 } else { token }
 }
 
 /// Пытается атомарно захватить конкретный слот через `compare_exchange`.
@@ -1074,6 +1077,8 @@ fn next_claim_token() -> u32 {
 fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
     // Сервер создаёт секцию под именем mapping_name(slot_name) — открываем так же.
     let mapping = Mapping::open(&mapping_name(slot_name))?; // Err => слота нет
+    // SAFETY: `Mapping::open` проверил размер отображения и держит его живым на
+    // всё время жизни `mapping` (а значит и `view`).
     let view = unsafe { SharedView::new(mapping.as_ptr()) };
     let control = view.control_block();
     if control.magic != SHARED_MAGIC || control.version != SHARED_VERSION {
@@ -1096,6 +1101,8 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
 /// Снять собственный claim со слота (CAS token -> FREE), если он всё ещё наш.
 fn release_claim(slot_name: &str, token: u32) {
     if let Ok(mapping) = Mapping::open(&mapping_name(slot_name)) {
+        // SAFETY: `Mapping::open` проверил размер отображения и держит его живым на
+        // всё время жизни `mapping` (а значит и `view`).
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
         let _ = view.control_block().reserved[RESERVED_CLAIM_INDEX].compare_exchange(
             token,
@@ -1112,7 +1119,7 @@ fn claim_free_slot(base_name: &str) -> Result<(u32, String, u32)> {
     let token = next_claim_token();
     let mut saw_slot = false;
     for slot_id in 0..MAX_MULTI_CLIENTS {
-        let slot_name = format!("{}_{}", base_name, slot_id);
+        let slot_name = format!("{base_name}_{slot_id}");
         match try_claim_slot(&slot_name, token) {
             Ok(true) => return Ok((slot_id, slot_name, token)),
             Ok(false) => {
@@ -1306,7 +1313,7 @@ mod tests {
             if !orphaned.is_empty() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(20));
         }
 
         assert_eq!(

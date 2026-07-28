@@ -20,17 +20,16 @@ fn rollback_handshake(view: &SharedView) {
     view.control_block()
         .client_state
         .store(HANDSHAKE_IDLE, Ordering::Release);
-    // SAFETY: заголовки валидны, пока жив `Mapping`, из которого построен view.
-    unsafe {
-        (*view.ring_header_a())
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        (*view.ring_header_b())
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-    }
+    let (header_a, header_b) = view.headers();
+    header_a
+        .handshake_state
+        .store(HANDSHAKE_IDLE, Ordering::Release);
+    header_b
+        .handshake_state
+        .store(HANDSHAKE_IDLE, Ordering::Release);
 }
 
+#[derive(Debug)]
 pub struct SharedClient {
     _mapping: Mapping,
     view: SharedView,
@@ -40,12 +39,16 @@ pub struct SharedClient {
     connected: bool,
 }
 
+// SAFETY: см. `SharedServer` -- владеющий `Mapping` плюс атомарные операции в
+// shared memory, привязки к потоку нет.
 unsafe impl Send for SharedClient {}
 
 impl SharedClient {
     pub fn connect(name: &str, timeout: Duration) -> Result<Self> {
         let map_name = mapping_name(name);
         let mapping = Mapping::open(&map_name)?;
+        // SAFETY: `Mapping::open` уже проверил, что отображение не меньше
+        // `shared_mapping_size()`, и держит его живым, пока жив `mapping`.
         let view = unsafe { SharedView::new(mapping.as_ptr()) };
 
         // Проверка magic и version для валидации shared memory
@@ -63,14 +66,13 @@ impl SharedClient {
             .client_state
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
 
-        unsafe {
-            (&*view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
-            (&*view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
-        }
+        let (header_a, header_b) = view.headers();
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
 
         events.connect_req.set()?;
 
@@ -85,22 +87,20 @@ impl SharedClient {
         }
 
         let generation = view.control_block().generation.load(Ordering::Acquire);
-        unsafe {
-            (&*view.ring_header_a())
-                .connection_gen
-                .store(generation, Ordering::Release);
-            (&*view.ring_header_b())
-                .connection_gen
-                .store(generation, Ordering::Release);
-            (&*view.ring_header_a())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-            (&*view.ring_header_b())
-                .handshake_state
-                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        }
+        header_a.connection_gen.store(generation, Ordering::Release);
+        header_b.connection_gen.store(generation, Ordering::Release);
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
+        // SAFETY: указатели из `SharedView` -- внутрь живого маппинга, выровнены
+        // по layout'у и не пересекаются; `mapping` переезжает в возвращаемую
+        // структуру, поэтому переживает кольца.
         let ring_tx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
+        // SAFETY: см. выше (встречное кольцо того же маппинга).
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
 
         let client = Self {
@@ -115,19 +115,20 @@ impl SharedClient {
         Ok(client)
     }
 
+    #[must_use]
     pub const fn is_connected(&self) -> bool {
         self.connected
     }
 
-    pub(crate) fn events(&self) -> &SharedEvents {
+    pub(crate) const fn events(&self) -> &SharedEvents {
         &self.events
     }
 
-    pub(crate) fn mark_disconnected(&mut self) {
+    pub(crate) const fn mark_disconnected(&mut self) {
         self.connected = false;
     }
 
-    fn ensure_connected(&self) -> Result<()> {
+    const fn ensure_connected(&self) -> Result<()> {
         if !self.connected {
             Err(ShmError::NotConnected)
         } else {
@@ -165,18 +166,7 @@ impl SharedClient {
 impl Drop for SharedClient {
     fn drop(&mut self) {
         if self.connected {
-            let control = self.view.control_block();
-            control
-                .client_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-            unsafe {
-                (&*self.view.ring_header_a())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-                (&*self.view.ring_header_b())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-            }
+            rollback_handshake(&self.view);
             let _ = self.events.disconnect.set();
             self.connected = false;
         }

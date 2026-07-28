@@ -9,13 +9,20 @@
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 compile_error!("xShm поддерживает только x86 и x86_64 архитектуры!");
 
+use core::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use crate::error::{Result, ShmError};
 use crate::layout::shared_mapping_size;
 use crate::ntapi::{
-    duration_to_nt_timeout,
+    // Types
+    CLIENT_ID,
+    EVENT_ALL_ACCESS,
+    HANDLE,
+    LARGE_INTEGER,
+    NT_CURRENT_PROCESS,
+    NTSTATUS,
     // Functions
     NtClose,
     NtCreateEvent,
@@ -31,21 +38,14 @@ use crate::ntapi::{
     NtWaitForMultipleObjects,
     NtWaitForSingleObject,
     NullDaclSecurityDescriptor,
-    // Types
-    CLIENT_ID,
-    EVENT_ALL_ACCESS,
-    HANDLE,
-    LARGE_INTEGER,
-    NTSTATUS,
-    NT_CURRENT_PROCESS,
-    OBJECT_ATTRIBUTES,
     OBJ_CASE_INSENSITIVE,
+    OBJECT_ATTRIBUTES,
     PAGE_READWRITE,
     PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE,
     PVOID,
-    SECTION_ALL_ACCESS,
     SEC_COMMIT,
+    SECTION_ALL_ACCESS,
     // Constants
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
@@ -54,6 +54,7 @@ use crate::ntapi::{
     UNICODE_STRING,
     VIEW_UNMAP,
     WAIT_ANY,
+    duration_to_nt_timeout,
 };
 
 // ============================================================================
@@ -70,18 +71,26 @@ const INVALID_HANDLE_VALUE: isize = -1;
 pub struct Handle(HANDLE);
 
 impl Handle {
-    pub fn raw(&self) -> HANDLE {
+    pub const fn raw(&self) -> HANDLE {
         self.0
     }
 
+    /// Числовое значение дескриптора.
+    ///
+    /// `HANDLE` -- это `*mut c_void` по типу, но не адрес памяти: ядро кладёт туда
+    /// индекс в таблице дескрипторов. Поэтому берём `addr()` (strict provenance),
+    /// а не `as isize`: провенанс здесь нечего сохранять.
     pub fn as_isize(&self) -> isize {
-        self.0 as isize
+        self.0.addr() as isize
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if !self.0.is_null() && self.0 as isize != INVALID_HANDLE_VALUE {
+        if !self.0.is_null() && self.0.addr() as isize != INVALID_HANDLE_VALUE {
+            // SAFETY: `Handle` -- единственный владелец дескриптора (конструируется
+            // только из свежего handle, полученного от NT), поэтому закрываем ровно
+            // один раз; null/INVALID отсеяны условием выше.
             unsafe {
                 let _ = NtClose(self.0);
             }
@@ -93,7 +102,7 @@ impl Drop for Handle {
 // Helper functions
 // ============================================================================
 
-fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
+const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
     ShmError::WindowsError {
         code: status as u32,
         context,
@@ -104,11 +113,17 @@ fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
 // EventHandle - NT Event через ntdll.dll
 // ============================================================================
 
+#[derive(Debug)]
 pub struct EventHandle {
     handle: Handle,
 }
 
+// SAFETY: внутри только NT-дескриптор (машинное слово). Все операции над ним
+// (`NtSetEvent`/`NtWaitForSingleObject`) потокобезопасны на уровне ядра и не
+// трогают состояние процесса, поэтому делить `EventHandle` между потоками
+// безопасно.
 unsafe impl Send for EventHandle {}
+// SAFETY: см. выше -- у типа нет внутренней изменяемости на стороне Rust.
 unsafe impl Sync for EventHandle {}
 
 impl EventHandle {
@@ -121,6 +136,8 @@ impl EventHandle {
 
         let mut handle: HANDLE = null_mut();
 
+        // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
+        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
                 &mut handle,
@@ -148,6 +165,8 @@ impl EventHandle {
 
         let mut handle: HANDLE = null_mut();
 
+        // SAFETY: `handle` -- валидный out-параметр; `obj_attr` (и `nt_name` внутри
+        // него) живут до конца вызова.
         let status = unsafe { NtOpenEvent(&mut handle, EVENT_ALL_ACCESS, &mut obj_attr) };
 
         if status != STATUS_SUCCESS {
@@ -162,6 +181,8 @@ impl EventHandle {
     /// Сигнализация через NtSetEvent
     pub fn set(&self) -> Result<()> {
         let mut previous_state: i32 = 0;
+        // SAFETY: дескриптор валиден, пока жив `self`; `previous_state` -- валидный
+        // out-параметр на стеке.
         let status = unsafe { NtSetEvent(self.handle.raw(), &mut previous_state) };
 
         if status != STATUS_SUCCESS {
@@ -183,6 +204,9 @@ impl EventHandle {
             null()
         };
 
+        // SAFETY: дескриптор валиден, пока жив `self`; `timeout_ptr` -- либо NULL
+        // (бесконечное ожидание), либо указатель на `timeout_value`, живущий до
+        // конца вызова.
         let status = unsafe {
             NtWaitForSingleObject(
                 self.handle.raw(),
@@ -217,7 +241,11 @@ pub struct Mapping {
     size: usize,
 }
 
+// SAFETY: внутри дескриптор секции и адрес отображения. Само отображение живёт,
+// пока жив `Mapping`, и не привязано к потоку-создателю; синхронизация доступа к
+// содержимому -- забота `RingBuffer`/`SharedView` (атомарные операции).
 unsafe impl Send for Mapping {}
+// SAFETY: см. выше.
 unsafe impl Sync for Mapping {}
 
 impl Mapping {
@@ -237,6 +265,9 @@ impl Mapping {
             QuadPart: size as i64,
         };
 
+        // SAFETY: все переданные указатели -- на локальные переменные, живущие до
+        // конца вызова; `object_name` либо NULL (anonymous), либо указывает на
+        // `UNICODE_STRING`, который держит вызывающий (`Mapping::create`).
         let status = unsafe {
             NtCreateSection(
                 &mut section_handle,
@@ -272,6 +303,8 @@ impl Mapping {
         let mut base_address: PVOID = null_mut();
         let mut view_size: usize = 0;
 
+        // SAFETY: дескриптор секции валиден (только что создан); `base_address` и
+        // `view_size` -- валидные out-параметры на стеке.
         let status = unsafe {
             NtMapViewOfSection(
                 handle.raw(),
@@ -298,7 +331,7 @@ impl Mapping {
 
         Ok(Mapping {
             _handle: handle,
-            view: base_address as *mut u8,
+            view: base_address.cast::<u8>(),
             // Секцию создали мы сами ровно на `size` байт; NtMapViewOfSection
             // с ViewSize=0 отображает её целиком, но округляет до страницы --
             // берём максимум, чтобы size() не занижал доступный диапазон.
@@ -348,6 +381,8 @@ impl Mapping {
 
         let mut section_handle: HANDLE = null_mut();
 
+        // SAFETY: out-параметр на стеке; `obj_attr` и `nt_name` внутри него живы до
+        // конца вызова.
         let status =
             unsafe { NtOpenSection(&mut section_handle, SECTION_ALL_ACCESS, &mut obj_attr) };
 
@@ -361,6 +396,8 @@ impl Mapping {
         let mut base_address: PVOID = null_mut();
         let mut view_size: usize = 0;
 
+        // SAFETY: дескриптор секции валиден (только что открыт); out-параметры --
+        // локальные переменные, живущие до конца вызова.
         let status = unsafe {
             NtMapViewOfSection(
                 handle.raw(),
@@ -382,7 +419,7 @@ impl Mapping {
 
         let mapping = Mapping {
             _handle: handle,
-            view: base_address as *mut u8,
+            view: base_address.cast::<u8>(),
             size: view_size,
         };
 
@@ -395,7 +432,7 @@ impl Mapping {
         Ok(mapping)
     }
 
-    pub fn as_ptr(&self) -> *mut u8 {
+    pub const fn as_ptr(&self) -> *mut u8 {
         self.view
     }
 }
@@ -403,8 +440,11 @@ impl Mapping {
 impl Drop for Mapping {
     fn drop(&mut self) {
         if !self.view.is_null() {
+            // SAFETY: `view` получен от `NtMapViewOfSection` в этом же процессе и
+            // ещё не размаплен (после размапливания поле зануляется ниже), поэтому
+            // отображение снимается ровно один раз.
             unsafe {
-                let _ = NtUnmapViewOfSection(NT_CURRENT_PROCESS, self.view as PVOID);
+                let _ = NtUnmapViewOfSection(NT_CURRENT_PROCESS, self.view.cast::<c_void>());
             }
             self.view = null_mut();
         }
@@ -431,10 +471,12 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
         null()
     };
 
+    // SAFETY: `handles` -- непустой срез живых NT-дескрипторов (проверено выше),
+    // его длина и указатель согласованы; `timeout_ptr` живёт до конца вызова.
     let status = unsafe {
         NtWaitForMultipleObjects(
             handles.len() as u32,
-            handles.as_ptr() as *const HANDLE,
+            handles.as_ptr().cast::<HANDLE>(),
             WAIT_ANY,
             0, // Alertable = FALSE
             timeout_ptr,
@@ -477,7 +519,9 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 
     let mut client_id = CLIENT_ID {
-        UniqueProcess: pid as usize as HANDLE,
+        // PID -- не адрес: собираем «указателеподобное» значение без провенанса
+        // (`without_provenance_mut`), а не через `as`-каста целого в указатель.
+        UniqueProcess: core::ptr::without_provenance_mut(pid as usize),
         UniqueThread: null_mut(),
     };
     // ObjectName = NULL: процессы не именованные объекты BaseNamedObjects,
@@ -485,6 +529,8 @@ pub fn is_process_alive(pid: u32) -> bool {
     let mut obj_attr = OBJECT_ATTRIBUTES::new(null_mut(), 0, null_mut());
     let mut raw_handle: HANDLE = null_mut();
 
+    // SAFETY: out-параметр и `obj_attr`/`client_id` -- локальные переменные,
+    // живущие до конца вызова; ObjectName внутри `obj_attr` намеренно NULL.
     let open_status = unsafe {
         NtOpenProcess(
             &mut raw_handle,
@@ -505,6 +551,8 @@ pub fn is_process_alive(pid: u32) -> bool {
     let handle = Handle(raw_handle);
 
     let zero_timeout: i64 = 0; // мгновенный опрос, не блокируем worker
+    // SAFETY: дескриптор процесса валиден (открыт выше, закрывается через Drop);
+    // `zero_timeout` живёт до конца вызова.
     let wait_status = unsafe { NtWaitForSingleObject(handle.raw(), 0, &zero_timeout) };
 
     match wait_status {

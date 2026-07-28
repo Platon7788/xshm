@@ -5,7 +5,7 @@
 //! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
 
 use std::ptr::NonNull;
-use std::sync::atomic::{compiler_fence, Ordering};
+use std::sync::atomic::{Ordering, compiler_fence};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
@@ -17,17 +17,24 @@ pub struct WriteOutcome {
     pub was_empty: bool,
 }
 
+#[derive(Debug)]
 pub struct RingBuffer {
     header: NonNull<RingHeader>,
     storage: NonNull<u8>,
     capacity: u32,
 }
 
+// SAFETY: тип хранит только адреса внутри shared-маппинга, который живёт не
+// меньше самого кольца (инвариант `RingBuffer::new`). Всё состояние кольца --
+// атомарные поля `RingHeader`, доступ к данным идёт по позициям, опубликованным
+// через Acquire/Release, поэтому передача между потоками безопасна.
 unsafe impl Send for RingBuffer {}
+// SAFETY: см. выше; SPSC-контракт (один писатель, один читатель) обеспечивает
+// вызывающий код, а не система типов.
 unsafe impl Sync for RingBuffer {}
 
 impl RingBuffer {
-    pub unsafe fn new(header: *mut RingHeader, data: *mut u8) -> Self {
+    pub const unsafe fn new(header: *mut RingHeader, data: *mut u8) -> Self {
         RingBuffer {
             header: NonNull::new(header).expect("header pointer must be valid"),
             storage: NonNull::new(data).expect("ring buffer pointer must be valid"),
@@ -35,20 +42,23 @@ impl RingBuffer {
         }
     }
 
-    fn header(&self) -> &RingHeader {
+    const fn header(&self) -> &RingHeader {
+        // SAFETY: указатель на заголовок валиден и выровнен на всё время жизни
+        // `self` (инвариант `RingBuffer::new`); все поля атомарные, поэтому
+        // shared-ссылки достаточно и для записи.
         unsafe { self.header.as_ref() }
     }
 
-    fn data_ptr(&self) -> *mut u8 {
+    const fn data_ptr(&self) -> *mut u8 {
         self.storage.as_ptr()
     }
 
-    fn available_bytes(&self, write: u32, read: u32) -> i64 {
+    const fn available_bytes(&self, write: u32, read: u32) -> i64 {
         let used = write.wrapping_sub(read);
         self.capacity as i64 - used as i64
     }
 
-    fn mask_index(&self, pos: u32) -> usize {
+    const fn mask_index(&self, pos: u32) -> usize {
         (pos & RING_MASK) as usize
     }
 
@@ -57,7 +67,7 @@ impl RingBuffer {
     /// отсутствие выхода за пределы `storage`; сам `copy_into` этого не
     /// проверяет -- проверки границ выполняются в `copy_into_wrapped` через
     /// модульную арифметику до вызова).
-    unsafe fn copy_into(&self, index: usize, data: &[u8]) {
+    const unsafe fn copy_into(&self, index: usize, data: &[u8]) {
         // SAFETY: storage валиден на всё время жизни self (гарантия
         // конструктора RingBuffer::new); index+data.len() <= capacity --
         // инвариант вызывающей стороны (см. doc выше).
@@ -69,7 +79,7 @@ impl RingBuffer {
 
     /// # Safety
     /// `index + dst.len() <= capacity` (см. `copy_into`).
-    unsafe fn copy_from(&self, index: usize, dst: &mut [u8]) {
+    const unsafe fn copy_from(&self, index: usize, dst: &mut [u8]) {
         // SAFETY: storage валиден на всё время жизни self; index+dst.len()
         // <= capacity -- инвариант вызывающей стороны (см. doc выше).
         unsafe {
@@ -103,9 +113,11 @@ impl RingBuffer {
             // SAFETY: start+data.len() <= capacity -- проверено веткой if.
             unsafe { self.copy_into(start, data) };
         } else {
-            // SAFETY: обе части (`first` и остаток) укладываются в
-            // [0, capacity) по построению (start+first == capacity).
+            // SAFETY: первая часть укладывается в [start, capacity) по построению
+            // (start+first == capacity).
             unsafe { self.copy_into(start, &data[..first]) };
+            // SAFETY: остаток укладывается в [0, capacity): его длина равна
+            // data.len()-first, а data.len() <= capacity (контракт функции).
             unsafe { self.copy_into(0, &data[first..]) };
         }
     }
@@ -120,9 +132,11 @@ impl RingBuffer {
             // SAFETY: start+dst.len() <= capacity -- проверено веткой if.
             unsafe { self.copy_from(start, dst) };
         } else {
-            // SAFETY: обе части укладываются в [0, capacity) по построению
+            // SAFETY: первая часть укладывается в [start, capacity) по построению
             // (start+first == capacity), как и в copy_into_wrapped.
             unsafe { self.copy_from(start, &mut dst[..first]) };
+            // SAFETY: остаток укладывается в [0, capacity): его длина равна
+            // dst.len()-first, а dst.len() <= capacity (контракт функции).
             unsafe { self.copy_from(0, &mut dst[first..]) };
         }
     }
@@ -257,18 +271,26 @@ impl RingBuffer {
             // ОПТИМИСТИЧНОЕ копирование ДО фиксации read_pos (seqlock-паттерн).
             // Если producer перезапишет слот во время копирования, CAS ниже
             // провалится, и мы отбросим эту (потенциально битую) копию.
-            // SAFETY: clear + reserve гарантируют capacity >= msg_len; copy_from_wrapped
-            // читает строго в пределах кольца (wrap по модулю capacity).
+            //
+            // Заполняем именно неинициализированный хвост (`spare_capacity_mut`),
+            // а `set_len` двигаем ПОСЛЕ записи: обратный порядок на мгновение
+            // создавал `&mut [u8]` на неинициализированную память -- UB по букве
+            // правил, даже если на x86 это работало (аудит 2026-07-28).
             out.clear();
             out.reserve(msg_len);
-            debug_assert!(out.capacity() >= msg_len);
+            let spare = &mut out.spare_capacity_mut()[..msg_len];
+            // SAFETY: `spare` -- ровно msg_len байт выделенной (пусть и
+            // неинициализированной) памяти вектора; copy_from_wrapped пишет
+            // строго в пределах кольца (wrap по модулю capacity) и заполняет
+            // весь срез целиком.
             unsafe {
-                out.set_len(msg_len);
                 self.copy_from_wrapped(
                     (idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize),
-                    out.as_mut_slice(),
+                    spare.assume_init_mut(),
                 );
             }
+            // SAFETY: первые msg_len байт только что инициализированы выше.
+            unsafe { out.set_len(msg_len) };
 
             // Барьер компилятора: копирование не должно «переехать» НИЖЕ CAS,
             // иначе валидация теряет смысл. На x86 успешный lock cmpxchg также
@@ -308,9 +330,9 @@ impl RingBuffer {
 mod overflow_race_tests {
     use super::*;
     use crate::layout::RingHeader;
-    use std::alloc::{alloc_zeroed, dealloc, Layout};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+    use std::alloc::{Layout, alloc_zeroed, dealloc};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
     use std::thread;
 
     /// Владелец сырой выровненной памяти под один RingHeader + RING_CAPACITY.
@@ -318,7 +340,12 @@ mod overflow_race_tests {
         ptr: *mut u8,
         layout: Layout,
     }
+    // SAFETY: владеет единственным блоком памяти, освобождает его ровно один раз
+    // в Drop; доступ к содержимому идёт только через `RingBuffer` (атомарные
+    // операции), поэтому передача владения между потоками безопасна.
     unsafe impl Send for RingMem {}
+    // SAFETY: см. выше -- сам `RingMem` не даёт доступа к памяти, он только
+    // владеет ей и освобождает.
     unsafe impl Sync for RingMem {}
     impl Drop for RingMem {
         fn drop(&mut self) {
@@ -328,13 +355,13 @@ mod overflow_race_tests {
     }
 
     fn make_ring() -> (RingBuffer, RingMem) {
-        let header_size = std::mem::size_of::<RingHeader>();
+        let header_size = size_of::<RingHeader>();
         let total = header_size + RING_CAPACITY;
         let layout = Layout::from_size_align(total, 64).unwrap();
         // SAFETY: ненулевой размер; зануление валидно для AtomicU32 полей.
         let ptr = unsafe { alloc_zeroed(layout) };
         assert!(!ptr.is_null(), "alloc failed");
-        let header = ptr as *mut RingHeader;
+        let header = ptr.cast::<RingHeader>();
         // SAFETY: ptr выровнен на 64 и указывает на зануленный RingHeader.
         unsafe { (*header).reset(1) };
         // SAFETY: data сразу за заголовком, в пределах выделения.
@@ -408,7 +435,6 @@ mod overflow_race_tests {
         };
 
         let consumer = {
-            let ring = ring.clone();
             let stop = stop.clone();
             let torn = torn.clone();
             let reads = reads.clone();
