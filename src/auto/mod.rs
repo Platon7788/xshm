@@ -123,36 +123,13 @@ enum WorkerCommand {
     Shutdown,
 }
 
-struct SendQueue {
-    queue: Mutex<VecDeque<Vec<u8>>>,
-}
-
-impl SendQueue {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    fn push(&self, data: Vec<u8>) {
-        let mut guard = self.queue.lock().unwrap();
-        guard.push_back(data);
-    }
-
-    fn pop(&self) -> Option<Vec<u8>> {
-        let mut guard = self.queue.lock().unwrap();
-        guard.pop_front()
-    }
-
-    fn push_front(&self, data: Vec<u8>) {
-        let mut guard = self.queue.lock().unwrap();
-        guard.push_front(data);
-    }
-
-    fn len(&self) -> usize {
-        self.queue.lock().unwrap().len()
-    }
-}
+/// Очередь неотправленных сообщений worker-потока.
+///
+/// Никакой синхронизации: создаётся ВНУТРИ `server_worker`/`client_worker` и
+/// видна только этому потоку (внешние отправители кладут сообщения через
+/// `mpsc::Sender`, а не сюда). Раньше здесь был `Mutex<VecDeque<..>>` -- три
+/// захвата lock-а на каждое сообщение без единого конкурента.
+type SendQueue = VecDeque<Vec<u8>>;
 
 pub struct AutoServer {
     cmd_tx: Sender<WorkerCommand>,
@@ -170,7 +147,6 @@ impl AutoServer {
         let join_running = running.clone();
         let join_stats = stats.clone();
         let join_handler = handler.clone();
-        let name_str = name.to_owned();
         // Thread name in debug only (opaque short tag `xsa-{name}` so
         // local traces still line up with the segment), anonymous in
         // release so Process Explorer / Process Hacker doesn't surface
@@ -179,12 +155,11 @@ impl AutoServer {
         let mut builder = thread::Builder::new();
         #[cfg(debug_assertions)]
         {
-            builder = builder.name(format!("xsa-{}", name));
+            builder = builder.name(format!("xsa-{name}"));
         }
         let join = builder
             .spawn(move || {
                 server_worker(
-                    &name_str,
                     &mut server,
                     join_handler,
                     options,
@@ -232,7 +207,6 @@ impl Drop for AutoServer {
 }
 
 fn server_worker(
-    _name: &str,
     server: &mut SharedServer,
     handler: Arc<dyn AutoHandler>,
     options: AutoOptions,
@@ -240,12 +214,18 @@ fn server_worker(
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
 ) {
-    let send_queue = SendQueue::new();
+    let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
-    // Anonymous режим не поддерживается в auto-mode
-    let server_events = server
-        .events()
-        .expect("Anonymous mode not supported in auto-mode");
+    // Anonymous-сервер не имеет событий, а auto-mode построен на ожидании
+    // событий -- сообщаем об этом через handler и выходим, а не паникуем в
+    // worker-потоке (аудит 2026-07-28: `expect()` в библиотечном коде).
+    // Практически недостижимо: AutoServer::start всегда поднимает named-сервер.
+    let Some(server_events) = server.events() else {
+        handler.on_error(ShmError::InvalidConfig(
+            "anonymous server is not supported in auto-mode",
+        ));
+        return;
+    };
     let handles = [
         server_events.disconnect.raw_handle(),
         server_events.c2s.data.raw_handle(),
@@ -262,18 +242,39 @@ fn server_worker(
                     handler.on_connect();
                 }
                 Err(ShmError::Timeout) => {
-                    drain_commands(&send_queue, &cmd_rx, &options, &running);
+                    drain_commands(
+                        &mut send_queue,
+                        &cmd_rx,
+                        &options,
+                        &running,
+                        &handler,
+                        ChannelKind::ServerToClient,
+                    );
                     continue;
                 }
                 Err(err) => {
                     handler.on_error(err.clone());
-                    drain_commands(&send_queue, &cmd_rx, &options, &running);
+                    drain_commands(
+                        &mut send_queue,
+                        &cmd_rx,
+                        &options,
+                        &running,
+                        &handler,
+                        ChannelKind::ServerToClient,
+                    );
                     continue;
                 }
             }
         }
 
-        drain_commands(&send_queue, &cmd_rx, &options, &running);
+        drain_commands(
+            &mut send_queue,
+            &cmd_rx,
+            &options,
+            &running,
+            &handler,
+            ChannelKind::ServerToClient,
+        );
 
         if !connected {
             continue;
@@ -281,7 +282,7 @@ fn server_worker(
 
         process_send_queue(
             server,
-            &send_queue,
+            &mut send_queue,
             &handler,
             &stats,
             ChannelKind::ServerToClient,
@@ -351,8 +352,16 @@ impl AutoClient {
         let handler_clone = handler.clone();
         let name_str = name.to_owned();
 
-        let join = thread::Builder::new()
-            .name(format!("xshm-auto-client-{}", name))
+        // Имя потока -- только в debug (короткий непрозрачный тег), как у
+        // AutoServer: в release имя потока не должно светить ни библиотеку,
+        // ни имя канала в Process Explorer / Process Hacker.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsc-{name}"));
+        }
+        let join = builder
             .spawn(move || {
                 client_worker(
                     &name_str,
@@ -410,7 +419,7 @@ fn client_worker(
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
 ) {
-    let send_queue = SendQueue::new();
+    let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
 
     while running.load(Ordering::Acquire) {
@@ -439,10 +448,17 @@ fn client_worker(
                 break;
             }
 
-            drain_commands(&send_queue, &cmd_rx, &options, &running);
+            drain_commands(
+                &mut send_queue,
+                &cmd_rx,
+                &options,
+                &running,
+                &handler,
+                ChannelKind::ClientToServer,
+            );
             process_send_queue(
                 &client,
-                &send_queue,
+                &mut send_queue,
                 &handler,
                 &stats,
                 ChannelKind::ClientToServer,
@@ -489,20 +505,28 @@ fn client_worker(
     }
 }
 
+/// Переносит команды из mpsc-канала в очередь отправки.
+///
+/// При переполнении (`max_send_queue`) вытесняется САМОЕ СТАРОЕ сообщение, а
+/// вызывающему сообщается об этом через `AutoHandler::on_overflow` -- раньше
+/// потеря была полностью молчаливой (аудит 2026-07-28), в отличие от
+/// симметричного `MultiClientHandler::on_overflow`.
 fn drain_commands(
-    queue: &SendQueue,
+    queue: &mut SendQueue,
     rx: &Receiver<WorkerCommand>,
     options: &AutoOptions,
     running: &Arc<AtomicBool>,
+    handler: &Arc<dyn AutoHandler>,
+    direction: ChannelKind,
 ) {
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
             WorkerCommand::Send(msg) => {
                 if queue.len() >= options.max_send_queue {
-                    // drop oldest (overwrite semantics)
-                    let _ = queue.pop();
+                    queue.pop_front();
+                    handler.on_overflow(direction, 1);
                 }
-                queue.push(msg);
+                queue.push_back(msg);
             }
             WorkerCommand::Shutdown => {
                 running.store(false, Ordering::Release);
@@ -513,14 +537,14 @@ fn drain_commands(
 
 fn process_send_queue<E>(
     endpoint: &E,
-    queue: &SendQueue,
+    queue: &mut SendQueue,
     handler: &Arc<dyn AutoHandler>,
     stats: &Arc<AutoStats>,
     direction: ChannelKind,
 ) where
     E: SendEndpoint,
 {
-    while let Some(msg) = queue.pop() {
+    while let Some(msg) = queue.pop_front() {
         match endpoint.write(&msg) {
             Ok(outcome) => {
                 stats.sent_messages.fetch_add(1, Ordering::Relaxed);
