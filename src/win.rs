@@ -31,9 +31,9 @@ use crate::ntapi::{
     NtWaitForMultipleObjects,
     NtWaitForSingleObject,
     NullDaclSecurityDescriptor,
-    EVENT_ALL_ACCESS,
     // Types
     CLIENT_ID,
+    EVENT_ALL_ACCESS,
     HANDLE,
     LARGE_INTEGER,
     NTSTATUS,
@@ -106,7 +106,6 @@ fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
 
 pub struct EventHandle {
     handle: Handle,
-    _name: String,
 }
 
 unsafe impl Send for EventHandle {}
@@ -138,7 +137,6 @@ impl EventHandle {
 
         Ok(EventHandle {
             handle: Handle(handle),
-            _name: name.to_owned(),
         })
     }
 
@@ -158,7 +156,6 @@ impl EventHandle {
 
         Ok(EventHandle {
             handle: Handle(handle),
-            _name: name.to_owned(),
         })
     }
 
@@ -214,8 +211,10 @@ impl EventHandle {
 pub struct Mapping {
     _handle: Handle,
     view: *mut u8,
-    _size: usize,
-    _name: String,
+    /// Фактический размер отображённого view (из `NtMapViewOfSection`).
+    /// Проверяется против `shared_mapping_size()` при открытии чужой секции --
+    /// см. `Mapping::open`.
+    size: usize,
 }
 
 unsafe impl Send for Mapping {}
@@ -228,7 +227,7 @@ impl Mapping {
     }
 
     /// Внутренний метод создания секции (общая логика для named и anonymous)
-    fn create_internal(object_name: *mut UNICODE_STRING, name_for_storage: String) -> Result<Self> {
+    fn create_internal(object_name: *mut UNICODE_STRING) -> Result<Self> {
         let size = shared_mapping_size();
         let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr = OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, sd.as_ptr());
@@ -300,15 +299,17 @@ impl Mapping {
         Ok(Mapping {
             _handle: handle,
             view: base_address as *mut u8,
-            _size: size,
-            _name: name_for_storage,
+            // Секцию создали мы сами ровно на `size` байт; NtMapViewOfSection
+            // с ViewSize=0 отображает её целиком, но округляет до страницы --
+            // берём максимум, чтобы size() не занижал доступный диапазон.
+            size: view_size.max(size),
         })
     }
 
     /// Создание секции через NtCreateSection с NULL DACL
     pub fn create(name: &str) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        Self::create_internal(nt_name.as_ptr(), name.to_owned())
+        Self::create_internal(nt_name.as_ptr())
     }
 
     /// Создание anonymous секции без имени (только через handle)
@@ -329,12 +330,18 @@ impl Mapping {
     /// все равно является указателем на структуру, а не NULL, поэтому создаст
     /// именованную секцию (которая, вероятно, завершится ошибкой из-за невалидного имени).
     pub fn create_anonymous() -> Result<Self> {
-        Self::create_internal(null_mut(), String::new())
+        Self::create_internal(null_mut())
     }
 
-    /// Открытие секции через NtOpenSection
+    /// Открытие секции через NtOpenSection.
+    ///
+    /// Отображённый view ОБЯЗАН быть не меньше `shared_mapping_size()`: имя в
+    /// `\BaseNamedObjects` может занять кто угодно (NULL DACL, namespace общий),
+    /// и секция меньшего размера превратила бы штатный доступ к ring buffer'ам
+    /// в чтение/запись за пределами отображения. Проверка размера -- граница
+    /// доверия к чужой секции наравне с magic/version (аудит 2026-07-28).
     pub fn open(name: &str) -> Result<Self> {
-        let size = shared_mapping_size();
+        let required = shared_mapping_size();
         let mut nt_name = NtName::new(name)?;
         let mut obj_attr =
             OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
@@ -373,12 +380,19 @@ impl Mapping {
             return Err(status_to_error(status, "NtMapViewOfSection"));
         }
 
-        Ok(Mapping {
+        let mapping = Mapping {
             _handle: handle,
             view: base_address as *mut u8,
-            _size: size,
-            _name: name.to_owned(),
-        })
+            size: view_size,
+        };
+
+        // Проверка ПОСЛЕ конструирования Mapping: так view гарантированно
+        // размапится через Drop, даже если секция окажется слишком мала.
+        if mapping.size < required {
+            return Err(ShmError::Corrupted);
+        }
+
+        Ok(mapping)
     }
 
     pub fn as_ptr(&self) -> *mut u8 {
@@ -510,6 +524,43 @@ mod tests {
     #[test]
     fn own_process_is_alive() {
         assert!(is_process_alive(std::process::id()));
+    }
+
+    /// Регрессия (аудит 2026-07-28): `Mapping::open` доверял чужой секции и
+    /// не сверял её размер. Любой процесс может первым занять имя в
+    /// `\BaseNamedObjects` (NULL DACL, общий namespace) и создать секцию
+    /// меньше `shared_mapping_size()` -- дальнейший штатный доступ к ring
+    /// buffer'ам ушёл бы ЗА пределы отображения.
+    #[test]
+    fn open_rejects_undersized_section() {
+        let name = format!("XSHM_TEST_SMALL_SECTION_{}", std::process::id());
+
+        let mut nt_name = NtName::new(&name).expect("nt name");
+        let mut sd = NullDaclSecurityDescriptor::new();
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
+        let mut handle: HANDLE = null_mut();
+        let mut max_size = LARGE_INTEGER { QuadPart: 4096 };
+
+        // SAFETY: все указатели валидны и живут до конца вызова.
+        let status = unsafe {
+            NtCreateSection(
+                &mut handle,
+                SECTION_ALL_ACCESS,
+                &mut obj_attr,
+                &mut max_size,
+                PAGE_READWRITE,
+                SEC_COMMIT,
+                null_mut(),
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS, "не удалось создать тестовую секцию");
+        let _owner = Handle(handle); // держим секцию живой + RAII-закрытие
+
+        match Mapping::open(&name) {
+            Err(ShmError::Corrupted) => {}
+            other => panic!("секция 4 КБ должна отвергаться, получено: {other:?}"),
+        }
     }
 
     #[test]
