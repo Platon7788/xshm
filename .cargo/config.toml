@@ -1,11 +1,8 @@
+# Статический CRT: у итогового бинаря нет зависимости от vcruntime/msvcrt DLL.
+# Только MSVC-таргеты -- MinGW-варианты убраны вместе с C/C++ FFI (0.7.0):
+# крейт чисто Rust-овый, GNU-ABI потребителей не осталось.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
-rustflags = ["-C", "target-feature=+crt-static"]
-
-[target.x86_64-pc-windows-gnu]
-rustflags = ["-C", "target-feature=+crt-static"]
-
-[target.i686-pc-windows-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]

@@ -1,6 +1,6 @@
 [package]
 name = "xshm"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 description = "High-performance cross-process shared memory IPC using direct NT API calls"
 authors = ["Platon"]
@@ -9,10 +9,7 @@ repository = "https://github.com/Platon7788/xshm"
 
 [lib]
 name = "xshm"
-crate-type = ["rlib", "staticlib"]
-
-[build-dependencies]
-cbindgen = "0.29"
+crate-type = ["rlib"]
 
 [dependencies]
 thiserror = "2"
