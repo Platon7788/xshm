@@ -4,7 +4,6 @@
 //! Никакого GetProcAddress, никакого TLS.
 
 #![allow(non_snake_case)]
-#![allow(dead_code)]
 
 use super::types::*;
 
@@ -61,9 +60,6 @@ extern "system" {
 
     /// Установка события в сигнальное состояние
     pub fn NtSetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
-
-    /// Сброс события
-    pub fn NtResetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
 
     // ========================================================================
     // Wait operations

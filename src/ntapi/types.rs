@@ -4,7 +4,6 @@
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
-#![allow(dead_code)]
 #![allow(clippy::upper_case_acronyms)]
 
 use core::ffi::c_void;
@@ -229,8 +228,6 @@ pub const EVENT_ALL_ACCESS: ACCESS_MASK = 0x001F0003;
 
 /// SynchronizationEvent - auto-reset event
 pub const SYNCHRONIZATION_EVENT: ULONG = 1;
-/// NotificationEvent - manual-reset event
-pub const NOTIFICATION_EVENT: ULONG = 0;
 
 // ============================================================================
 // Константы для Wait
@@ -238,5 +235,3 @@ pub const NOTIFICATION_EVENT: ULONG = 0;
 
 /// WaitAny - вернуться когда любой объект сигнализирован
 pub const WAIT_ANY: ULONG = 1;
-/// WaitAll - вернуться когда все объекты сигнализированы
-pub const WAIT_ALL: ULONG = 0;

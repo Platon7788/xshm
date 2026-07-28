@@ -83,3 +83,20 @@ pub const fn shared_mapping_size() -> usize {
         + core::mem::size_of::<RingHeader>() * 2
         + RING_CAPACITY * 2
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Размеры структур -- часть wire-формата: любое изменение ломает
+    /// совместимость с уже собранными пирами и с kernel-драйвером.
+    #[test]
+    fn layout_sizes_are_exact() {
+        assert_eq!(core::mem::size_of::<ControlBlock>(), 64);
+        assert_eq!(core::mem::align_of::<ControlBlock>(), 64);
+        assert_eq!(core::mem::size_of::<RingHeader>(), 64);
+        assert_eq!(core::mem::align_of::<RingHeader>(), 64);
+        assert_eq!(shared_mapping_size(), 64 + 2 * 64 + 2 * RING_CAPACITY);
+        assert_eq!(shared_mapping_size(), 4_194_496);
+    }
+}

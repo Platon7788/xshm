@@ -10,7 +10,6 @@ use crate::shared::SharedView;
 use crate::win::Mapping;
 
 pub struct SharedServer {
-    _name: String,
     _mapping: Mapping,
     view: SharedView,
     events: Option<SharedEvents>, // None для anonymous режима
@@ -45,7 +44,6 @@ impl SharedServer {
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
 
         Ok(Self {
-            _name: name.to_owned(),
             _mapping: mapping,
             view,
             events: Some(events),
@@ -89,7 +87,6 @@ impl SharedServer {
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
 
         Ok(Self {
-            _name: String::new(), // Anonymous - нет имени
             _mapping: mapping,
             view,
             events: None, // No events for anonymous mode
@@ -121,48 +118,16 @@ impl SharedServer {
             return Err(ShmError::Timeout);
         }
 
-        let control = self.view.control_block();
-        let client_state = control.client_state.load(Ordering::Acquire);
+        let client_state = self
+            .view
+            .control_block()
+            .client_state
+            .load(Ordering::Acquire);
         if client_state != HANDSHAKE_CLIENT_HELLO {
             return Err(ShmError::HandshakeFailed);
         }
 
-        // ВАЖНО: сначала сбрасываем буферы, потом обновляем generation
-        // Это гарантирует, что клиент увидит чистые буферы когда прочитает новый generation
-        let current_gen = control.generation.load(Ordering::Acquire);
-        let new_generation = current_gen.wrapping_add(1);
-
-        unsafe {
-            (&*self.view.ring_header_a()).reset(new_generation);
-            (&*self.view.ring_header_b()).reset(new_generation);
-        }
-
-        // Теперь атомарно публикуем новый generation
-        control.generation.store(new_generation, Ordering::Release);
-
-        let header_a = unsafe { &*self.view.ring_header_a() };
-        let header_b = unsafe { &*self.view.ring_header_b() };
-
-        header_a
-            .handshake_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        header_b
-            .handshake_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-
-        control
-            .server_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        control
-            .client_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-
-        // Anonymous режим не поддерживается в named режиме (здесь events всегда Some)
-        if let Some(events) = &self.events {
-            events.connect_ack.set()?;
-        }
-        self.connected = true;
-        Ok(())
+        self.complete_handshake()
     }
 
     /// Ожидание клиента без событий (polling по shared memory).
@@ -190,27 +155,38 @@ impl SharedServer {
             std::thread::sleep(Duration::from_millis(1));
         }
 
-        // ВАЖНО: сначала сбрасываем буферы, потом обновляем generation
-        let current_gen = control.generation.load(Ordering::Acquire);
-        let new_generation = current_gen.wrapping_add(1);
+        self.complete_handshake()
+    }
 
+    /// Завершение серверной стороны handshake, общее для событийного и
+    /// polling-путей: сброс колец -> публикация нового generation ->
+    /// SERVER_READY -> сигнал connect_ack.
+    ///
+    /// Порядок критичен: буферы сбрасываются ДО публикации generation
+    /// (`Release`), поэтому клиент, прочитавший новый generation (`Acquire`),
+    /// гарантированно видит уже очищенные кольца.
+    fn complete_handshake(&mut self) -> Result<()> {
+        let control = self.view.control_block();
+        let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
+
+        // SAFETY: указатели заголовков валидны, пока жив `_mapping` (инвариант
+        // SharedView), а `&mut self` исключает конкурентный доступ с нашей стороны.
         unsafe {
-            (&*self.view.ring_header_a()).reset(new_generation);
-            (&*self.view.ring_header_b()).reset(new_generation);
+            (*self.view.ring_header_a()).reset(new_generation);
+            (*self.view.ring_header_b()).reset(new_generation);
         }
 
-        // Теперь атомарно публикуем новый generation
         control.generation.store(new_generation, Ordering::Release);
 
-        let header_a = unsafe { &*self.view.ring_header_a() };
-        let header_b = unsafe { &*self.view.ring_header_b() };
-
-        header_a
-            .handshake_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        header_b
-            .handshake_state
-            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        // SAFETY: см. выше.
+        unsafe {
+            (*self.view.ring_header_a())
+                .handshake_state
+                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+            (*self.view.ring_header_b())
+                .handshake_state
+                .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        }
 
         control
             .server_state
@@ -219,11 +195,16 @@ impl SharedServer {
             .client_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
+        // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
+        // опросом `server_state`.
+        if let Some(events) = &self.events {
+            events.connect_ack.set()?;
+        }
         self.connected = true;
         Ok(())
     }
 
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         self.connected
     }
 
@@ -236,7 +217,7 @@ impl SharedServer {
     }
 
     /// Проверка, является ли сервер anonymous (без имени и events)
-    pub fn is_anonymous(&self) -> bool {
+    pub const fn is_anonymous(&self) -> bool {
         self.events.is_none()
     }
 

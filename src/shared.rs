@@ -30,7 +30,7 @@ impl SharedView {
         unsafe { &*(self.base.as_ptr() as *const ControlBlock) }
     }
 
-    pub fn control_block_ptr(&self) -> *mut ControlBlock {
+    pub const fn control_block_ptr(&self) -> *mut ControlBlock {
         self.base.as_ptr() as *mut ControlBlock
     }
 

@@ -13,12 +13,9 @@ mod win;
 
 pub mod auto;
 pub mod dispatch;
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub mod ffi;
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub mod multi;
 
-// Внутренний модуль - не экспортируется в C API
+// Внутренний модуль - деталь реализации, не часть публичного API
 pub(crate) mod ntapi;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
@@ -108,13 +105,16 @@ mod tests {
         assert!(server_result.is_ok());
     }
 
+    /// Накопитель принятых сообщений + Condvar для пробуждения ожидающего.
+    type MessageLog = Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>;
+
     #[derive(Clone)]
     struct CaptureHandler {
-        buffer: Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>,
+        buffer: MessageLog,
     }
 
     impl CaptureHandler {
-        fn new() -> (Self, Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>) {
+        fn new() -> (Self, MessageLog) {
             let shared = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
             (
                 CaptureHandler {
@@ -124,7 +124,7 @@ mod tests {
             )
         }
 
-        fn wait_for(shared: &Arc<(Mutex<Vec<Vec<u8>>>, Condvar)>, expected: &[u8]) {
+        fn wait_for(shared: &MessageLog, expected: &[u8]) {
             let (lock, cv) = &**shared;
             let mut guard = lock.lock().unwrap();
             const TIMEOUT: Duration = Duration::from_secs(2);

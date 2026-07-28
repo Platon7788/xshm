@@ -1,7 +1,5 @@
 //! Вспомогательные функции для работы с NT API
 
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
@@ -138,22 +136,6 @@ impl NtName {
     pub fn as_ptr(&mut self) -> *mut UNICODE_STRING {
         &mut self.unicode
     }
-}
-
-// ============================================================================
-// NTSTATUS helpers
-// ============================================================================
-
-/// Проверка успешности NTSTATUS
-#[inline]
-pub fn nt_success(status: NTSTATUS) -> bool {
-    status >= 0
-}
-
-/// Проверка на timeout
-#[inline]
-pub fn is_timeout(status: NTSTATUS) -> bool {
-    status == STATUS_TIMEOUT
 }
 
 // ============================================================================

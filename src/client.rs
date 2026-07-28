@@ -11,8 +11,27 @@ use crate::ring::{RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::Mapping;
 
+/// Откат клиентской стороны handshake в IDLE.
+///
+/// Вызывается на всех неуспешных путях `SharedClient::connect`: без него в
+/// shared memory остался бы «висящий» `CLIENT_HELLO`, который сервер принял бы
+/// за живую заявку на подключение.
+fn rollback_handshake(view: &SharedView) {
+    view.control_block()
+        .client_state
+        .store(HANDSHAKE_IDLE, Ordering::Release);
+    // SAFETY: заголовки валидны, пока жив `Mapping`, из которого построен view.
+    unsafe {
+        (*view.ring_header_a())
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        (*view.ring_header_b())
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+    }
+}
+
 pub struct SharedClient {
-    _name: String,
     _mapping: Mapping,
     view: SharedView,
     events: SharedEvents,
@@ -56,32 +75,12 @@ impl SharedClient {
         events.connect_req.set()?;
 
         if !events.connect_ack.wait(Some(timeout))? {
-            view.control_block()
-                .client_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-            unsafe {
-                (&*view.ring_header_a())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-                (&*view.ring_header_b())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-            }
+            rollback_handshake(&view);
             return Err(ShmError::Timeout);
         }
 
         if view.control_block().server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
-            view.control_block()
-                .client_state
-                .store(HANDSHAKE_IDLE, Ordering::Release);
-            unsafe {
-                (&*view.ring_header_a())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-                (&*view.ring_header_b())
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-            }
+            rollback_handshake(&view);
             return Err(ShmError::HandshakeFailed);
         }
 
@@ -105,7 +104,6 @@ impl SharedClient {
         let ring_rx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
 
         let client = Self {
-            _name: name.to_owned(),
             _mapping: mapping,
             view,
             events,
@@ -117,7 +115,7 @@ impl SharedClient {
         Ok(client)
     }
 
-    pub fn is_connected(&self) -> bool {
+    pub const fn is_connected(&self) -> bool {
         self.connected
     }
 

@@ -43,16 +43,6 @@ impl RingBuffer {
         self.storage.as_ptr()
     }
 
-    #[allow(dead_code)]
-    pub fn capacity(&self) -> u32 {
-        self.capacity
-    }
-
-    #[allow(dead_code)]
-    pub fn reset(&self, generation: u32) {
-        self.header().reset(generation);
-    }
-
     fn available_bytes(&self, write: u32, read: u32) -> i64 {
         let used = write.wrapping_sub(read);
         self.capacity as i64 - used as i64
@@ -307,11 +297,6 @@ impl RingBuffer {
 
     pub fn message_count(&self) -> u32 {
         self.header().message_count.load(Ordering::Acquire)
-    }
-
-    #[allow(dead_code)]
-    pub fn drop_count(&self) -> u32 {
-        self.header().drop_count.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
