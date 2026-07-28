@@ -322,16 +322,3 @@ fn test_bidirectional_ordering_stress() {
         "Client should receive most messages"
     );
 }
-
-/// Тест: проверка что compile-time assert работает (этот тест всегда проходит на x86/x64)
-#[test]
-fn test_architecture_supported() {
-    #[cfg(target_arch = "x86")]
-    println!("Running on x86 (32-bit)");
-
-    #[cfg(target_arch = "x86_64")]
-    println!("Running on x86_64 (64-bit)");
-
-    // Если мы здесь - значит архитектура поддерживается
-    assert!(cfg!(any(target_arch = "x86", target_arch = "x86_64")));
-}

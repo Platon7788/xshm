@@ -244,7 +244,7 @@ fn test_multi_multiple_clients_auto_slot() {
         let ch = Arc::new(TestClientHandler::new());
         println!("[TEST] Connecting client {}...", i);
         let client = MultiClient::connect(&base_name, ch.clone(), MultiClientOptions::default())
-            .expect(&format!("Client {} connect", i));
+            .unwrap_or_else(|e| panic!("Client {i} connect: {e:?}"));
 
         // Ждём подключения каждого клиента
         assert!(
@@ -291,7 +291,7 @@ fn test_multi_multiple_clients_auto_slot() {
         let msg = format!("Hello from client {}", i);
         client
             .send(msg.as_bytes())
-            .expect(&format!("Client {} send", i));
+            .unwrap_or_else(|e| panic!("Client {i} send: {e:?}"));
     }
 
     // Сервер должен получить все
