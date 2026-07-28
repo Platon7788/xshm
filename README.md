@@ -27,6 +27,7 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 - ✅ **Pure Rust crate** (breaking) — the entire C/C++ FFI layer is gone: `ffi.rs`, `multi/ffi.rs`, `dispatch/ffi.rs`, the `cbindgen` build step, the generated `include/*.h` headers and the `staticlib` crate type. `xshm` now builds as an `rlib` only and is consumed from Rust. A separate synchronous C23 project covers native consumers.
 - ✅ **Zero build dependencies** — `build.rs` now does nothing but `cargo:rustc-link-lib=ntdll`; `thiserror` remains the only runtime dependency
+- ✅ **Edition 2024 / modern Rust** — `unsafe extern` for NT imports, if-let chains, strict provenance (`.addr()` / `without_provenance_mut`) instead of `as` casts between ints and pointers, `MaybeUninit` + `spare_capacity_mut` instead of `set_len`-before-write, lint policy in the manifest with `undocumented_unsafe_blocks = "deny"`, `Debug` and `#[must_use]` across the public API
 - ✅ **Full audit pass** — `Global\` naming actually works now (cross-session IPC was broken before), `Mapping::open` rejects undersized sections, `MultiClient::is_connected()`/`DispatchClient::is_connected()` stopped lying after teardown, send-queue overflow is reported through `on_overflow`, all `expect()` panics removed from worker threads
 
 ## Previously in v0.6.0
@@ -137,7 +138,7 @@ Channel events always land in the same namespace as the section.
 ## Requirements
 
 - Windows 10/11
-- Rust 1.82+ (stable) — the codebase uses the `#[unsafe(...)]` attribute syntax; developed/tested against 1.97
+- Rust 1.97+ (stable) — edition 2024 and `rust-version = "1.97"` in the manifest
 - MSVC toolchain (MinGW targets were dropped in 0.7.0 together with the C ABI)
 - **No administrator privileges required** — named kernel objects are session-scoped (`Local\` prefix → `\Sessions\<SessionId>\BaseNamedObjects\`). Elevated rights are only needed if you explicitly use the `Global\` prefix
 
