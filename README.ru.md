@@ -4,10 +4,10 @@
 
 **Высокопроизводительный межпроцессный IPC через shared memory для Windows**
 
-Двунаправленный обмен сообщениями через lock-free SPSC кольцевые буферы, поверх прямых вызовов NT API. Ядро на Rust, полноценный C/C++ FFI.
+Двунаправленный обмен сообщениями через lock-free SPSC кольцевые буферы, поверх прямых вызовов NT API. Чистый Rust-крейт — без C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.6.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,11 +23,17 @@
 
 ---
 
-## 🆕 Что нового в v0.6.0
+## 🆕 Что нового в v0.7.0
+
+- ✅ **Чистый Rust-крейт** (breaking) — весь слой C/C++ FFI удалён: `ffi.rs`, `multi/ffi.rs`, `dispatch/ffi.rs`, сборочный шаг `cbindgen`, сгенерированные заголовки `include/*.h` и crate-type `staticlib`. Крейт собирается только как `rlib` и потребляется из Rust; для нативных потребителей пишется отдельный синхронный проект на C23.
+- ✅ **Ноль build-зависимостей** — `build.rs` теперь делает единственную вещь: `cargo:rustc-link-lib=ntdll`; `thiserror` остаётся единственной runtime-зависимостью
+- ✅ **Полный аудит** — `Global\` в имени канала наконец работает (межсессионный IPC был сломан), `Mapping::open` отвергает секции недостаточного размера, `MultiClient::is_connected()`/`DispatchClient::is_connected()` перестали врать после остановки, переполнение send-очереди сообщается через `on_overflow`, из worker-потоков убраны все `expect()`-паники
+
+## Ранее в v0.6.0
 
 - ✅ **Dispatch-режим** — пятый режим (`DispatchServer`/`DispatchClient`): одно лобби + динамический канал на каждого клиента, без фиксированного верхнего предела числа клиентов
 - ✅ **Редизайн Multi-client** — центральный lobby-сегмент убран. Клиенты теперь конкурентно захватывают свободный слот через lock-free CAS на памяти самого слота — полностью параллельные подключения, без общей точки конкуренции
-- ✅ **Хардненинг** — защита от torn-read при переполнении кольца, обнаружение мёртвых/брошенных слотов (liveness-проверка процесса-владельца), синхронный `stop()` (больше никакого use-after-free через FFI при остановке), ограниченные send-очереди повсюду
+- ✅ **Хардненинг** — защита от torn-read при переполнении кольца, обнаружение мёртвых/брошенных слотов (liveness-проверка процесса-владельца), синхронный `stop()` (после возврата ни один callback уже не вызывается), ограниченные send-очереди повсюду
 - ✅ **Чистка API** (breaking, pre-1.0) — убраны мёртвые поля, унифицированы имена между режимами (`poll_timeout`, `channel_name`), убран автогенерируемый префикс имени объекта — вызывающая сторона теперь полностью владеет видимым именем NT-объекта
 - ✅ **Не требует прав администратора** — именованные объекты по умолчанию session-scoped; повышенные привилегии нужны только при явном использовании `Global\`
 
@@ -37,7 +43,7 @@
 - Lock-free конкурентный доступ: независимые чтение/запись, автоматический overwrite при переполнении, защита от torn-read при переполнении (seqlock-копирование)
 - Синхронизация на событиях NT API для уведомлений о данных/месте/подключении
 - Гарантия чистого старта: буферы сбрасываются при каждом новом подключении с отслеживанием generation
-- Готовые к использованию C-заголовки (`xshm.h`, `xshm_server.h`, `xshm_client.h`) со вспомогательными функциями
+- Трейты-обработчики вместо callback-структур: `AutoHandler`, `MultiHandler`, `MultiClientHandler`, `DispatchHandler`, `DispatchClientHandler`
 - **Auto-режим**: фоновая обработка сообщений с callback'ами (`on_message`/`on_overflow`), автоматический reconnect
 - **Multi-client режим**: один сервер обслуживает до `MAX_MULTI_CLIENTS` (31) клиентов через lock-free конкурентный захват слота
 - **Dispatch-режим**: одно лобби + динамический канал на клиента, вообще без фиксированного числа слотов
@@ -48,15 +54,11 @@
 
 ```mermaid
 flowchart TD
-    App["Ваше приложение (Rust или C/C++)"]
-    App --> FFI["C FFI — ffi.rs / multi/ffi.rs / dispatch/ffi.rs"]
-    App -. напрямую через Rust API .-> Auto
-    App -. напрямую через Rust API .-> Multi
-    App -. напрямую через Rust API .-> Dispatch
-
-    FFI --> Auto["Auto — auto/mod.rs<br/>worker-поток + reconnect"]
-    FFI --> Multi["Multi-client — multi/mod.rs<br/>фиксированные слоты, lock-free захват"]
-    FFI --> Dispatch["Dispatch — dispatch/mod.rs<br/>лобби + динамические каналы"]
+    App["Ваше Rust-приложение"]
+    App --> Auto["Auto — auto/mod.rs<br/>worker-поток + reconnect"]
+    App --> Multi["Multi-client — multi/mod.rs<br/>фиксированные слоты, lock-free захват"]
+    App --> Dispatch["Dispatch — dispatch/mod.rs<br/>лобби + динамические каналы"]
+    App --> Endpoint
 
     Dispatch -. переиспользует .-> Auto
 
@@ -118,11 +120,25 @@ sequenceDiagram
 | Стоимость подключения | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 round-trip к лобби + 1 handshake |
 | Когда использовать | простейший парный IPC, интеграция с драйвером | один пир, нужна устойчивость | известный/ограниченный парк клиентов | размер парка заранее неизвестен |
 
+## Именование каналов
+
+Имя, переданное в конструктор, становится именем kernel-объекта как есть, а
+namespace выбирается по префиксу:
+
+| Что передали | Объект-секция | Namespace |
+|--------------|---------------|-----------|
+| `"Chan"` | `Local\Chan` | session-local |
+| `"Local\Chan"` | `Local\Chan` | session-local (префикс не удваивается) |
+| `"Global\Chan"` | `Global\Chan` | глобальный — нужен для IPC между сессиями (служба в сессии 0 ↔ процесс на десктопе) |
+| `"\BaseNamedObjects\Chan"` | как есть | готовый NT-путь |
+
+События канала всегда попадают в тот же namespace, что и секция.
+
 ## Требования
 
 - Windows 10/11
-- Rust 1.82+ (stable) — кодовая база использует синтаксис атрибутов `#[unsafe(...)]`; разрабатывается и тестируется на 1.96
-- Тулчейн MSVC или MinGW
+- Rust 1.82+ (stable) — кодовая база использует синтаксис атрибутов `#[unsafe(...)]`; разрабатывается и тестируется на 1.97
+- Тулчейн MSVC (MinGW-таргеты убраны в 0.7.0 вместе с C ABI)
 - **Права администратора НЕ требуются** — именованные kernel-объекты session-scoped (префикс `Local\` → `\Sessions\<SessionId>\BaseNamedObjects\`). Повышенные права нужны только при явном использовании префикса `Global\`
 
 ## Зависимости
@@ -141,27 +157,24 @@ thiserror = "2"
 
 ## Сборка
 
-```bash
-# Запуск тестов
-cargo test -- --test-threads=1   # последовательно: тесты делят пространство имён объектов
+Подключается как path- или git-зависимость:
 
-# Сборка статических библиотек
-cargo build --release                                        # x64 MSVC (по умолчанию)
-cargo build --release --target i686-pc-windows-msvc          # x86 MSVC
-cargo build --release --target x86_64-pc-windows-gnu         # x64 MinGW
+```toml
+[dependencies]
+xshm = { path = "../xshm" }
 ```
 
-Выходные файлы:
+```bash
+cargo build --release                                   # x64 MSVC (по умолчанию)
+cargo build --release --target i686-pc-windows-msvc     # x86 MSVC
 
-| Таргет | Debug | Release |
-|--------|-------|---------|
-| MSVC x64 | `target/debug/xshm.lib` | `target/release/xshm.lib` |
-| MSVC x86 | `target/i686-pc-windows-msvc/debug/xshm.lib` | `target/i686-pc-windows-msvc/release/xshm.lib` |
-| MinGW x64 | `target/x86_64-pc-windows-gnu/debug/libxshm.a` | `target/x86_64-pc-windows-gnu/release/libxshm.a` |
+# Запуск тестов
+cargo test -- --test-threads=1   # последовательно: тесты делят пространство имён объектов
+```
 
-Заголовки генерируются автоматически через `cbindgen` во время сборки.
+Крейт собирается только как `rlib`. `build.rs` делает ровно одно — `cargo:rustc-link-lib=ntdll`, — так что `ntdll` линкуется в итоговый бинарь потребителя.
 
-## Использование (Rust)
+## Использование
 
 ```rust
 use std::thread;
@@ -197,7 +210,7 @@ fn main() -> xshm::Result<()> {
 }
 ```
 
-### Auto-режим (Rust)
+### Auto-режим
 
 ```rust
 use std::sync::Arc;
@@ -224,7 +237,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Multi-client режим (Rust)
+### Multi-client режим
 
 Фиксированный пул слотов (по умолчанию 20, жёсткий предел 31). Клиенты
 конкурентно захватывают свободный слот через lock-free CAS — без
@@ -312,7 +325,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Dispatch-режим (Rust)
+### Dispatch-режим
 
 Одно лобби + динамический канал на базе `AutoServer` для каждого клиента.
 В отличие от Multi-client, здесь нет фиксированного числа слотов — выбирайте
@@ -376,171 +389,6 @@ fn main() -> Result<()> {
 }
 ```
 
-## Интеграция с C/C++
-
-### Заголовки
-
-```c
-#include "xshm.h"          // Основной заголовок (включает все API)
-#include "xshm_server.h"   // Серверная сторона (опционально, уже включена в xshm.h)
-#include "xshm_client.h"   // Клиентская сторона (опционально, уже включена в xshm.h)
-```
-
-Event handles для интеграции с kernel-драйвером описаны отдельно в разделе
-[Event Handles для kernel-драйверов](#event-handles-для-kernel-драйверов) ниже.
-
-### Линковка
-
-- MSVC: `xshm.lib` + `ntdll.lib`
-- MinGW: `libxshm.a` + `-lntdll`
-
-### Пример сервера (C)
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-int main(void) {
-    shm_endpoint_config_t cfg = xshm_server_config("MyShmChannel");
-    shm_callbacks_t callbacks = xshm_server_callbacks_default();
-
-    ServerHandle* server = shm_server_start(&cfg, &callbacks);
-    if (!server) return 1;
-
-    if (shm_server_wait_for_client(server, 5000) != SHM_SUCCESS) {
-        shm_server_stop(server);
-        return 1;
-    }
-
-    const char msg[] = "Hello client";
-    shm_server_send(server, msg, sizeof msg);
-
-    uint8_t buffer[1024];
-    uint32_t len = sizeof buffer;
-    if (shm_server_receive(server, buffer, &len) == SHM_SUCCESS) {
-        printf("received %u bytes\n", len);
-    }
-
-    shm_server_stop(server);
-    return 0;
-}
-```
-
-### Пример клиента (C)
-
-```c
-#include "xshm_client.h"
-#include <stdio.h>
-
-int main(void) {
-    shm_endpoint_config_t cfg = xshm_client_config("MyShmChannel");
-    shm_callbacks_t callbacks = xshm_client_callbacks_default();
-
-    ClientHandle* client = shm_client_connect(&cfg, &callbacks, 5000);
-    if (!client) return 1;
-
-    uint8_t buffer[1024];
-    uint32_t len = sizeof buffer;
-    if (shm_client_receive(client, buffer, &len) == SHM_SUCCESS) {
-        printf("server says: %.*s\n", (int)len, buffer);
-    }
-
-    const char reply[] = "Hello server";
-    shm_client_send(client, reply, sizeof reply);
-
-    shm_client_disconnect(client);
-    return 0;
-}
-```
-
-### Multi-client сервер (C)
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-void on_connect(uint32_t client_id, void* user_data) {
-    printf("Client %u connected\n", client_id);
-}
-
-void on_disconnect(uint32_t client_id, void* user_data) {
-    printf("Client %u disconnected\n", client_id);
-}
-
-void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_data) {
-    printf("Message from client %u: %.*s\n", client_id, (int)size, (const char*)data);
-}
-
-int main(void) {
-    shm_multi_callbacks_t callbacks = shm_multi_callbacks_default();
-    callbacks.on_client_connect = on_connect;
-    callbacks.on_client_disconnect = on_disconnect;
-    callbacks.on_message = on_message;
-
-    shm_multi_options_t options = shm_multi_options_default();
-    options.max_clients = 20;  // по умолчанию 20, жёсткий предел 31
-
-    MultiServerHandle* server = shm_multi_server_start("MyService", &callbacks, &options);
-    if (!server) return 1;
-
-    // Клиенты подключаются к "MyService" и конкурентно захватывают
-    // свободный слот (без round-trip к лобби) — см. shm_multi_client_connect в xshm.h
-
-    // Отправка конкретному клиенту
-    shm_multi_server_send_to(server, 0, "Hello client 0", 14);
-
-    // Broadcast всем
-    uint32_t sent = 0;
-    shm_multi_server_broadcast(server, "Hello all", 9, &sent);
-    printf("Broadcast sent to %u clients\n", sent);
-
-    // Количество подключённых клиентов
-    printf("Connected: %u clients\n", shm_multi_server_client_count(server));
-
-    shm_multi_server_stop(server);
-    return 0;
-}
-```
-
-### Dispatch-сервер (C)
-
-Одно лобби, без фиксированного числа слотов — динамический канал создаётся
-на каждого клиента при регистрации.
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-void on_client_connect(uint32_t client_id, uint32_t pid, uint16_t revision,
-                        const char* name, void* user_data) {
-    printf("Client %u connected (pid %u, %s)\n", client_id, pid, name);
-}
-
-void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_data) {
-    printf("From %u: %.*s\n", client_id, (int)size, (const char*)data);
-}
-
-int main(void) {
-    shm_dispatch_callbacks_t callbacks = xshm_dispatch_callbacks_default();
-    callbacks.on_client_connect = on_client_connect;
-    callbacks.on_message = on_message;
-
-    shm_dispatch_options_t options = shm_dispatch_options_default();
-
-    DispatchServerHandle* server = shm_dispatch_server_start("MyService", &callbacks, &options);
-    if (!server) return 1;
-
-    // Клиенты регистрируются через shm_dispatch_client_connect() — сервер
-    // выдаёт динамически сгенерированное имя канала на каждого, без лимита слотов
-
-    uint32_t sent = 0;
-    shm_dispatch_server_broadcast(server, "hello everyone", 14, &sent);
-
-    shm_dispatch_server_stop(server);
-    return 0;
-}
-```
-
 ## Константы
 
 | Константа | Значение | Описание |
@@ -556,28 +404,9 @@ int main(void) {
 
 Любой именованный сервер может отдать свои raw NT event handles, чтобы
 kernel-драйвер мог ждать на них напрямую (event-driven, без polling) вместо
-обращения через FFI/Rust API на каждое уведомление.
+обращения через Rust API на каждое уведомление. Handles — обычные `isize`:
+передайте их драйверу через IOCTL, дальше их временем жизни управляет драйвер.
 
-**C API**:
-```c
-#include "xshm.h"
-
-ServerHandle* server = shm_server_start(&config, NULL);
-
-shm_event_handles_t event_handles = {0};
-if (shm_server_get_event_handles(server, &event_handles)) {
-    // event_handles.s2c_data - событие данных Сервер→Клиент (пользователь сигналит драйверу)
-    // event_handles.c2s_data - событие данных Клиент→Сервер (драйвер сигналит пользователю)
-
-    // Пример: передача в kernel-драйвер через IOCTL
-    request.ShmDataEventHandle = (HANDLE)event_handles.s2c_data;
-    request.ShmSpaceEventHandle = (HANDLE)event_handles.c2s_data;
-} else {
-    // Anonymous-сервер - событий нет, используйте polling
-}
-```
-
-**Rust API**:
 ```rust
 use xshm::{SharedServer, EventHandles};
 
@@ -589,7 +418,7 @@ if let Some(handles) = server.get_event_handles() {
 ```
 
 **Примечание**: для anonymous-серверов (`SharedServer::start_anonymous()`)
-возвращается `false`/`None` — именованные события не создаются. В этом
+возвращается `None` — именованные события не создаются. В этом
 случае используйте polling.
 
 ## Ограничения
@@ -620,7 +449,6 @@ xshm/
 │   ├── ring.rs          # Lock-free SPSC кольцевой буфер
 │   ├── layout.rs       # Структуры shared memory
 │   ├── events.rs       # Синхронизация на событиях
-│   ├── ffi.rs          # C-совместимый FFI-слой (single-client + auto)
 │   ├── error.rs        # Типы ошибок
 │   ├── constants.rs    # Константы протокола
 │   ├── naming.rs       # Именование kernel-объектов
@@ -628,23 +456,16 @@ xshm/
 │   ├── auto/
 │   │   └── mod.rs      # Auto-режим с фоновыми worker'ами
 │   ├── multi/
-│   │   ├── mod.rs      # MultiServer/MultiClient — фикс. слоты, конкурентный захват
-│   │   └── ffi.rs      # C API для Multi-client
+│   │   └── mod.rs      # MultiServer/MultiClient — фикс. слоты, конкурентный захват
 │   └── dispatch/
 │       ├── mod.rs      # DispatchServer/DispatchClient — лобби + динамические каналы
-│       ├── ffi.rs      # C API для Dispatch
 │       └── protocol.rs # Бинарный протокол регистрации в лобби
-├── include/
-│   ├── xshm.h          # Основной FFI-заголовок (автогенерация через cbindgen)
-│   ├── xshm_server.h   # Серверные хелперы (single/multi/dispatch)
-│   └── xshm_client.h   # Клиентские хелперы (single/multi/dispatch)
 ├── tests/
 │   ├── stress.rs       # Стресс-тесты
 │   ├── ordering.rs     # Тесты memory ordering
 │   └── multi.rs        # Тесты Multi-client
 ├── Cargo.toml
-├── build.rs            # Интеграция cbindgen
-└── cbindgen.toml
+└── build.rs            # линкует ntdll
 ```
 
 ## Лицензия

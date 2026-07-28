@@ -4,10 +4,10 @@
 
 **High-performance cross-process shared memory IPC for Windows**
 
-Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. Rust core, first-class C/C++ FFI.
+Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. A pure Rust crate — no C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.6.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,11 +23,17 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ---
 
-## 🆕 What's New in v0.6.0
+## 🆕 What's New in v0.7.0
+
+- ✅ **Pure Rust crate** (breaking) — the entire C/C++ FFI layer is gone: `ffi.rs`, `multi/ffi.rs`, `dispatch/ffi.rs`, the `cbindgen` build step, the generated `include/*.h` headers and the `staticlib` crate type. `xshm` now builds as an `rlib` only and is consumed from Rust. A separate synchronous C23 project covers native consumers.
+- ✅ **Zero build dependencies** — `build.rs` now does nothing but `cargo:rustc-link-lib=ntdll`; `thiserror` remains the only runtime dependency
+- ✅ **Full audit pass** — `Global\` naming actually works now (cross-session IPC was broken before), `Mapping::open` rejects undersized sections, `MultiClient::is_connected()`/`DispatchClient::is_connected()` stopped lying after teardown, send-queue overflow is reported through `on_overflow`, all `expect()` panics removed from worker threads
+
+## Previously in v0.6.0
 
 - ✅ **Dispatch mode** — a fifth mode (`DispatchServer`/`DispatchClient`): one lobby + a dynamic per-client channel, no fixed upper bound on client count
 - ✅ **Multi-client redesign** — the central lobby segment is gone. Clients now concurrently claim a free slot via lock-free CAS on the slot's own memory — fully parallel connects, no shared contention point
-- ✅ **Hardening pass** — torn-read protection under ring overflow, dead/orphaned slot detection (liveness-checks the owning process), synchronous `stop()` (no more use-after-free through FFI on teardown), bounded send queues everywhere
+- ✅ **Hardening pass** — torn-read protection under ring overflow, dead/orphaned slot detection (liveness-checks the owning process), synchronous `stop()` (no callback can fire after it returns), bounded send queues everywhere
 - ✅ **API cleanup** (breaking, pre-1.0) — dropped dead fields, unified naming across modes (`poll_timeout`, `channel_name`), dropped the auto-generated name prefix — the caller now fully owns the visible NT object name
 - ✅ **No admin privileges required** — named objects are session-scoped by default; elevated rights are only needed if you explicitly opt into `Global\`
 
@@ -37,7 +43,7 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 - Lock-free concurrent access: independent read/write, automatic overwrite on overflow, torn-read-safe under overflow (seqlock-style copy)
 - Event-based synchronization via NT API for data/space/connection notifications
 - Clean start guarantee: buffers reset on each new connection with generation tracking
-- Ready-to-use C headers (`xshm.h`, `xshm_server.h`, `xshm_client.h`) with helper functions
+- Handler traits instead of callback structs: `AutoHandler`, `MultiHandler`, `MultiClientHandler`, `DispatchHandler`, `DispatchClientHandler`
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`), automatic reconnect
 - **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (31) clients via lock-free concurrent slot claim
 - **Dispatch mode**: single lobby + dynamic per-client channel, no fixed slot count at all
@@ -48,15 +54,11 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ```mermaid
 flowchart TD
-    App["Your application (Rust or C/C++)"]
-    App --> FFI["C FFI — ffi.rs / multi/ffi.rs / dispatch/ffi.rs"]
-    App -. direct Rust API .-> Auto
-    App -. direct Rust API .-> Multi
-    App -. direct Rust API .-> Dispatch
-
-    FFI --> Auto["Auto — auto/mod.rs<br/>worker thread + reconnect"]
-    FFI --> Multi["Multi-client — multi/mod.rs<br/>fixed slots, lock-free claim"]
-    FFI --> Dispatch["Dispatch — dispatch/mod.rs<br/>lobby + dynamic channels"]
+    App["Your Rust application"]
+    App --> Auto["Auto — auto/mod.rs<br/>worker thread + reconnect"]
+    App --> Multi["Multi-client — multi/mod.rs<br/>fixed slots, lock-free claim"]
+    App --> Dispatch["Dispatch — dispatch/mod.rs<br/>lobby + dynamic channels"]
+    App --> Endpoint
 
     Dispatch -. reuses .-> Auto
 
@@ -118,11 +120,25 @@ sequenceDiagram
 | Connect cost | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 lobby round-trip + 1 handshake |
 | Best for | simplest pairwise IPC, driver integration | one peer, needs resilience | known/bounded fleet size | fleet size unknown ahead of time |
 
+## Channel Naming
+
+The name you pass to any constructor becomes the kernel object name as-is; the
+namespace is chosen by its prefix:
+
+| You pass | Section object | Namespace |
+|----------|----------------|-----------|
+| `"Chan"` | `Local\Chan` | session-local |
+| `"Local\Chan"` | `Local\Chan` | session-local (prefix is not doubled) |
+| `"Global\Chan"` | `Global\Chan` | global — needed for cross-session IPC (service in session 0 ↔ desktop process) |
+| `"\BaseNamedObjects\Chan"` | as-is | raw NT path |
+
+Channel events always land in the same namespace as the section.
+
 ## Requirements
 
 - Windows 10/11
-- Rust 1.82+ (stable) — the codebase uses the `#[unsafe(...)]` attribute syntax; developed/tested against 1.96
-- MSVC or MinGW toolchain
+- Rust 1.82+ (stable) — the codebase uses the `#[unsafe(...)]` attribute syntax; developed/tested against 1.97
+- MSVC toolchain (MinGW targets were dropped in 0.7.0 together with the C ABI)
 - **No administrator privileges required** — named kernel objects are session-scoped (`Local\` prefix → `\Sessions\<SessionId>\BaseNamedObjects\`). Elevated rights are only needed if you explicitly use the `Global\` prefix
 
 ## Dependencies
@@ -141,25 +157,22 @@ NT API calls are made directly via static linking with `ntdll.dll`:
 
 ## Build
 
-```bash
-# Run tests
-cargo test -- --test-threads=1   # sequential: tests share named-object namespaces
+Add it as a path or git dependency:
 
-# Build static libraries
-cargo build --release                                        # x64 MSVC (default)
-cargo build --release --target i686-pc-windows-msvc          # x86 MSVC
-cargo build --release --target x86_64-pc-windows-gnu         # x64 MinGW
+```toml
+[dependencies]
+xshm = { path = "../xshm" }
 ```
 
-Output files:
+```bash
+cargo build --release                                   # x64 MSVC (default)
+cargo build --release --target i686-pc-windows-msvc     # x86 MSVC
 
-| Target | Debug | Release |
-|--------|-------|---------|
-| MSVC x64 | `target/debug/xshm.lib` | `target/release/xshm.lib` |
-| MSVC x86 | `target/i686-pc-windows-msvc/debug/xshm.lib` | `target/i686-pc-windows-msvc/release/xshm.lib` |
-| MinGW x64 | `target/x86_64-pc-windows-gnu/debug/libxshm.a` | `target/x86_64-pc-windows-gnu/release/libxshm.a` |
+# Run tests
+cargo test -- --test-threads=1   # sequential: tests share named-object namespaces
+```
 
-Headers are auto-generated via `cbindgen` during build.
+The crate builds as an `rlib` only. `build.rs` does one thing — `cargo:rustc-link-lib=ntdll` — so `ntdll` is linked into whatever binary consumes the crate.
 
 ## Rust Usage
 
@@ -197,7 +210,7 @@ fn main() -> xshm::Result<()> {
 }
 ```
 
-### Auto-mode (Rust)
+### Auto-mode
 
 ```rust
 use std::sync::Arc;
@@ -224,7 +237,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Multi-client mode (Rust)
+### Multi-client mode
 
 Fixed pool of slots (default 20, hard cap 31). Clients concurrently claim a
 free slot via lock-free CAS — no central lobby, no negotiation round-trip:
@@ -311,7 +324,7 @@ fn main() -> Result<()> {
 }
 ```
 
-### Dispatch mode (Rust)
+### Dispatch mode
 
 One lobby + a dynamic `AutoServer`-backed channel per client. Unlike
 Multi-client there is no fixed slot count — pick this mode when the number
@@ -375,171 +388,6 @@ fn main() -> Result<()> {
 }
 ```
 
-## C/C++ Integration
-
-### Headers
-
-```c
-#include "xshm.h"          // Main header (includes all APIs)
-#include "xshm_server.h"   // Server side (optional, included in xshm.h)
-#include "xshm_client.h"   // Client side (optional, included in xshm.h)
-```
-
-Event handles for kernel driver integration are covered separately in
-[Event Handles for Kernel Drivers](#event-handles-for-kernel-drivers) below.
-
-### Linking
-
-- MSVC: `xshm.lib` + `ntdll.lib`
-- MinGW: `libxshm.a` + `-lntdll`
-
-### Server Example (C)
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-int main(void) {
-    shm_endpoint_config_t cfg = xshm_server_config("MyShmChannel");
-    shm_callbacks_t callbacks = xshm_server_callbacks_default();
-
-    ServerHandle* server = shm_server_start(&cfg, &callbacks);
-    if (!server) return 1;
-
-    if (shm_server_wait_for_client(server, 5000) != SHM_SUCCESS) {
-        shm_server_stop(server);
-        return 1;
-    }
-
-    const char msg[] = "Hello client";
-    shm_server_send(server, msg, sizeof msg);
-
-    uint8_t buffer[1024];
-    uint32_t len = sizeof buffer;
-    if (shm_server_receive(server, buffer, &len) == SHM_SUCCESS) {
-        printf("received %u bytes\n", len);
-    }
-
-    shm_server_stop(server);
-    return 0;
-}
-```
-
-### Client Example (C)
-
-```c
-#include "xshm_client.h"
-#include <stdio.h>
-
-int main(void) {
-    shm_endpoint_config_t cfg = xshm_client_config("MyShmChannel");
-    shm_callbacks_t callbacks = xshm_client_callbacks_default();
-
-    ClientHandle* client = shm_client_connect(&cfg, &callbacks, 5000);
-    if (!client) return 1;
-
-    uint8_t buffer[1024];
-    uint32_t len = sizeof buffer;
-    if (shm_client_receive(client, buffer, &len) == SHM_SUCCESS) {
-        printf("server says: %.*s\n", (int)len, buffer);
-    }
-
-    const char reply[] = "Hello server";
-    shm_client_send(client, reply, sizeof reply);
-
-    shm_client_disconnect(client);
-    return 0;
-}
-```
-
-### Multi-client Server (C)
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-void on_connect(uint32_t client_id, void* user_data) {
-    printf("Client %u connected\n", client_id);
-}
-
-void on_disconnect(uint32_t client_id, void* user_data) {
-    printf("Client %u disconnected\n", client_id);
-}
-
-void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_data) {
-    printf("Message from client %u: %.*s\n", client_id, (int)size, (const char*)data);
-}
-
-int main(void) {
-    shm_multi_callbacks_t callbacks = shm_multi_callbacks_default();
-    callbacks.on_client_connect = on_connect;
-    callbacks.on_client_disconnect = on_disconnect;
-    callbacks.on_message = on_message;
-
-    shm_multi_options_t options = shm_multi_options_default();
-    options.max_clients = 20;  // default is 20, hard cap is 31
-
-    MultiServerHandle* server = shm_multi_server_start("MyService", &callbacks, &options);
-    if (!server) return 1;
-
-    // Clients connect to "MyService" and concurrently claim a free slot
-    // (no lobby round-trip) — see shm_multi_client_connect in xshm.h
-
-    // Send to specific client
-    shm_multi_server_send_to(server, 0, "Hello client 0", 14);
-
-    // Broadcast to all
-    uint32_t sent = 0;
-    shm_multi_server_broadcast(server, "Hello all", 9, &sent);
-    printf("Broadcast sent to %u clients\n", sent);
-
-    // Get connected clients
-    printf("Connected: %u clients\n", shm_multi_server_client_count(server));
-
-    shm_multi_server_stop(server);
-    return 0;
-}
-```
-
-### Dispatch Server (C)
-
-One lobby, no fixed slot count — a dynamic channel is created per client on
-registration.
-
-```c
-#include "xshm_server.h"
-#include <stdio.h>
-
-void on_client_connect(uint32_t client_id, uint32_t pid, uint16_t revision,
-                        const char* name, void* user_data) {
-    printf("Client %u connected (pid %u, %s)\n", client_id, pid, name);
-}
-
-void on_message(uint32_t client_id, const void* data, uint32_t size, void* user_data) {
-    printf("From %u: %.*s\n", client_id, (int)size, (const char*)data);
-}
-
-int main(void) {
-    shm_dispatch_callbacks_t callbacks = xshm_dispatch_callbacks_default();
-    callbacks.on_client_connect = on_client_connect;
-    callbacks.on_message = on_message;
-
-    shm_dispatch_options_t options = shm_dispatch_options_default();
-
-    DispatchServerHandle* server = shm_dispatch_server_start("MyService", &callbacks, &options);
-    if (!server) return 1;
-
-    // Clients register via shm_dispatch_client_connect() — server hands out
-    // a dynamically generated channel name per client, no slot limit
-
-    uint32_t sent = 0;
-    shm_dispatch_server_broadcast(server, "hello everyone", 14, &sent);
-
-    shm_dispatch_server_stop(server);
-    return 0;
-}
-```
-
 ## Constants
 
 | Constant | Value | Description |
@@ -555,28 +403,10 @@ int main(void) {
 
 Any named server can hand out its raw NT event handles so a kernel driver
 can wait on them directly (event-driven, no polling) instead of going
-through the FFI/Rust API for every notification.
+through the Rust API for every notification. The handles are plain `isize`
+values — pass them to the driver via IOCTL; the driver owns their lifetime
+from that point on.
 
-**C API**:
-```c
-#include "xshm.h"
-
-ServerHandle* server = shm_server_start(&config, NULL);
-
-shm_event_handles_t event_handles = {0};
-if (shm_server_get_event_handles(server, &event_handles)) {
-    // event_handles.s2c_data - Server→Client data event (user signals driver)
-    // event_handles.c2s_data - Client→Server data event (driver signals user)
-
-    // Example: pass to a kernel driver via IOCTL
-    request.ShmDataEventHandle = (HANDLE)event_handles.s2c_data;
-    request.ShmSpaceEventHandle = (HANDLE)event_handles.c2s_data;
-} else {
-    // Anonymous server - no events available, use polling mode
-}
-```
-
-**Rust API**:
 ```rust
 use xshm::{SharedServer, EventHandles};
 
@@ -588,8 +418,7 @@ if let Some(handles) = server.get_event_handles() {
 ```
 
 **Note**: For anonymous servers (`SharedServer::start_anonymous()`), this
-returns `false`/`None` — no named events are created. Use polling mode in
-that case.
+returns `None` — no named events are created. Use polling mode in that case.
 
 ## Limitations
 
@@ -619,7 +448,6 @@ xshm/
 │   ├── ring.rs         # Lock-free SPSC ring buffer
 │   ├── layout.rs       # Shared memory structures
 │   ├── events.rs       # Event synchronization
-│   ├── ffi.rs          # C-compatible FFI layer (single-client + auto)
 │   ├── error.rs        # Error types
 │   ├── constants.rs    # Protocol constants
 │   ├── naming.rs       # Kernel object naming
@@ -627,23 +455,16 @@ xshm/
 │   ├── auto/
 │   │   └── mod.rs      # Auto-mode with background workers
 │   ├── multi/
-│   │   ├── mod.rs      # MultiServer/MultiClient — fixed slots, concurrent claim
-│   │   └── ffi.rs      # Multi-client C API
+│   │   └── mod.rs      # MultiServer/MultiClient — fixed slots, concurrent claim
 │   └── dispatch/
 │       ├── mod.rs      # DispatchServer/DispatchClient — lobby + dynamic channels
-│       ├── ffi.rs      # Dispatch C API
 │       └── protocol.rs # Binary lobby registration protocol
-├── include/
-│   ├── xshm.h          # Main FFI header (auto-generated via cbindgen)
-│   ├── xshm_server.h   # Server helpers (single/multi/dispatch)
-│   └── xshm_client.h   # Client helpers (single/multi/dispatch)
 ├── tests/
 │   ├── stress.rs       # Stress tests
 │   ├── ordering.rs     # Memory ordering tests
 │   └── multi.rs        # Multi-client tests
 ├── Cargo.toml
-├── build.rs            # cbindgen integration
-└── cbindgen.toml
+└── build.rs            # links ntdll
 ```
 
 ## License
