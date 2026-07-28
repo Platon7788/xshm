@@ -5,8 +5,8 @@
 //! 2. Валидацию magic/version при подключении
 //! 3. Корректность handshake с generation
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,7 +31,7 @@ fn test_message_count_before_write_pos() {
     let server_ready = Arc::new(AtomicBool::new(false));
     let errors_found = Arc::new(AtomicU32::new(0));
 
-    let server_ready_clone = server_ready.clone();
+    let server_ready_clone = server_ready;
     let errors_clone = errors_found.clone();
     let name_clone = name.clone();
 
@@ -42,12 +42,12 @@ fn test_message_count_before_write_pos() {
 
         // Быстро отправляем сообщения
         for i in 0..ITERATIONS {
-            let msg = format!("MSG_{:04}", i);
+            let msg = format!("MSG_{i:04}");
             match server.send_to_client(msg.as_bytes()) {
                 Ok(_) => {}
                 Err(e) => {
                     errors_clone.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("Server send error: {:?}", e);
+                    eprintln!("Server send error: {e:?}");
                 }
             }
             // Без sleep - максимальная нагрузка на ordering
@@ -94,8 +94,7 @@ fn test_message_count_before_write_pos() {
         // Это индикатор ordering проблемы
         if empty_after_data > ITERATIONS as u32 * 2 {
             eprintln!(
-                "Warning: {} empty reads after data (possible ordering issue)",
-                empty_after_data
+                "Warning: {empty_after_data} empty reads after data (possible ordering issue)"
             );
         }
 
@@ -107,9 +106,9 @@ fn test_message_count_before_write_pos() {
     match client_result {
         Ok(received) => {
             assert!(received > 0, "Should receive at least some messages");
-            println!("Received {} messages", received);
+            println!("Received {received} messages");
         }
-        Err(e) => panic!("Client error: {:?}", e),
+        Err(e) => panic!("Client error: {e:?}"),
     }
 
     assert_eq!(errors_found.load(Ordering::Relaxed), 0, "Server had errors");
@@ -175,7 +174,6 @@ fn test_generation_on_reconnect() {
 
     // Второе подключение
     let client2_thread = thread::spawn({
-        let name = name.clone();
         move || -> xshm::Result<()> {
             let client = SharedClient::connect(&name, Duration::from_secs(2))?;
             client.send_to_server(b"HELLO2")?;
@@ -220,7 +218,7 @@ fn test_bidirectional_ordering_stress() {
             {
                 // Отправка
                 if sent < MESSAGES_PER_SIDE {
-                    let msg = format!("S{:04}", sent);
+                    let msg = format!("S{sent:04}");
                     if server.send_to_client(msg.as_bytes()).is_ok() {
                         sent += 1;
                     }
@@ -265,7 +263,7 @@ fn test_bidirectional_ordering_stress() {
         {
             // Отправка
             if sent < MESSAGES_PER_SIDE {
-                let msg = format!("C{:04}", sent);
+                let msg = format!("C{sent:04}");
                 if client.send_to_server(msg.as_bytes()).is_ok() {
                     sent += 1;
                 }
@@ -299,8 +297,8 @@ fn test_bidirectional_ordering_stress() {
     let (server_sent, server_received) = server_result.expect("server error");
     let (client_sent, client_received) = client_result.expect("client error");
 
-    println!("Server: sent={}, received={}", server_sent, server_received);
-    println!("Client: sent={}, received={}", client_sent, client_received);
+    println!("Server: sent={server_sent}, received={server_received}");
+    println!("Client: sent={client_sent}, received={client_received}");
 
     // Должны отправить все сообщения
     assert_eq!(

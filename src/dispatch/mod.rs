@@ -76,7 +76,7 @@ pub trait DispatchClientHandler: Send + Sync + 'static {
 }
 
 /// Настройки DispatchServer.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DispatchOptions {
     /// Таймаут чтения данных регистрации из лобби после handshake.
     pub lobby_timeout: Duration,
@@ -100,7 +100,7 @@ impl Default for DispatchOptions {
 }
 
 /// Настройки DispatchClient.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct DispatchClientOptions {
     /// Таймаут подключения к лобби.
     pub lobby_timeout: Duration,
@@ -396,12 +396,9 @@ impl DispatchServer {
     /// и регистрация в `self.clients` вынесены в отдельный поток, чтобы не
     /// сериализовать всех клиентов через самый медленный из них.
     fn handle_lobby_client(&self, lobby: &mut SharedServer, buffer: &mut Vec<u8>) {
-        let events = match lobby.events() {
-            Some(e) => e,
-            None => {
-                self.handler.on_error(None, ShmError::NotReady);
-                return;
-            }
+        let Some(events) = lobby.events() else {
+            self.handler.on_error(None, ShmError::NotReady);
+            return;
         };
 
         // Ожидаем данные регистрации через событие c2s.data (по событию, без опроса)
@@ -445,7 +442,7 @@ impl DispatchServer {
         let info = ClientRegistration {
             pid: request.pid,
             revision: request.revision,
-            name: request.name.clone(),
+            name: request.name,
         };
 
         // Создаём AutoServer для выделенного канала этого клиента
@@ -566,6 +563,17 @@ impl DispatchServer {
     }
 }
 
+impl std::fmt::Debug for DispatchServer {
+    /// Ручная реализация: `handler` -- `Arc<dyn DispatchHandler>` без `Debug`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchServer")
+            .field("base_name", &self.base_name)
+            .field("clients", &self.client_count())
+            .field("running", &self.running.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
 impl Drop for DispatchServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
@@ -624,7 +632,7 @@ impl AutoHandler for AutoProxyHandler {
                 None
             }
         }; // write-лог освобождён здесь; `removed` (если Some) ещё жив,
-           // AutoServer внутри него ещё НЕ дропнут.
+        // AutoServer внутри него ещё НЕ дропнут.
 
         if let Some(dispatched_client) = removed {
             // Фактический Drop (и его синхронный join) переносим на ОТДЕЛЬНЫЙ
@@ -729,11 +737,13 @@ impl DispatchClient {
     }
 
     /// Возвращает назначенный ID клиента.
-    pub fn client_id(&self) -> u32 {
+    #[must_use]
+    pub const fn client_id(&self) -> u32 {
         self.client_id
     }
 
     /// Возвращает имя назначенного канала.
+    #[must_use]
     pub fn channel_name(&self) -> &str {
         &self.channel_name
     }
@@ -742,6 +752,7 @@ impl DispatchClient {
     ///
     /// Становится `false` не только после `stop()`, но и при разрыве канала со
     /// стороны сервера -- прокси гасит `running` в `on_disconnect`.
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         self.running.load(Ordering::Acquire) && self.auto_client.lock().unwrap().is_some()
     }
@@ -765,6 +776,16 @@ impl DispatchClient {
             client.stop();
             drop(client);
         }
+    }
+}
+
+impl std::fmt::Debug for DispatchClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DispatchClient")
+            .field("client_id", &self.client_id)
+            .field("channel_name", &self.channel_name)
+            .field("connected", &self.is_connected())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1046,7 +1067,7 @@ mod tests {
         let client = DispatchClient::connect(
             &name,
             registration,
-            client_handler.clone(),
+            client_handler,
             DispatchClientOptions::default(),
         )
         .expect("client connect");
@@ -1152,9 +1173,8 @@ mod tests {
         let name = format!("TEST_DISPATCH_NODEADLOCK_{}", std::process::id());
 
         let server_handler = Arc::new(TestServerHandler::new());
-        let server =
-            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
-                .expect("server start");
+        let server = DispatchServer::start(&name, server_handler, DispatchOptions::default())
+            .expect("server start");
 
         thread::sleep(Duration::from_millis(100));
 
@@ -1167,7 +1187,7 @@ mod tests {
         let client = DispatchClient::connect(
             &name,
             registration,
-            client_handler.clone(),
+            client_handler,
             DispatchClientOptions::default(),
         )
         .expect("client connect");
@@ -1200,7 +1220,7 @@ mod tests {
         let server_handler = Arc::new(TestServerHandler::new());
         let server = DispatchServer::start(
             &name,
-            server_handler.clone(),
+            server_handler,
             DispatchOptions {
                 // Заметно длиннее, чем должна занять регистрация клиента B --
                 // если бы лобби всё ещё было последовательным, тест бы либо
@@ -1243,7 +1263,7 @@ mod tests {
         let client_b = DispatchClient::connect(
             &name,
             reg_b,
-            client_handler_b.clone(),
+            client_handler_b,
             DispatchClientOptions::default(),
         )
         .expect("client B connect");
@@ -1302,9 +1322,8 @@ mod tests {
         let name = format!("TEST_DISPATCH_CFLAG_{}", std::process::id());
 
         let server_handler = Arc::new(TestServerHandler::new());
-        let server =
-            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
-                .expect("server start");
+        let server = DispatchServer::start(&name, server_handler, DispatchOptions::default())
+            .expect("server start");
 
         thread::sleep(Duration::from_millis(100));
 
@@ -1316,7 +1335,7 @@ mod tests {
                 revision: 1,
                 name: "cflag.exe".into(),
             },
-            client_handler.clone(),
+            client_handler,
             DispatchClientOptions::default(),
         )
         .expect("client connect");

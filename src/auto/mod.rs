@@ -66,7 +66,7 @@ pub trait AutoHandler: Send + Sync + 'static {
     fn on_error(&self, _err: ShmError) {}
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct AutoOptions {
     /// Интервал опроса в worker loop. Переименовано из `wait_timeout` (0.6.0)
     /// для единообразия с `MultiOptions`/`DispatchOptions`, где то же самое
@@ -99,7 +99,7 @@ pub struct AutoStatsSnapshot {
     pub receive_overflows: u64,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct AutoStats {
     sent_messages: AtomicU64,
     send_overflows: AtomicU64,
@@ -118,6 +118,7 @@ impl AutoStats {
     }
 }
 
+#[derive(Debug)]
 enum WorkerCommand {
     Send(Vec<u8>),
     Shutdown,
@@ -131,6 +132,7 @@ enum WorkerCommand {
 /// захвата lock-а на каждое сообщение без единого конкурента.
 type SendQueue = VecDeque<Vec<u8>>;
 
+#[derive(Debug)]
 pub struct AutoServer {
     cmd_tx: Sender<WorkerCommand>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -331,6 +333,7 @@ fn server_worker(
     }
 }
 
+#[derive(Debug)]
 pub struct AutoClient {
     cmd_tx: Sender<WorkerCommand>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -560,7 +563,7 @@ fn process_send_queue<E>(
                 break;
             }
             Err(err) => {
-                handler.on_error(err.clone());
+                handler.on_error(err);
                 queue.push_front(msg);
                 break;
             }
@@ -611,7 +614,7 @@ where
                 };
             }
             Err(err) => {
-                handler.on_error(err.clone());
+                handler.on_error(err);
                 drained = true;
                 break;
             }

@@ -3,7 +3,7 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 
-use super::funcs::{NtQueryInformationProcess, NT_CURRENT_PROCESS};
+use super::funcs::{NT_CURRENT_PROCESS, NtQueryInformationProcess};
 use super::types::*;
 use crate::error::{Result, ShmError};
 
@@ -23,7 +23,7 @@ fn current_session_id() -> u32 {
             NT_CURRENT_PROCESS,
             PROCESS_SESSION_INFORMATION_CLASS,
             &mut info as *mut _ as PVOID,
-            core::mem::size_of::<PROCESS_SESSION_INFORMATION>() as ULONG,
+            size_of::<PROCESS_SESSION_INFORMATION>() as ULONG,
             &mut ret_len,
         )
     };
@@ -128,12 +128,12 @@ impl NtName {
         };
 
         // Теперь wide на своём месте, можно взять указатель
-        result.unicode.Buffer = result.wide.as_ptr() as *mut u16;
+        result.unicode.Buffer = result.wide.as_ptr().cast_mut();
         Ok(result)
     }
 
     /// Получить указатель на UNICODE_STRING для передачи в NT функции
-    pub fn as_ptr(&mut self) -> *mut UNICODE_STRING {
+    pub const fn as_ptr(&mut self) -> *mut UNICODE_STRING {
         &mut self.unicode
     }
 }
@@ -158,11 +158,7 @@ impl NtName {
 pub fn duration_to_nt_timeout(duration: std::time::Duration) -> i64 {
     let units_100ns = duration.as_nanos() / 100;
     if units_100ns == 0 {
-        if duration.is_zero() {
-            0
-        } else {
-            -1
-        }
+        if duration.is_zero() { 0 } else { -1 }
     } else {
         -(units_100ns.min(i64::MAX as u128) as i64)
     }

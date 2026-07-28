@@ -61,6 +61,7 @@ fn truncate_utf8(value: &str, max: usize) -> &[u8] {
 /// [12..13] name_len: u8
 /// [13..]   name: UTF-8 байты (максимум 64)
 /// ```
+#[must_use]
 pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
     let name_bytes = truncate_utf8(&req.name, MAX_NAME_LEN);
     let name_len = name_bytes.len() as u8;
@@ -138,6 +139,7 @@ pub struct RegistrationResponse {
 /// [11..12] channel_name_len: u8
 /// [12..]   channel_name: UTF-8 байты (максимум 64)
 /// ```
+#[must_use]
 pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
     let name_bytes = truncate_utf8(&resp.channel_name, MAX_CHANNEL_NAME_LEN);
     let name_len = name_bytes.len() as u8;

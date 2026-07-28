@@ -3,14 +3,16 @@ use crate::constants::{
     EVENT_SPACE_SUFFIX,
 };
 use crate::error::Result;
-use crate::naming::{event_name, Direction};
+use crate::naming::{Direction, event_name};
 use crate::win::EventHandle;
 
+#[derive(Debug)]
 pub struct ChannelEvents {
     pub data: EventHandle,
     pub space: EventHandle,
 }
 
+#[derive(Debug)]
 pub struct SharedEvents {
     pub s2c: ChannelEvents,
     pub c2s: ChannelEvents,
@@ -86,6 +88,7 @@ impl SharedEvents {
     /// - c2s_data: Client→Server data event (driver signals when data available for user)
     ///
     /// Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
+    #[must_use]
     pub fn get_event_handles(&self) -> EventHandles {
         EventHandles {
             s2c_data: self.s2c.data.raw_handle(),

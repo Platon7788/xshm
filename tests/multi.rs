@@ -5,10 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use xshm::ShmError;
 use xshm::multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
-use xshm::ShmError;
 
 fn unique_name(tag: &str) -> String {
     use std::time::SystemTime;
@@ -34,7 +34,7 @@ struct TestServerHandler {
 }
 
 impl TestServerHandler {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             connects: AtomicU32::new(0),
             disconnects: AtomicU32::new(0),
@@ -69,13 +69,13 @@ impl TestServerHandler {
 
 impl MultiHandler for TestServerHandler {
     fn on_client_connect(&self, client_id: u32) {
-        println!("[Server] Client {} connected", client_id);
+        println!("[Server] Client {client_id} connected");
         self.connects.fetch_add(1, Ordering::Release);
         self.last_client_id.store(client_id, Ordering::Release);
     }
 
     fn on_client_disconnect(&self, client_id: u32) {
-        println!("[Server] Client {} disconnected", client_id);
+        println!("[Server] Client {client_id} disconnected");
         self.disconnects.fetch_add(1, Ordering::Release);
     }
 
@@ -92,7 +92,7 @@ impl MultiHandler for TestServerHandler {
     }
 
     fn on_error(&self, client_id: Option<u32>, err: ShmError) {
-        println!("[Server] Error for client {:?}: {:?}", client_id, err);
+        println!("[Server] Error for client {client_id:?}: {err:?}");
     }
 }
 
@@ -105,7 +105,7 @@ struct TestClientHandler {
 }
 
 impl TestClientHandler {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             slot_id: AtomicU32::new(u32::MAX),
             messages: AtomicU32::new(0),
@@ -139,7 +139,7 @@ impl TestClientHandler {
 
 impl MultiClientHandler for TestClientHandler {
     fn on_connect(&self, slot_id: u32) {
-        println!("[Client] Connected to slot {}", slot_id);
+        println!("[Client] Connected to slot {slot_id}");
         self.slot_id.store(slot_id, Ordering::Release);
         self.connected.fetch_add(1, Ordering::Release);
     }
@@ -157,14 +157,14 @@ impl MultiClientHandler for TestClientHandler {
     }
 
     fn on_error(&self, err: ShmError) {
-        println!("[Client] Error: {:?}", err);
+        println!("[Client] Error: {err:?}");
     }
 }
 
 #[test]
 fn test_multi_single_client_auto_slot() {
     let base_name = unique_name("SINGLE_AUTO");
-    println!("[TEST] Base name: {}", base_name);
+    println!("[TEST] Base name: {base_name}");
 
     // Запускаем сервер
     let server_handler = Arc::new(TestServerHandler::new());
@@ -194,7 +194,7 @@ fn test_multi_single_client_auto_slot() {
 
     // Проверяем что клиент получил слот
     let slot_id = client_handler.slot_id.load(Ordering::Acquire);
-    println!("[TEST] Client got slot_id: {}", slot_id);
+    println!("[TEST] Client got slot_id: {slot_id}");
     assert!(slot_id < 10, "Slot ID should be valid");
     assert!(client.is_connected());
 
@@ -220,7 +220,7 @@ fn test_multi_single_client_auto_slot() {
 #[test]
 fn test_multi_multiple_clients_auto_slot() {
     let base_name = unique_name("MULTI_AUTO");
-    println!("[TEST] Base name: {}", base_name);
+    println!("[TEST] Base name: {base_name}");
 
     // Запускаем сервер с 3 слотами
     let server_handler = Arc::new(TestServerHandler::new());
@@ -242,15 +242,14 @@ fn test_multi_multiple_clients_auto_slot() {
 
     for i in 0..3 {
         let ch = Arc::new(TestClientHandler::new());
-        println!("[TEST] Connecting client {}...", i);
+        println!("[TEST] Connecting client {i}...");
         let client = MultiClient::connect(&base_name, ch.clone(), MultiClientOptions::default())
             .unwrap_or_else(|e| panic!("Client {i} connect: {e:?}"));
 
         // Ждём подключения каждого клиента
         assert!(
             ch.wait_for_connect(Duration::from_secs(5)),
-            "Client {} should connect",
-            i
+            "Client {i} should connect"
         );
 
         clients.push(client);
@@ -270,7 +269,7 @@ fn test_multi_multiple_clients_auto_slot() {
         .map(|h| h.slot_id.load(Ordering::Acquire))
         .collect();
     slots.sort();
-    println!("[TEST] Assigned slots: {:?}", slots);
+    println!("[TEST] Assigned slots: {slots:?}");
     assert_eq!(slots, vec![0, 1, 2], "Each client should get unique slot");
 
     // Broadcast от сервера
@@ -281,14 +280,13 @@ fn test_multi_multiple_clients_auto_slot() {
     for (i, ch) in client_handlers.iter().enumerate() {
         assert!(
             ch.wait_for_messages(1, Duration::from_secs(2)),
-            "Client {} should receive broadcast",
-            i
+            "Client {i} should receive broadcast"
         );
     }
 
     // Каждый клиент отправляет сообщение
     for (i, client) in clients.iter().enumerate() {
-        let msg = format!("Hello from client {}", i);
+        let msg = format!("Hello from client {i}");
         client
             .send(msg.as_bytes())
             .unwrap_or_else(|e| panic!("Client {i} send: {e:?}"));
@@ -306,7 +304,7 @@ fn test_multi_multiple_clients_auto_slot() {
 #[test]
 fn test_multi_client_reconnect() {
     let base_name = unique_name("RECONN_AUTO");
-    println!("[TEST] Base name: {}", base_name);
+    println!("[TEST] Base name: {base_name}");
 
     let server_handler = Arc::new(TestServerHandler::new());
     let _server = MultiServer::start(&base_name, server_handler.clone(), MultiOptions::default())
@@ -322,7 +320,7 @@ fn test_multi_client_reconnect() {
 
         assert!(ch.wait_for_connect(Duration::from_secs(5)));
         let slot1 = ch.slot_id.load(Ordering::Acquire);
-        println!("[TEST] First client got slot: {}", slot1);
+        println!("[TEST] First client got slot: {slot1}");
 
         client.send(b"First client").expect("First send");
         assert!(server_handler.wait_for_messages(1, Duration::from_secs(2)));
@@ -340,7 +338,7 @@ fn test_multi_client_reconnect() {
 
         assert!(ch.wait_for_connect(Duration::from_secs(5)));
         let slot2 = ch.slot_id.load(Ordering::Acquire);
-        println!("[TEST] Second client got slot: {}", slot2);
+        println!("[TEST] Second client got slot: {slot2}");
 
         client.send(b"Second client").expect("Second send");
         assert!(server_handler.wait_for_messages(2, Duration::from_secs(2)));
@@ -423,7 +421,7 @@ fn test_multi_oversubscription() {
     let server_handler = Arc::new(TestServerHandler::new());
     let server = MultiServer::start(
         &base_name,
-        server_handler.clone(),
+        server_handler,
         MultiOptions {
             max_clients: N,
             ..Default::default()
