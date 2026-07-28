@@ -3,12 +3,10 @@
 //! Статическая линковка через #[link(name = "ntdll")].
 //! Никакого GetProcAddress, никакого TLS.
 
-#![allow(non_snake_case)]
-
 use super::types::*;
 
 #[link(name = "ntdll")]
-extern "system" {
+unsafe extern "system" {
     // ========================================================================
     // Handle operations
     // ========================================================================

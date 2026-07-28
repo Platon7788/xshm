@@ -1,7 +1,8 @@
 [package]
 name = "xshm"
 version = "0.7.0"
-edition = "2021"
+edition = "2024"
+rust-version = "1.97"
 description = "High-performance cross-process shared memory IPC using direct NT API calls"
 authors = ["Platon"]
 license = "MIT"
@@ -19,6 +20,27 @@ thiserror = "2"
 
 [features]
 default = []
+
+# Политика линтов живёт в манифесте (Cargo 1.74+), а не в атрибутах крейта:
+# так она распространяется на все таргеты (lib, tests) единообразно и видна
+# сразу при чтении манифеста.
+[lints.rust]
+# В edition 2024 это дефолт, но `forbid` не даёт локально ослабить правило.
+unsafe_op_in_unsafe_fn = "forbid"
+missing_debug_implementations = "warn"
+unused_qualifications = "warn"
+
+[lints.clippy]
+# Правило проекта №3 (CLAUDE.md): у каждого unsafe -- обоснование. Теперь это
+# проверяет компилятор, а не ревьюер.
+undocumented_unsafe_blocks = "deny"
+ptr_as_ptr = "warn"
+ptr_cast_constness = "warn"
+manual_let_else = "warn"
+uninlined_format_args = "warn"
+missing_const_for_fn = "warn"
+redundant_clone = "warn"
+semicolon_if_nothing_returned = "warn"
 
 [profile.dev]
 panic = "abort"

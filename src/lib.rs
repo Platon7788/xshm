@@ -1,4 +1,4 @@
-#![forbid(unsafe_op_in_unsafe_fn)]
+// Политика линтов -- в `[lints]` секции Cargo.toml (см. манифест).
 
 mod client;
 mod constants;
@@ -135,13 +135,13 @@ mod tests {
                 }
                 let elapsed = start.elapsed();
                 if elapsed >= TIMEOUT {
-                    panic!("timeout waiting for message {:?}", expected);
+                    panic!("timeout waiting for message {expected:?}");
                 }
                 let wait_for = (TIMEOUT - elapsed).min(Duration::from_millis(20));
                 let (g, result) = cv.wait_timeout(guard, wait_for).unwrap();
                 guard = g;
                 if result.timed_out() && start.elapsed() >= TIMEOUT {
-                    panic!("timeout waiting for message {:?}", expected);
+                    panic!("timeout waiting for message {expected:?}");
                 }
             }
         }
