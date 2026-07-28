@@ -24,10 +24,6 @@
 //! N клиентов подключаются ПОЛНОСТЬЮ КОНКУРЕНТНО: CAS на разной памяти,
 //! без общего состояния, без coalescing событий, без коллизий слотов.
 
-mod ffi;
-
-pub use ffi::*;
-
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -63,7 +59,7 @@ const RESERVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// силой — иначе сервер может отнять слот у ещё легитимно ожидающего
 /// клиента (аудит 2026-07-10). `slot_timeout` из `MultiClientOptions`
 /// клампится этим запасом в `client_worker`, независимо от того, что задал
-/// вызывающий (FFI не ограничивает `slot_timeout_ms` сверху).
+/// вызывающий (значение в `MultiClientOptions` сверху не ограничено).
 const RESERVE_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 
 /// Throttle для liveness-проверки процесса-владельца connected-слота
@@ -237,8 +233,15 @@ impl MultiServer {
 
         // Запускаем worker thread
         let server_clone = server.clone();
-        let handle = thread::Builder::new()
-            .name(format!("xshm-multi-{}", base_name))
+        // Имя потока -- только в debug (короткий непрозрачный тег), чтобы в
+        // release ни библиотека, ни имя канала не светились в списке потоков.
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsm-{base_name}"));
+        }
+        let handle = builder
             .spawn(move || server_clone.worker_loop())
             .map_err(|e| ShmError::WindowsError {
                 code: e.raw_os_error().unwrap_or(-1) as u32,
@@ -344,8 +347,8 @@ impl MultiServer {
     ///
     /// Синхронно дожидается выхода worker-потока перед возвратом — после
     /// return ни один callback (`on_message`/`on_client_connect`/`on_error`)
-    /// больше не будет вызван. Это критично для FFI: C-вызывающий код может
-    /// сразу освободить `user_data`/callback-структуры сразу после возврата.
+    /// больше не будет вызван -- вызывающий может сразу после возврата
+    /// освободить состояние, на которое ссылается handler.
     /// Идемпотентна: повторный вызов — no-op (`worker_handle` уже `None`).
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
@@ -480,11 +483,13 @@ impl MultiServer {
                 let slots = self.slots.read().unwrap();
                 for slot_mutex in slots.iter() {
                     let slot = slot_mutex.lock().unwrap();
-                    // Anonymous режим не поддерживается в multi-mode
-                    let events = slot
-                        .server
-                        .events()
-                        .expect("Anonymous mode not supported in multi-mode");
+                    // Слоты всегда named (MultiServer::start поднимает
+                    // SharedServer::start), но на anonymous-слоте событий нет --
+                    // молча пропускаем вместо паники в worker-потоке
+                    // (аудит 2026-07-28: `expect()` в библиотечном коде).
+                    let Some(events) = slot.server.events() else {
+                        continue;
+                    };
 
                     if slot.connected {
                         // Данные от клиента
@@ -601,12 +606,11 @@ impl MultiServer {
             .client_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
-        // Anonymous режим не поддерживается в multi-mode
-        server
-            .events()
-            .expect("Anonymous mode not supported in multi-mode")
-            .connect_ack
-            .set()?;
+        // Слот обязан быть named: без событий handshake завершить нечем.
+        let events = server.events().ok_or(ShmError::InvalidConfig(
+            "anonymous server is not supported in multi-mode",
+        ))?;
+        events.connect_ack.set()?;
         server.set_connected(true);
 
         Ok(())
@@ -666,10 +670,14 @@ impl MultiServer {
                 return; // уже обработан (например явным disconnect-событием)
             }
 
-            let claim_field =
-                &slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+            let claim_field = &slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
             if claim_field
-                .compare_exchange(expected_claim, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    expected_claim,
+                    CLAIM_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .is_err()
             {
                 return; // claim изменился — состояние слота уже не то, что при детекции
@@ -808,8 +816,13 @@ impl MultiClient {
         let slot_id_clone = slot_id.clone();
         let name = base_name.to_owned();
 
-        let handle = thread::Builder::new()
-            .name(format!("xshm-multi-client-{}", base_name))
+        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsmc-{base_name}"));
+        }
+        let handle = builder
             .spawn(move || {
                 client_worker(&name, handler, options, rx, running_clone, slot_id_clone);
             })
@@ -864,7 +877,7 @@ impl Drop for MultiClient {
 
 /// Клампит клиентский `slot_timeout` ниже `RESERVE_TIMEOUT` с запасом
 /// `RESERVE_SAFETY_MARGIN` — иначе при достаточно большом вызывающим-заданном
-/// `slot_timeout` (FFI не ограничивает его сверху) сервер мог бы счесть
+/// `slot_timeout` (сверху он не ограничен) сервер мог бы счесть
 /// клиента протухшим и отдать слот другому раньше, чем клиент сам отвалится
 /// по своему таймауту.
 fn clamp_slot_timeout(requested: Duration) -> Duration {
@@ -1008,6 +1021,11 @@ fn client_worker(
         // Слот освободился у нас — снимаем claim (best-effort), чтобы он сразу
         // вернулся в оборот. CAS token->FREE сработает, только если claim ещё наш
         // (если сервер уже отнял слот по таймауту/force-disconnect — это no-op).
+        //
+        // slot_id сбрасывается ЗДЕСЬ, а не только на ветке disconnect: выход по
+        // `running == false` (stop()/Drop) её минует, и `is_connected()` навсегда
+        // оставался бы `true` уже после остановки клиента (аудит 2026-07-28).
+        slot_id_out.store(SLOT_ID_NO_SLOT, Ordering::Release);
         drop(client);
         release_claim(&slot_name, token);
 
@@ -1069,8 +1087,7 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
         // RESERVED_OWNER_PID_INDEX) -- пишем СРАЗУ после успешного захвата,
         // Release гарантирует, что сервер, увидевший claim (Acquire), увидит
         // и корректный PID, а не мусор/значение от предыдущего владельца.
-        control.reserved[RESERVED_OWNER_PID_INDEX]
-            .store(std::process::id(), Ordering::Release);
+        control.reserved[RESERVED_OWNER_PID_INDEX].store(std::process::id(), Ordering::Release);
     }
     Ok(claimed)
     // mapping размапится здесь; захваченный claim остаётся в shared memory.
@@ -1144,7 +1161,7 @@ mod tests {
         }
     }
 
-    /// Регрессия (аудит 2026-07-10): FFI не ограничивал slot_timeout_ms
+    /// Регрессия (аудит 2026-07-10): `slot_timeout` не ограничивался
     /// сверху, позволяя caller-у задать значение >= RESERVE_TIMEOUT, из-за
     /// чего сервер мог отнять слот у ещё легитимно подключающегося клиента.
     #[test]
@@ -1179,10 +1196,10 @@ mod tests {
         let overflowed = push_with_cap(&mut queue, b"c".to_vec(), 2);
         assert!(overflowed);
         assert_eq!(queue.len(), 2);
-        assert_eq!(queue.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), [
-            b"b".as_slice(),
-            b"c".as_slice()
-        ]);
+        assert_eq!(
+            queue.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+            [b"b".as_slice(), b"c".as_slice()]
+        );
     }
 
     /// Регрессия (аудит 2026-07-10): токены захвата не должны предсказуемо
@@ -1219,8 +1236,8 @@ mod tests {
 
     /// `stop()` обязан синхронно дождаться выхода worker-потока: после
     /// возврата `worker_handle` должен быть `None` (взят и заджойнен), иначе
-    /// C-вызывающий код может освободить `user_data` до того как worker
-    /// перестал дёргать callbacks (UAF), а Drop потом попытался бы
+    /// вызывающий может освободить состояние handler'а до того, как worker
+    /// перестал дёргать callbacks, а Drop потом попытался бы
     /// повторно/self-join'ить уже неактуальный handle.
     #[test]
     fn stop_synchronously_joins_worker() {
@@ -1328,8 +1345,7 @@ mod tests {
             slot0.claim_seen_at = None; // форсируем немедленную liveness-проверку
             let control = slot0.server.view().control_block();
             control.reserved[RESERVED_CLAIM_INDEX].store(0xABCD_0001, Ordering::Release);
-            control.reserved[RESERVED_OWNER_PID_INDEX]
-                .store(std::process::id(), Ordering::Release);
+            control.reserved[RESERVED_OWNER_PID_INDEX].store(std::process::id(), Ordering::Release);
         }
 
         let orphaned = server.reclaim_stale_claims();
@@ -1417,11 +1433,15 @@ mod tests {
             let slots = server.slots.read().unwrap();
             let mut slot0 = slots[0].lock().unwrap();
             slot0.connected = true;
-            let claim_field =
-                &slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+            let claim_field = &slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
             claim_field.store(CLAIM_FREE, Ordering::Release);
             claim_field
-                .compare_exchange(CLAIM_FREE, RACING_TOKEN, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(
+                    CLAIM_FREE,
+                    RACING_TOKEN,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
                 .expect("simulated racing claim must succeed");
         }
 
@@ -1474,6 +1494,61 @@ mod tests {
 
         let slots = server.slots.read().unwrap();
         let slot0 = slots[0].lock().unwrap();
-        assert!(!slot0.connected, "слот должен быть отключён — claim реально FREE");
+        assert!(
+            !slot0.connected,
+            "слот должен быть отключён — claim реально FREE"
+        );
+    }
+    /// Регрессия (аудит 2026-07-28): `slot_id` сбрасывался только на ветке
+    /// disconnect-события, поэтому выход worker-а по `running == false`
+    /// (`stop()`/`Drop`) оставлял `is_connected()` навсегда `true`.
+    #[test]
+    fn is_connected_becomes_false_after_stop() {
+        struct Noop;
+        impl MultiHandler for Noop {
+            fn on_client_connect(&self, _id: u32) {}
+            fn on_client_disconnect(&self, _id: u32) {}
+            fn on_message(&self, _id: u32, _data: &[u8]) {}
+        }
+        struct NoopClient;
+        impl MultiClientHandler for NoopClient {
+            fn on_connect(&self, _slot: u32) {}
+            fn on_disconnect(&self) {}
+            fn on_message(&self, _data: &[u8]) {}
+        }
+
+        let name = format!("TEST_MULTI_STOP_FLAG_{}", std::process::id());
+        let server = MultiServer::start(
+            &name,
+            Arc::new(Noop),
+            MultiOptions {
+                max_clients: 2,
+                ..MultiOptions::default()
+            },
+        )
+        .expect("server start");
+
+        let client =
+            MultiClient::connect(&name, Arc::new(NoopClient), MultiClientOptions::default())
+                .expect("client connect");
+
+        let start = Instant::now();
+        while !client.is_connected() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(client.is_connected(), "клиент не подключился");
+
+        client.stop();
+
+        let start = Instant::now();
+        while client.is_connected() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !client.is_connected(),
+            "после stop() is_connected() обязан стать false"
+        );
+
+        server.stop();
     }
 }

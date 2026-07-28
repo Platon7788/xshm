@@ -33,6 +33,22 @@ pub struct RegistrationRequest {
     pub name: String,
 }
 
+/// Обрезает строку до `max` БАЙТ, не разрывая UTF-8 последовательность.
+///
+/// Наивное `&bytes[..max]` рубило по байту и могло оставить хвост
+/// многобайтового символа -- декодер (`from_utf8_lossy`) заменял его на U+FFFD,
+/// т.е. усечение молча портило последний символ имени (аудит 2026-07-28).
+fn truncate_utf8(value: &str, max: usize) -> &[u8] {
+    if value.len() <= max {
+        return value.as_bytes();
+    }
+    let mut end = max;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value.as_bytes()[..end]
+}
+
 /// Кодирует запрос регистрации в байты.
 ///
 /// Layout (v2):
@@ -46,8 +62,8 @@ pub struct RegistrationRequest {
 /// [13..]   name: UTF-8 байты (максимум 64)
 /// ```
 pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
-    let name_bytes = req.name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_NAME_LEN) as u8;
+    let name_bytes = truncate_utf8(&req.name, MAX_NAME_LEN);
+    let name_len = name_bytes.len() as u8;
     let total = 13 + name_len as usize;
     let mut buf = Vec::with_capacity(total);
 
@@ -57,7 +73,7 @@ pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
     buf.extend_from_slice(&req.pid.to_le_bytes());
     buf.extend_from_slice(&req.revision.to_le_bytes());
     buf.push(name_len);
-    buf.extend_from_slice(&name_bytes[..name_len as usize]);
+    buf.extend_from_slice(name_bytes);
 
     buf
 }
@@ -123,8 +139,8 @@ pub struct RegistrationResponse {
 /// [12..]   channel_name: UTF-8 байты (максимум 64)
 /// ```
 pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
-    let name_bytes = resp.channel_name.as_bytes();
-    let name_len = name_bytes.len().min(MAX_CHANNEL_NAME_LEN) as u8;
+    let name_bytes = truncate_utf8(&resp.channel_name, MAX_CHANNEL_NAME_LEN);
+    let name_len = name_bytes.len() as u8;
     let total = 12 + name_len as usize;
     let mut buf = Vec::with_capacity(total);
 
@@ -134,7 +150,7 @@ pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
     buf.push(resp.status);
     buf.extend_from_slice(&resp.client_id.to_le_bytes());
     buf.push(name_len);
-    buf.extend_from_slice(&name_bytes[..name_len as usize]);
+    buf.extend_from_slice(name_bytes);
 
     buf
 }
@@ -219,6 +235,26 @@ mod tests {
         let encoded = encode_request(&req);
         let decoded = decode_request(&encoded).unwrap();
         assert_eq!(decoded.name.len(), MAX_NAME_LEN);
+    }
+
+    /// Регрессия (аудит 2026-07-28): усечение до MAX_NAME_LEN байт не должно
+    /// разрывать многобайтовый символ -- иначе имя приезжает с U+FFFD.
+    #[test]
+    fn request_name_truncated_on_char_boundary() {
+        // 'Ж' -- 2 байта: 33 символа = 66 байт > MAX_NAME_LEN (64).
+        let req = RegistrationRequest {
+            pid: 1,
+            revision: 0,
+            name: "Ж".repeat(33),
+        };
+        let decoded = decode_request(&encode_request(&req)).unwrap();
+        assert!(decoded.name.len() <= MAX_NAME_LEN);
+        assert!(
+            !decoded.name.contains('\u{FFFD}'),
+            "усечение порвало UTF-8: {}",
+            decoded.name
+        );
+        assert_eq!(decoded.name, "Ж".repeat(32));
     }
 
     #[test]

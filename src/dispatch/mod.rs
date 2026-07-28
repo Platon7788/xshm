@@ -14,7 +14,6 @@
 //! Обмен 1:1 на выделенном канале
 //! ```
 
-pub mod ffi;
 pub mod protocol;
 
 use std::collections::HashMap;
@@ -154,7 +153,8 @@ pub struct DispatchServer {
     /// Потоки, ожидающие подключения клиента к выделенному каналу (см.
     /// `handle_lobby_client`) -- обязаны быть заджойнены в `stop()` ДО
     /// возврата, иначе `on_client_connect` мог бы выстрелить уже после того,
-    /// как C-вызывающий код счёл сервер остановленным и освободил user_data.
+    /// как вызывающий счёл сервер остановленным и освободил ресурсы,
+    /// на которые ссылается handler.
     pending_connects: Mutex<Vec<JoinHandle<()>>>,
     handler: Arc<dyn DispatchHandler>,
     options: DispatchOptions,
@@ -276,8 +276,8 @@ impl DispatchServer {
     /// Синхронно дожидается выхода lobby worker-потока И всех "pending
     /// connect" потоков (см. `handle_lobby_client`) перед возвратом — после
     /// return ни один callback (`on_client_connect`/`on_message`/`on_error`/…)
-    /// больше не будет вызван. Критично для FFI: C-вызывающий код может
-    /// освободить `user_data` сразу после возврата. Идемпотентна (повторный
+    /// больше не будет вызван -- вызывающий может сразу после возврата
+    /// освободить состояние, которым владеет handler. Идемпотентна (повторный
     /// вызов — no-op, обе очереди handle-ов уже опустошены).
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
@@ -530,7 +530,9 @@ impl DispatchServer {
                 if *guard {
                     break true;
                 }
-                let (guard, _) = cvar.wait_timeout(guard, remaining.min(poll_timeout)).unwrap();
+                let (guard, _) = cvar
+                    .wait_timeout(guard, remaining.min(poll_timeout))
+                    .unwrap();
                 if *guard {
                     break true;
                 }
@@ -651,7 +653,10 @@ impl AutoHandler for AutoProxyHandler {
 /// обмен данными → остановка. НЕ переподключается автоматически — при
 /// отключении нужно создать нового клиента.
 pub struct DispatchClient {
-    auto_client: Mutex<Option<AutoClient>>,
+    /// Разделяется с `DispatchClientProxy`: при разрыве канала прокси сам
+    /// забирает отсюда `AutoClient` и роняет его, останавливая бесконечные
+    /// попытки переподключения (см. `DispatchClientProxy::on_disconnect`).
+    auto_client: Arc<Mutex<Option<AutoClient>>>,
     running: Arc<AtomicBool>,
     client_id: u32,
     channel_name: String,
@@ -675,9 +680,14 @@ impl DispatchClient {
 
         // Фаза 2: подключение к выделенному каналу через AutoClient
         let running = Arc::new(AtomicBool::new(true));
+        let slot: Arc<Mutex<Option<AutoClient>>> = Arc::new(Mutex::new(None));
 
         let client_handler = Arc::new(DispatchClientProxy {
             handler: handler.clone(),
+            running: Arc::clone(&running),
+            slot: Arc::clone(&slot),
+            client_id: assigned_id,
+            channel_name: assigned_channel.clone(),
         });
 
         let auto_options = AutoOptions {
@@ -689,11 +699,17 @@ impl DispatchClient {
         };
 
         let auto_client = AutoClient::connect(&assigned_channel, client_handler, auto_options)?;
+        *slot.lock().unwrap() = Some(auto_client);
 
-        handler.on_connect(assigned_id, &assigned_channel);
+        // `on_connect` больше НЕ вызывается здесь: возврат `AutoClient::connect`
+        // означает лишь "worker-поток запущен", а не "канал поднят". Уведомление
+        // приходит из `DispatchClientProxy::on_connect`, когда handshake на
+        // выделенном канале реально завершён (аудит 2026-07-28) -- симметрично
+        // серверу, который ждёт фактического подключения перед
+        // `on_client_connect`.
 
         Ok(Self {
-            auto_client: Mutex::new(Some(auto_client)),
+            auto_client: slot,
             running,
             client_id: assigned_id,
             channel_name: assigned_channel,
@@ -722,7 +738,10 @@ impl DispatchClient {
         &self.channel_name
     }
 
-    /// Проверяет подключение к выделенному каналу.
+    /// Проверяет, жив ли выделенный канал.
+    ///
+    /// Становится `false` не только после `stop()`, но и при разрыве канала со
+    /// стороны сервера -- прокси гасит `running` в `on_disconnect`.
     pub fn is_connected(&self) -> bool {
         self.running.load(Ordering::Acquire) && self.auto_client.lock().unwrap().is_some()
     }
@@ -730,9 +749,21 @@ impl DispatchClient {
     /// Останавливает клиента и отключается.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
-        let mut guard = self.auto_client.lock().unwrap();
-        if let Some(client) = guard.take() {
+        Self::shutdown_channel(&self.auto_client);
+    }
+
+    /// Забирает `AutoClient` из общего слота и роняет его УЖЕ ПОСЛЕ
+    /// освобождения mutex-а.
+    ///
+    /// Порядок принципиален: `Drop for AutoClient` синхронно джойнит свой
+    /// worker-поток, а тот в этот момент может выполнять
+    /// `DispatchClientProxy::on_disconnect`, которому нужен тот же mutex --
+    /// дроп под захваченным lock-ом дал бы взаимную блокировку.
+    fn shutdown_channel(slot: &Arc<Mutex<Option<AutoClient>>>) {
+        let taken = slot.lock().unwrap().take();
+        if let Some(client) = taken {
             client.stop();
+            drop(client);
         }
     }
 }
@@ -740,10 +771,7 @@ impl DispatchClient {
 impl Drop for DispatchClient {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
-        let mut guard = self.auto_client.lock().unwrap();
-        if let Some(client) = guard.take() {
-            client.stop();
-        }
+        Self::shutdown_channel(&self.auto_client);
     }
 }
 
@@ -803,12 +831,33 @@ fn lobby_register(
 }
 
 /// Proxy-обработчик, пересылающий события AutoClient в DispatchClientHandler.
+///
+/// Дополнительно приводит поведение к задокументированному контракту
+/// `DispatchClient` (не переподключается автоматически): нижележащий
+/// `AutoClient` сам по себе переподключался бы к выделенному каналу вечно, хотя
+/// сервер этот канал уже снёс -- получался бесконечный цикл reconnect с потоком
+/// `on_error`, а `is_connected()` продолжал возвращать `true` (аудит 2026-07-28).
 struct DispatchClientProxy {
     handler: Arc<dyn DispatchClientHandler>,
+    running: Arc<AtomicBool>,
+    slot: Arc<Mutex<Option<AutoClient>>>,
+    client_id: u32,
+    channel_name: String,
 }
 
 impl AutoHandler for DispatchClientProxy {
+    fn on_connect(&self) {
+        self.handler.on_connect(self.client_id, &self.channel_name);
+    }
+
     fn on_disconnect(&self) {
+        self.running.store(false, Ordering::Release);
+        // Вызывается СИНХРОННО из worker-потока самого AutoClient. Забираем
+        // его из слота и роняем: `Drop for AutoClient` распознаёт self-join
+        // (`join_unless_self`) и просто открепляет поток, поэтому deadlock-а
+        // нет, а бесконечный reconnect прекращается.
+        let taken = self.slot.lock().unwrap().take();
+        drop(taken);
         self.handler.on_disconnect();
     }
 
@@ -886,9 +935,9 @@ mod tests {
     }
 
     /// Регрессия (аудит 2026-07-10, тот же класс, что и в multi/): stop()
-    /// обязан синхронно дождаться выхода lobby worker-потока, иначе
-    /// FFI-обёртка (shm_dispatch_server_stop) не может гарантировать, что
-    /// callbacks перестали дёргаться до освобождения user_data.
+    /// обязан синхронно дождаться выхода lobby worker-потока, иначе после
+    /// возврата из `stop()` callbacks могут продолжать дёргаться на уже
+    /// освобождённом вызывающим состоянии.
     #[test]
     fn stop_synchronously_joins_worker() {
         let handler = Arc::new(TestServerHandler::new());
@@ -1173,9 +1222,13 @@ mod tests {
             revision: 1,
             name: "stalled.exe".into(),
         };
-        let (_id_a, _channel_a) =
-            lobby_register(&name, &reg_a, &DispatchClientOptions::default(), &mut buffer)
-                .expect("client A lobby_register");
+        let (_id_a, _channel_a) = lobby_register(
+            &name,
+            &reg_a,
+            &DispatchClientOptions::default(),
+            &mut buffer,
+        )
+        .expect("client A lobby_register");
         // Намеренно НЕ вызываем AutoClient::connect для client A -- канал
         // остаётся неподключённым до истечения channel_connect_timeout.
 
@@ -1236,6 +1289,56 @@ mod tests {
                 "имя канала должно состоять только из hex-символов: {n}"
             );
         }
+
+        server.stop();
+    }
+    /// Регрессия (аудит 2026-07-28): после `disconnect_client()` со стороны
+    /// сервера нижележащий `AutoClient` продолжал бесконечно переподключаться
+    /// к уже снесённому каналу, а `DispatchClient::is_connected()` оставался
+    /// `true` -- вопреки задокументированному "не переподключается
+    /// автоматически".
+    #[test]
+    fn client_is_connected_false_after_server_disconnect() {
+        let name = format!("TEST_DISPATCH_CFLAG_{}", std::process::id());
+
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server =
+            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
+                .expect("server start");
+
+        thread::sleep(Duration::from_millis(100));
+
+        let client_handler = Arc::new(TestClientHandler::new());
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration {
+                pid: std::process::id(),
+                revision: 1,
+                name: "cflag.exe".into(),
+            },
+            client_handler.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+
+        let start = std::time::Instant::now();
+        while server.client_count() == 0 && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(server.client_count(), 1);
+        assert!(client.is_connected(), "канал должен быть поднят");
+
+        let ids = server.connected_clients();
+        server.disconnect_client(ids[0]).expect("disconnect_client");
+
+        let start = std::time::Instant::now();
+        while client.is_connected() && start.elapsed() < Duration::from_secs(5) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !client.is_connected(),
+            "после разрыва со стороны сервера is_connected() обязан стать false"
+        );
 
         server.stop();
     }
