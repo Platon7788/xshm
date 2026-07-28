@@ -11,4 +11,5 @@ CLAUDE.md
 /.claude-flow
 /.mcp.json
 /.swarm
+/claude-flow.config.json
 /ruvector.db
