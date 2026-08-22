@@ -6,10 +6,7 @@ Cargo.lock
 /Docs
 CLAUDE.md
 
-# Локальные инструменты/артефакты (ruflo / claude-flow / claude code)
+# Локальные инструменты/артефакты (xflow / claude code)
 /.claude
-/.claude-flow
 /.mcp.json
-/.swarm
-/claude-flow.config.json
-/ruvector.db
+/.xflow

@@ -138,7 +138,7 @@ Channel events always land in the same namespace as the section.
 ## Requirements
 
 - Windows 10/11
-- Rust 1.97+ (stable) — edition 2024 and `rust-version = "1.97"` in the manifest
+- Rust 1.98+ (stable) — edition 2024 and `rust-version = "1.98"` in the manifest
 - MSVC toolchain (MinGW targets were dropped in 0.7.0 together with the C ABI)
 - **No administrator privileges required** — named kernel objects are session-scoped (`Local\` prefix → `\Sessions\<SessionId>\BaseNamedObjects\`). Elevated rights are only needed if you explicitly use the `Global\` prefix
 
