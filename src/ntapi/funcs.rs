@@ -59,6 +59,9 @@ unsafe extern "system" {
     /// Установка события в сигнальное состояние
     pub fn NtSetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
 
+    /// Сброс события в несигнальное состояние
+    pub fn NtResetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
+
     // ========================================================================
     // Wait operations
     // ========================================================================

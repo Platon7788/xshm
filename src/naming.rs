@@ -26,7 +26,7 @@ impl Direction {
 /// `to_nt_path` разворачивал его в `\Sessions\<id>\BaseNamedObjects\Global\Chan`
 /// — несуществующий путь, из-за чего межсессионный IPC через `Global\`
 /// (заявленный в README и в доке `to_nt_path`) не работал вообще.
-fn has_explicit_namespace(base: &str) -> bool {
+pub(crate) fn has_explicit_namespace(base: &str) -> bool {
     base.starts_with("Global\\") || base.starts_with("Local\\") || base.starts_with('\\')
 }
 

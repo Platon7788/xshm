@@ -12,6 +12,7 @@ mod shared;
 mod win;
 
 pub mod auto;
+mod beacon;
 pub mod dispatch;
 pub mod multi;
 
@@ -22,6 +23,7 @@ pub(crate) mod ntapi;
 mod peer_tests;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
+pub use beacon::Beacon;
 pub use client::SharedClient;
 /// Лимиты кольца -- нужны потребителям, которые строят свой протокол поверх
 /// `try_send*`/`free_space` (размер кадра, число слотов).

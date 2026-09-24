@@ -7,7 +7,7 @@
 Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. A pure Rust crate — no C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,7 +23,15 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ---
 
-## 🆕 What's New in v0.8.0
+## 🆕 What's New in v0.9.0
+
+- ✅ **`Beacon` — event-driven server discovery** — a named manual-reset
+  notification event `<name>_beacon`: the server `raise`s it on start and
+  `lower`s it on a clean stop, clients sleep in `wait()` and all wake at once
+  when the server appears — no connect-polling while no server exists.
+  `open` creates or opens (any start order).
+
+## Previously in v0.8.0
 
 - ✅ **Lossless writes** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` never overwrite unread data (`Err(QueueFull)` leaves the ring untouched); `free_space()` gives a conservative writer-side estimate; `wait_for_space()` sleeps on the `SPACE` event. Layout-compatible with 0.7.0 (`SHARED_VERSION` unchanged).
 - ✅ **Reliable peer-crash detection** — peers exchange PIDs during the handshake and each side holds an open handle to the other's process; a killed/crashed peer is noticed within ~1–5 ms (see [Peer liveness](#peer-liveness)). New `DisconnectReason` (`Graceful` / `PeerDied` / `Local` / `Error`) via the default-method callbacks `on_disconnect_reason` / `on_client_disconnect_reason`, `is_peer_alive()` / `peer_pid()` accessors, `ShmError::PeerDied` from `wait_for_space` / `poll_*`. Wire-compatible with 0.7.0 / early 0.8.0 peers (they simply aren't watched).

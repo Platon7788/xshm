@@ -21,6 +21,7 @@ use crate::ntapi::{
     EVENT_ALL_ACCESS,
     HANDLE,
     LARGE_INTEGER,
+    NOTIFICATION_EVENT,
     NT_CURRENT_PROCESS,
     NTSTATUS,
     // Functions
@@ -33,12 +34,14 @@ use crate::ntapi::{
     NtOpenEvent,
     NtOpenProcess,
     NtOpenSection,
+    NtResetEvent,
     NtSetEvent,
     NtUnmapViewOfSection,
     NtWaitForMultipleObjects,
     NtWaitForSingleObject,
     NullDaclSecurityDescriptor,
     OBJ_CASE_INSENSITIVE,
+    OBJ_OPENIF,
     OBJECT_ATTRIBUTES,
     PAGE_READWRITE,
     PROCESS_QUERY_LIMITED_INFORMATION,
@@ -46,6 +49,7 @@ use crate::ntapi::{
     PVOID,
     SEC_COMMIT,
     SECTION_ALL_ACCESS,
+    STATUS_OBJECT_NAME_EXISTS,
     // Constants
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
@@ -155,6 +159,48 @@ impl EventHandle {
         Ok(EventHandle {
             handle: Handle(handle),
         })
+    }
+
+    /// Событие-уведомление (ручной сброс): создаётся или, если уже есть,
+    /// открывается (`OBJ_OPENIF`). NULL DACL — как у остальных объектов.
+    pub fn open_or_create_notification(name: &str) -> Result<Self> {
+        let mut nt_name = NtName::new(name)?;
+        let mut sd = NullDaclSecurityDescriptor::new();
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
+            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            sd.as_ptr(),
+        );
+        let mut handle: HANDLE = null_mut();
+        // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
+        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
+        let status = unsafe {
+            NtCreateEvent(
+                &mut handle,
+                EVENT_ALL_ACCESS,
+                &mut obj_attr,
+                NOTIFICATION_EVENT,
+                0, // InitialState = FALSE (у нового; существующее не трогаем)
+            )
+        };
+        if status != STATUS_SUCCESS && status != STATUS_OBJECT_NAME_EXISTS {
+            return Err(status_to_error(status, "NtCreateEvent(notification)"));
+        }
+        Ok(EventHandle {
+            handle: Handle(handle),
+        })
+    }
+
+    /// Сброс в несигнальное состояние через NtResetEvent
+    pub fn reset(&self) -> Result<()> {
+        let mut previous_state: i32 = 0;
+        // SAFETY: дескриптор валиден, пока жив `self`; `previous_state` --
+        // валидный out-параметр на стеке.
+        let status = unsafe { NtResetEvent(self.handle.raw(), &mut previous_state) };
+        if status != STATUS_SUCCESS {
+            return Err(status_to_error(status, "NtResetEvent"));
+        }
+        Ok(())
     }
 
     /// Открытие события через NtOpenEvent

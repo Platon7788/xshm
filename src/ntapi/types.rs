@@ -243,6 +243,13 @@ pub const EVENT_ALL_ACCESS: ACCESS_MASK = 0x001F0003;
 
 /// SynchronizationEvent - auto-reset event
 pub const SYNCHRONIZATION_EVENT: ULONG = 1;
+/// Событие-уведомление: остаётся взведённым, будит всех ждущих, сбрасывается
+/// явно (`NtResetEvent`).
+pub const NOTIFICATION_EVENT: ULONG = 0;
+/// Открыть существующий именованный объект вместо ошибки коллизии имени.
+pub const OBJ_OPENIF: ULONG = 0x0000_0080;
+/// Информационный успех `OBJ_OPENIF`: объект уже существовал и открыт.
+pub const STATUS_OBJECT_NAME_EXISTS: NTSTATUS = 0x4000_0000;
 
 // ============================================================================
 // Константы для Wait
