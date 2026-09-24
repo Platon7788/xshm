@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::constants::*;
 use crate::error::{Result, ShmError};
 use crate::layout::RingHeader;
-use crate::win::EventHandle;
+use crate::win::{EventHandle, ProcessWatch, wait_any};
 
 /// Максимальный отрезок одного сна в `wait_for_space`: страховка от
 /// потерянного сигнала (читатель старой версии не знает про заявку) --
@@ -517,18 +517,22 @@ impl RingBuffer {
 
     /// Писатель: дождаться, пока в кольце появится место под payload длины
     /// `payload_len`. `Ok(true)` -- место есть (следующий `try_write_message`
-    /// этого писателя пройдёт), `Ok(false)` -- истёк `timeout`. `None` --
-    /// ждать без ограничения (осторожно: мёртвый читатель место не
-    /// освободит никогда).
+    /// этого писателя пройдёт), `Ok(false)` -- истёк `timeout`,
+    /// `Err(PeerDied)` -- процесс читателя умер (место не освободится
+    /// никогда). `timeout = None` -- ждать без ограничения: безопасно только
+    /// при наблюдаемом пире (`peer`), иначе мёртвый читатель подвесит навсегда.
     ///
     /// Пробуждение -- событие `SPACE` направления, которое читатель сигналит
-    /// через `take_space_waiter`. Ожидание нарезается кусками не длиннее
-    /// `SPACE_WAIT_SLICE`, поэтому и без события (anonymous-сервер, читатель
-    /// старой версии, не знающий про заявку) место будет замечено опросом.
+    /// через `take_space_waiter`, либо сигнал handle процесса-читателя (он
+    /// лежит в том же наборе ожидания). Ожидание нарезается кусками не
+    /// длиннее `SPACE_WAIT_SLICE`, поэтому и без события (anonymous-сервер,
+    /// читатель старой версии, не знающий про заявку) место будет замечено
+    /// опросом.
     pub(crate) fn wait_for_space(
         &self,
         payload_len: usize,
         space_event: Option<&EventHandle>,
+        peer: Option<&ProcessWatch>,
         timeout: Option<Duration>,
     ) -> Result<bool> {
         let frame = frame_len(payload_len)?;
@@ -554,16 +558,36 @@ impl RingBuffer {
                 }
                 None => SPACE_WAIT_SLICE,
             };
-            match space_event {
+            let peer_died = match (space_event, peer) {
+                // Событие + handle пира в одном ожидании: индекс 1 -- смерть.
+                (Some(event), Some(peer)) => {
+                    match wait_any(&[event.raw_handle(), peer.raw_handle()], Some(slice)) {
+                        Ok(index) => index == Some(1),
+                        Err(err) => {
+                            self.disarm_space_waiter();
+                            return Err(err);
+                        }
+                    }
+                }
                 // Результат (сигнал/таймаут) не важен: цикл всё равно
                 // перепроверяет место. Ошибка ядра -- пробрасываем.
-                Some(event) => {
+                (Some(event), None) => {
                     if let Err(err) = event.wait(Some(slice)) {
                         self.disarm_space_waiter();
                         return Err(err);
                     }
+                    false
                 }
-                None => std::thread::sleep(slice.min(SPACE_POLL_INTERVAL)),
+                (None, peer) => {
+                    std::thread::sleep(slice.min(SPACE_POLL_INTERVAL));
+                    peer.is_some_and(ProcessWatch::has_exited)
+                }
+            };
+            // Читатель мог успеть освободить место перед смертью -- тогда
+            // честно отвечаем «место есть» на следующей итерации.
+            if peer_died && !self.free_space().fits(payload_len) {
+                self.disarm_space_waiter();
+                return Err(ShmError::PeerDied);
             }
         }
     }
@@ -1017,7 +1041,7 @@ mod try_write_tests {
         const LEN: usize = 60_000;
         while ring.try_write_message(&[0u8; LEN]).is_ok() {}
         assert_eq!(
-            ring.wait_for_space(LEN, None, Some(Duration::from_millis(20))),
+            ring.wait_for_space(LEN, None, None, Some(Duration::from_millis(20))),
             Ok(false)
         );
         assert_eq!(
@@ -1036,13 +1060,13 @@ mod try_write_tests {
             })
         };
         assert_eq!(
-            ring.wait_for_space(LEN, None, Some(Duration::from_secs(5))),
+            ring.wait_for_space(LEN, None, None, Some(Duration::from_secs(5))),
             Ok(true)
         );
         reader.join().unwrap();
         ring.try_write_message(&[1u8; LEN]).unwrap();
         assert_eq!(
-            ring.wait_for_space(1, None, None),
+            ring.wait_for_space(1, None, None, None),
             Err(ShmError::MessageTooSmall),
             "длина проверяется до ожидания"
         );

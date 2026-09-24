@@ -26,6 +26,7 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 ## 🆕 What's New in v0.8.0
 
 - ✅ **Lossless writes** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` never overwrite unread data (`Err(QueueFull)` leaves the ring untouched); `free_space()` gives a conservative writer-side estimate; `wait_for_space()` sleeps on the `SPACE` event. Layout-compatible with 0.7.0 (`SHARED_VERSION` unchanged).
+- ✅ **Reliable peer-crash detection** — peers exchange PIDs during the handshake and each side holds an open handle to the other's process; a killed/crashed peer is noticed within ~1–5 ms (see [Peer liveness](#peer-liveness)). New `DisconnectReason` (`Graceful` / `PeerDied` / `Local` / `Error`) via the default-method callbacks `on_disconnect_reason` / `on_client_disconnect_reason`, `is_peer_alive()` / `peer_pid()` accessors, `ShmError::PeerDied` from `wait_for_space` / `poll_*`. Wire-compatible with 0.7.0 / early 0.8.0 peers (they simply aren't watched).
 - ✅ Ring constants (`RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, …) are exported from the crate root.
 - 🐛 Auto: a `send` with an invalid length no longer blocks the queue forever — it is dropped and reported via `on_error`.
 
@@ -451,6 +452,38 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 
 The layout is unchanged: the wake-up request lives in a previously reserved
 `RingHeader` word, so `SHARED_VERSION` stays the same and 0.7.0 peers interoperate.
+
+### Peer liveness
+
+Graceful disconnects are signalled by the `DISCONNECT` event, but a crashed or
+killed process signals nothing. Since 0.8 both sides learn the peer's PID during
+the handshake and **hold an open process handle** (`SYNCHRONIZE`) for the whole
+connection. The process object stays alive while the handle is open and becomes
+signalled when the process exits, so death is detected reliably and PID reuse
+cannot fool it (re-opening by PID cannot tell "gone" from "access denied").
+
+| Mode | How death is surfaced |
+|------|-----------------------|
+| Single-client | `poll_client` / `poll_server` / `wait_for_space` return `Err(ShmError::PeerDied)` right away; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
+| Auto | the peer's process handle is in the worker's wait set → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
+| Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
+| Multi-client | orphaned slots of dead clients are reclaimed on the next worker iteration (no 3 s throttle) |
+
+- The new callbacks are **default methods** that forward to `on_disconnect` /
+  `on_client_disconnect`, so existing handlers keep working. The library calls only
+  the `*_reason` variant.
+- Everything the peer wrote into the ring before it died is delivered **before**
+  `PeerDied` is reported.
+- `is_peer_alive()` returns `None` ("unknown") when the peer is an older version
+  (no PID in the handshake) or its process could not be opened (e.g. a service in
+  another session without rights). Those connections behave exactly like 0.7.
+- Measured on Windows 11 (`tests/peer_death.rs`, `TerminateProcess` of the peer):
+  1–5 ms from kill to callback / error in all modes.
+
+Protocol extension (no layout or `SHARED_VERSION` change): the server writes its PID
+to `ControlBlock.reserved[2]` at creation; the client writes its PID to
+`reserved[3]` before `CLIENT_HELLO`, and the server consumes it with `swap(0)`. A PID
+whose process is already dead at handshake time is ignored.
 
 ## Constants
 

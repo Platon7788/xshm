@@ -496,73 +496,124 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
 }
 
 // ============================================================================
-// is_process_alive - liveness-проверка процесса по PID (NtOpenProcess)
+// ProcessWatch - удерживаемый handle процесса-пира (детекция смерти)
 // ============================================================================
 
-/// Проверяет, жив ли процесс с данным PID.
+/// Удерживаемый handle процесса-пира.
 ///
-/// Используется multi-client сервером для liveness-детекции connected-слотов,
-/// чей клиент мог упасть ПОСЛЕ завершения handshake, не освободив claim (в
-/// этом случае никаких событий от мёртвого процесса не придёт, и слот иначе
-/// был бы потерян навсегда — см. `RESERVED_OWNER_PID_INDEX`).
+/// Открывается ОДИН раз при подключении (`NtOpenProcess` с
+/// `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`) и живёт, пока живёт
+/// соединение. Пока handle открыт, объект-процесс не уничтожается ядром даже
+/// после смерти процесса -- он просто переходит в сигнальное состояние. Поэтому:
 ///
-/// Консервативна по конструкции: при любой двусмысленности (PID уже
-/// переиспользован под другой процесс, недостаточно прав, иная ошибка NT)
-/// возвращает `true` ("жив") — чтобы не отключить силой ещё легитимно
-/// работающего клиента. Возвращает `false` ТОЛЬКО при однозначном
-/// подтверждении: handle открыт и находится в сигнальном состоянии
-/// (WaitForSingleObject с нулевым таймаутом вернул STATUS_WAIT_0 — процесс
-/// завершился).
+/// - смерть видна надёжно (в отличие от повторного `NtOpenProcess` по PID:
+///   когда последний handle мёртвого процесса закрыт, открыть его уже нельзя,
+///   и «не открылся» неотличим от «нет прав»);
+/// - переиспользование PID после смерти не путает наблюдателя -- handle
+///   ссылается на конкретный объект-процесс, а не на номер;
+/// - handle можно положить в набор `wait_any` рядом с событиями канала и
+///   узнать о смерти пира без опроса.
+#[derive(Debug)]
+pub struct ProcessWatch {
+    handle: Handle,
+    pid: u32,
+}
+
+// SAFETY: внутри только NT-дескриптор процесса (машинное слово) и PID. Все
+// операции над дескриптором (`NtWaitForSingleObject`/`NtWaitForMultipleObjects`
+// с нулевым/любым таймаутом, `NtClose` в Drop) потокобезопасны на уровне ядра,
+// у типа нет внутренней изменяемости на стороне Rust -- как у `EventHandle`.
+// Без этого `SharedServer`/`SharedClient` молча потеряли бы `Sync`, которым
+// обладали до 0.8 (ломающее изменение API).
+unsafe impl Send for ProcessWatch {}
+// SAFETY: см. выше.
+unsafe impl Sync for ProcessWatch {}
+
+impl ProcessWatch {
+    /// Открыть процесс `pid` для наблюдения. `None` -- PID неизвестен (0),
+    /// процесса уже нет, либо не хватает прав (например, пир -- служба в
+    /// другой сессии); вызывающий тогда работает без детекции смерти.
+    pub fn open(pid: u32) -> Option<Self> {
+        if pid == 0 {
+            return None; // 0 -- «PID не передан» (пир старой версии)
+        }
+
+        let mut client_id = CLIENT_ID {
+            // PID -- не адрес: собираем «указателеподобное» значение без провенанса
+            // (`without_provenance_mut`), а не через `as`-каста целого в указатель.
+            UniqueProcess: core::ptr::without_provenance_mut(pid as usize),
+            UniqueThread: null_mut(),
+        };
+        // ObjectName = NULL: процессы не именованные объекты BaseNamedObjects,
+        // идентифицируются исключительно через ClientId.
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(null_mut(), 0, null_mut());
+        let mut raw_handle: HANDLE = null_mut();
+
+        // SAFETY: out-параметр и `obj_attr`/`client_id` -- локальные переменные,
+        // живущие до конца вызова; ObjectName внутри `obj_attr` намеренно NULL.
+        let open_status = unsafe {
+            NtOpenProcess(
+                &mut raw_handle,
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+                &mut obj_attr,
+                &mut client_id,
+            )
+        };
+        if open_status != STATUS_SUCCESS || raw_handle.is_null() {
+            return None;
+        }
+        Some(Self {
+            handle: Handle(raw_handle),
+            pid,
+        })
+    }
+
+    /// Открыть наблюдение за пиром, чей PID пришёл в handshake. Процесс,
+    /// который уже мёртв в момент подключения, НЕ наблюдается (`None`, а не
+    /// «сразу умер»): живой пир не мог бы прислать HELLO из мёртвого процесса,
+    /// значит PID устаревший (например, остался от упавшего посреди handshake
+    /// клиента), и честный ответ -- «неизвестно».
+    pub fn open_peer(pid: u32) -> Option<Self> {
+        Self::open(pid).filter(|watch| !watch.has_exited())
+    }
+
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// `true` -- процесс подтверждённо завершился (объект-процесс сигнален).
+    /// Любая неоднозначность (ошибка ожидания) трактуется как «жив».
+    pub fn has_exited(&self) -> bool {
+        let zero_timeout: i64 = 0; // мгновенный опрос, без блокировки
+        // SAFETY: дескриптор процесса валиден (открыт в `open`, закрывается
+        // через Drop `Handle`); `zero_timeout` живёт до конца вызова.
+        let wait_status = unsafe { NtWaitForSingleObject(self.handle.raw(), 0, &zero_timeout) };
+        wait_status == STATUS_WAIT_0
+    }
+
+    /// Числовой handle для набора `wait_any` (сигналится при смерти процесса).
+    pub fn raw_handle(&self) -> isize {
+        self.handle.as_isize()
+    }
+}
+
+/// Проверяет, жив ли процесс с данным PID (разовая проверка без удержания).
+///
+/// Используется multi-client сервером как запасной путь, когда у слота нет
+/// удерживаемого `ProcessWatch` (клиент старой версии не передал PID в
+/// handshake) -- см. `RESERVED_OWNER_PID_INDEX`.
+///
+/// Консервативна по конструкции: при любой двусмысленности (процесс не
+/// открылся -- PID переиспользован, нет прав, ИЛИ процесс уже полностью
+/// удалён ядром, потому что никто не держал его handle) возвращает `true`
+/// ("жив"). Возвращает `false` ТОЛЬКО если handle открылся и процесс
+/// сигнален. Для надёжной детекции смерти держите `ProcessWatch` с момента
+/// подключения.
 pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return true; // 0 не бывает PID пользовательского процесса
     }
-
-    let mut client_id = CLIENT_ID {
-        // PID -- не адрес: собираем «указателеподобное» значение без провенанса
-        // (`without_provenance_mut`), а не через `as`-каста целого в указатель.
-        UniqueProcess: core::ptr::without_provenance_mut(pid as usize),
-        UniqueThread: null_mut(),
-    };
-    // ObjectName = NULL: процессы не именованные объекты BaseNamedObjects,
-    // идентифицируются исключительно через ClientId.
-    let mut obj_attr = OBJECT_ATTRIBUTES::new(null_mut(), 0, null_mut());
-    let mut raw_handle: HANDLE = null_mut();
-
-    // SAFETY: out-параметр и `obj_attr`/`client_id` -- локальные переменные,
-    // живущие до конца вызова; ObjectName внутри `obj_attr` намеренно NULL.
-    let open_status = unsafe {
-        NtOpenProcess(
-            &mut raw_handle,
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            &mut obj_attr,
-            &mut client_id,
-        )
-    };
-
-    if open_status != STATUS_SUCCESS {
-        // Не удалось открыть — PID переиспользован, отказано в доступе или
-        // иная ошибка. Ни один из этих случаев не является подтверждением
-        // смерти процесса-владельца claim, поэтому НЕ считаем его мёртвым.
-        return true;
-    }
-
-    // RAII: handle закроется через NtClose при выходе из функции.
-    let handle = Handle(raw_handle);
-
-    let zero_timeout: i64 = 0; // мгновенный опрос, не блокируем worker
-    // SAFETY: дескриптор процесса валиден (открыт выше, закрывается через Drop);
-    // `zero_timeout` живёт до конца вызова.
-    let wait_status = unsafe { NtWaitForSingleObject(handle.raw(), 0, &zero_timeout) };
-
-    match wait_status {
-        // Объект-процесс сигнален => процесс завершился.
-        STATUS_WAIT_0 => false,
-        // Таймаут (объект не сигнален) => процесс всё ещё выполняется.
-        STATUS_TIMEOUT => true,
-        // Любой иной статус — двусмысленность, консервативно трактуем как "жив".
-        _ => true,
-    }
+    ProcessWatch::open(pid).is_none_or(|watch| !watch.has_exited())
 }
 
 #[cfg(test)]

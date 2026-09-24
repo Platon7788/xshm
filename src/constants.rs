@@ -51,3 +51,19 @@ pub const CLAIM_FREE: u32 = 0;
 /// упавший ПОСЛЕ завершения handshake (но не освободивший claim), иначе
 /// навсегда лишает сервер слота — событий от мёртвого процесса не будет.
 pub const RESERVED_OWNER_PID_INDEX: usize = 1;
+
+/// Индекс в reserved[] ControlBlock для PID процесса-сервера (0.8+).
+///
+/// Пишется сервером при создании сегмента (`SharedServer::start*`); клиент
+/// читает его после SERVER_READY и открывает удерживаемый handle процесса
+/// сервера (`ProcessWatch`) для детекции его смерти. `0` -- сервер старой
+/// версии, PID неизвестен (детекции смерти нет, поведение как в 0.7).
+pub const RESERVED_SERVER_PID_INDEX: usize = 2;
+
+/// Индекс в reserved[] ControlBlock для PID процесса-клиента (0.8+).
+///
+/// Клиент пишет его ДО `CLIENT_HELLO` (Release-публикация через
+/// `client_state`); сервер в `complete_handshake` забирает его `swap(0)` --
+/// значение одноразовое, поэтому клиент старой версии, пришедший следом, не
+/// унаследует чужой PID. Откат handshake на клиенте тоже его обнуляет.
+pub const RESERVED_CLIENT_PID_INDEX: usize = 3;

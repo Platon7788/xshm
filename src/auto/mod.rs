@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::client::SharedClient;
 use crate::constants::{MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE};
-use crate::error::{Result, ShmError};
+use crate::error::{DisconnectReason, Result, ShmError};
 use crate::ring::{FreeSpace, WriteOutcome, frame_len};
 use crate::server::SharedServer;
 use crate::wait_delay;
@@ -61,6 +61,14 @@ pub enum ChannelKind {
 pub trait AutoHandler: Send + Sync + 'static {
     fn on_connect(&self) {}
     fn on_disconnect(&self) {}
+    /// Отключение с причиной (0.8+). По умолчанию вызывает `on_disconnect()` --
+    /// существующие реализации работают как раньше; переопределите, чтобы
+    /// отличать штатное отключение от смерти процесса пира
+    /// (`DisconnectReason::PeerDied`). Worker вызывает ТОЛЬКО этот метод.
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        let _ = reason;
+        self.on_disconnect();
+    }
     fn on_message(&self, _direction: ChannelKind, _payload: &[u8]) {}
     fn on_overflow(&self, _direction: ChannelKind, _count: u32) {}
     fn on_space_available(&self, _direction: ChannelKind) {}
@@ -163,15 +171,59 @@ type SendQueue = VecDeque<Outgoing>;
 /// (`Acquire`) ДО снимка. Увидел уменьшенный `pending` -- увидит и
 /// уменьшенный снимок; не увидел -- вычтет ещё не списанное сообщение из
 /// снимка, в котором его ещё нет. В обоих случаях оценка не завышена.
+///
+/// `peer_*` -- состояние наблюдения за процессом пира, которое публикует
+/// worker (он единственный держит `ProcessWatch`): PID и статус
+/// `PEER_UNKNOWN`/`PEER_ALIVE`/`PEER_DEAD`.
 #[derive(Debug, Default)]
-struct SendGauge {
+struct ChannelState {
     pending_msgs: AtomicUsize,
     pending_bytes: AtomicUsize,
     ring_free_bytes: AtomicUsize,
     ring_free_msgs: AtomicU32,
+    peer_pid: AtomicU32,
+    peer_status: AtomicU8,
 }
 
-impl SendGauge {
+const PEER_UNKNOWN: u8 = 0;
+const PEER_ALIVE: u8 = 1;
+const PEER_DEAD: u8 = 2;
+
+impl ChannelState {
+    /// Worker: соединение поднято; `pid` -- наблюдаемый пир (если есть).
+    fn peer_connected(&self, pid: Option<u32>) {
+        self.peer_pid.store(pid.unwrap_or(0), Ordering::Release);
+        let status = if pid.is_some() {
+            PEER_ALIVE
+        } else {
+            PEER_UNKNOWN
+        };
+        self.peer_status.store(status, Ordering::Release);
+    }
+
+    /// Worker: соединение разорвано. После смерти пира PID сохраняется
+    /// (для диагностики), статус -- `PEER_DEAD` до следующего подключения.
+    fn peer_disconnected(&self, reason: DisconnectReason) {
+        if reason == DisconnectReason::PeerDied {
+            self.peer_status.store(PEER_DEAD, Ordering::Release);
+        } else {
+            self.peer_status.store(PEER_UNKNOWN, Ordering::Release);
+            self.peer_pid.store(0, Ordering::Release);
+        }
+    }
+
+    fn peer_alive(&self) -> Option<bool> {
+        match self.peer_status.load(Ordering::Acquire) {
+            PEER_ALIVE => Some(true),
+            PEER_DEAD => Some(false),
+            _ => None,
+        }
+    }
+
+    fn peer_pid(&self) -> Option<u32> {
+        Some(self.peer_pid.load(Ordering::Acquire)).filter(|&pid| pid != 0)
+    }
+
     /// Принять сообщение в учёт (до отправки команды worker-у).
     fn acquire(&self, frame: usize) {
         self.pending_bytes.fetch_add(frame, Ordering::AcqRel);
@@ -226,7 +278,7 @@ impl SendGauge {
 fn enqueue(
     cmd_tx: &Sender<WorkerCommand>,
     running: &AtomicBool,
-    gauge: &SendGauge,
+    gauge: &ChannelState,
     data: &[u8],
     lossless: bool,
     max_send_queue: usize,
@@ -261,7 +313,7 @@ pub struct AutoServer {
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
-    gauge: Arc<SendGauge>,
+    gauge: Arc<ChannelState>,
     max_send_queue: usize,
 }
 
@@ -271,7 +323,7 @@ impl AutoServer {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
-        let gauge = Arc::new(SendGauge::default());
+        let gauge = Arc::new(ChannelState::default());
         let max_send_queue = options.max_send_queue;
         let join_running = running.clone();
         let join_stats = stats.clone();
@@ -366,6 +418,23 @@ impl AutoServer {
         self.gauge.estimate(self.max_send_queue.max(1))
     }
 
+    /// Жив ли процесс пира по данным worker-а: `Some(true)` -- подключён и
+    /// наблюдается через удерживаемый handle; `Some(false)` -- последнее
+    /// отключение было `PeerDied` (до следующего подключения); `None` -- нет
+    /// подключения или пир не наблюдается (старая версия / нет прав).
+    /// Смерть пира worker замечает сразу (handle в наборе ожидания), но
+    /// статус обновляется после доставки оставшихся в кольце сообщений.
+    #[must_use]
+    pub fn is_peer_alive(&self) -> Option<bool> {
+        self.gauge.peer_alive()
+    }
+
+    /// PID наблюдаемого пира (после `PeerDied` -- PID умершего процесса).
+    #[must_use]
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.gauge.peer_pid()
+    }
+
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
     }
@@ -392,7 +461,7 @@ fn server_worker(
     cmd_rx: Receiver<WorkerCommand>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
-    gauge: Arc<SendGauge>,
+    gauge: Arc<ChannelState>,
 ) {
     let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
@@ -406,7 +475,7 @@ fn server_worker(
         ));
         return;
     };
-    let handles = [
+    let base_handles = [
         server_events.disconnect.raw_handle(),
         server_events.c2s.data.raw_handle(),
         server_events.s2c.space.raw_handle(),
@@ -421,6 +490,7 @@ fn server_worker(
             match server.wait_for_client(Some(options.poll_timeout)) {
                 Ok(_) => {
                     connected = true;
+                    gauge.peer_connected(server.peer_pid());
                     handler.on_connect();
                 }
                 Err(ShmError::Timeout) => {
@@ -483,7 +553,7 @@ fn server_worker(
             ChannelKind::ClientToServer,
         );
         if outcome.fatal {
-            handler.on_disconnect();
+            notify_disconnect(&handler, &gauge, DisconnectReason::Error);
             server.mark_disconnected();
             connected = false;
             continue;
@@ -493,9 +563,10 @@ fn server_worker(
             continue;
         }
 
-        match win::wait_any(&handles, Some(options.poll_timeout)) {
+        let (handles, count) = wait_set(base_handles, server.peer_wait_handle());
+        match win::wait_any(&handles[..count], Some(options.poll_timeout)) {
             Ok(Some(0)) => {
-                handler.on_disconnect();
+                notify_disconnect(&handler, &gauge, DisconnectReason::Graceful);
                 server.mark_disconnected();
                 connected = false;
             }
@@ -505,14 +576,71 @@ fn server_worker(
             Ok(Some(2)) => {
                 handler.on_space_available(ChannelKind::ServerToClient);
             }
+            Ok(Some(PEER_WAIT_INDEX)) => {
+                drain_after_peer_death(
+                    server,
+                    &handler,
+                    &stats,
+                    &mut buffer,
+                    options.recv_batch,
+                    ChannelKind::ClientToServer,
+                );
+                notify_disconnect(&handler, &gauge, DisconnectReason::PeerDied);
+                server.mark_disconnected();
+                connected = false;
+            }
             Ok(Some(_)) => {}
             Ok(None) => {}
             Err(err) => {
                 handler.on_error(err.clone());
-                handler.on_disconnect();
+                notify_disconnect(&handler, &gauge, DisconnectReason::Error);
                 server.mark_disconnected();
                 connected = false;
             }
+        }
+    }
+}
+
+/// Индекс handle процесса пира в наборе ожидания worker-а: после трёх
+/// событий канала (DISCONNECT, DATA, SPACE). NT при одновременном сигнале
+/// возвращает наименьший индекс, поэтому штатный DISCONNECT и последние
+/// данные пира имеют приоритет над «процесс завершился».
+const PEER_WAIT_INDEX: usize = 3;
+
+/// Набор ожидания worker-а: события канала + (если пир наблюдается) handle
+/// его процесса.
+const fn wait_set(base: [isize; 3], peer: Option<isize>) -> ([isize; 4], usize) {
+    match peer {
+        Some(peer) => ([base[0], base[1], base[2], peer], 4),
+        None => ([base[0], base[1], base[2], 0], 3),
+    }
+}
+
+/// Сообщить об отключении: сначала публикуем статус пира (его видят
+/// `is_peer_alive()`), затем callback с причиной.
+fn notify_disconnect(
+    handler: &Arc<dyn AutoHandler>,
+    state: &ChannelState,
+    reason: DisconnectReason,
+) {
+    state.peer_disconnected(reason);
+    handler.on_disconnect_reason(reason);
+}
+
+/// Пир мёртв -- новых данных не будет, но всё, что он успел записать до
+/// смерти, доставляем ДО `on_disconnect_reason(PeerDied)`.
+fn drain_after_peer_death<R: ReceiveEndpoint>(
+    endpoint: &R,
+    handler: &Arc<dyn AutoHandler>,
+    stats: &Arc<AutoStats>,
+    buffer: &mut Vec<u8>,
+    batch: usize,
+    direction: ChannelKind,
+) {
+    loop {
+        let outcome = process_receive_queue(endpoint, handler, stats, buffer, batch, direction);
+        if outcome.fatal || !outcome.more_pending {
+            break;
         }
     }
 }
@@ -523,7 +651,7 @@ pub struct AutoClient {
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
-    gauge: Arc<SendGauge>,
+    gauge: Arc<ChannelState>,
     max_send_queue: usize,
 }
 
@@ -536,7 +664,7 @@ impl AutoClient {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
-        let gauge = Arc::new(SendGauge::default());
+        let gauge = Arc::new(ChannelState::default());
         let max_send_queue = options.max_send_queue;
         let join_gauge = gauge.clone();
         let join_stats = stats.clone();
@@ -611,6 +739,23 @@ impl AutoClient {
         self.gauge.estimate(self.max_send_queue.max(1))
     }
 
+    /// Жив ли процесс пира по данным worker-а: `Some(true)` -- подключён и
+    /// наблюдается через удерживаемый handle; `Some(false)` -- последнее
+    /// отключение было `PeerDied` (до следующего подключения); `None` -- нет
+    /// подключения или пир не наблюдается (старая версия / нет прав).
+    /// Смерть пира worker замечает сразу (handle в наборе ожидания), но
+    /// статус обновляется после доставки оставшихся в кольце сообщений.
+    #[must_use]
+    pub fn is_peer_alive(&self) -> Option<bool> {
+        self.gauge.peer_alive()
+    }
+
+    /// PID наблюдаемого пира (после `PeerDied` -- PID умершего процесса).
+    #[must_use]
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.gauge.peer_pid()
+    }
+
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
     }
@@ -637,7 +782,7 @@ fn client_worker(
     cmd_rx: Receiver<WorkerCommand>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
-    gauge: Arc<SendGauge>,
+    gauge: Arc<ChannelState>,
 ) {
     let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
@@ -654,10 +799,11 @@ fn client_worker(
             }
         };
 
+        gauge.peer_connected(client.peer_pid());
         handler.on_connect();
         // SharedClient всегда использует named events (не anonymous)
         let client_events = client.events();
-        let handles = [
+        let base_handles = [
             client_events.disconnect.raw_handle(),
             client_events.s2c.data.raw_handle(),
             client_events.c2s.space.raw_handle(),
@@ -694,7 +840,7 @@ fn client_worker(
                 ChannelKind::ServerToClient,
             );
             if outcome.fatal {
-                handler.on_disconnect();
+                notify_disconnect(&handler, &gauge, DisconnectReason::Error);
                 client.mark_disconnected();
                 break;
             }
@@ -702,19 +848,33 @@ fn client_worker(
                 continue;
             }
 
-            match win::wait_any(&handles, Some(options.poll_timeout)) {
+            let (handles, count) = wait_set(base_handles, client.peer_wait_handle());
+            match win::wait_any(&handles[..count], Some(options.poll_timeout)) {
                 Ok(Some(0)) => {
-                    handler.on_disconnect();
+                    notify_disconnect(&handler, &gauge, DisconnectReason::Graceful);
                     client.mark_disconnected();
                     break;
                 }
                 Ok(Some(1)) => {}
                 Ok(Some(2)) => handler.on_space_available(ChannelKind::ClientToServer),
+                Ok(Some(PEER_WAIT_INDEX)) => {
+                    drain_after_peer_death(
+                        &client,
+                        &handler,
+                        &stats,
+                        &mut buffer,
+                        options.recv_batch,
+                        ChannelKind::ServerToClient,
+                    );
+                    notify_disconnect(&handler, &gauge, DisconnectReason::PeerDied);
+                    client.mark_disconnected();
+                    break;
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => {}
                 Err(err) => {
                     handler.on_error(err.clone());
-                    handler.on_disconnect();
+                    notify_disconnect(&handler, &gauge, DisconnectReason::Error);
                     client.mark_disconnected();
                     break;
                 }
@@ -738,14 +898,14 @@ fn client_worker(
 /// `MultiClientHandler::on_overflow`. Сообщения `try_send` не вытесняются
 /// никогда: если вся очередь из них, выбрасывается само новое сообщение
 /// `send` (тоже с `on_overflow`). Сообщения `try_send` принимаются всегда --
-/// их число уже ограничено `max_send_queue` на входе (`SendGauge::try_acquire`).
+/// их число уже ограничено `max_send_queue` на входе (`ChannelState::try_acquire`).
 fn drain_commands(
     queue: &mut SendQueue,
     rx: &Receiver<WorkerCommand>,
     options: &AutoOptions,
     running: &Arc<AtomicBool>,
     handler: &Arc<dyn AutoHandler>,
-    gauge: &SendGauge,
+    gauge: &ChannelState,
     direction: ChannelKind,
 ) {
     while let Ok(cmd) = rx.try_recv() {
@@ -786,7 +946,7 @@ fn process_send_queue<E>(
     queue: &mut SendQueue,
     handler: &Arc<dyn AutoHandler>,
     stats: &Arc<AutoStats>,
-    gauge: &SendGauge,
+    gauge: &ChannelState,
     direction: ChannelKind,
 ) where
     E: SendEndpoint,
@@ -813,7 +973,7 @@ fn process_send_queue<E>(
                 let frame = msg.frame();
                 queue.pop_front();
                 // Сначала снимок кольца (уже с этим сообщением), потом
-                // списание из pending -- порядок описан у `SendGauge`.
+                // списание из pending -- порядок описан у `ChannelState`.
                 gauge.publish_ring(endpoint.free_space());
                 gauge.release(frame);
                 stats.sent_messages.fetch_add(1, Ordering::Relaxed);
@@ -1114,7 +1274,7 @@ mod lossless_tests {
     fn queue_policy_never_evicts_lossless() {
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
-        let gauge = SendGauge::default();
+        let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
         let handler: Arc<dyn AutoHandler> = counters.clone();
         let options = AutoOptions {
@@ -1153,7 +1313,7 @@ mod lossless_tests {
             data: b"L0".to_vec(),
             lossless: true,
         });
-        let gauge = SendGauge::default();
+        let gauge = ChannelState::default();
         gauge.acquire(6);
         gauge.acquire(6);
         enqueue(&tx, &running, &gauge, b"S2", false, 2).unwrap();
@@ -1169,7 +1329,7 @@ mod lossless_tests {
     fn blocked_lossless_head_keeps_fifo_and_arms_waiter() {
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
-        let gauge = SendGauge::default();
+        let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
         let handler: Arc<dyn AutoHandler> = counters.clone();
         let stats = Arc::new(AutoStats::default());
@@ -1211,7 +1371,7 @@ mod lossless_tests {
     fn invalid_message_does_not_wedge_queue() {
         let (tx, rx) = mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
-        let gauge = SendGauge::default();
+        let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
         let handler: Arc<dyn AutoHandler> = counters.clone();
         let stats = Arc::new(AutoStats::default());
@@ -1240,7 +1400,7 @@ mod lossless_tests {
     /// свободным местом очереди.
     #[test]
     fn gauge_estimate_is_conservative() {
-        let gauge = SendGauge::default();
+        let gauge = ChannelState::default();
         assert_eq!(gauge.estimate(8), FreeSpace::ZERO, "до подключения");
         gauge.publish_ring(FreeSpace {
             bytes: 10_000,

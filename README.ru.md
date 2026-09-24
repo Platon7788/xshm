@@ -26,6 +26,7 @@
 ## 🆕 Что нового в v0.8.0
 
 - ✅ **Запись без потерь** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` никогда не затирают непрочитанное (`Err(QueueFull)` — кольцо не тронуто); `free_space()` — консервативная оценка места для писателя; `wait_for_space()` ждёт события `SPACE`. Раскладка совместима с 0.7.0 (`SHARED_VERSION` прежний).
+- ✅ **Надёжная детекция смерти пира** — в handshake стороны обмениваются PID, и каждая держит открытый handle процесса другой; убитый/упавший пир замечается за ~1–5 мс (см. [Живость пира](#живость-пира)). Новый `DisconnectReason` (`Graceful` / `PeerDied` / `Local` / `Error`) через колбэки-методы по умолчанию `on_disconnect_reason` / `on_client_disconnect_reason`, аксессоры `is_peer_alive()` / `peer_pid()`, `ShmError::PeerDied` из `wait_for_space` / `poll_*`. Совместимо по wire-формату с пирами 0.7.0 / раннего 0.8.0 (за ними просто нет наблюдения).
 - ✅ Константы кольца (`RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, …) экспортируются из корня крейта.
 - 🐛 Auto: `send` недопустимой длины больше не блокирует очередь навсегда — сообщение выбрасывается с `on_error`.
 
@@ -452,6 +453,38 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 
 Layout не менялся: заявка на пробуждение живёт в бывшем зарезервированном слове
 `RingHeader`, поэтому `SHARED_VERSION` прежний и пиры 0.7.0 совместимы.
+
+### Живость пира
+
+Штатное отключение сигналится событием `DISCONNECT`, но упавший или убитый
+процесс не сигналит ничего. С 0.8 обе стороны узнают PID пира в handshake и
+**держат открытый handle его процесса** (`SYNCHRONIZE`) всё время соединения.
+Пока handle открыт, объект-процесс не удаляется ядром и при завершении процесса
+становится сигнальным -- смерть видна надёжно, а переиспользование PID не
+обманывает (повторное открытие по PID не отличает «процесса нет» от «нет прав»).
+
+| Режим | Как видна смерть пира |
+|-------|-----------------------|
+| Single-client | `poll_client` / `poll_server` / `wait_for_space` сразу возвращают `Err(ShmError::PeerDied)`; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
+| Auto | handle процесса пира лежит в наборе ожидания worker-а → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
+| Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
+| Multi-client | слоты умерших клиентов освобождаются на следующей итерации worker-а (без 3-с троттлинга) |
+
+- Новые колбэки -- **методы по умолчанию**, которые вызывают `on_disconnect` /
+  `on_client_disconnect`, поэтому существующие обработчики работают как раньше.
+  Библиотека вызывает только вариант `*_reason`.
+- Всё, что пир успел записать в кольцо до смерти, доставляется **до** сообщения
+  о `PeerDied`.
+- `is_peer_alive()` возвращает `None` («неизвестно»), если пир старой версии (PID в
+  handshake не передан) или его процесс не удалось открыть (например, служба в
+  другой сессии без прав). Такие соединения ведут себя в точности как в 0.7.
+- Замер на Windows 11 (`tests/peer_death.rs`, `TerminateProcess` пира): 1–5 мс от
+  убийства до колбэка / ошибки во всех режимах.
+
+Расширение протокола (без изменения layout и `SHARED_VERSION`): сервер пишет свой
+PID в `ControlBlock.reserved[2]` при создании; клиент пишет свой PID в
+`reserved[3]` до `CLIENT_HELLO`, сервер забирает его `swap(0)`. PID процесса, уже
+мёртвого на момент handshake, игнорируется.
 
 ## Константы
 

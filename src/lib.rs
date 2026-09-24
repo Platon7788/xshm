@@ -18,6 +18,9 @@ pub mod multi;
 // Внутренний модуль - деталь реализации, не часть публичного API
 pub(crate) mod ntapi;
 
+#[cfg(test)]
+mod peer_tests;
+
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
 /// Лимиты кольца -- нужны потребителям, которые строят свой протокол поверх
@@ -29,7 +32,7 @@ pub use dispatch::{
     ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
     DispatchHandler, DispatchOptions, DispatchServer,
 };
-pub use error::{Result, ShmError};
+pub use error::{DisconnectReason, Result, ShmError};
 pub use events::EventHandles;
 pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,

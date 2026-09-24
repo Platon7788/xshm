@@ -1,13 +1,16 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
+use crate::constants::{
+    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, RESERVED_CLIENT_PID_INDEX,
+    RESERVED_SERVER_PID_INDEX,
+};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::naming::mapping_name;
 use crate::ring::{FreeSpace, RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
-use crate::win::Mapping;
+use crate::win::{Mapping, ProcessWatch, wait_any};
 
 #[derive(Debug)]
 pub struct SharedServer {
@@ -17,6 +20,9 @@ pub struct SharedServer {
     ring_tx: RingBuffer,
     ring_rx: RingBuffer,
     connected: bool,
+    /// Удерживаемый handle процесса клиента (если клиент 0.8+ передал PID и
+    /// процесс удалось открыть) -- для детекции его смерти.
+    peer: Option<ProcessWatch>,
 }
 
 // SAFETY: все поля либо владеющие (`Mapping`), либо синхронизируются через
@@ -36,6 +42,8 @@ impl SharedServer {
         // на control block здесь не алиасится ни другим потоком, ни другим процессом.
         let control = unsafe { &mut *view.control_block_ptr() };
         control.reset();
+        // Протокол 0.8+: PID сервера для детекции его смерти клиентом.
+        control.reserved[RESERVED_SERVER_PID_INDEX].store(std::process::id(), Ordering::Release);
         let generation = control.generation.load(Ordering::Relaxed);
 
         let (header_a, header_b) = view.headers();
@@ -58,6 +66,7 @@ impl SharedServer {
             ring_tx,
             ring_rx,
             connected: false,
+            peer: None,
         })
     }
 
@@ -84,6 +93,8 @@ impl SharedServer {
         // на control block здесь не алиасится ни другим потоком, ни другим процессом.
         let control = unsafe { &mut *view.control_block_ptr() };
         control.reset();
+        // Протокол 0.8+: PID сервера для детекции его смерти клиентом.
+        control.reserved[RESERVED_SERVER_PID_INDEX].store(std::process::id(), Ordering::Release);
         let generation = control.generation.load(Ordering::Relaxed);
 
         let (header_a, header_b) = view.headers();
@@ -106,6 +117,7 @@ impl SharedServer {
             ring_tx,
             ring_rx,
             connected: false,
+            peer: None,
         })
     }
 
@@ -181,6 +193,12 @@ impl SharedServer {
     /// гарантированно видит уже очищенные кольца.
     fn complete_handshake(&mut self) -> Result<()> {
         let control = self.view.control_block();
+        // Протокол 0.8+: PID клиента, записанный им ДО CLIENT_HELLO (видим
+        // благодаря Acquire-чтению client_state в wait_for_client*). `swap(0)`:
+        // значение одноразовое -- клиент старой версии, пришедший следом,
+        // не унаследует чужой PID. 0 -- клиент старой версии, наблюдения нет.
+        let client_pid = control.reserved[RESERVED_CLIENT_PID_INDEX].swap(0, Ordering::AcqRel);
+        self.peer = ProcessWatch::open_peer(client_pid);
         let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
 
         let (header_a, header_b) = self.view.headers();
@@ -251,6 +269,8 @@ impl SharedServer {
 
     pub(crate) fn mark_disconnected(&mut self) {
         self.connected = false;
+        // Закрываем handle процесса бывшего клиента (RAII).
+        self.peer = None;
 
         // Сбрасываем состояние в shared memory для возможности reconnect
         let control = self.view.control_block();
@@ -333,7 +353,8 @@ impl SharedServer {
     pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
         self.ensure_connected()?;
         let event = self.events.as_ref().map(|e| &e.s2c.space);
-        self.ring_tx.wait_for_space(payload_len, event, timeout)
+        self.ring_tx
+            .wait_for_space(payload_len, event, self.peer.as_ref(), timeout)
     }
 
     /// Для auto-режима: заявка/снятие ожидания места в исходящем кольце.
@@ -359,16 +380,69 @@ impl SharedServer {
         Ok(len)
     }
 
+    /// Ждать данных от клиента. `Ok(true)` -- в кольце есть сообщение,
+    /// `Ok(false)` -- таймаут (или anonymous-режим без данных),
+    /// `Err(PeerDied)` -- процесс клиента умер и всё, что он успел записать,
+    /// уже прочитано (пока в кольце есть данные, возвращается `Ok(true)`).
     pub fn poll_client(&self, timeout: Option<Duration>) -> Result<bool> {
         self.ensure_connected()?;
         if !self.ring_rx.is_empty() {
             return Ok(true);
         }
         // Для anonymous режима просто проверяем буфер (polling)
-        if self.events.is_none() {
-            return Ok(false); // Нет данных, но не timeout
+        let Some(events) = self.events.as_ref() else {
+            return match &self.peer {
+                Some(peer) if peer.has_exited() && self.ring_rx.is_empty() => {
+                    Err(ShmError::PeerDied)
+                }
+                _ => Ok(false), // Нет данных, но не timeout
+            };
+        };
+        poll_with_peer(&events.c2s.data, self.peer.as_ref(), &self.ring_rx, timeout)
+    }
+
+    /// PID процесса клиента, если клиент 0.8+ передал его в handshake.
+    #[must_use]
+    pub fn peer_pid(&self) -> Option<u32> {
+        self.peer.as_ref().map(ProcessWatch::pid)
+    }
+
+    /// Жив ли процесс клиента: `Some(true/false)` -- клиент наблюдается через
+    /// удерживаемый handle процесса; `None` -- не подключён или наблюдения
+    /// нет (клиент старой версии, не передал PID, или handle не открылся --
+    /// например, клиент в другой сессии без прав). Один syscall, без блокировки.
+    #[must_use]
+    pub fn is_peer_alive(&self) -> Option<bool> {
+        if !self.connected {
+            return None;
         }
-        self.events.as_ref().unwrap().c2s.data.wait(timeout)
+        self.peer.as_ref().map(|peer| !peer.has_exited())
+    }
+
+    /// Handle процесса клиента для набора ожидания worker-а (auto-режим).
+    pub(crate) fn peer_wait_handle(&self) -> Option<isize> {
+        self.peer.as_ref().map(ProcessWatch::raw_handle)
+    }
+}
+
+/// Общий для сервера и клиента `poll_*`: ждём событие данных ИЛИ смерть пира.
+///
+/// Индекс 0 -- данные (приоритет: при одновременном сигнале NT возвращает
+/// наименьший индекс, так что последние данные мёртвого пира не теряются).
+pub(crate) fn poll_with_peer(
+    data: &crate::win::EventHandle,
+    peer: Option<&ProcessWatch>,
+    ring: &RingBuffer,
+    timeout: Option<Duration>,
+) -> Result<bool> {
+    let Some(peer) = peer else {
+        return data.wait(timeout);
+    };
+    match wait_any(&[data.raw_handle(), peer.raw_handle()], timeout)? {
+        Some(0) => Ok(true),
+        Some(_) if !ring.is_empty() => Ok(true),
+        Some(_) => Err(ShmError::PeerDied),
+        None => Ok(false),
     }
 }
 

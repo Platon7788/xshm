@@ -48,4 +48,27 @@ pub enum ShmError {
     /// Некорректная конфигурация (например, недопустимое число клиентов).
     #[error("invalid configuration: {0}")]
     InvalidConfig(&'static str),
+    /// Процесс пира завершился без штатного отключения (крах, kill).
+    /// Возвращается блокирующими операциями (`wait_for_space`, `poll_*`),
+    /// когда пир наблюдается через удерживаемый handle процесса (оба пира
+    /// 0.8+ и handle удалось открыть).
+    #[error("peer process died")]
+    PeerDied,
+}
+
+/// Почему соединение разорвано (для `on_disconnect_reason` и аналогов).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DisconnectReason {
+    /// Пир отключился штатно (Drop/`stop()` -> событие DISCONNECT).
+    Graceful,
+    /// Процесс пира завершился без штатного отключения (крах, kill,
+    /// `TerminateProcess`) -- замечено по удерживаемому handle процесса.
+    /// Всё, что пир успел записать в кольцо до смерти, к этому моменту
+    /// уже доставлено.
+    PeerDied,
+    /// Соединение разорвала локальная сторона (`disconnect_client`, `stop`).
+    Local,
+    /// Ошибка протокола или ожидания (`Corrupted`, ошибка NT-вызова).
+    Error,
 }

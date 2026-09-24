@@ -25,7 +25,7 @@ use std::time::Duration;
 use crate::auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind};
 use crate::client::SharedClient;
 use crate::constants::MAX_MESSAGE_SIZE;
-use crate::error::{Result, ShmError};
+use crate::error::{DisconnectReason, Result, ShmError};
 use crate::ring::FreeSpace;
 use crate::server::SharedServer;
 use crate::wait_delay;
@@ -50,6 +50,15 @@ pub trait DispatchHandler: Send + Sync + 'static {
     /// Вызывается при отключении клиента от выделенного канала.
     fn on_client_disconnect(&self, client_id: u32);
 
+    /// Отключение клиента с причиной (0.8+). По умолчанию вызывает
+    /// `on_client_disconnect`; сервер вызывает ТОЛЬКО этот метод.
+    /// `PeerDied` -- процесс клиента завершился без штатного отключения
+    /// (замечено по удерживаемому handle процесса, обычно за единицы мс).
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        let _ = reason;
+        self.on_client_disconnect(client_id);
+    }
+
     /// Вызывается при получении сообщения от клиента по выделенному каналу.
     fn on_message(&self, client_id: u32, data: &[u8]);
 
@@ -66,6 +75,14 @@ pub trait DispatchClientHandler: Send + Sync + 'static {
 
     /// Вызывается при отключении от выделенного канала.
     fn on_disconnect(&self);
+
+    /// Отключение с причиной (0.8+). По умолчанию вызывает `on_disconnect`;
+    /// клиент вызывает ТОЛЬКО этот метод. `PeerDied` -- процесс сервера
+    /// (viewer-а) умер без штатного отключения.
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        let _ = reason;
+        self.on_disconnect();
+    }
 
     /// Вызывается при получении сообщения от сервера.
     fn on_message(&self, data: &[u8]);
@@ -222,6 +239,17 @@ impl DispatchServer {
         client.server.try_send(data)
     }
 
+    /// Жив ли процесс клиента (`AutoServer::is_peer_alive`); `None` -- клиента
+    /// нет или он не наблюдается (клиент старой версии, нет прав).
+    #[must_use]
+    pub fn is_client_alive(&self, client_id: u32) -> Option<bool> {
+        self.clients
+            .read()
+            .unwrap()
+            .get(&client_id)
+            .and_then(|c| c.server.is_peer_alive())
+    }
+
     /// Консервативная оценка места под новое сообщение клиенту
     /// (`AutoServer::free_space`); `None` -- клиента нет.
     #[must_use]
@@ -252,7 +280,8 @@ impl DispatchServer {
             // Помечаем как отключённого, чтобы AutoProxyHandler не уведомил повторно
             client.disconnected.store(true, Ordering::Release);
             client.server.stop();
-            self.handler.on_client_disconnect(client_id);
+            self.handler
+                .on_client_disconnect_reason(client_id, DisconnectReason::Local);
             Ok(())
         } else {
             Err(ShmError::NotConnected)
@@ -405,7 +434,8 @@ impl DispatchServer {
         for (id, client) in clients.drain() {
             client.disconnected.store(true, Ordering::Release);
             client.server.stop();
-            self.handler.on_client_disconnect(id);
+            self.handler
+                .on_client_disconnect_reason(id, DisconnectReason::Local);
         }
     }
 
@@ -627,7 +657,7 @@ impl AutoHandler for AutoProxyHandler {
         cvar.notify_one();
     }
 
-    fn on_disconnect(&self) {
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
         // Проверяем, не обработано ли уже (например, через disconnect_client())
         //
         // ВАЖНО: `clients.remove(...)` результат обязательно привязывается к
@@ -661,7 +691,8 @@ impl AutoHandler for AutoProxyHandler {
             // поток -- он не является worker-потоком этого AutoServer, поэтому
             // join там безопасен и не self-join'ится.
             thread::spawn(move || drop(dispatched_client));
-            self.handler.on_client_disconnect(self.client_id);
+            self.handler
+                .on_client_disconnect_reason(self.client_id, reason);
         }
     }
 
@@ -690,6 +721,9 @@ pub struct DispatchClient {
     running: Arc<AtomicBool>,
     client_id: u32,
     channel_name: String,
+    /// Причина разрыва канала (заполняет прокси; `None` -- канал жив или
+    /// остановлен локально через `stop()`).
+    last_reason: Arc<Mutex<Option<DisconnectReason>>>,
 }
 
 impl DispatchClient {
@@ -711,6 +745,7 @@ impl DispatchClient {
         // Фаза 2: подключение к выделенному каналу через AutoClient
         let running = Arc::new(AtomicBool::new(true));
         let slot: Arc<Mutex<Option<AutoClient>>> = Arc::new(Mutex::new(None));
+        let last_reason = Arc::new(Mutex::new(None));
 
         let client_handler = Arc::new(DispatchClientProxy {
             handler: handler.clone(),
@@ -718,6 +753,7 @@ impl DispatchClient {
             slot: Arc::clone(&slot),
             client_id: assigned_id,
             channel_name: assigned_channel.clone(),
+            last_reason: Arc::clone(&last_reason),
         });
 
         let auto_options = AutoOptions {
@@ -743,7 +779,37 @@ impl DispatchClient {
             running,
             client_id: assigned_id,
             channel_name: assigned_channel,
+            last_reason,
         })
+    }
+
+    /// Жив ли процесс сервера (viewer-а): `Some(true)` -- канал поднят и
+    /// сервер наблюдается через удерживаемый handle процесса; `Some(false)` --
+    /// канал разорван из-за смерти сервера; `None` -- неизвестно (канал ещё
+    /// не поднят, сервер старой версии, нет прав, остановлен локально).
+    #[must_use]
+    pub fn is_peer_alive(&self) -> Option<bool> {
+        if let Some(client) = self.auto_client.lock().unwrap().as_ref() {
+            return client.is_peer_alive();
+        }
+        (self.disconnect_reason() == Some(DisconnectReason::PeerDied)).then_some(false)
+    }
+
+    /// PID процесса сервера, пока канал поднят (сервер 0.8+).
+    #[must_use]
+    pub fn server_pid(&self) -> Option<u32> {
+        self.auto_client
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(AutoClient::peer_pid)
+    }
+
+    /// Почему канал разорван со стороны сервера (`Graceful`/`PeerDied`/`Error`);
+    /// `None` -- канал жив или остановлен локально.
+    #[must_use]
+    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        *self.last_reason.lock().unwrap()
     }
 
     /// Отправляет сообщение серверу по выделенному каналу.
@@ -916,6 +982,7 @@ struct DispatchClientProxy {
     slot: Arc<Mutex<Option<AutoClient>>>,
     client_id: u32,
     channel_name: String,
+    last_reason: Arc<Mutex<Option<DisconnectReason>>>,
 }
 
 impl AutoHandler for DispatchClientProxy {
@@ -923,7 +990,8 @@ impl AutoHandler for DispatchClientProxy {
         self.handler.on_connect(self.client_id, &self.channel_name);
     }
 
-    fn on_disconnect(&self) {
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        *self.last_reason.lock().unwrap() = Some(reason);
         self.running.store(false, Ordering::Release);
         // Вызывается СИНХРОННО из worker-потока самого AutoClient. Забираем
         // его из слота и роняем: `Drop for AutoClient` распознаёт self-join
@@ -931,7 +999,7 @@ impl AutoHandler for DispatchClientProxy {
         // нет, а бесконечный reconnect прекращается.
         let taken = self.slot.lock().unwrap().take();
         drop(taken);
-        self.handler.on_disconnect();
+        self.handler.on_disconnect_reason(reason);
     }
 
     fn on_message(&self, _direction: ChannelKind, payload: &[u8]) {

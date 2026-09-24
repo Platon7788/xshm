@@ -210,42 +210,53 @@ fn cross_process_lossless_backpressure() {
 /// сразу, а не по 50-мс страховочному опросу.
 #[test]
 fn wait_for_space_is_woken_by_reader_event() {
-    let name = unique_name("WAKE");
-    let server_thread = thread::spawn({
-        let name = name.clone();
-        move || {
-            let mut server = SharedServer::start(&name).unwrap();
-            server
-                .wait_for_client(Some(Duration::from_secs(5)))
-                .unwrap();
-            let big = vec![7u8; 60_000];
-            while server.try_send_to_client(&big).is_ok() {}
-            assert!(!server.free_space().fits(big.len()));
-            assert!(server.free_space().max_payload() < big.len());
-            let t = Instant::now();
-            let ok = server
-                .wait_for_space(big.len(), Some(Duration::from_secs(5)))
-                .unwrap();
-            (ok, t.elapsed(), server)
+    // Пробуждение событием занимает доли миллисекунды, а пробуждение по
+    // 50-мс срезу опроса при чтении «между срезами» -- ~25 мс. Под нагрузкой
+    // (полный прогон тестов) единичный замер может «поплыть», поэтому берём
+    // лучший из трёх: опрос не даст < 20 мс ни в одной попытке.
+    let mut best = Duration::MAX;
+    for attempt in 0..3 {
+        let name = unique_name(&format!("WAKE{attempt}"));
+        let server_thread = thread::spawn({
+            let name = name.clone();
+            move || {
+                let mut server = SharedServer::start(&name).unwrap();
+                server
+                    .wait_for_client(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let big = vec![7u8; 60_000];
+                while server.try_send_to_client(&big).is_ok() {}
+                assert!(!server.free_space().fits(big.len()));
+                assert!(server.free_space().max_payload() < big.len());
+                let ok = server
+                    .wait_for_space(big.len(), Some(Duration::from_secs(5)))
+                    .unwrap();
+                // Момент пробуждения -- внутри писателя, без учёта join.
+                (ok, Instant::now(), server)
+            }
+        });
+        thread::sleep(Duration::from_millis(50));
+        let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        // Читаем между двумя 50-мс срезами ожидания писателя.
+        thread::sleep(Duration::from_millis(125));
+        let mut buf = Vec::new();
+        let read_at = Instant::now();
+        client.receive_from_server(&mut buf).unwrap();
+        let (ok, woke_at, server) = server_thread.join().unwrap();
+        assert!(ok, "место так и не дождались");
+        assert!(server.free_space().fits(60_000));
+        let latency = woke_at.saturating_duration_since(read_at);
+        println!("wait_for_space wake latency after read: {latency:?}");
+        best = best.min(latency);
+        drop(client);
+        if best < Duration::from_millis(20) {
+            break;
         }
-    });
-    thread::sleep(Duration::from_millis(50));
-    let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
-    // Читаем между двумя 50-мс срезами ожидания писателя.
-    thread::sleep(Duration::from_millis(125));
-    let mut buf = Vec::new();
-    let read_at = Instant::now();
-    client.receive_from_server(&mut buf).unwrap();
-    let (ok, _total, server) = server_thread.join().unwrap();
-    let latency = read_at.elapsed();
-    assert!(ok, "место так и не дождались");
-    println!("wait_for_space wake latency after read: {latency:?}");
+    }
     assert!(
-        latency < Duration::from_millis(20),
-        "пробуждение через {latency:?} -- похоже на опрос, а не на событие"
+        best < Duration::from_millis(20),
+        "лучшее пробуждение через {best:?} -- похоже на опрос, а не на событие"
     );
-    assert!(server.free_space().fits(60_000));
-    drop(client);
 }
 
 /// `free_space()` вне подключения -- ноль, `try_send` -- NotConnected.

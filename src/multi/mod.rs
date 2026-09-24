@@ -451,9 +451,18 @@ impl MultiServer {
                     orphaned.push((slot.id, CLAIM_FREE)); // abandoned-handshake
                     continue;
                 }
-                // Живой claim на connected-слоте: троттлим liveness-проверку
-                // процесса-владельца вместо детекции по событиям (их не будет,
-                // если процесс мёртв).
+                // Клиент 0.8+ передал PID в handshake, и слот держит handle его
+                // процесса: проверка надёжна и дешёва (один syscall без
+                // блокировки) -- делаем её на каждой итерации, без троттлинга.
+                if let Some(alive) = slot.server.is_peer_alive() {
+                    if !alive {
+                        orphaned.push((slot.id, claim));
+                    }
+                    continue;
+                }
+                // Клиент старой версии (PID не передан): троттлим разовую
+                // liveness-проверку процесса-владельца по PID из claim-а вместо
+                // детекции по событиям (их не будет, если процесс мёртв).
                 let should_check = match slot.claim_seen_at {
                     None => true,
                     Some(last_check) => last_check.elapsed() >= LIVENESS_CHECK_INTERVAL,
