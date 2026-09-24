@@ -36,6 +36,7 @@ use crate::constants::{
 };
 use crate::error::{Result, ShmError};
 use crate::naming::mapping_name;
+use crate::ring::FreeSpace;
 use crate::server::SharedServer;
 use crate::shared::SharedView;
 use crate::wait_delay;
@@ -267,6 +268,35 @@ impl MultiServer {
 
         slot.server.send_to_client(data)?;
         Ok(())
+    }
+
+    /// Отправка клиенту **без перезаписи** непрочитанных данных
+    /// (`SharedServer::try_send_to_client`): `Err(QueueFull)`, если в кольце
+    /// слота нет места; кольцо тогда не меняется.
+    pub fn try_send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
+        let slots = self.slots.read().unwrap();
+        let slot_mutex = slots
+            .get(client_id as usize)
+            .ok_or(ShmError::NotConnected)?;
+        let slot = slot_mutex.lock().unwrap();
+
+        if !slot.connected {
+            return Err(ShmError::NotConnected);
+        }
+
+        slot.server.try_send_to_client(data)?;
+        Ok(())
+    }
+
+    /// Свободное место в кольце Server -> Client слота (точное значение:
+    /// запись в слот идёт только под его mutex-ом, так что до следующего
+    /// `send_to`/`try_send_to` это нижняя граница). `None` -- слота нет или
+    /// клиент не подключён.
+    #[must_use]
+    pub fn free_space(&self, client_id: u32) -> Option<FreeSpace> {
+        let slots = self.slots.read().unwrap();
+        let slot = slots.get(client_id as usize)?.lock().unwrap();
+        slot.connected.then(|| slot.server.free_space())
     }
 
     /// Отправка сообщения всем подключённым клиентам

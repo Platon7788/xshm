@@ -7,7 +7,7 @@ use crate::constants::{
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::naming::mapping_name;
-use crate::ring::{RingBuffer, WriteOutcome};
+use crate::ring::{FreeSpace, RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::Mapping;
 
@@ -145,10 +145,55 @@ impl SharedClient {
         Ok(result)
     }
 
+    /// Отправка серверу **без перезаписи** непрочитанных данных.
+    ///
+    /// Сообщение либо целиком ложится в свободное место кольца
+    /// Client -> Server, либо `Err(ShmError::QueueFull)` и кольцо не
+    /// меняется. Семантика -- `SharedServer::try_send_to_client`.
+    pub fn try_send_to_server(&self, payload: &[u8]) -> Result<WriteOutcome> {
+        self.ensure_connected()?;
+        let result = self.ring_tx.try_write_message(payload)?;
+        if result.was_empty {
+            let _ = self.events.c2s.data.set();
+        }
+        Ok(result)
+    }
+
+    /// Свободное место в кольце Client -> Server (нижняя граница из потока
+    /// писателя, см. `SharedServer::free_space`). Вне подключения --
+    /// `FreeSpace::ZERO`.
+    #[must_use]
+    pub fn free_space(&self) -> FreeSpace {
+        if self.connected {
+            self.ring_tx.free_space()
+        } else {
+            FreeSpace::ZERO
+        }
+    }
+
+    /// Ждать места в кольце Client -> Server под payload длины `payload_len`
+    /// (семантика -- `SharedServer::wait_for_space`).
+    pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
+        self.ensure_connected()?;
+        self.ring_tx
+            .wait_for_space(payload_len, Some(&self.events.c2s.space), timeout)
+    }
+
+    /// Для auto-режима: заявка/снятие ожидания места в исходящем кольце.
+    pub(crate) fn arm_space_waiter(&self, frame: u32) {
+        self.ring_tx.arm_space_waiter(frame);
+    }
+
+    pub(crate) fn disarm_space_waiter(&self) {
+        self.ring_tx.disarm_space_waiter();
+    }
+
     pub fn receive_from_server(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.ensure_connected()?;
         let len = self.ring_rx.read_message(buffer)?;
-        if self.ring_rx.message_count() == 0 {
+        // SPACE -- когда кольцо опустело ИЛИ писатель-сервер ждёт места и
+        // его теперь хватает (см. `SharedServer::receive_from_client`).
+        if self.ring_rx.take_space_waiter() || self.ring_rx.message_count() == 0 {
             let _ = self.events.s2c.space.set();
         }
         Ok(len)

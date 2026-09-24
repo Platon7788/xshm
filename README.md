@@ -7,7 +7,7 @@
 Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. A pure Rust crate — no C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,7 +23,13 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ---
 
-## 🆕 What's New in v0.7.0
+## 🆕 What's New in v0.8.0
+
+- ✅ **Lossless writes** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` never overwrite unread data (`Err(QueueFull)` leaves the ring untouched); `free_space()` gives a conservative writer-side estimate; `wait_for_space()` sleeps on the `SPACE` event. Layout-compatible with 0.7.0 (`SHARED_VERSION` unchanged).
+- ✅ Ring constants (`RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, …) are exported from the crate root.
+- 🐛 Auto: a `send` with an invalid length no longer blocks the queue forever — it is dropped and reported via `on_error`.
+
+## Previously in v0.7.0
 
 - ✅ **Pure Rust crate** (breaking) — the entire C/C++ FFI layer is gone: `ffi.rs`, `multi/ffi.rs`, `dispatch/ffi.rs`, the `cbindgen` build step, the generated `include/*.h` headers and the `staticlib` crate type. `xshm` now builds as an `rlib` only and is consumed from Rust. A separate synchronous C23 project covers native consumers.
 - ✅ **Zero build dependencies** — `build.rs` now does nothing but `cargo:rustc-link-lib=ntdll`; `thiserror` remains the only runtime dependency
@@ -389,7 +395,67 @@ fn main() -> Result<()> {
 }
 ```
 
+### Lossless writes (backpressure)
+
+By default every send path overwrites the oldest unread messages when the
+ring is full. When the consumer must see *every* message (e.g. a profiler
+stream), use the non-overwriting variants instead:
+
+| Mode | Send without overwrite | Free space |
+|------|------------------------|------------|
+| Single-client | `SharedServer::try_send_to_client`, `SharedClient::try_send_to_server` | `free_space()`, `wait_for_space(len, timeout)` |
+| Auto | `AutoServer::try_send`, `AutoClient::try_send` | `free_space()` |
+| Dispatch | `DispatchClient::try_send`, `DispatchServer::try_send_to` | `DispatchClient::free_space()`, `DispatchServer::free_space(id)` |
+| Multi-client | `MultiServer::try_send_to` | `MultiServer::free_space(id)` |
+
+Semantics:
+
+- A message is either written **whole** into free space or rejected with
+  `ShmError::QueueFull`; unread data is never touched (`overwritten` is always 0).
+  Atomicity is the same as for regular sends — the reader sees the whole message or nothing.
+- `FreeSpace { bytes, messages }` (+ `fits(len)`, `max_payload()`) is a **lower bound**
+  when taken on the writer side: if `fits(n)`, the next `try_send*` of `n` bytes succeeds.
+  Every message costs `MESSAGE_HEADER_SIZE` (4) + payload bytes; at most `MAX_MESSAGES` (500)
+  messages and `RING_CAPACITY` (2 MiB) bytes per ring. A 65 535-byte message always fits an empty ring.
+- `wait_for_space` sleeps on the channel's `SPACE` event: the reader wakes the writer only
+  once enough space is freed. Waits are sliced at 50 ms, so it also works with 0.7.0 peers and
+  anonymous servers (polling). A dead reader never frees space — always pass a timeout.
+- Auto/Dispatch are asynchronous: `try_send` returns `QueueFull` once `max_send_queue`
+  accepted messages are still waiting for the ring; accepted lossless messages are never evicted
+  and are written with the non-overwriting path. The guarantee holds within one connection
+  (a reconnect resets the rings). Don't mix `send` and `try_send` on a channel that must be
+  lossless — an overwriting `send` may evict earlier messages from the ring.
+- One writer per direction, as before (SPSC).
+
+```rust
+use std::time::Duration;
+use xshm::{SharedServer, ShmError};
+
+fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
+    for block in blocks {
+        loop {
+            match server.try_send_to_client(block) {
+                Ok(_) => break,
+                Err(ShmError::QueueFull) => {
+                    if !server.wait_for_space(block.len(), Some(Duration::from_secs(3)))? {
+                        return Err(ShmError::Timeout); // consumer is stuck or gone
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+The layout is unchanged: the wake-up request lives in a previously reserved
+`RingHeader` word, so `SHARED_VERSION` stays the same and 0.7.0 peers interoperate.
+
 ## Constants
+
+The ring limits below are re-exported from the crate root
+(`xshm::RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, `MIN_MESSAGE_SIZE`, `MESSAGE_HEADER_SIZE`).
 
 | Constant | Value | Description |
 |----------|-------|-------------|
@@ -424,7 +490,7 @@ returns `None` — no named events are created. Use polling mode in that case.
 ## Limitations
 
 - **SPSC**: Strictly one producer and one consumer per channel
-- **Overwrite on overflow**: New messages evict oldest when queue is full
+- **Overwrite on overflow** (default): New messages evict oldest when queue is full — use `try_send*` for lossless backpressure
 - **Windows only**: Uses direct NT API calls, relies on x86/x86_64 TSO memory ordering (not portable to ARM/RISC-V without rework)
 - **Message size**: 2 to 65535 bytes
 - **Anonymous servers**: No event handles available (polling mode only)

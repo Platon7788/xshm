@@ -5,7 +5,7 @@ use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::naming::mapping_name;
-use crate::ring::{RingBuffer, WriteOutcome};
+use crate::ring::{FreeSpace, RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::Mapping;
 
@@ -290,12 +290,69 @@ impl SharedServer {
         Ok(result)
     }
 
+    /// Отправка клиенту **без перезаписи** непрочитанных данных.
+    ///
+    /// Сообщение либо целиком ложится в свободное место кольца
+    /// Server -> Client, либо возвращается `Err(ShmError::QueueFull)` и
+    /// кольцо не меняется. Подробная семантика -- `RingBuffer::try_write_message`
+    /// (атомарность, консервативность проверки, `MessageTooSmall`/`MessageTooLarge`).
+    /// Ждать освобождения места -- `wait_for_space`.
+    pub fn try_send_to_client(&self, payload: &[u8]) -> Result<WriteOutcome> {
+        self.ensure_connected()?;
+        let result = self.ring_tx.try_write_message(payload)?;
+        if let Some(ref events) = self.events
+            && result.was_empty
+        {
+            let _ = events.s2c.data.set();
+        }
+        Ok(result)
+    }
+
+    /// Свободное место в кольце Server -> Client.
+    ///
+    /// Из потока, который пишет в это кольцо, -- нижняя граница: если
+    /// `free_space().fits(n)`, следующий `try_send_to_client` с payload длины
+    /// `n` пройдёт. Вне подключения возвращает `FreeSpace::ZERO`.
+    #[must_use]
+    pub fn free_space(&self) -> FreeSpace {
+        if self.connected {
+            self.ring_tx.free_space()
+        } else {
+            FreeSpace::ZERO
+        }
+    }
+
+    /// Ждать, пока в кольце Server -> Client освободится место под payload
+    /// длины `payload_len`. `Ok(true)` -- место есть, `Ok(false)` -- таймаут;
+    /// `timeout = None` -- без ограничения (мёртвый клиент место не
+    /// освободит -- лучше задавать таймаут и параллельно следить за живостью).
+    ///
+    /// Будит сигнал читателя (событие `SPACE`, только когда места реально
+    /// хватает); без событий (anonymous) и со старым клиентом, не знающим про
+    /// заявку, работает опросом с шагом не больше 50 мс.
+    pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
+        self.ensure_connected()?;
+        let event = self.events.as_ref().map(|e| &e.s2c.space);
+        self.ring_tx.wait_for_space(payload_len, event, timeout)
+    }
+
+    /// Для auto-режима: заявка/снятие ожидания места в исходящем кольце.
+    pub(crate) fn arm_space_waiter(&self, frame: u32) {
+        self.ring_tx.arm_space_waiter(frame);
+    }
+
+    pub(crate) fn disarm_space_waiter(&self) {
+        self.ring_tx.disarm_space_waiter();
+    }
+
     pub fn receive_from_client(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.ensure_connected()?;
         let len = self.ring_rx.read_message(buffer)?;
-        // Сигнализируем только если events доступны
+        // Сигнализируем только если events доступны. SPACE -- когда кольцо
+        // опустело (как раньше) ИЛИ когда писатель оставил заявку и места
+        // ему теперь хватает (`try_send`/`wait_for_space` на той стороне).
         if let Some(ref events) = self.events
-            && self.ring_rx.message_count() == 0
+            && (self.ring_rx.take_space_waiter() || self.ring_rx.message_count() == 0)
         {
             let _ = events.c2s.space.set();
         }

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -7,8 +7,9 @@ use std::time::Duration;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::client::SharedClient;
-use crate::constants::MAX_MESSAGE_SIZE;
+use crate::constants::{MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE};
 use crate::error::{Result, ShmError};
+use crate::ring::{FreeSpace, WriteOutcome, frame_len};
 use crate::server::SharedServer;
 use crate::wait_delay;
 use crate::win::{self};
@@ -118,9 +119,26 @@ impl AutoStats {
     }
 }
 
+/// Исходящее сообщение в очереди worker-а.
+#[derive(Debug)]
+struct Outgoing {
+    data: Vec<u8>,
+    /// `true` -- пришло через `try_send`: пишется в кольцо только
+    /// `try_write_message` (без перезаписи) и никогда не вытесняется из
+    /// очереди; `false` -- обычный `send` с политикой overwrite-oldest.
+    lossless: bool,
+}
+
+impl Outgoing {
+    /// Байты, которые сообщение займёт в кольце (заголовок + payload).
+    const fn frame(&self) -> usize {
+        MESSAGE_HEADER_SIZE + self.data.len()
+    }
+}
+
 #[derive(Debug)]
 enum WorkerCommand {
-    Send(Vec<u8>),
+    Send(Outgoing),
     Shutdown,
 }
 
@@ -130,7 +148,112 @@ enum WorkerCommand {
 /// видна только этому потоку (внешние отправители кладут сообщения через
 /// `mpsc::Sender`, а не сюда). Раньше здесь был `Mutex<VecDeque<..>>` -- три
 /// захвата lock-а на каждое сообщение без единого конкурента.
-type SendQueue = VecDeque<Vec<u8>>;
+type SendQueue = VecDeque<Outgoing>;
+
+/// Счётчики исходящего направления, общие для API-потоков и worker-а.
+///
+/// `pending_*` -- принятые `send`/`try_send`, но ещё не записанные в кольцо
+/// (в mpsc-канале или в `SendQueue`); `ring_free_*` -- последний снимок
+/// `free_space()` кольца, снятый worker-ом (он же единственный писатель
+/// кольца, поэтому снимок -- нижняя граница до его следующей записи).
+///
+/// Порядок, на котором держится консервативность `estimate()`: worker
+/// сначала публикует новый (меньший) снимок кольца, и только потом
+/// (`Release`) уменьшает `pending_*`; `estimate()` читает `pending_*`
+/// (`Acquire`) ДО снимка. Увидел уменьшенный `pending` -- увидит и
+/// уменьшенный снимок; не увидел -- вычтет ещё не списанное сообщение из
+/// снимка, в котором его ещё нет. В обоих случаях оценка не завышена.
+#[derive(Debug, Default)]
+struct SendGauge {
+    pending_msgs: AtomicUsize,
+    pending_bytes: AtomicUsize,
+    ring_free_bytes: AtomicUsize,
+    ring_free_msgs: AtomicU32,
+}
+
+impl SendGauge {
+    /// Принять сообщение в учёт (до отправки команды worker-у).
+    fn acquire(&self, frame: usize) {
+        self.pending_bytes.fetch_add(frame, Ordering::AcqRel);
+        self.pending_msgs.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// То же, но только если в очереди есть место (`try_send`): CAS-цикл,
+    /// чтобы несколько отправителей не превысили `max_send_queue`.
+    fn try_acquire(&self, frame: usize, max_send_queue: usize) -> bool {
+        let admitted = self
+            .pending_msgs
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                (cur < max_send_queue).then_some(cur + 1)
+            })
+            .is_ok();
+        if admitted {
+            self.pending_bytes.fetch_add(frame, Ordering::AcqRel);
+        }
+        admitted
+    }
+
+    /// Списать сообщение из учёта (записано в кольцо или выброшено).
+    fn release(&self, frame: usize) {
+        self.pending_bytes.fetch_sub(frame, Ordering::AcqRel);
+        self.pending_msgs.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Опубликовать снимок свободного места кольца (только worker).
+    fn publish_ring(&self, space: FreeSpace) {
+        self.ring_free_bytes.store(space.bytes, Ordering::Release);
+        self.ring_free_msgs.store(space.messages, Ordering::Release);
+    }
+
+    /// Консервативная оценка места для НОВОГО сообщения: кольцо минус всё,
+    /// что уже принято, но ещё не записано; слоты ограничены и кольцом, и
+    /// свободным местом очереди `max_send_queue`.
+    fn estimate(&self, max_send_queue: usize) -> FreeSpace {
+        let pending_msgs = self.pending_msgs.load(Ordering::Acquire);
+        let pending_bytes = self.pending_bytes.load(Ordering::Acquire);
+        let ring_msgs = self.ring_free_msgs.load(Ordering::Acquire) as usize;
+        let ring_bytes = self.ring_free_bytes.load(Ordering::Acquire);
+        let queue_room = max_send_queue.saturating_sub(pending_msgs);
+        let ring_room = ring_msgs.saturating_sub(pending_msgs);
+        FreeSpace {
+            bytes: ring_bytes.saturating_sub(pending_bytes),
+            messages: queue_room.min(ring_room) as u32,
+        }
+    }
+}
+
+/// Общая для `AutoServer`/`AutoClient` постановка сообщения в очередь.
+fn enqueue(
+    cmd_tx: &Sender<WorkerCommand>,
+    running: &AtomicBool,
+    gauge: &SendGauge,
+    data: &[u8],
+    lossless: bool,
+    max_send_queue: usize,
+) -> Result<()> {
+    if !running.load(Ordering::Acquire) {
+        return Err(ShmError::NotReady);
+    }
+    let frame = MESSAGE_HEADER_SIZE + data.len();
+    if lossless {
+        // Длину проверяем синхронно: иначе ошибка ушла бы в on_error
+        // асинхронно, а вызывающий считал бы сообщение принятым.
+        frame_len(data.len())?;
+        if !gauge.try_acquire(frame, max_send_queue.max(1)) {
+            return Err(ShmError::QueueFull);
+        }
+    } else {
+        gauge.acquire(frame);
+    }
+    let msg = Outgoing {
+        data: data.to_vec(),
+        lossless,
+    };
+    cmd_tx.send(WorkerCommand::Send(msg)).map_err(|_| {
+        gauge.release(frame);
+        ShmError::NotReady
+    })
+}
 
 #[derive(Debug)]
 pub struct AutoServer {
@@ -138,6 +261,8 @@ pub struct AutoServer {
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
+    gauge: Arc<SendGauge>,
+    max_send_queue: usize,
 }
 
 impl AutoServer {
@@ -146,9 +271,12 @@ impl AutoServer {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
+        let gauge = Arc::new(SendGauge::default());
+        let max_send_queue = options.max_send_queue;
         let join_running = running.clone();
         let join_stats = stats.clone();
         let join_handler = handler.clone();
+        let join_gauge = gauge.clone();
         // Thread name in debug only (opaque short tag `xsa-{name}` so
         // local traces still line up with the segment), anonymous in
         // release so Process Explorer / Process Hacker doesn't surface
@@ -168,6 +296,7 @@ impl AutoServer {
                     rx,
                     join_stats,
                     join_running,
+                    join_gauge,
                 );
             })
             .map_err(|err| map_spawn_error(err, "spawn server worker"))?;
@@ -176,17 +305,65 @@ impl AutoServer {
             join: Mutex::new(Some(join)),
             stats,
             running,
+            gauge,
+            max_send_queue,
         })
     }
 
+    /// Асинхронная отправка с политикой overwrite-oldest: при переполнении
+    /// очереди вытесняется самое старое обычное сообщение, при переполнении
+    /// кольца -- самые старые непрочитанные (`on_overflow`).
     pub fn send(&self, data: &[u8]) -> Result<()> {
-        if !self.running.load(Ordering::Acquire) {
-            return Err(ShmError::NotReady);
-        }
-        let msg = data.to_vec();
-        self.cmd_tx
-            .send(WorkerCommand::Send(msg))
-            .map_err(|_| ShmError::NotReady)
+        enqueue(
+            &self.cmd_tx,
+            &self.running,
+            &self.gauge,
+            data,
+            false,
+            self.max_send_queue,
+        )
+    }
+
+    /// Асинхронная отправка **без потерь** (backpressure).
+    ///
+    /// - `Ok(())` -- сообщение принято и будет записано в кольцо
+    ///   `try_write_message`-ом, то есть без перезаписи чего-либо; из очереди
+    ///   оно не вытесняется (ни `send`, ни `try_send`), порядок -- FIFO вместе
+    ///   с остальными сообщениями канала;
+    /// - `Err(QueueFull)` -- в очереди уже `max_send_queue` непереданных
+    ///   сообщений; ничего не принято, повторите позже (`free_space`,
+    ///   `on_space_available`);
+    /// - `Err(MessageTooSmall | MessageTooLarge)` -- проверяется синхронно;
+    /// - `Err(NotReady)` -- сервер остановлен.
+    ///
+    /// Гарантия «без потерь» действует в пределах одного подключения: при
+    /// переподключении handshake сбрасывает кольца, и уже записанные, но не
+    /// прочитанные сообщения пропадают (неотправленные остаются в очереди и
+    /// уйдут новому клиенту). Смешивать с `send` можно, но сообщения `send`
+    /// пишутся с перезаписью и могут вытеснить из КОЛЬЦА ранее записанные
+    /// сообщения `try_send` -- для строго lossless-канала используйте только
+    /// `try_send`.
+    pub fn try_send(&self, data: &[u8]) -> Result<()> {
+        enqueue(
+            &self.cmd_tx,
+            &self.running,
+            &self.gauge,
+            data,
+            true,
+            self.max_send_queue,
+        )
+    }
+
+    /// Консервативная оценка места под новое сообщение: свободное место
+    /// кольца Server -> Client (снимок worker-а) минус всё принятое, но ещё
+    /// не записанное; `messages` дополнительно ограничено свободным местом
+    /// очереди. Если `free_space().fits(n)`, то `try_send` payload-а длины
+    /// `n` будет принят и записан в кольцо без ожидания читателя (при одном
+    /// отправляющем потоке). Снимок кольца обновляется на каждой итерации
+    /// worker-а (не реже `poll_timeout`), вне подключения -- `FreeSpace::ZERO`.
+    #[must_use]
+    pub fn free_space(&self) -> FreeSpace {
+        self.gauge.estimate(self.max_send_queue.max(1))
     }
 
     pub fn stop(&self) {
@@ -215,6 +392,7 @@ fn server_worker(
     cmd_rx: Receiver<WorkerCommand>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
+    gauge: Arc<SendGauge>,
 ) {
     let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
@@ -238,6 +416,8 @@ fn server_worker(
 
     while running.load(Ordering::Acquire) {
         if !connected {
+            // Вне подключения писать некуда: оценка места -- ноль.
+            gauge.publish_ring(FreeSpace::ZERO);
             match server.wait_for_client(Some(options.poll_timeout)) {
                 Ok(_) => {
                     connected = true;
@@ -250,6 +430,7 @@ fn server_worker(
                         &options,
                         &running,
                         &handler,
+                        &gauge,
                         ChannelKind::ServerToClient,
                     );
                     continue;
@@ -262,6 +443,7 @@ fn server_worker(
                         &options,
                         &running,
                         &handler,
+                        &gauge,
                         ChannelKind::ServerToClient,
                     );
                     continue;
@@ -275,6 +457,7 @@ fn server_worker(
             &options,
             &running,
             &handler,
+            &gauge,
             ChannelKind::ServerToClient,
         );
 
@@ -287,6 +470,7 @@ fn server_worker(
             &mut send_queue,
             &handler,
             &stats,
+            &gauge,
             ChannelKind::ServerToClient,
         );
 
@@ -339,6 +523,8 @@ pub struct AutoClient {
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
+    gauge: Arc<SendGauge>,
+    max_send_queue: usize,
 }
 
 impl AutoClient {
@@ -350,6 +536,9 @@ impl AutoClient {
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
+        let gauge = Arc::new(SendGauge::default());
+        let max_send_queue = options.max_send_queue;
+        let join_gauge = gauge.clone();
         let join_stats = stats.clone();
         let join_running = running.clone();
         let handler_clone = handler.clone();
@@ -373,6 +562,7 @@ impl AutoClient {
                     rx,
                     join_stats,
                     join_running,
+                    join_gauge,
                 );
             })
             .map_err(|err| map_spawn_error(err, "spawn client worker"))?;
@@ -382,17 +572,43 @@ impl AutoClient {
             join: Mutex::new(Some(join)),
             stats,
             running,
+            gauge,
+            max_send_queue,
         })
     }
 
+    /// Асинхронная отправка с политикой overwrite-oldest
+    /// (см. `AutoServer::send`).
     pub fn send(&self, data: &[u8]) -> Result<()> {
-        if !self.running.load(Ordering::Acquire) {
-            return Err(ShmError::NotReady);
-        }
-        let msg = data.to_vec();
-        self.cmd_tx
-            .send(WorkerCommand::Send(msg))
-            .map_err(|_| ShmError::NotReady)
+        enqueue(
+            &self.cmd_tx,
+            &self.running,
+            &self.gauge,
+            data,
+            false,
+            self.max_send_queue,
+        )
+    }
+
+    /// Асинхронная отправка без потерь с backpressure (`Err(QueueFull)`,
+    /// когда в очереди `max_send_queue` непереданных сообщений). Полная
+    /// семантика -- `AutoServer::try_send`.
+    pub fn try_send(&self, data: &[u8]) -> Result<()> {
+        enqueue(
+            &self.cmd_tx,
+            &self.running,
+            &self.gauge,
+            data,
+            true,
+            self.max_send_queue,
+        )
+    }
+
+    /// Консервативная оценка места под новое сообщение в направлении
+    /// Client -> Server (см. `AutoServer::free_space`).
+    #[must_use]
+    pub fn free_space(&self) -> FreeSpace {
+        self.gauge.estimate(self.max_send_queue.max(1))
     }
 
     pub fn stop(&self) {
@@ -421,6 +637,7 @@ fn client_worker(
     cmd_rx: Receiver<WorkerCommand>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
+    gauge: Arc<SendGauge>,
 ) {
     let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
@@ -457,6 +674,7 @@ fn client_worker(
                 &options,
                 &running,
                 &handler,
+                &gauge,
                 ChannelKind::ClientToServer,
             );
             process_send_queue(
@@ -464,6 +682,7 @@ fn client_worker(
                 &mut send_queue,
                 &handler,
                 &stats,
+                &gauge,
                 ChannelKind::ClientToServer,
             );
             let outcome = process_receive_queue(
@@ -502,6 +721,8 @@ fn client_worker(
             }
         }
 
+        // Соединение потеряно: писать некуда, оценка места -- ноль.
+        gauge.publish_ring(FreeSpace::ZERO);
         if !wait_delay(&running, options.reconnect_delay) {
             break;
         }
@@ -510,26 +731,40 @@ fn client_worker(
 
 /// Переносит команды из mpsc-канала в очередь отправки.
 ///
-/// При переполнении (`max_send_queue`) вытесняется САМОЕ СТАРОЕ сообщение, а
-/// вызывающему сообщается об этом через `AutoHandler::on_overflow` -- раньше
-/// потеря была полностью молчаливой (аудит 2026-07-28), в отличие от
-/// симметричного `MultiClientHandler::on_overflow`.
+/// При переполнении (`max_send_queue`) обычным `send` вытесняется САМОЕ
+/// СТАРОЕ обычное (не lossless) сообщение, а вызывающему сообщается об этом
+/// через `AutoHandler::on_overflow` -- раньше потеря была полностью молчаливой
+/// (аудит 2026-07-28), в отличие от симметричного
+/// `MultiClientHandler::on_overflow`. Сообщения `try_send` не вытесняются
+/// никогда: если вся очередь из них, выбрасывается само новое сообщение
+/// `send` (тоже с `on_overflow`). Сообщения `try_send` принимаются всегда --
+/// их число уже ограничено `max_send_queue` на входе (`SendGauge::try_acquire`).
 fn drain_commands(
     queue: &mut SendQueue,
     rx: &Receiver<WorkerCommand>,
     options: &AutoOptions,
     running: &Arc<AtomicBool>,
     handler: &Arc<dyn AutoHandler>,
+    gauge: &SendGauge,
     direction: ChannelKind,
 ) {
     while let Ok(cmd) = rx.try_recv() {
         match cmd {
             WorkerCommand::Send(msg) => {
-                if queue.len() >= options.max_send_queue {
-                    queue.pop_front();
+                if !msg.lossless && queue.len() >= options.max_send_queue {
+                    match queue.iter().position(|m| !m.lossless) {
+                        Some(pos) => {
+                            if let Some(evicted) = queue.remove(pos) {
+                                gauge.release(evicted.frame());
+                            }
+                            queue.push_back(msg);
+                        }
+                        None => gauge.release(msg.frame()),
+                    }
                     handler.on_overflow(direction, 1);
+                } else {
+                    queue.push_back(msg);
                 }
-                queue.push_back(msg);
             }
             WorkerCommand::Shutdown => {
                 running.store(false, Ordering::Release);
@@ -538,18 +773,49 @@ fn drain_commands(
     }
 }
 
+/// Пишет очередь в кольцо, пока пишется.
+///
+/// Обычные сообщения -- `write_message` (overwrite-oldest), lossless --
+/// `try_write_message`. Если lossless-сообщение в голове очереди не влезает,
+/// worker оставляет в кольце заявку (`arm_space_waiter`) и ОДИН раз
+/// перепроверяет -- после этого либо запись прошла, либо читатель гарантированно
+/// увидит заявку и просигналит `SPACE`, который будит `wait_any` worker-а.
+/// Порядок FIFO сохраняется: пока голова ждёт места, остальные тоже ждут.
 fn process_send_queue<E>(
     endpoint: &E,
     queue: &mut SendQueue,
     handler: &Arc<dyn AutoHandler>,
     stats: &Arc<AutoStats>,
+    gauge: &SendGauge,
     direction: ChannelKind,
 ) where
     E: SendEndpoint,
 {
-    while let Some(msg) = queue.pop_front() {
-        match endpoint.write(&msg) {
+    // `armed` -- заявка поставлена в ЭТОМ проходе; `cleared` -- заявка,
+    // возможно оставшаяся с прошлого прохода (читатель её не снял: места
+    // было мало или он старой версии), уже снята. Снимаем на первой же
+    // успешной записи -- одна запись в заголовок за проход.
+    let mut armed = false;
+    let mut cleared = false;
+    while let Some(msg) = queue.front() {
+        let result = if msg.lossless {
+            endpoint.try_write(&msg.data)
+        } else {
+            endpoint.write(&msg.data)
+        };
+        match result {
             Ok(outcome) => {
+                if armed || !cleared {
+                    endpoint.disarm_space_waiter();
+                    armed = false;
+                    cleared = true;
+                }
+                let frame = msg.frame();
+                queue.pop_front();
+                // Сначала снимок кольца (уже с этим сообщением), потом
+                // списание из pending -- порядок описан у `SendGauge`.
+                gauge.publish_ring(endpoint.free_space());
+                gauge.release(frame);
                 stats.sent_messages.fetch_add(1, Ordering::Relaxed);
                 if outcome.overwritten > 0 {
                     stats
@@ -558,17 +824,26 @@ fn process_send_queue<E>(
                     handler.on_overflow(direction, outcome.overwritten);
                 }
             }
-            Err(ShmError::QueueFull) => {
-                queue.push_front(msg);
-                break;
+            Err(ShmError::QueueFull) if msg.lossless && !armed => {
+                endpoint.arm_space_waiter(msg.frame() as u32);
+                armed = true;
+            }
+            Err(ShmError::QueueFull) => break,
+            Err(err @ (ShmError::MessageTooSmall | ShmError::MessageTooLarge)) => {
+                // Сообщение невалидно навсегда: раньше оно возвращалось в
+                // голову очереди и блокировало канал до конца жизни worker-а.
+                handler.on_error(err);
+                if let Some(bad) = queue.pop_front() {
+                    gauge.release(bad.frame());
+                }
             }
             Err(err) => {
                 handler.on_error(err);
-                queue.push_front(msg);
                 break;
             }
         }
     }
+    gauge.publish_ring(endpoint.free_space());
 }
 
 /// Результат обработки приёмной очереди за один проход.
@@ -627,7 +902,11 @@ where
 }
 
 trait SendEndpoint {
-    fn write(&self, data: &[u8]) -> Result<crate::ring::WriteOutcome>;
+    fn write(&self, data: &[u8]) -> Result<WriteOutcome>;
+    fn try_write(&self, data: &[u8]) -> Result<WriteOutcome>;
+    fn free_space(&self) -> FreeSpace;
+    fn arm_space_waiter(&self, frame: u32);
+    fn disarm_space_waiter(&self);
 }
 
 trait ReceiveEndpoint {
@@ -635,8 +914,20 @@ trait ReceiveEndpoint {
 }
 
 impl SendEndpoint for SharedServer {
-    fn write(&self, data: &[u8]) -> Result<crate::ring::WriteOutcome> {
+    fn write(&self, data: &[u8]) -> Result<WriteOutcome> {
         self.send_to_client(data)
+    }
+    fn try_write(&self, data: &[u8]) -> Result<WriteOutcome> {
+        self.try_send_to_client(data)
+    }
+    fn free_space(&self) -> FreeSpace {
+        SharedServer::free_space(self)
+    }
+    fn arm_space_waiter(&self, frame: u32) {
+        SharedServer::arm_space_waiter(self, frame);
+    }
+    fn disarm_space_waiter(&self) {
+        SharedServer::disarm_space_waiter(self);
     }
 }
 
@@ -647,8 +938,20 @@ impl ReceiveEndpoint for SharedServer {
 }
 
 impl SendEndpoint for SharedClient {
-    fn write(&self, data: &[u8]) -> Result<crate::ring::WriteOutcome> {
+    fn write(&self, data: &[u8]) -> Result<WriteOutcome> {
         self.send_to_server(data)
+    }
+    fn try_write(&self, data: &[u8]) -> Result<WriteOutcome> {
+        self.try_send_to_server(data)
+    }
+    fn free_space(&self) -> FreeSpace {
+        SharedClient::free_space(self)
+    }
+    fn arm_space_waiter(&self, frame: u32) {
+        SharedClient::arm_space_waiter(self, frame);
+    }
+    fn disarm_space_waiter(&self) {
+        SharedClient::disarm_space_waiter(self);
     }
 }
 
@@ -725,5 +1028,238 @@ mod tests {
             disconnect_returned.load(Ordering::Acquire),
             "on_disconnect не вернулся за 10с -- self-join deadlock"
         );
+    }
+}
+
+#[cfg(test)]
+mod lossless_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    #[derive(Default)]
+    struct Counters {
+        overflows: AtomicU32,
+        errors: AtomicU32,
+    }
+    impl AutoHandler for Counters {
+        fn on_overflow(&self, _direction: ChannelKind, count: u32) {
+            self.overflows.fetch_add(count, Ordering::Relaxed);
+        }
+        fn on_error(&self, _err: ShmError) {
+            self.errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Поддельный endpoint: кольцо «вмещает» `room` сообщений; `try_write`
+    /// при нехватке отвечает QueueFull, `write` -- как overwrite (всегда Ok).
+    struct MockEndpoint {
+        room: Cell<usize>,
+        written: RefCell<Vec<Vec<u8>>>,
+        armed: Cell<u32>,
+        arms: Cell<u32>,
+    }
+    impl MockEndpoint {
+        fn new(room: usize) -> Self {
+            Self {
+                room: Cell::new(room),
+                written: RefCell::new(Vec::new()),
+                armed: Cell::new(0),
+                arms: Cell::new(0),
+            }
+        }
+        fn accept(&self, data: &[u8]) -> Result<WriteOutcome> {
+            frame_len(data.len())?;
+            self.written.borrow_mut().push(data.to_vec());
+            self.room.set(self.room.get().saturating_sub(1));
+            Ok(WriteOutcome {
+                overwritten: 0,
+                was_empty: false,
+            })
+        }
+    }
+    impl SendEndpoint for MockEndpoint {
+        fn write(&self, data: &[u8]) -> Result<WriteOutcome> {
+            self.accept(data)
+        }
+        fn try_write(&self, data: &[u8]) -> Result<WriteOutcome> {
+            frame_len(data.len())?;
+            if self.room.get() == 0 {
+                return Err(ShmError::QueueFull);
+            }
+            self.accept(data)
+        }
+        fn free_space(&self) -> FreeSpace {
+            FreeSpace {
+                bytes: self.room.get() * 1000,
+                messages: self.room.get() as u32,
+            }
+        }
+        fn arm_space_waiter(&self, frame: u32) {
+            self.armed.set(frame);
+            self.arms.set(self.arms.get() + 1);
+        }
+        fn disarm_space_waiter(&self) {
+            self.armed.set(0);
+        }
+    }
+
+    fn data_of(queue: &SendQueue) -> Vec<Vec<u8>> {
+        queue.iter().map(|m| m.data.clone()).collect()
+    }
+
+    /// `try_send` ограничен `max_send_queue` на входе, `send` -- нет; при
+    /// переполнении `send` вытесняет только обычные сообщения, а если в
+    /// очереди одни lossless -- выбрасывается само новое сообщение `send`.
+    #[test]
+    fn queue_policy_never_evicts_lossless() {
+        let (tx, rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let gauge = SendGauge::default();
+        let counters = Arc::new(Counters::default());
+        let handler: Arc<dyn AutoHandler> = counters.clone();
+        let options = AutoOptions {
+            max_send_queue: 2,
+            ..AutoOptions::default()
+        };
+        let dir = ChannelKind::ClientToServer;
+
+        enqueue(&tx, &running, &gauge, b"L1", true, 2).unwrap();
+        enqueue(&tx, &running, &gauge, b"L2", true, 2).unwrap();
+        assert_eq!(
+            enqueue(&tx, &running, &gauge, b"L3", true, 2),
+            Err(ShmError::QueueFull)
+        );
+        assert_eq!(
+            enqueue(&tx, &running, &gauge, b"x", true, 2),
+            Err(ShmError::MessageTooSmall),
+            "длина lossless-сообщения проверяется синхронно"
+        );
+        enqueue(&tx, &running, &gauge, b"S1", false, 2).unwrap();
+
+        let mut queue = SendQueue::new();
+        drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
+        assert_eq!(data_of(&queue), [b"L1".to_vec(), b"L2".to_vec()]);
+        assert_eq!(counters.overflows.load(Ordering::Relaxed), 1);
+        assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 2);
+        assert_eq!(gauge.pending_bytes.load(Ordering::Acquire), 2 * (4 + 2));
+
+        // Смешанная очередь: вытесняется самое старое ОБЫЧНОЕ сообщение.
+        let mut queue = SendQueue::new();
+        queue.push_back(Outgoing {
+            data: b"S0".to_vec(),
+            lossless: false,
+        });
+        queue.push_back(Outgoing {
+            data: b"L0".to_vec(),
+            lossless: true,
+        });
+        let gauge = SendGauge::default();
+        gauge.acquire(6);
+        gauge.acquire(6);
+        enqueue(&tx, &running, &gauge, b"S2", false, 2).unwrap();
+        drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
+        assert_eq!(data_of(&queue), [b"L0".to_vec(), b"S2".to_vec()]);
+        assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 2);
+    }
+
+    /// Голова-lossless не влезает: worker ставит заявку ровно один раз,
+    /// ничего не теряет и не обгоняет (FIFO); освободилось место --
+    /// очередь уходит целиком, заявка снимается, учёт pending обнуляется.
+    #[test]
+    fn blocked_lossless_head_keeps_fifo_and_arms_waiter() {
+        let (tx, rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let gauge = SendGauge::default();
+        let counters = Arc::new(Counters::default());
+        let handler: Arc<dyn AutoHandler> = counters.clone();
+        let stats = Arc::new(AutoStats::default());
+        let options = AutoOptions::default();
+        let dir = ChannelKind::ClientToServer;
+        for i in 0..5u8 {
+            enqueue(&tx, &running, &gauge, &[i, i, i], true, 16).unwrap();
+        }
+        let mut queue = SendQueue::new();
+        drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
+
+        let ep = MockEndpoint::new(2);
+        process_send_queue(&ep, &mut queue, &handler, &stats, &gauge, dir);
+        assert_eq!(ep.written.borrow().len(), 2);
+        assert_eq!(queue.len(), 3);
+        assert_eq!(ep.arms.get(), 1, "заявка -- один раз за проход");
+        assert_eq!(ep.armed.get(), 4 + 3);
+        assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 3);
+        // Оценка места: кольцо пусто (room=0), а 3 сообщения ещё ждут.
+        assert_eq!(gauge.estimate(16), FreeSpace::ZERO);
+
+        ep.room.set(10);
+        process_send_queue(&ep, &mut queue, &handler, &stats, &gauge, dir);
+        assert!(queue.is_empty());
+        assert_eq!(ep.armed.get(), 0, "успешная запись снимает заявку");
+        let written = ep.written.borrow();
+        for (i, msg) in written.iter().enumerate() {
+            assert_eq!(msg, &vec![i as u8; 3], "порядок нарушен");
+        }
+        assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 0);
+        assert_eq!(gauge.pending_bytes.load(Ordering::Acquire), 0);
+        assert_eq!(stats.sent_messages.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.overflows.load(Ordering::Relaxed), 0);
+    }
+
+    /// Регрессия: невалидное сообщение `send` раньше возвращалось в голову
+    /// очереди и навсегда блокировало канал. Теперь -- `on_error` и дальше.
+    #[test]
+    fn invalid_message_does_not_wedge_queue() {
+        let (tx, rx) = mpsc::channel();
+        let running = Arc::new(AtomicBool::new(true));
+        let gauge = SendGauge::default();
+        let counters = Arc::new(Counters::default());
+        let handler: Arc<dyn AutoHandler> = counters.clone();
+        let stats = Arc::new(AutoStats::default());
+        let dir = ChannelKind::ServerToClient;
+        enqueue(&tx, &running, &gauge, b"x", false, 16).unwrap();
+        enqueue(&tx, &running, &gauge, b"ok", false, 16).unwrap();
+        let mut queue = SendQueue::new();
+        drain_commands(
+            &mut queue,
+            &rx,
+            &AutoOptions::default(),
+            &running,
+            &handler,
+            &gauge,
+            dir,
+        );
+        let ep = MockEndpoint::new(10);
+        process_send_queue(&ep, &mut queue, &handler, &stats, &gauge, dir);
+        assert!(queue.is_empty());
+        assert_eq!(*ep.written.borrow(), [b"ok".to_vec()]);
+        assert_eq!(counters.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 0);
+    }
+
+    /// Оценка места консервативна: вычитает ещё не записанное и ограничена
+    /// свободным местом очереди.
+    #[test]
+    fn gauge_estimate_is_conservative() {
+        let gauge = SendGauge::default();
+        assert_eq!(gauge.estimate(8), FreeSpace::ZERO, "до подключения");
+        gauge.publish_ring(FreeSpace {
+            bytes: 10_000,
+            messages: 100,
+        });
+        assert_eq!(
+            gauge.estimate(8),
+            FreeSpace {
+                bytes: 10_000,
+                messages: 8
+            }
+        );
+        gauge.acquire(4 + 996);
+        gauge.acquire(4 + 996);
+        let est = gauge.estimate(8);
+        assert_eq!(est.bytes, 8_000);
+        assert_eq!(est.messages, 6);
+        assert!(!gauge.try_acquire(10, 2), "очередь 2/2");
+        gauge.release(1000);
+        assert!(gauge.try_acquire(10, 2));
     }
 }

@@ -20,6 +20,11 @@ pub(crate) mod ntapi;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use client::SharedClient;
+/// Лимиты кольца -- нужны потребителям, которые строят свой протокол поверх
+/// `try_send*`/`free_space` (размер кадра, число слотов).
+pub use constants::{
+    MAX_MESSAGE_SIZE, MAX_MESSAGES, MESSAGE_HEADER_SIZE, MIN_MESSAGE_SIZE, RING_CAPACITY,
+};
 pub use dispatch::{
     ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
     DispatchHandler, DispatchOptions, DispatchServer,
@@ -29,7 +34,7 @@ pub use events::EventHandles;
 pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
-pub use ring::WriteOutcome;
+pub use ring::{FreeSpace, WriteOutcome};
 pub use server::SharedServer;
 
 use std::sync::atomic::{AtomicBool, Ordering};

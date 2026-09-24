@@ -7,7 +7,7 @@
 Двунаправленный обмен сообщениями через lock-free SPSC кольцевые буферы, поверх прямых вызовов NT API. Чистый Rust-крейт — без C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.7.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,7 +23,13 @@
 
 ---
 
-## 🆕 Что нового в v0.7.0
+## 🆕 Что нового в v0.8.0
+
+- ✅ **Запись без потерь** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` никогда не затирают непрочитанное (`Err(QueueFull)` — кольцо не тронуто); `free_space()` — консервативная оценка места для писателя; `wait_for_space()` ждёт события `SPACE`. Раскладка совместима с 0.7.0 (`SHARED_VERSION` прежний).
+- ✅ Константы кольца (`RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, …) экспортируются из корня крейта.
+- 🐛 Auto: `send` недопустимой длины больше не блокирует очередь навсегда — сообщение выбрасывается с `on_error`.
+
+## Ранее в v0.7.0
 
 - ✅ **Чистый Rust-крейт** (breaking) — весь слой C/C++ FFI удалён: `ffi.rs`, `multi/ffi.rs`, `dispatch/ffi.rs`, сборочный шаг `cbindgen`, сгенерированные заголовки `include/*.h` и crate-type `staticlib`. Крейт собирается только как `rlib` и потребляется из Rust; для нативных потребителей пишется отдельный синхронный проект на C23.
 - ✅ **Ноль build-зависимостей** — `build.rs` теперь делает единственную вещь: `cargo:rustc-link-lib=ntdll`; `thiserror` остаётся единственной runtime-зависимостью
@@ -390,7 +396,67 @@ fn main() -> Result<()> {
 }
 ```
 
+### Запись без потерь (backpressure)
+
+По умолчанию все пути отправки при заполненном кольце вытесняют самые старые
+непрочитанные сообщения. Если читатель обязан увидеть *каждое* сообщение
+(например, поток профайлера), используйте варианты без перезаписи:
+
+| Режим | Отправка без перезаписи | Свободное место |
+|-------|-------------------------|-----------------|
+| Single-client | `SharedServer::try_send_to_client`, `SharedClient::try_send_to_server` | `free_space()`, `wait_for_space(len, timeout)` |
+| Auto | `AutoServer::try_send`, `AutoClient::try_send` | `free_space()` |
+| Dispatch | `DispatchClient::try_send`, `DispatchServer::try_send_to` | `DispatchClient::free_space()`, `DispatchServer::free_space(id)` |
+| Multi-client | `MultiServer::try_send_to` | `MultiServer::free_space(id)` |
+
+Семантика:
+
+- Сообщение либо **целиком** ложится в свободное место, либо отклоняется с
+  `ShmError::QueueFull`; непрочитанные данные не трогаются никогда (`overwritten` всегда 0).
+  Атомарность та же, что у обычной отправки: читатель видит сообщение целиком или не видит вовсе.
+- `FreeSpace { bytes, messages }` (+ `fits(len)`, `max_payload()`), снятый на стороне писателя, --
+  **нижняя граница**: если `fits(n)`, следующий `try_send*` длины `n` пройдёт. Каждое сообщение
+  занимает `MESSAGE_HEADER_SIZE` (4) + длину payload; в кольце не больше `MAX_MESSAGES` (500)
+  сообщений и `RING_CAPACITY` (2 МиБ) байт. Сообщение в 65 535 байт всегда помещается в пустое кольцо.
+- `wait_for_space` спит на событии `SPACE` канала: читатель будит писателя, только когда места
+  стало достаточно. Ожидание нарезано срезами по 50 мс, поэтому работает и с пирами 0.7.0, и с
+  anonymous-сервером (опросом). Мёртвый читатель место не освободит -- всегда задавайте таймаут.
+- Auto/Dispatch асинхронны: `try_send` возвращает `QueueFull`, когда `max_send_queue` принятых
+  сообщений ещё ждут места в кольце; принятые lossless-сообщения никогда не вытесняются и пишутся
+  путём без перезаписи. Гарантия действует в пределах одного подключения (переподключение
+  сбрасывает кольца). Не смешивайте `send` и `try_send` на канале, который обязан быть без потерь:
+  перезаписывающий `send` может вытеснить из кольца более ранние сообщения.
+- Писатель на направление -- по-прежнему один (SPSC).
+
+```rust
+use std::time::Duration;
+use xshm::{SharedServer, ShmError};
+
+fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
+    for block in blocks {
+        loop {
+            match server.try_send_to_client(block) {
+                Ok(_) => break,
+                Err(ShmError::QueueFull) => {
+                    if !server.wait_for_space(block.len(), Some(Duration::from_secs(3)))? {
+                        return Err(ShmError::Timeout); // читатель завис или умер
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+    }
+    Ok(())
+}
+```
+
+Layout не менялся: заявка на пробуждение живёт в бывшем зарезервированном слове
+`RingHeader`, поэтому `SHARED_VERSION` прежний и пиры 0.7.0 совместимы.
+
 ## Константы
+
+Лимиты кольца реэкспортированы из корня крейта
+(`xshm::RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, `MIN_MESSAGE_SIZE`, `MESSAGE_HEADER_SIZE`).
 
 | Константа | Значение | Описание |
 |-----------|----------|----------|
@@ -425,7 +491,7 @@ if let Some(handles) = server.get_event_handles() {
 ## Ограничения
 
 - **SPSC**: строго один producer и один consumer на канал
-- **Overwrite при переполнении**: новые сообщения вытесняют старые, когда очередь заполнена
+- **Overwrite при переполнении** (по умолчанию): новые сообщения вытесняют старые, когда очередь заполнена -- для backpressure без потерь есть `try_send*`
 - **Только Windows**: использует прямые вызовы NT API, полагается на x86/x86_64 TSO memory ordering (не переносимо на ARM/RISC-V без переработки)
 - **Размер сообщения**: от 2 до 65535 байт
 - **Anonymous-серверы**: event handles недоступны (только режим polling)

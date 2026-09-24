@@ -11,7 +11,17 @@ pub struct RingHeader {
     pub sequence: AtomicU32,
     pub connection_gen: AtomicU32,
     pub handshake_state: AtomicU32,
-    pub reserved: [u32; 8],
+    /// Заявка писателя, ждущего места (`wait_for_space`, lossless-отправка
+    /// auto-режима): размер кадра (заголовок + payload) в байтах, `0` --
+    /// никто не ждёт. Читатель, освободивший достаточно места, снимает
+    /// заявку и сигналит событие `SPACE` (см. `RingBuffer::take_space_waiter`).
+    ///
+    /// Бывший `reserved[0]`: во всех прежних версиях поле всегда было нулём
+    /// и никем не читалось, поэтому размер структуры и `SHARED_VERSION` не
+    /// меняются. Старый читатель заявку просто игнорирует -- писатель тогда
+    /// просыпается по прежнему сигналу «кольцо опустело» или по таймауту.
+    pub space_waiter: AtomicU32,
+    pub reserved: [u32; 7],
 }
 
 impl RingHeader {
@@ -24,6 +34,7 @@ impl RingHeader {
         self.connection_gen.store(generation, Ordering::Relaxed);
         self.handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Relaxed);
+        self.space_waiter.store(0, Ordering::Relaxed);
     }
 }
 
@@ -96,5 +107,22 @@ mod tests {
         assert_eq!(align_of::<RingHeader>(), 64);
         assert_eq!(shared_mapping_size(), 64 + 2 * 64 + 2 * RING_CAPACITY);
         assert_eq!(shared_mapping_size(), 4_194_496);
+    }
+
+    /// `space_waiter` занял бывший `reserved[0]`: смещения всех прежних полей
+    /// и хвост `reserved` обязаны остаться на месте (wire-совместимость с
+    /// пирами 0.7.0 без смены `SHARED_VERSION`).
+    #[test]
+    fn ring_header_offsets_are_stable() {
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(RingHeader, write_pos), 0);
+        assert_eq!(offset_of!(RingHeader, read_pos), 4);
+        assert_eq!(offset_of!(RingHeader, message_count), 8);
+        assert_eq!(offset_of!(RingHeader, drop_count), 12);
+        assert_eq!(offset_of!(RingHeader, sequence), 16);
+        assert_eq!(offset_of!(RingHeader, connection_gen), 20);
+        assert_eq!(offset_of!(RingHeader, handshake_state), 24);
+        assert_eq!(offset_of!(RingHeader, space_waiter), 28);
+        assert_eq!(offset_of!(RingHeader, reserved), 32);
     }
 }

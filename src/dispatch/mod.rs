@@ -26,6 +26,7 @@ use crate::auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind}
 use crate::client::SharedClient;
 use crate::constants::MAX_MESSAGE_SIZE;
 use crate::error::{Result, ShmError};
+use crate::ring::FreeSpace;
 use crate::server::SharedServer;
 use crate::wait_delay;
 
@@ -209,6 +210,27 @@ impl DispatchServer {
         let clients = self.clients.read().unwrap();
         let client = clients.get(&client_id).ok_or(ShmError::NotConnected)?;
         client.server.send(data)
+    }
+
+    /// Отправка клиенту без потерь (backpressure): `Err(QueueFull)`, когда в
+    /// очереди канала `max_send_queue` непереданных сообщений; принятое
+    /// сообщение пишется в кольцо без перезаписи. Семантика --
+    /// `AutoServer::try_send`.
+    pub fn try_send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
+        let clients = self.clients.read().unwrap();
+        let client = clients.get(&client_id).ok_or(ShmError::NotConnected)?;
+        client.server.try_send(data)
+    }
+
+    /// Консервативная оценка места под новое сообщение клиенту
+    /// (`AutoServer::free_space`); `None` -- клиента нет.
+    #[must_use]
+    pub fn free_space(&self, client_id: u32) -> Option<FreeSpace> {
+        self.clients
+            .read()
+            .unwrap()
+            .get(&client_id)
+            .map(|c| c.server.free_space())
     }
 
     /// Рассылает сообщение всем подключённым клиентам.
@@ -734,6 +756,36 @@ impl DispatchClient {
             Some(client) => client.send(data),
             None => Err(ShmError::NotConnected),
         }
+    }
+
+    /// Отправка серверу **без потерь** (backpressure).
+    ///
+    /// `Ok(())` -- сообщение принято и будет записано в кольцо без
+    /// перезаписи непрочитанного; `Err(QueueFull)` -- в очереди уже
+    /// `DispatchClientOptions::max_send_queue` непереданных сообщений (сервер
+    /// не успевает читать), ничего не принято; `MessageTooSmall`/
+    /// `MessageTooLarge` -- синхронно; `NotReady`/`NotConnected` -- канал
+    /// остановлен или разорван. Семантика -- `AutoServer::try_send`.
+    pub fn try_send(&self, data: &[u8]) -> Result<()> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(ShmError::NotReady);
+        }
+        let guard = self.auto_client.lock().unwrap();
+        match guard.as_ref() {
+            Some(client) => client.try_send(data),
+            None => Err(ShmError::NotConnected),
+        }
+    }
+
+    /// Консервативная оценка места под новое сообщение серверу
+    /// (`AutoClient::free_space`); после разрыва канала -- `FreeSpace::ZERO`.
+    #[must_use]
+    pub fn free_space(&self) -> FreeSpace {
+        self.auto_client
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(FreeSpace::ZERO, AutoClient::free_space)
     }
 
     /// Возвращает назначенный ID клиента.

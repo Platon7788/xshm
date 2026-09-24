@@ -5,17 +5,99 @@
 //! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
 
 use std::ptr::NonNull;
-use std::sync::atomic::{Ordering, compiler_fence};
+use std::sync::atomic::{Ordering, compiler_fence, fence};
+use std::time::{Duration, Instant};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
 use crate::layout::RingHeader;
+use crate::win::EventHandle;
+
+/// Максимальный отрезок одного сна в `wait_for_space`: страховка от
+/// потерянного сигнала (читатель старой версии не знает про заявку) --
+/// место всё равно будет замечено не позже чем через этот интервал.
+const SPACE_WAIT_SLICE: Duration = Duration::from_millis(50);
+/// Шаг опроса, когда события нет вовсе (anonymous-сервер).
+const SPACE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOutcome {
     pub overwritten: u32,
     pub was_empty: bool,
 }
+
+/// Свободное место в исходящем кольце.
+///
+/// Снимок, снятый на стороне писателя, -- **нижняя граница**: единственный,
+/// кто уменьшает свободное место, это сам писатель, а читатель параллельно
+/// может только освобождать. Поэтому если `fits(n)` вернул `true`, следующий
+/// `try_send*` того же писателя с payload длины `n` гарантированно пройдёт
+/// (при одном писателе на направление -- см. SPSC-контракт).
+///
+/// Снимок, снятый из другого потока, чем писатель, -- просто наблюдение:
+/// писатель мог уже занять часть места.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FreeSpace {
+    /// Свободные байты кольца. Каждое сообщение занимает
+    /// `MESSAGE_HEADER_SIZE` (4) + длина payload.
+    pub bytes: usize,
+    /// Сколько ещё сообщений можно положить до лимита `MAX_MESSAGES`.
+    pub messages: u32,
+}
+
+impl FreeSpace {
+    /// Нулевое место: канал не подключён или кольцо заполнено.
+    pub const ZERO: Self = Self {
+        bytes: 0,
+        messages: 0,
+    };
+
+    /// Поместится ли сейчас payload длины `payload_len` без перезаписи.
+    /// Для недопустимых длин (`< MIN_MESSAGE_SIZE` или `> MAX_MESSAGE_SIZE`)
+    /// -- всегда `false`: такие сообщения не принимаются никогда.
+    #[must_use]
+    pub const fn fits(&self, payload_len: usize) -> bool {
+        payload_len >= MIN_MESSAGE_SIZE
+            && payload_len <= MAX_MESSAGE_SIZE
+            && self.messages > 0
+            && self.bytes >= MESSAGE_HEADER_SIZE + payload_len
+    }
+
+    /// Максимальная длина payload, которая поместится прямо сейчас
+    /// (`0` -- не поместится ни одно сообщение).
+    #[must_use]
+    pub const fn max_payload(&self) -> usize {
+        if self.messages == 0 || self.bytes < MESSAGE_HEADER_SIZE + MIN_MESSAGE_SIZE {
+            return 0;
+        }
+        let room = self.bytes - MESSAGE_HEADER_SIZE;
+        if room > MAX_MESSAGE_SIZE {
+            MAX_MESSAGE_SIZE
+        } else {
+            room
+        }
+    }
+}
+
+/// Размер кадра (заголовок + payload) для валидной длины payload.
+///
+/// Единая проверка границ для `write_message`/`try_write_message`/
+/// `wait_for_space`: `MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE`. Кадр максимальной
+/// длины (65 539 байт) заведомо меньше `RING_CAPACITY` (2 МиБ), поэтому
+/// «сообщение больше кольца» отдельной ветки не требует.
+pub(crate) const fn frame_len(payload_len: usize) -> Result<u32> {
+    if payload_len < MIN_MESSAGE_SIZE {
+        return Err(ShmError::MessageTooSmall);
+    }
+    if payload_len > MAX_MESSAGE_SIZE {
+        return Err(ShmError::MessageTooLarge);
+    }
+    Ok((MESSAGE_HEADER_SIZE + payload_len) as u32)
+}
+
+// Кадр максимальной длины обязан помещаться в пустое кольцо -- иначе
+// `try_write_message` мог бы вечно отвечать `QueueFull` на валидное сообщение.
+const _: () = assert!(MESSAGE_HEADER_SIZE + MAX_MESSAGE_SIZE <= RING_CAPACITY);
 
 #[derive(Debug)]
 pub struct RingBuffer {
@@ -178,18 +260,11 @@ impl RingBuffer {
         }
     }
 
+    /// Запись с политикой «перезаписать старейшее»: при нехватке места
+    /// (байт или слотов `MAX_MESSAGES`) вытесняет самые старые непрочитанные
+    /// сообщения, число вытесненных -- в `WriteOutcome::overwritten`.
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
-        if payload.len() < MIN_MESSAGE_SIZE {
-            return Err(ShmError::MessageTooSmall);
-        }
-        if payload.len() > MAX_MESSAGE_SIZE {
-            return Err(ShmError::MessageTooLarge);
-        }
-
-        let total_required = (MESSAGE_HEADER_SIZE + payload.len()) as u32;
-        if total_required > self.capacity {
-            return Err(ShmError::MessageTooLarge);
-        }
+        let total_required = frame_len(payload.len())?;
 
         let header = self.header();
         let mut overwritten = 0u32;
@@ -210,36 +285,159 @@ impl RingBuffer {
                 continue;
             }
 
-            let idx = self.mask_index(write);
-            let len_le = (payload.len() as u16).to_le_bytes();
-            let flags = 0u16.to_le_bytes();
-            // SAFETY: каждый вызов copy_into_wrapped пишет <= capacity байт
-            // (len_le/flags -- по 2 байта, payload -- не более MAX_MESSAGE_SIZE,
-            // и total_required = MESSAGE_HEADER_SIZE+payload.len() уже
-            // проверен против self.capacity веткой availability-проверки выше).
-            unsafe {
-                self.copy_into_wrapped(idx, &len_le);
-                self.copy_into_wrapped((idx + 2) & (RING_MASK as usize), &flags);
-                self.copy_into_wrapped((idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize), payload);
-            }
-
-            // ВАЖНО: сначала увеличиваем message_count, потом обновляем write_pos
-            // Это гарантирует, что reader увидит count > 0 когда видит новый write_pos
-            // На x86/x64 TSO это безопасно, но порядок операций всё равно важен
-            let prev_count = header.message_count.fetch_add(1, Ordering::AcqRel);
-
-            let new_write = write.wrapping_add(total_required);
-            header.write_pos.store(new_write, Ordering::Release);
-
-            if prev_count == 0 {
-                header.sequence.fetch_add(1, Ordering::Relaxed);
-            }
-
+            let was_empty = self.commit(write, payload, total_required);
             return Ok(WriteOutcome {
                 overwritten,
-                was_empty: prev_count == 0,
+                was_empty,
             });
         }
+    }
+
+    /// Запись без перезаписи: либо сообщение целиком ложится в свободное
+    /// место кольца, либо `Err(QueueFull)` и кольцо не меняется вовсе.
+    ///
+    /// Семантика:
+    /// - **никогда** не трогает `read_pos` и непрочитанные данные
+    ///   (`overwritten` в результате всегда `0`, `drop_count` не растёт);
+    /// - атомарность сообщения та же, что у `write_message`: данные
+    ///   копируются до публикации `write_pos`, читатель видит сообщение
+    ///   целиком или не видит вовсе;
+    /// - `QueueFull` -- не хватает байт (`4 + len`) или занято `MAX_MESSAGES`
+    ///   слотов; проверка консервативна (см. `free_space`), ложных успехов
+    ///   нет, ложный `QueueFull` возможен только если читатель освободил
+    ///   место в тот же момент -- повтор увидит его;
+    /// - длина вне `MIN_MESSAGE_SIZE..=MAX_MESSAGE_SIZE` --
+    ///   `MessageTooSmall`/`MessageTooLarge` (кадр максимальной длины всегда
+    ///   помещается в пустое кольцо, «больше кольца» не бывает);
+    /// - писатель на направление ровно один (SPSC), как и у `write_message`.
+    ///
+    /// Ordering: `read_pos` читается с `Acquire`. Читатель двигает его CAS-ом
+    /// (`AcqRel`) строго ПОСЛЕ того, как докопировал сообщение, поэтому всё,
+    /// что писатель затем пишет в освобождённый диапазон, happens-after
+    /// чтения этого диапазона читателем -- гонки данных «писатель затирает
+    /// то, что читатель ещё копирует» нет (в отличие от overwrite-пути, где
+    /// её разруливает seqlock-валидация в `read_message`).
+    pub fn try_write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
+        let total_required = frame_len(payload.len())?;
+        let header = self.header();
+
+        // write_pos меняет только этот (единственный) писатель; read_pos и
+        // message_count читатель может лишь уменьшать «занятость», поэтому
+        // значения ниже -- консервативная оценка свободного места.
+        let write = header.write_pos.load(Ordering::Acquire);
+        let read = header.read_pos.load(Ordering::Acquire);
+        let count = header.message_count.load(Ordering::Acquire);
+
+        if self.available_bytes(write, read) < total_required as i64 || count >= MAX_MESSAGES {
+            return Err(ShmError::QueueFull);
+        }
+
+        let was_empty = self.commit(write, payload, total_required);
+        Ok(WriteOutcome {
+            overwritten: 0,
+            was_empty,
+        })
+    }
+
+    /// Копирует кадр в позицию `write` и публикует его.
+    /// Возвращает `true`, если кольцо было пусто (переход empty -> non-empty).
+    ///
+    /// Вызывающий обязан предварительно убедиться, что `total_required`
+    /// байт начиная с `write` свободны и `message_count < MAX_MESSAGES`.
+    fn commit(&self, write: u32, payload: &[u8], total_required: u32) -> bool {
+        let header = self.header();
+        let idx = self.mask_index(write);
+        let len_le = (payload.len() as u16).to_le_bytes();
+        let flags = 0u16.to_le_bytes();
+        // SAFETY: каждый вызов copy_into_wrapped пишет <= capacity байт
+        // (len_le/flags -- по 2 байта, payload -- не более MAX_MESSAGE_SIZE,
+        // `frame_len` + const-assert гарантируют total_required <= capacity).
+        unsafe {
+            self.copy_into_wrapped(idx, &len_le);
+            self.copy_into_wrapped((idx + 2) & (RING_MASK as usize), &flags);
+            self.copy_into_wrapped((idx + MESSAGE_HEADER_SIZE) & (RING_MASK as usize), payload);
+        }
+
+        // ВАЖНО: сначала увеличиваем message_count, потом обновляем write_pos
+        // Это гарантирует, что reader увидит count > 0 когда видит новый write_pos
+        // На x86/x64 TSO это безопасно, но порядок операций всё равно важен
+        let prev_count = header.message_count.fetch_add(1, Ordering::AcqRel);
+
+        let new_write = write.wrapping_add(total_required);
+        header.write_pos.store(new_write, Ordering::Release);
+
+        if prev_count == 0 {
+            header.sequence.fetch_add(1, Ordering::Relaxed);
+        }
+        prev_count == 0
+    }
+
+    /// Свободное место кольца (байты и слоты сообщений).
+    ///
+    /// Для писателя -- нижняя граница (см. `FreeSpace`): порядок загрузок
+    /// тот же, что в `try_write_message`, и каждое из значений может только
+    /// устареть в сторону «занято больше, чем на самом деле».
+    pub fn free_space(&self) -> FreeSpace {
+        let header = self.header();
+        let write = header.write_pos.load(Ordering::Acquire);
+        let read = header.read_pos.load(Ordering::Acquire);
+        let count = header.message_count.load(Ordering::Acquire);
+        let bytes = self.available_bytes(write, read);
+        FreeSpace {
+            // Отрицательное значение возможно только на повреждённом
+            // заголовке (read > write) -- трактуем как «места нет».
+            bytes: if bytes > 0 { bytes as usize } else { 0 },
+            messages: MAX_MESSAGES.saturating_sub(count),
+        }
+    }
+
+    /// Писатель: заявить, что ждём места под кадр `frame` байт.
+    ///
+    /// Протокол «заявка -> перепроверка -> сон» (Dekker): писатель пишет
+    /// заявку, ставит `fence(SeqCst)` и ЗАТЕМ перепроверяет место; читатель
+    /// двигает `read_pos`, ставит `fence(SeqCst)` и ЗАТЕМ читает заявку
+    /// (`take_space_waiter`). Два SeqCst-фенса гарантируют, что хотя бы одна
+    /// сторона увидит запись другой: либо писатель при перепроверке увидит
+    /// освобождённое место, либо читатель увидит заявку и просигналит
+    /// событие -- потерянного пробуждения нет.
+    pub(crate) fn arm_space_waiter(&self, frame: u32) {
+        // Relaxed: упорядочивание с последующей перепроверкой даёт fence ниже.
+        self.header().space_waiter.store(frame, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+    }
+
+    /// Писатель: снять свою заявку (место нашлось без ожидания).
+    pub(crate) fn disarm_space_waiter(&self) {
+        // Relaxed: заявка -- только подсказка для пробуждения; лишний сигнал
+        // события после снятия безвреден (писатель перепроверяет место).
+        self.header().space_waiter.store(0, Ordering::Relaxed);
+    }
+
+    /// Читатель (после успешного `read_message`): если писатель ждёт места и
+    /// его теперь достаточно -- атомарно снимает заявку и возвращает `true`
+    /// (вызывающий сигналит событие `SPACE`).
+    pub(crate) fn take_space_waiter(&self) -> bool {
+        let header = self.header();
+        // Парный фенс к `arm_space_waiter` (см. там): сдвиг read_pos в
+        // read_message упорядочен перед чтением заявки.
+        fence(Ordering::SeqCst);
+        // Relaxed: упорядочивание с read_pos обеспечил фенс выше.
+        let frame = header.space_waiter.load(Ordering::Relaxed);
+        if frame == 0 {
+            return false;
+        }
+        let free = self.free_space();
+        if free.messages == 0 || free.bytes < frame as usize {
+            // Места пока мало -- не будим писателя зря, заявка остаётся.
+            return false;
+        }
+        // CAS, а не store: писатель мог уже снять/переподать заявку; сигналим,
+        // только если сняли именно ту, которую проверяли. AcqRel -- по
+        // конвенции для CAS, сам фенс выше уже дал нужный порядок.
+        header
+            .space_waiter
+            .compare_exchange(frame, 0, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
     }
 
     pub fn read_message(&self, out: &mut Vec<u8>) -> Result<usize> {
@@ -317,6 +515,59 @@ impl RingBuffer {
         }
     }
 
+    /// Писатель: дождаться, пока в кольце появится место под payload длины
+    /// `payload_len`. `Ok(true)` -- место есть (следующий `try_write_message`
+    /// этого писателя пройдёт), `Ok(false)` -- истёк `timeout`. `None` --
+    /// ждать без ограничения (осторожно: мёртвый читатель место не
+    /// освободит никогда).
+    ///
+    /// Пробуждение -- событие `SPACE` направления, которое читатель сигналит
+    /// через `take_space_waiter`. Ожидание нарезается кусками не длиннее
+    /// `SPACE_WAIT_SLICE`, поэтому и без события (anonymous-сервер, читатель
+    /// старой версии, не знающий про заявку) место будет замечено опросом.
+    pub(crate) fn wait_for_space(
+        &self,
+        payload_len: usize,
+        space_event: Option<&EventHandle>,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        let frame = frame_len(payload_len)?;
+        let deadline = timeout.map(|t| Instant::now() + t);
+        loop {
+            if self.free_space().fits(payload_len) {
+                return Ok(true);
+            }
+            self.arm_space_waiter(frame);
+            // Перепроверка ПОСЛЕ заявки -- вторая половина Dekker-протокола.
+            if self.free_space().fits(payload_len) {
+                self.disarm_space_waiter();
+                return Ok(true);
+            }
+            let slice = match deadline {
+                Some(deadline) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        self.disarm_space_waiter();
+                        return Ok(false);
+                    }
+                    remaining.min(SPACE_WAIT_SLICE)
+                }
+                None => SPACE_WAIT_SLICE,
+            };
+            match space_event {
+                // Результат (сигнал/таймаут) не важен: цикл всё равно
+                // перепроверяет место. Ошибка ядра -- пробрасываем.
+                Some(event) => {
+                    if let Err(err) = event.wait(Some(slice)) {
+                        self.disarm_space_waiter();
+                        return Err(err);
+                    }
+                }
+                None => std::thread::sleep(slice.min(SPACE_POLL_INTERVAL)),
+            }
+        }
+    }
+
     pub fn message_count(&self) -> u32 {
         self.header().message_count.load(Ordering::Acquire)
     }
@@ -336,7 +587,7 @@ mod overflow_race_tests {
     use std::thread;
 
     /// Владелец сырой выровненной памяти под один RingHeader + RING_CAPACITY.
-    struct RingMem {
+    pub(super) struct RingMem {
         ptr: *mut u8,
         layout: Layout,
     }
@@ -354,7 +605,7 @@ mod overflow_race_tests {
         }
     }
 
-    fn make_ring() -> (RingBuffer, RingMem) {
+    pub(super) fn make_ring() -> (RingBuffer, RingMem) {
         let header_size = size_of::<RingHeader>();
         let total = header_size + RING_CAPACITY;
         let layout = Layout::from_size_align(total, 64).unwrap();
@@ -411,6 +662,10 @@ mod overflow_race_tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "seqlock-чтение при перезаписи -- гонка по модели Rust by design"
+    )]
     fn overflow_does_not_tear_messages() {
         let (ring, _mem) = make_ring();
         let ring = Arc::new(ring);
@@ -460,7 +715,7 @@ mod overflow_race_tests {
             })
         };
 
-        thread::sleep(std::time::Duration::from_millis(800));
+        thread::sleep(Duration::from_millis(800));
         stop.store(true, O::Release);
         producer.join().unwrap();
         consumer.join().unwrap();
@@ -472,5 +727,458 @@ mod overflow_race_tests {
             torn, 0,
             "обнаружены порванные сообщения: {torn} (из {reads} прочитанных)"
         );
+    }
+}
+
+#[cfg(test)]
+mod try_write_tests {
+    use super::overflow_race_tests::make_ring;
+    use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as O};
+    use std::thread;
+
+    /// Детерминированный xorshift64* -- без внешних зависимостей (proptest
+    /// в крейт не тянем: правило «никаких зависимостей без крайней нужды»).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn drop_count(ring: &RingBuffer) -> u32 {
+        ring.header().drop_count.load(O::Acquire)
+    }
+
+    /// Payload с seq в начале/середине/конце и детерминированным телом --
+    /// по нему видно и потерю/перестановку, и порванное сообщение.
+    fn make_payload(seq: u32, len: usize) -> Vec<u8> {
+        let mut v: Vec<u8> = (0..len)
+            .map(|i| (i as u32).wrapping_mul(31).wrapping_add(seq) as u8)
+            .collect();
+        if len >= 12 {
+            let s = seq.to_le_bytes();
+            v[..4].copy_from_slice(&s);
+            let mid = len / 2 - 2;
+            v[mid..mid + 4].copy_from_slice(&s);
+            v[len - 4..].copy_from_slice(&s);
+        }
+        v
+    }
+
+    #[test]
+    fn free_space_of_empty_ring() {
+        let (ring, _mem) = make_ring();
+        let free = ring.free_space();
+        assert_eq!(free.bytes, RING_CAPACITY);
+        assert_eq!(free.messages, MAX_MESSAGES);
+        assert_eq!(free.max_payload(), MAX_MESSAGE_SIZE);
+        assert!(free.fits(MAX_MESSAGE_SIZE));
+    }
+
+    #[test]
+    fn free_space_helpers_edge_cases() {
+        let fs = |bytes, messages| FreeSpace { bytes, messages };
+        assert_eq!(FreeSpace::ZERO.max_payload(), 0);
+        assert!(!FreeSpace::ZERO.fits(MIN_MESSAGE_SIZE));
+        // Хватает ровно на минимальный кадр.
+        assert!(fs(6, 1).fits(2));
+        assert_eq!(fs(6, 1).max_payload(), 2);
+        assert!(!fs(5, 1).fits(2));
+        assert_eq!(fs(5, 1).max_payload(), 0);
+        // Байт много, слотов нет.
+        assert!(!fs(RING_CAPACITY, 0).fits(10));
+        assert_eq!(fs(RING_CAPACITY, 0).max_payload(), 0);
+        // Недопустимые длины не «влезают» никогда.
+        assert!(!fs(RING_CAPACITY, 10).fits(1));
+        assert!(!fs(RING_CAPACITY, 10).fits(MAX_MESSAGE_SIZE + 1));
+        assert_eq!(fs(1000, 1).max_payload(), 996);
+    }
+
+    #[test]
+    fn try_write_rejects_bad_lengths_without_side_effects() {
+        let (ring, _mem) = make_ring();
+        assert_eq!(
+            ring.try_write_message(&[1]).err(),
+            Some(ShmError::MessageTooSmall)
+        );
+        assert_eq!(
+            ring.try_write_message(&vec![0u8; MAX_MESSAGE_SIZE + 1])
+                .err(),
+            Some(ShmError::MessageTooLarge)
+        );
+        assert_eq!(ring.free_space().bytes, RING_CAPACITY);
+        assert!(ring.try_write_message(&vec![7u8; MAX_MESSAGE_SIZE]).is_ok());
+    }
+
+    #[test]
+    fn free_space_tracks_writes_and_reads_exactly() {
+        let (ring, _mem) = make_ring();
+        let mut out = Vec::new();
+        ring.try_write_message(&[1u8; 100]).unwrap();
+        ring.try_write_message(&[2u8; 10]).unwrap();
+        let free = ring.free_space();
+        assert_eq!(free.bytes, RING_CAPACITY - (4 + 100) - (4 + 10));
+        assert_eq!(free.messages, MAX_MESSAGES - 2);
+        ring.read_message(&mut out).unwrap();
+        assert_eq!(ring.free_space().bytes, RING_CAPACITY - (4 + 10));
+        assert_eq!(ring.free_space().messages, MAX_MESSAGES - 1);
+    }
+
+    /// Кольцо, заполненное по БАЙТАМ: try_write отвечает QueueFull, ничего
+    /// не вытесняет; после чтения одного сообщения запись снова проходит.
+    #[test]
+    fn try_write_full_by_bytes_never_overwrites_and_resumes() {
+        let (ring, _mem) = make_ring();
+        const LEN: usize = 60_000;
+        let mut written = 0u32;
+        loop {
+            match ring.try_write_message(&make_payload(written, LEN)) {
+                Ok(outcome) => {
+                    assert_eq!(outcome.overwritten, 0);
+                    written += 1;
+                }
+                Err(ShmError::QueueFull) => break,
+                Err(err) => panic!("unexpected {err:?}"),
+            }
+        }
+        assert_eq!(written as usize, RING_CAPACITY / (4 + LEN));
+        let before = ring.free_space();
+        assert!(!before.fits(LEN));
+        assert_eq!(drop_count(&ring), 0);
+        // Повторные попытки ничего не меняют.
+        for _ in 0..3 {
+            assert_eq!(
+                ring.try_write_message(&make_payload(999, LEN)).err(),
+                Some(ShmError::QueueFull)
+            );
+        }
+        assert_eq!(ring.free_space(), before);
+        assert_eq!(ring.message_count(), written);
+
+        let mut out = Vec::new();
+        ring.read_message(&mut out).unwrap();
+        assert_eq!(
+            out,
+            make_payload(0, LEN),
+            "первое сообщение не должно быть затёрто"
+        );
+        assert!(ring.free_space().fits(LEN));
+        ring.try_write_message(&make_payload(written, LEN)).unwrap();
+        // Всё прочитанное -- строго по порядку, без пропусков.
+        for seq in 1..=written {
+            ring.read_message(&mut out).unwrap();
+            assert_eq!(out, make_payload(seq, LEN));
+        }
+        assert!(ring.is_empty());
+        assert_eq!(drop_count(&ring), 0);
+    }
+
+    /// Кольцо, заполненное по СЧЁТЧИКУ (`MAX_MESSAGES`), при почти пустых байтах.
+    #[test]
+    fn try_write_full_by_count() {
+        let (ring, _mem) = make_ring();
+        for i in 0..MAX_MESSAGES {
+            ring.try_write_message(&i.to_le_bytes()).unwrap();
+        }
+        let free = ring.free_space();
+        assert_eq!(free.messages, 0);
+        assert!(free.bytes > RING_CAPACITY / 2);
+        assert_eq!(
+            ring.try_write_message(b"xx").err(),
+            Some(ShmError::QueueFull)
+        );
+        let mut out = Vec::new();
+        ring.read_message(&mut out).unwrap();
+        assert_eq!(out, 0u32.to_le_bytes());
+        ring.try_write_message(b"xx").unwrap();
+        assert_eq!(drop_count(&ring), 0);
+    }
+
+    /// Рандомизированная проверка кадрирования против модели (VecDeque):
+    /// случайные длины (с упором на границы 2/65535 и перенос через конец
+    /// кольца), случайное чередование записи и чтения, многократный wrap
+    /// позиций. Однопоточно предсказание QueueFull точное, поэтому модель
+    /// сверяет и сам факт отказа, и содержимое каждого прочитанного сообщения.
+    #[test]
+    fn randomized_framing_matches_model() {
+        let (ring, _mem) = make_ring();
+        let steps = if cfg!(miri) { 300 } else { 60_000 };
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+        let mut used = 0usize;
+        let mut out = Vec::new();
+        let mut seq = 0u32;
+        let mut fulls = 0u32;
+        for _ in 0..steps {
+            if rng.below(100) < 55 {
+                let len = match rng.below(10) {
+                    0 => MIN_MESSAGE_SIZE,
+                    1 => MAX_MESSAGE_SIZE,
+                    2..=5 => 2 + rng.below(64) as usize,
+                    _ => 2 + rng.below((MAX_MESSAGE_SIZE - 1) as u64) as usize,
+                };
+                let payload = make_payload(seq, len);
+                let fits_model =
+                    used + 4 + len <= RING_CAPACITY && (model.len() as u32) < MAX_MESSAGES;
+                assert_eq!(ring.free_space().fits(len), fits_model);
+                match ring.try_write_message(&payload) {
+                    Ok(o) => {
+                        assert!(fits_model, "try_write прошёл, хотя места нет по модели");
+                        assert_eq!(o.overwritten, 0);
+                        assert_eq!(o.was_empty, model.is_empty());
+                        used += 4 + len;
+                        model.push_back(payload);
+                        seq += 1;
+                    }
+                    Err(ShmError::QueueFull) => {
+                        assert!(!fits_model, "ложный QueueFull");
+                        fulls += 1;
+                    }
+                    Err(err) => panic!("unexpected {err:?}"),
+                }
+            } else {
+                match ring.read_message(&mut out) {
+                    Ok(n) => {
+                        let expect = model.pop_front().expect("кольцо отдало лишнее");
+                        assert_eq!(n, expect.len());
+                        assert_eq!(out, expect);
+                        used -= 4 + n;
+                    }
+                    Err(ShmError::QueueEmpty) => assert!(model.is_empty()),
+                    Err(err) => panic!("unexpected {err:?}"),
+                }
+            }
+            let free = ring.free_space();
+            assert_eq!(free.bytes, RING_CAPACITY - used);
+            assert_eq!(free.messages, MAX_MESSAGES - model.len() as u32);
+        }
+        assert_eq!(drop_count(&ring), 0);
+        if !cfg!(miri) {
+            assert!(fulls > 0, "тест ни разу не упёрся в полное кольцо");
+            let total_written = ring.header().write_pos.load(O::Acquire) as usize;
+            assert!(
+                total_written / RING_CAPACITY >= 10,
+                "позиции обернулись всего {} раз",
+                total_written / RING_CAPACITY
+            );
+        }
+    }
+
+    /// Заявка писателя: читатель снимает её и «будит» только когда места
+    /// реально хватает под заявленный кадр.
+    #[test]
+    fn space_waiter_is_taken_only_when_enough_space() {
+        let (ring, _mem) = make_ring();
+        const LEN: usize = 60_000;
+        while ring.try_write_message(&[0u8; LEN]).is_ok() {}
+        let mut out = Vec::new();
+
+        // Никто не ждёт -- сигналить нечего.
+        ring.read_message(&mut out).unwrap();
+        assert!(!ring.take_space_waiter());
+        while ring.try_write_message(&[0u8; LEN]).is_ok() {}
+
+        // Ждём место под 2 кадра: после первого чтения его ещё мало.
+        let need = 2 * (4 + LEN) as u32;
+        ring.arm_space_waiter(need);
+        ring.read_message(&mut out).unwrap();
+        assert!(!ring.take_space_waiter(), "места под заявку ещё нет");
+        ring.read_message(&mut out).unwrap();
+        assert!(
+            ring.take_space_waiter(),
+            "места хватает -- заявку надо снять"
+        );
+        assert!(!ring.take_space_waiter(), "заявка снимается ровно один раз");
+        assert_eq!(ring.header().space_waiter.load(O::Acquire), 0);
+
+        // Снятая самим писателем заявка не будит.
+        ring.arm_space_waiter(4 + LEN as u32);
+        ring.disarm_space_waiter();
+        assert!(!ring.take_space_waiter());
+    }
+
+    /// `wait_for_space` без события (anonymous-путь или читатель старой
+    /// версии, не знающий про заявку): заявка + опрос.
+    #[test]
+    fn wait_for_space_polls_without_event() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        const LEN: usize = 60_000;
+        while ring.try_write_message(&[0u8; LEN]).is_ok() {}
+        assert_eq!(
+            ring.wait_for_space(LEN, None, Some(Duration::from_millis(20))),
+            Ok(false)
+        );
+        assert_eq!(
+            ring.header().space_waiter.load(O::Acquire),
+            0,
+            "таймаут снимает заявку"
+        );
+
+        let reader = {
+            let ring = ring.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                let mut out = Vec::new();
+                ring.read_message(&mut out).unwrap();
+                // «Старый» читатель: заявку не смотрит.
+            })
+        };
+        assert_eq!(
+            ring.wait_for_space(LEN, None, Some(Duration::from_secs(5))),
+            Ok(true)
+        );
+        reader.join().unwrap();
+        ring.try_write_message(&[1u8; LEN]).unwrap();
+        assert_eq!(
+            ring.wait_for_space(1, None, None),
+            Err(ShmError::MessageTooSmall),
+            "длина проверяется до ожидания"
+        );
+    }
+
+    /// Писатель быстрее читателя: try_write упирается в QueueFull, но ни одно
+    /// сообщение не теряется, не переставляется и не рвётся; после того как
+    /// читатель разгребает кольцо, запись продолжается.
+    #[test]
+    fn lossless_producer_faster_than_consumer() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        let total: u32 = if cfg!(miri) { 60 } else { 20_000 };
+        let fulls = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let producer = {
+            let ring = ring.clone();
+            let fulls = fulls.clone();
+            thread::spawn(move || {
+                let mut rng = Rng(42);
+                for seq in 0..total {
+                    let len = if cfg!(miri) {
+                        16 + rng.below(64) as usize
+                    } else {
+                        12 + rng.below(40_000) as usize
+                    };
+                    let payload = make_payload(seq, len);
+                    loop {
+                        match ring.try_write_message(&payload) {
+                            Ok(o) => {
+                                assert_eq!(o.overwritten, 0);
+                                break;
+                            }
+                            Err(ShmError::QueueFull) => {
+                                fulls.fetch_add(1, O::Relaxed);
+                                thread::yield_now();
+                            }
+                            Err(err) => panic!("unexpected {err:?}"),
+                        }
+                    }
+                }
+            })
+        };
+
+        let consumer = {
+            let ring = ring.clone();
+            let done = done.clone();
+            thread::spawn(move || {
+                let mut out = Vec::new();
+                let mut expected = 0u32;
+                while expected < total {
+                    match ring.read_message(&mut out) {
+                        Ok(len) => {
+                            let seq = u32::from_le_bytes(out[..4].try_into().unwrap());
+                            assert_eq!(seq, expected, "потеря или перестановка");
+                            assert_eq!(out, make_payload(seq, len), "порванное сообщение");
+                            expected += 1;
+                            // Читатель заметно медленнее писателя.
+                            if !cfg!(miri) && expected.is_multiple_of(8) {
+                                thread::sleep(Duration::from_micros(200));
+                            }
+                        }
+                        Err(ShmError::QueueEmpty) => thread::yield_now(),
+                        Err(err) => panic!("unexpected {err:?}"),
+                    }
+                }
+                done.store(true, O::Release);
+            })
+        };
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
+        assert!(done.load(O::Acquire));
+        assert_eq!(drop_count(&ring), 0);
+        assert!(ring.is_empty());
+        if !cfg!(miri) {
+            assert!(
+                fulls.load(O::Relaxed) > 0,
+                "писатель ни разу не упёрся в полное кольцо"
+            );
+        }
+    }
+
+    /// Микробенчмарк: `cargo test --release --lib -- --ignored --nocapture bench_`
+    #[test]
+    #[ignore = "бенчмарк, запускать вручную в --release"]
+    fn bench_try_write_vs_write() {
+        use std::hint::black_box;
+        let (ring, _mem) = make_ring();
+        let mut out = Vec::with_capacity(MAX_MESSAGE_SIZE);
+        const ITERS: u32 = 2_000_000;
+        for len in [16usize, 256, 4096] {
+            let payload = vec![0xA5u8; len];
+            // Прогрев.
+            for _ in 0..10_000 {
+                ring.write_message(&payload).unwrap();
+                ring.read_message(&mut out).unwrap();
+            }
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                black_box(ring.write_message(black_box(&payload)).unwrap());
+                ring.read_message(&mut out).unwrap();
+            }
+            let write_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                black_box(ring.try_write_message(black_box(&payload)).unwrap());
+                ring.read_message(&mut out).unwrap();
+            }
+            let try_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                black_box(ring.try_write_message(black_box(&payload)).unwrap());
+                ring.read_message(&mut out).unwrap();
+                black_box(ring.take_space_waiter());
+            }
+            let try_waiter_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
+            let t = Instant::now();
+            for _ in 0..ITERS {
+                black_box(ring.free_space());
+            }
+            let free_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
+            println!(
+                "len={len:5}: write+read {write_ns:6.1} ns | try_write+read {try_ns:6.1} ns | \
+                 try_write+read+take_space_waiter {try_waiter_ns:6.1} ns | free_space {free_ns:5.1} ns"
+            );
+        }
+        // Отказ на полном кольце -- стоимость «холостой» попытки.
+        let big = vec![0u8; 60_000];
+        while ring.try_write_message(&big).is_ok() {}
+        let t = Instant::now();
+        for _ in 0..ITERS {
+            black_box(ring.try_write_message(black_box(&big)).is_err());
+        }
+        let full_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
+        println!("try_write on full ring (QueueFull): {full_ns:.1} ns");
     }
 }
