@@ -25,11 +25,71 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ## 🆕 What's New in v0.9.0
 
+- ✅ **Fully event-driven Auto/Dispatch workers** (breaking: `poll_timeout` is now
+  `Option<Duration>`, default `None`) — every worker, lobby and pending-connect
+  thread sleeps in the kernel until something happens: data, space, disconnect,
+  peer death, a new command (`send`/`try_send`/`stop` wake the worker through a
+  private unnamed event) or shutdown. Zero wake-ups while idle; sends are no
+  longer delayed until the next 50 ms poll tick. `Some(t)` keeps an optional
+  safety-net timeout.
+- ✅ **Event-driven Multi-client** (breaking: `MultiOptions`/`MultiClientOptions::poll_timeout`
+  are `Option<Duration>`, default `None`; new `MultiClientOptions::retry_delay`) — no 50 ms
+  tick any more. Server workers (one per 21 slots) sleep on `CONNECT_REQ` / `DISCONNECT` /
+  `DATA` / the client's process handle / a private `wake` event and time out only at the
+  nearest *deadline* (stale slot claim, one-shot abandoned-handshake check). A dead client
+  is detected by its process handle (`on_client_disconnect_reason(PeerDied)`), a client that
+  finds no free slot nudges the server so a crashed claimer's slot is freed exactly at its
+  deadline. New `on_client_disconnect_reason` / `on_disconnect_reason` default methods,
+  `MultiServer::is_client_alive`. Tests prove 0 wake-ups per idle second on every side.
+- ✅ **`wait_for_space` without slicing** — one kernel wait for the whole timeout on
+  `[SPACE, DISCONNECT, peer process]`; a graceful peer disconnect returns
+  `Err(NotConnected)` instead of waiting out the timeout.
+- ✅ **Dispatch lobby serialized** — clients take the named mutex `<lobby>_lock` for the
+  whole lobby handshake (two simultaneous clients could read each other's reply);
+  channel names inherit the lobby namespace (`Global\<hex>`), so cross-session Dispatch
+  works; `Beacon::open` rejects a squatted auto-reset event of the same name.
 - ✅ **`Beacon` — event-driven server discovery** — a named manual-reset
-  notification event `<name>_beacon`: the server `raise`s it on start and
-  `lower`s it on a clean stop, clients sleep in `wait()` and all wake at once
-  when the server appears — no connect-polling while no server exists.
-  `open` creates or opens (any start order).
+  notification event `<name>_beacon`: the server `raise`s it right after its
+  lobby exists and `lower`s it before stopping; clients sleep in `wait()` /
+  `wait_any()` and all wake at once — no connect-polling while no server exists.
+  `open` creates or opens (any start order), `is_raised()` checks without
+  waiting. `Beacon::unnamed()` is a private unnamed event of the same kind
+  (e.g. a stop signal next to the beacon in `wait_any`; it cannot be opened or
+  squatted by name). `ProcessExit` holds a process handle and fires when the
+  process exits; `xshm::wait_any(&[&dyn Waitable], timeout)` waits on beacons
+  and process exits together. See [Server discovery](#server-discovery).
+- ✅ **Dispatch hardening** — `DispatchServer::start` creates the lobby
+  synchronously (a busy name is an error, not silent background retries);
+  a client is announced (`on_client_connect`) on its channel worker **before**
+  its first `on_message` (early messages used to arrive for an unknown client
+  and were lost); messages queued before `disconnect_client`/`stop` are
+  flushed into the ring and the peer drains them before its `on_disconnect`
+  (a farewell message with a reason now arrives); `stop()` wakes every thread
+  by event instead of waiting for poll ticks or `channel_connect_timeout`;
+  `DispatchClient::lobby_exists(name)`.
+- ✅ **Space events for senders** — `DispatchClientHandler::on_space_available()`
+  and `DispatchHandler::on_space_available(client_id)` (default no-op): a
+  lossless sender that got `QueueFull` sleeps until the peer frees space
+  instead of sleeping in a loop. The worker flushes its queue into the freed
+  space before the callback.
+- 🐛 **Revision 2 (2026-09-25)** — a client disconnected right after the
+  handshake (e.g. refused from `on_client_connect`) now receives the farewell
+  and `on_disconnect`: the handshake counts as accepted when `generation`
+  changed, even if the server is already `IDLE` (it used to roll back and
+  reconnect to the vanished channel forever). The handshake is committed by
+  CAS on both sides (no stale `S2C_CONNECT` for the next client); a dedicated
+  Dispatch channel never reconnects, even after a failed first connect;
+  Multi `disconnect_client` keeps the slot claim until the client wakes (two
+  clients could end up on one ring); `stop()`/Drop no longer wait for the
+  handshake timeout; `MultiServer::stop()` signals clients at once;
+  `DispatchServer::stop()` from a handler callback no longer deadlocks.
+  Peer-visible rules R15–R17 — [`INTEROP.md`](INTEROP.md).
+- 🐛 Beacon test names were not unique (`Instant::now().elapsed()` ≈ 0).
+
+> **Native (C/C++) peers:** the shared-memory layout and the channel kernel objects are
+> unchanged, but 0.9 no longer papers over missed signals with a 50 ms poll. What a
+> compatible implementation must signal, the new `<name>_beacon` object and the Dispatch
+> ordering guarantees are specified in [INTEROP.md](INTEROP.md) (in Russian).
 
 ## Previously in v0.8.0
 
@@ -427,8 +487,13 @@ Semantics:
   Every message costs `MESSAGE_HEADER_SIZE` (4) + payload bytes; at most `MAX_MESSAGES` (500)
   messages and `RING_CAPACITY` (2 MiB) bytes per ring. A 65 535-byte message always fits an empty ring.
 - `wait_for_space` sleeps on the channel's `SPACE` event: the reader wakes the writer only
-  once enough space is freed. Waits are sliced at 50 ms, so it also works with 0.7.0 peers and
-  anonymous servers (polling). A dead reader never frees space — always pass a timeout.
+  once enough space is freed. Since 0.9 it is a single kernel wait on `[SPACE, DISCONNECT,
+  peer process]` (no 50 ms slices): a dead reader → `Err(PeerDied)`, a graceful disconnect →
+  `Err(NotConnected)`. A 0.7 reader wakes it only when it empties the ring; a crashed reader
+  without PID exchange never wakes it — pass a timeout. Anonymous servers poll every 1 ms.
+- Auto/Dispatch report freed space as an event: `AutoHandler::on_space_available`,
+  `DispatchClientHandler::on_space_available()`, `DispatchHandler::on_space_available(id)` —
+  a sender that got `QueueFull` waits for it instead of sleeping in a loop.
 - Auto/Dispatch are asynchronous: `try_send` returns `QueueFull` once `max_send_queue`
   accepted messages are still waiting for the ring; accepted lossless messages are never evicted
   and are written with the non-overwriting path. The guarantee holds within one connection
@@ -475,7 +540,7 @@ cannot fool it (re-opening by PID cannot tell "gone" from "access denied").
 | Single-client | `poll_client` / `poll_server` / `wait_for_space` return `Err(ShmError::PeerDied)` right away; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
 | Auto | the peer's process handle is in the worker's wait set → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
 | Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
-| Multi-client | orphaned slots of dead clients are reclaimed on the next worker iteration (no 3 s throttle) |
+| Multi-client | the client's process handle is in the server worker's wait set → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, slot freed; `MultiServer::is_client_alive(id)`; the client sees server death → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
 
 - The new callbacks are **default methods** that forward to `on_disconnect` /
   `on_client_disconnect`, so existing handlers keep working. The library calls only
@@ -493,6 +558,44 @@ to `ControlBlock.reserved[2]` at creation; the client writes its PID to
 `reserved[3]` before `CLIENT_HELLO`, and the server consumes it with `swap(0)`. A PID
 whose process is already dead at handshake time is ignored.
 
+### Server discovery
+
+A client that waits for a server (e.g. a profiler waiting for its viewer)
+should not poll for it. `Beacon` is a named manual-reset event:
+
+```rust
+use xshm::{Beacon, DispatchClient};
+
+// Client: sleep until a server appears or we are asked to stop.
+let lobby = Beacon::open("MyService")?;
+let stop = Beacon::unnamed()?; // raised by our own shutdown path
+loop {
+    match Beacon::wait_any(&[&stop, &lobby], None)? {
+        Some(1) => {}
+        _ => break, // stop
+    }
+    match DispatchClient::connect("MyService", registration(), handler(), Default::default()) {
+        Ok(client) => { /* work until the channel drops */ }
+        Err(_) if !DispatchClient::lobby_exists("MyService") => {
+            // The server crashed with the beacon raised: lower it for it and
+            // re-check — a server that came up meanwhile raised the beacon
+            // after creating its lobby, so either we see the lobby now or the
+            // new raise wakes us.
+            lobby.lower()?;
+            if DispatchClient::lobby_exists("MyService") {
+                lobby.raise()?;
+            }
+        }
+        Err(_) => { /* transient error: back off (interruptible by `stop`) */ }
+    }
+}
+```
+
+Server order: create the lobby first (`DispatchServer::start` is synchronous),
+then `raise()`; on shutdown `lower()` first, then stop. `ProcessExit::open(pid)`
+plus `xshm::wait_any` lets a client that was refused by a server sleep until
+that server process exits — still without polling.
+
 ## Constants
 
 The ring limits below are re-exported from the crate root
@@ -505,7 +608,7 @@ The ring limits below are re-exported from the crate root
 | `MAX_MESSAGE_SIZE` | 65535 | Max message size (bytes) |
 | `MIN_MESSAGE_SIZE` | 2 | Min message size (bytes) |
 | `DEFAULT_MAX_CLIENTS` | 20 | Default slot count for `MultiServer` |
-| `MAX_MULTI_CLIENTS` | 31 | Hard cap for `MultiServer` (`NtWaitForMultipleObjects` limit) |
+| `MAX_MULTI_CLIENTS` | 31 | Hard cap for `MultiServer` (one worker per 21 slots: 64-handle `NtWaitForMultipleObjects` limit) |
 
 ## Event Handles for Kernel Drivers
 
@@ -536,6 +639,8 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **Message size**: 2 to 65535 bytes
 - **Anonymous servers**: No event handles available (polling mode only)
 - **Multi-client slot count**: hard cap of 31 concurrent clients (`NtWaitForMultipleObjects` limit) — use Dispatch mode if you need more
+- **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* (no server, no free slot) retries every `reconnect_delay` / `retry_delay`; connected channels never wake while idle. Use `Beacon` for fully event-driven discovery
+- **No authentication**: named objects use a NULL DACL — any local process (any session with `Global\`) can open them; do not send secrets
 
 ## Project Structure
 

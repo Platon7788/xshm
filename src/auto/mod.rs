@@ -6,13 +6,13 @@ use std::time::Duration;
 
 use std::sync::mpsc::{self, Receiver, Sender};
 
-use crate::client::SharedClient;
+use crate::client::{Interrupt, SharedClient};
 use crate::constants::{MAX_MESSAGE_SIZE, MESSAGE_HEADER_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::ring::{FreeSpace, WriteOutcome, frame_len};
 use crate::server::SharedServer;
-use crate::wait_delay;
-use crate::win::{self};
+use crate::wait_delay_or;
+use crate::win::{self, EventHandle};
 
 fn map_spawn_error(err: std::io::Error, context: &'static str) -> ShmError {
     let code = err.raw_os_error().map(|c| c as u32).unwrap_or(0xFFFFFFFF);
@@ -71,17 +71,24 @@ pub trait AutoHandler: Send + Sync + 'static {
     }
     fn on_message(&self, _direction: ChannelKind, _payload: &[u8]) {}
     fn on_overflow(&self, _direction: ChannelKind, _count: u32) {}
+    /// Читатель освободил место в исходящем кольце (событие SPACE: кольцо
+    /// опустело или места хватает ждущему lossless-сообщению). К моменту
+    /// вызова worker уже дописал в кольцо из своей очереди всё, что влезло,
+    /// — `try_send`, получивший `QueueFull`, стоит повторить.
     fn on_space_available(&self, _direction: ChannelKind) {}
     fn on_error(&self, _err: ShmError) {}
 }
 
 #[derive(Clone, Debug)]
 pub struct AutoOptions {
-    /// Интервал опроса в worker loop. Переименовано из `wait_timeout` (0.6.0)
-    /// для единообразия с `MultiOptions`/`DispatchOptions`, где то же самое
-    /// поле называется `poll_timeout` -- разнобой имён заставлял вручную
-    /// перекладывать значения при построении `AutoOptions` внутри `dispatch/`.
-    pub poll_timeout: Duration,
+    /// Страховочный таймаут ожидания worker-а. `None` (по умолчанию, 0.9+)
+    /// -- только события: worker спит в ядре, пока не придут данные, место,
+    /// отключение, смерть пира, новая команда (`send`/`try_send`/`stop`
+    /// будят его своим событием) -- ни одного пробуждения в простое.
+    /// `Some(t)` -- дополнительно просыпаться не реже `t` (не нужно для
+    /// корректности; оставлено для диагностики). До 0.9 -- `Duration`
+    /// (50 мс): worker опрашивал очередь команд по таймеру.
+    pub poll_timeout: Option<Duration>,
     pub reconnect_delay: Duration,
     pub connect_timeout: Duration,
     pub max_send_queue: usize,
@@ -91,7 +98,7 @@ pub struct AutoOptions {
 impl Default for AutoOptions {
     fn default() -> Self {
         Self {
-            poll_timeout: Duration::from_millis(50),
+            poll_timeout: None,
             reconnect_delay: Duration::from_millis(250),
             connect_timeout: Duration::from_secs(2),
             max_send_queue: 256,
@@ -114,9 +121,16 @@ struct AutoStats {
     send_overflows: AtomicU64,
     received_messages: AtomicU64,
     receive_overflows: AtomicU64,
+    /// Возвраты worker-а из ожидания в ядре (0.9) -- тесты доказывают по
+    /// нему отсутствие пробуждений в простое. В снимок не входит.
+    wakeups: AtomicU64,
 }
 
 impl AutoStats {
+    fn wake(&self) {
+        self.wakeups.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn snapshot(&self) -> AutoStatsSnapshot {
         AutoStatsSnapshot {
             sent_messages: self.sent_messages.load(Ordering::Relaxed),
@@ -274,9 +288,11 @@ impl ChannelState {
     }
 }
 
-/// Общая для `AutoServer`/`AutoClient` постановка сообщения в очередь.
+/// Общая для `AutoServer`/`AutoClient` постановка сообщения в очередь;
+/// принятое сообщение будит worker его событием `wake`.
 fn enqueue(
     cmd_tx: &Sender<WorkerCommand>,
+    wake: &EventHandle,
     running: &AtomicBool,
     gauge: &ChannelState,
     data: &[u8],
@@ -304,12 +320,24 @@ fn enqueue(
     cmd_tx.send(WorkerCommand::Send(msg)).map_err(|_| {
         gauge.release(frame);
         ShmError::NotReady
-    })
+    })?;
+    // Команда уже в канале: worker, проснувшись, её увидит. Ошибка
+    // сигнала -- только испорченный дескриптор; сообщение всё равно уйдёт
+    // при следующем пробуждении worker-а.
+    let _ = wake.set();
+    Ok(())
+}
+
+/// Событие «в очереди команд что-то есть» (автосброс, безымянное).
+fn new_wake() -> Result<Arc<EventHandle>> {
+    EventHandle::create_unnamed(false).map(Arc::new)
 }
 
 #[derive(Debug)]
 pub struct AutoServer {
     cmd_tx: Sender<WorkerCommand>,
+    /// Будит worker: новая команда (`send`/`try_send`/`stop`/Drop).
+    wake: Arc<EventHandle>,
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
@@ -320,6 +348,8 @@ pub struct AutoServer {
 impl AutoServer {
     pub fn start(name: &str, handler: Arc<dyn AutoHandler>, options: AutoOptions) -> Result<Self> {
         let mut server = SharedServer::start(name)?;
+        let wake = new_wake()?;
+        let join_wake = Arc::clone(&wake);
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
@@ -346,6 +376,7 @@ impl AutoServer {
                     join_handler,
                     options,
                     rx,
+                    &join_wake,
                     join_stats,
                     join_running,
                     join_gauge,
@@ -354,6 +385,7 @@ impl AutoServer {
             .map_err(|err| map_spawn_error(err, "spawn server worker"))?;
         Ok(Self {
             cmd_tx: tx,
+            wake,
             join: Mutex::new(Some(join)),
             stats,
             running,
@@ -368,6 +400,7 @@ impl AutoServer {
     pub fn send(&self, data: &[u8]) -> Result<()> {
         enqueue(
             &self.cmd_tx,
+            &self.wake,
             &self.running,
             &self.gauge,
             data,
@@ -398,6 +431,7 @@ impl AutoServer {
     pub fn try_send(&self, data: &[u8]) -> Result<()> {
         enqueue(
             &self.cmd_tx,
+            &self.wake,
             &self.running,
             &self.gauge,
             data,
@@ -411,8 +445,9 @@ impl AutoServer {
     /// не записанное; `messages` дополнительно ограничено свободным местом
     /// очереди. Если `free_space().fits(n)`, то `try_send` payload-а длины
     /// `n` будет принят и записан в кольцо без ожидания читателя (при одном
-    /// отправляющем потоке). Снимок кольца обновляется на каждой итерации
-    /// worker-а (не реже `poll_timeout`), вне подключения -- `FreeSpace::ZERO`.
+    /// отправляющем потоке). Снимок кольца обновляется при каждом пробуждении
+    /// worker-а (отправка, приём, событие места -- читатель сигналит его и
+    /// когда кольцо опустело), вне подключения -- `FreeSpace::ZERO`.
     #[must_use]
     pub fn free_space(&self) -> FreeSpace {
         self.gauge.estimate(self.max_send_queue.max(1))
@@ -435,12 +470,21 @@ impl AutoServer {
         self.gauge.peer_pid()
     }
 
+    /// Остановить worker (асинхронно): очередь дописывается в кольцо,
+    /// сколько влезет, и worker выходит. Синхронно дожидается -- `Drop`.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        let _ = self.wake.set();
     }
 
     pub fn stats(&self) -> AutoStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Число пробуждений worker-а (тесты: ноль в простое).
+    #[cfg(test)]
+    pub(crate) fn wakeups(&self) -> u64 {
+        self.stats.wakeups.load(Ordering::Relaxed)
     }
 }
 
@@ -448,17 +492,23 @@ impl Drop for AutoServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        let _ = self.wake.set();
         if let Some(handle) = self.join.lock().unwrap().take() {
             join_unless_self(handle);
         }
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "внутренняя функция worker-а: каждый аргумент -- своя часть общего состояния"
+)]
 fn server_worker(
     server: &mut SharedServer,
     handler: Arc<dyn AutoHandler>,
     options: AutoOptions,
     cmd_rx: Receiver<WorkerCommand>,
+    wake: &EventHandle,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
     gauge: Arc<ChannelState>,
@@ -480,6 +530,7 @@ fn server_worker(
         server_events.c2s.data.raw_handle(),
         server_events.s2c.space.raw_handle(),
     ];
+    let dir = ChannelKind::ServerToClient;
 
     let mut connected = false;
 
@@ -487,13 +538,17 @@ fn server_worker(
         if !connected {
             // Вне подключения писать некуда: оценка места -- ноль.
             gauge.publish_ring(FreeSpace::ZERO);
-            match server.wait_for_client(Some(options.poll_timeout)) {
-                Ok(_) => {
+            // Ждём клиента ИЛИ команду/остановку (событие `wake`) -- без
+            // опроса по таймеру.
+            let accepted = server.wait_for_client_or(wake.raw_handle(), options.poll_timeout);
+            stats.wake();
+            match accepted {
+                Ok(true) => {
                     connected = true;
                     gauge.peer_connected(server.peer_pid());
                     handler.on_connect();
                 }
-                Err(ShmError::Timeout) => {
+                Ok(false) => {
                     drain_commands(
                         &mut send_queue,
                         &cmd_rx,
@@ -501,7 +556,7 @@ fn server_worker(
                         &running,
                         &handler,
                         &gauge,
-                        ChannelKind::ServerToClient,
+                        dir,
                     );
                     continue;
                 }
@@ -514,7 +569,7 @@ fn server_worker(
                         &running,
                         &handler,
                         &gauge,
-                        ChannelKind::ServerToClient,
+                        dir,
                     );
                     continue;
                 }
@@ -528,21 +583,14 @@ fn server_worker(
             &running,
             &handler,
             &gauge,
-            ChannelKind::ServerToClient,
+            dir,
         );
 
         if !connected {
             continue;
         }
 
-        process_send_queue(
-            server,
-            &mut send_queue,
-            &handler,
-            &stats,
-            &gauge,
-            ChannelKind::ServerToClient,
-        );
+        process_send_queue(server, &mut send_queue, &handler, &stats, &gauge, dir);
 
         let outcome = process_receive_queue(
             server,
@@ -562,22 +610,41 @@ fn server_worker(
             // Ещё есть данные — не блокируемся, сразу следующий проход.
             continue;
         }
+        if !running.load(Ordering::Acquire) {
+            break;
+        }
 
-        let (handles, count) = wait_set(base_handles, server.peer_wait_handle());
-        match win::wait_any(&handles[..count], Some(options.poll_timeout)) {
-            Ok(Some(0)) => {
+        let set = WaitSet::new(base_handles, server.peer_wait_handle(), wake.raw_handle());
+        let result = win::wait_any(set.handles(), options.poll_timeout);
+        stats.wake();
+        match result {
+            Ok(Some(DISCONNECT_INDEX)) => {
+                // Штатное отключение: всё, что клиент успел записать (например,
+                // прощальное сообщение), доставляем ДО `on_disconnect`.
+                drain_remaining(
+                    server,
+                    &handler,
+                    &stats,
+                    &mut buffer,
+                    options.recv_batch,
+                    ChannelKind::ClientToServer,
+                );
                 notify_disconnect(&handler, &gauge, DisconnectReason::Graceful);
                 server.mark_disconnected();
                 connected = false;
             }
-            Ok(Some(1)) => {
-                // data available, loop will read
+            Ok(Some(DATA_INDEX)) => {
+                // Данные -- прочитаем на следующем проходе.
             }
-            Ok(Some(2)) => {
-                handler.on_space_available(ChannelKind::ServerToClient);
+            Ok(Some(SPACE_INDEX)) => {
+                // Сначала дописать очередь в освободившееся место, потом
+                // сообщить: `try_send` после `on_space_available` находит
+                // место и в очереди.
+                process_send_queue(server, &mut send_queue, &handler, &stats, &gauge, dir);
+                handler.on_space_available(dir);
             }
-            Ok(Some(PEER_WAIT_INDEX)) => {
-                drain_after_peer_death(
+            Ok(Some(i)) if Some(i) == set.peer => {
+                drain_remaining(
                     server,
                     &handler,
                     &stats,
@@ -589,8 +656,9 @@ fn server_worker(
                 server.mark_disconnected();
                 connected = false;
             }
-            Ok(Some(_)) => {}
-            Ok(None) => {}
+            Ok(Some(_) | None) => {
+                // `wake` (новая команда / остановка) или страховочный таймаут.
+            }
             Err(err) => {
                 handler.on_error(err.clone());
                 notify_disconnect(&handler, &gauge, DisconnectReason::Error);
@@ -599,20 +667,58 @@ fn server_worker(
             }
         }
     }
+
+    // Остановка: принятое до `stop()` (например, прощальное сообщение)
+    // дописываем в кольцо, сколько влезет, -- клиент дочитает его до
+    // события отключения.
+    if connected {
+        drain_commands(
+            &mut send_queue,
+            &cmd_rx,
+            &options,
+            &running,
+            &handler,
+            &gauge,
+            dir,
+        );
+        process_send_queue(server, &mut send_queue, &handler, &stats, &gauge, dir);
+    }
 }
 
-/// Индекс handle процесса пира в наборе ожидания worker-а: после трёх
-/// событий канала (DISCONNECT, DATA, SPACE). NT при одновременном сигнале
-/// возвращает наименьший индекс, поэтому штатный DISCONNECT и последние
-/// данные пира имеют приоритет над «процесс завершился».
-const PEER_WAIT_INDEX: usize = 3;
+/// Индексы событий канала в наборе ожидания worker-а. NT при одновременном
+/// сигнале возвращает наименьший индекс: штатный DISCONNECT и данные имеют
+/// приоритет над «процесс пира завершился», а тот -- над `wake`.
+const DISCONNECT_INDEX: usize = 0;
+const DATA_INDEX: usize = 1;
+const SPACE_INDEX: usize = 2;
 
-/// Набор ожидания worker-а: события канала + (если пир наблюдается) handle
-/// его процесса.
-const fn wait_set(base: [isize; 3], peer: Option<isize>) -> ([isize; 4], usize) {
-    match peer {
-        Some(peer) => ([base[0], base[1], base[2], peer], 4),
-        None => ([base[0], base[1], base[2], 0], 3),
+/// Набор ожидания worker-а: DISCONNECT, DATA, SPACE, handle процесса пира
+/// (если наблюдается), `wake` (последним).
+struct WaitSet {
+    handles: [isize; 5],
+    count: usize,
+    /// Индекс handle процесса пира.
+    peer: Option<usize>,
+}
+
+impl WaitSet {
+    const fn new(base: [isize; 3], peer: Option<isize>, wake: isize) -> Self {
+        match peer {
+            Some(peer) => Self {
+                handles: [base[0], base[1], base[2], peer, wake],
+                count: 5,
+                peer: Some(3),
+            },
+            None => Self {
+                handles: [base[0], base[1], base[2], wake, 0],
+                count: 4,
+                peer: None,
+            },
+        }
+    }
+
+    fn handles(&self) -> &[isize] {
+        &self.handles[..self.count]
     }
 }
 
@@ -627,9 +733,9 @@ fn notify_disconnect(
     handler.on_disconnect_reason(reason);
 }
 
-/// Пир мёртв -- новых данных не будет, но всё, что он успел записать до
-/// смерти, доставляем ДО `on_disconnect_reason(PeerDied)`.
-fn drain_after_peer_death<R: ReceiveEndpoint>(
+/// Пир отключился или умер -- новых данных не будет, но всё, что он успел
+/// записать до этого, доставляем ДО `on_disconnect_reason`.
+fn drain_remaining<R: ReceiveEndpoint>(
     endpoint: &R,
     handler: &Arc<dyn AutoHandler>,
     stats: &Arc<AutoStats>,
@@ -648,6 +754,8 @@ fn drain_after_peer_death<R: ReceiveEndpoint>(
 #[derive(Debug)]
 pub struct AutoClient {
     cmd_tx: Sender<WorkerCommand>,
+    /// Будит worker: новая команда (`send`/`try_send`/`stop`/Drop).
+    wake: Arc<EventHandle>,
     join: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
@@ -661,6 +769,31 @@ impl AutoClient {
         handler: Arc<dyn AutoHandler>,
         options: AutoOptions,
     ) -> Result<Self> {
+        Self::connect_with(name, handler, options, ClientMode::Reconnect)
+    }
+
+    /// Клиент выделенного канала Dispatch (ревизия 2): не переподключается.
+    /// Первое подключение не удалось или канал разорван -- `on_error` (для
+    /// неудачного подключения), `on_disconnect_reason(..)` и выход worker-а,
+    /// без повторов к каналу, которого больше нет. PID сервера из
+    /// рукопожатия публикуется в `server_pid` и НЕ стирается при разрыве.
+    pub(crate) fn connect_dedicated(
+        name: &str,
+        handler: Arc<dyn AutoHandler>,
+        options: AutoOptions,
+        server_pid: Arc<AtomicU32>,
+    ) -> Result<Self> {
+        Self::connect_with(name, handler, options, ClientMode::Dedicated(server_pid))
+    }
+
+    fn connect_with(
+        name: &str,
+        handler: Arc<dyn AutoHandler>,
+        options: AutoOptions,
+        mode: ClientMode,
+    ) -> Result<Self> {
+        let wake = new_wake()?;
+        let join_wake = Arc::clone(&wake);
         let (tx, rx) = mpsc::channel();
         let stats = Arc::new(AutoStats::default());
         let running = Arc::new(AtomicBool::new(true));
@@ -688,15 +821,18 @@ impl AutoClient {
                     handler_clone,
                     options,
                     rx,
+                    &join_wake,
                     join_stats,
                     join_running,
                     join_gauge,
+                    &mode,
                 );
             })
             .map_err(|err| map_spawn_error(err, "spawn client worker"))?;
 
         Ok(Self {
             cmd_tx: tx,
+            wake,
             join: Mutex::new(Some(join)),
             stats,
             running,
@@ -710,6 +846,7 @@ impl AutoClient {
     pub fn send(&self, data: &[u8]) -> Result<()> {
         enqueue(
             &self.cmd_tx,
+            &self.wake,
             &self.running,
             &self.gauge,
             data,
@@ -724,6 +861,7 @@ impl AutoClient {
     pub fn try_send(&self, data: &[u8]) -> Result<()> {
         enqueue(
             &self.cmd_tx,
+            &self.wake,
             &self.running,
             &self.gauge,
             data,
@@ -756,12 +894,21 @@ impl AutoClient {
         self.gauge.peer_pid()
     }
 
+    /// Остановить worker (асинхронно): очередь дописывается в кольцо,
+    /// сколько влезет, и worker выходит. Синхронно дожидается -- `Drop`.
     pub fn stop(&self) {
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        let _ = self.wake.set();
     }
 
     pub fn stats(&self) -> AutoStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Число пробуждений worker-а (тесты: ноль в простое).
+    #[cfg(test)]
+    pub(crate) fn wakeups(&self) -> u64 {
+        self.stats.wakeups.load(Ordering::Relaxed)
     }
 }
 
@@ -769,30 +916,78 @@ impl Drop for AutoClient {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.cmd_tx.send(WorkerCommand::Shutdown);
+        let _ = self.wake.set();
         if let Some(handle) = self.join.lock().unwrap().take() {
             join_unless_self(handle);
         }
     }
 }
 
+/// Режим клиентского worker-а.
+enum ClientMode {
+    /// `AutoClient::connect`: переподключаться раз в `reconnect_delay`.
+    Reconnect,
+    /// Выделенный канал Dispatch: одно подключение; PID сервера -- сюда.
+    Dedicated(Arc<AtomicU32>),
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "внутренняя функция worker-а: каждый аргумент -- своя часть общего состояния"
+)]
 fn client_worker(
     name: &str,
     handler: Arc<dyn AutoHandler>,
     options: AutoOptions,
     cmd_rx: Receiver<WorkerCommand>,
+    wake: &EventHandle,
     stats: Arc<AutoStats>,
     running: Arc<AtomicBool>,
     gauge: Arc<ChannelState>,
+    mode: &ClientMode,
 ) {
     let mut send_queue = SendQueue::new();
     let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+    let dir = ChannelKind::ClientToServer;
 
     while running.load(Ordering::Acquire) {
-        let mut client = match SharedClient::connect(name, options.connect_timeout) {
+        // Ревизия 2: ожидание `S2C_CONNECT` прерывается `wake` -- `stop`/Drop
+        // не ждут `connect_timeout`. На `wake` команды переносятся в очередь
+        // (Shutdown гасит `running`), `send` ожидание не прерывает.
+        let mut should_stop = || {
+            drain_commands(
+                &mut send_queue,
+                &cmd_rx,
+                &options,
+                &running,
+                &handler,
+                &gauge,
+                dir,
+            );
+            !running.load(Ordering::Acquire)
+        };
+        let connected = SharedClient::connect_interruptible(
+            name,
+            options.connect_timeout,
+            Interrupt {
+                wake: wake.raw_handle(),
+                should_stop: &mut should_stop,
+            },
+        );
+        let mut client = match connected {
             Ok(client) => client,
+            Err(_) if !running.load(Ordering::Acquire) => break,
             Err(err) => {
                 handler.on_error(err.clone());
-                if !wait_delay(&running, options.reconnect_delay) {
+                if let ClientMode::Dedicated(_) = mode {
+                    // Выделенный канал не поднялся -- повторять не к чему
+                    // (сервер его уже снёс или не дождался нас).
+                    notify_disconnect(&handler, &gauge, DisconnectReason::Error);
+                    break;
+                }
+                // Отступ перед новой попыткой; остановка прерывает его сразу
+                // (событие `wake`), без сна-циклов.
+                if !wait_delay_or(&running, wake, options.reconnect_delay) {
                     break;
                 }
                 continue;
@@ -800,6 +995,9 @@ fn client_worker(
         };
 
         gauge.peer_connected(client.peer_pid());
+        if let ClientMode::Dedicated(server_pid) = mode {
+            server_pid.store(client.peer_pid().unwrap_or(0), Ordering::Release);
+        }
         handler.on_connect();
         // SharedClient всегда использует named events (не anonymous)
         let client_events = client.events();
@@ -811,6 +1009,19 @@ fn client_worker(
 
         loop {
             if !running.load(Ordering::Acquire) {
+                // Остановка: принятое до `stop()` (например, прощальное
+                // сообщение) дописываем в кольцо, сколько влезет, -- сервер
+                // дочитает его до события отключения (Drop клиента).
+                drain_commands(
+                    &mut send_queue,
+                    &cmd_rx,
+                    &options,
+                    &running,
+                    &handler,
+                    &gauge,
+                    dir,
+                );
+                process_send_queue(&client, &mut send_queue, &handler, &stats, &gauge, dir);
                 break;
             }
 
@@ -821,16 +1032,9 @@ fn client_worker(
                 &running,
                 &handler,
                 &gauge,
-                ChannelKind::ClientToServer,
+                dir,
             );
-            process_send_queue(
-                &client,
-                &mut send_queue,
-                &handler,
-                &stats,
-                &gauge,
-                ChannelKind::ClientToServer,
-            );
+            process_send_queue(&client, &mut send_queue, &handler, &stats, &gauge, dir);
             let outcome = process_receive_queue(
                 &client,
                 &handler,
@@ -844,21 +1048,37 @@ fn client_worker(
                 client.mark_disconnected();
                 break;
             }
-            if outcome.more_pending {
+            if outcome.more_pending || !running.load(Ordering::Acquire) {
                 continue;
             }
 
-            let (handles, count) = wait_set(base_handles, client.peer_wait_handle());
-            match win::wait_any(&handles[..count], Some(options.poll_timeout)) {
-                Ok(Some(0)) => {
+            let set = WaitSet::new(base_handles, client.peer_wait_handle(), wake.raw_handle());
+            let result = win::wait_any(set.handles(), options.poll_timeout);
+            stats.wake();
+            match result {
+                Ok(Some(DISCONNECT_INDEX)) => {
+                    // Штатное отключение сервера: его последние сообщения
+                    // (например, прощальное) доставляем ДО `on_disconnect`.
+                    drain_remaining(
+                        &client,
+                        &handler,
+                        &stats,
+                        &mut buffer,
+                        options.recv_batch,
+                        ChannelKind::ServerToClient,
+                    );
                     notify_disconnect(&handler, &gauge, DisconnectReason::Graceful);
                     client.mark_disconnected();
                     break;
                 }
-                Ok(Some(1)) => {}
-                Ok(Some(2)) => handler.on_space_available(ChannelKind::ClientToServer),
-                Ok(Some(PEER_WAIT_INDEX)) => {
-                    drain_after_peer_death(
+                Ok(Some(DATA_INDEX)) => {}
+                Ok(Some(SPACE_INDEX)) => {
+                    // Сначала дописать очередь, потом сообщить (см. сервер).
+                    process_send_queue(&client, &mut send_queue, &handler, &stats, &gauge, dir);
+                    handler.on_space_available(dir);
+                }
+                Ok(Some(i)) if Some(i) == set.peer => {
+                    drain_remaining(
                         &client,
                         &handler,
                         &stats,
@@ -870,8 +1090,9 @@ fn client_worker(
                     client.mark_disconnected();
                     break;
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => {}
+                Ok(Some(_) | None) => {
+                    // `wake` (новая команда / остановка) или страховочный таймаут.
+                }
                 Err(err) => {
                     handler.on_error(err.clone());
                     notify_disconnect(&handler, &gauge, DisconnectReason::Error);
@@ -883,7 +1104,11 @@ fn client_worker(
 
         // Соединение потеряно: писать некуда, оценка места -- ноль.
         gauge.publish_ring(FreeSpace::ZERO);
-        if !wait_delay(&running, options.reconnect_delay) {
+        drop(client);
+        if matches!(mode, ClientMode::Dedicated(_)) {
+            break;
+        }
+        if !wait_delay_or(&running, wake, options.reconnect_delay) {
             break;
         }
     }
@@ -1172,8 +1397,20 @@ mod tests {
         let client = AutoClient::connect(&name, Arc::new(NoopHandler), AutoOptions::default())
             .expect("client connect");
 
-        // Даём клиенту время реально подключиться, прежде чем отключать.
-        thread::sleep(Duration::from_millis(200));
+        // Дождаться реального подключения (сервер принял клиента), прежде
+        // чем отключать: с ревизии 2 `stop()` во время рукопожатия отзывает
+        // заявку (соединения и `on_disconnect` тогда нет), а фиксированная
+        // пауза под нагрузкой полного прогона не гарантирует подключения.
+        let start = std::time::Instant::now();
+        while container
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| s.is_peer_alive() != Some(true))
+            && start.elapsed() < Duration::from_secs(10)
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
         client.stop();
 
         // Если self-join deadlock всё ещё существует, on_disconnect зависнет
@@ -1273,6 +1510,7 @@ mod lossless_tests {
     #[test]
     fn queue_policy_never_evicts_lossless() {
         let (tx, rx) = mpsc::channel();
+        let wake = EventHandle::create_unnamed(false).unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
@@ -1283,18 +1521,18 @@ mod lossless_tests {
         };
         let dir = ChannelKind::ClientToServer;
 
-        enqueue(&tx, &running, &gauge, b"L1", true, 2).unwrap();
-        enqueue(&tx, &running, &gauge, b"L2", true, 2).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"L1", true, 2).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"L2", true, 2).unwrap();
         assert_eq!(
-            enqueue(&tx, &running, &gauge, b"L3", true, 2),
+            enqueue(&tx, &wake, &running, &gauge, b"L3", true, 2),
             Err(ShmError::QueueFull)
         );
         assert_eq!(
-            enqueue(&tx, &running, &gauge, b"x", true, 2),
+            enqueue(&tx, &wake, &running, &gauge, b"x", true, 2),
             Err(ShmError::MessageTooSmall),
             "длина lossless-сообщения проверяется синхронно"
         );
-        enqueue(&tx, &running, &gauge, b"S1", false, 2).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"S1", false, 2).unwrap();
 
         let mut queue = SendQueue::new();
         drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
@@ -1316,7 +1554,7 @@ mod lossless_tests {
         let gauge = ChannelState::default();
         gauge.acquire(6);
         gauge.acquire(6);
-        enqueue(&tx, &running, &gauge, b"S2", false, 2).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"S2", false, 2).unwrap();
         drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
         assert_eq!(data_of(&queue), [b"L0".to_vec(), b"S2".to_vec()]);
         assert_eq!(gauge.pending_msgs.load(Ordering::Acquire), 2);
@@ -1328,6 +1566,7 @@ mod lossless_tests {
     #[test]
     fn blocked_lossless_head_keeps_fifo_and_arms_waiter() {
         let (tx, rx) = mpsc::channel();
+        let wake = EventHandle::create_unnamed(false).unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
@@ -1336,7 +1575,7 @@ mod lossless_tests {
         let options = AutoOptions::default();
         let dir = ChannelKind::ClientToServer;
         for i in 0..5u8 {
-            enqueue(&tx, &running, &gauge, &[i, i, i], true, 16).unwrap();
+            enqueue(&tx, &wake, &running, &gauge, &[i, i, i], true, 16).unwrap();
         }
         let mut queue = SendQueue::new();
         drain_commands(&mut queue, &rx, &options, &running, &handler, &gauge, dir);
@@ -1370,14 +1609,15 @@ mod lossless_tests {
     #[test]
     fn invalid_message_does_not_wedge_queue() {
         let (tx, rx) = mpsc::channel();
+        let wake = EventHandle::create_unnamed(false).unwrap();
         let running = Arc::new(AtomicBool::new(true));
         let gauge = ChannelState::default();
         let counters = Arc::new(Counters::default());
         let handler: Arc<dyn AutoHandler> = counters.clone();
         let stats = Arc::new(AutoStats::default());
         let dir = ChannelKind::ServerToClient;
-        enqueue(&tx, &running, &gauge, b"x", false, 16).unwrap();
-        enqueue(&tx, &running, &gauge, b"ok", false, 16).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"x", false, 16).unwrap();
+        enqueue(&tx, &wake, &running, &gauge, b"ok", false, 16).unwrap();
         let mut queue = SendQueue::new();
         drain_commands(
             &mut queue,
@@ -1421,5 +1661,141 @@ mod lossless_tests {
         assert!(!gauge.try_acquire(10, 2), "очередь 2/2");
         gauge.release(1000);
         assert!(gauge.try_acquire(10, 2));
+    }
+
+    #[derive(Default)]
+    struct Counting {
+        connected: AtomicBool,
+        received: AtomicU64,
+    }
+
+    impl AutoHandler for Counting {
+        fn on_connect(&self) {
+            self.connected.store(true, Ordering::Release);
+        }
+        fn on_message(&self, _direction: ChannelKind, _payload: &[u8]) {
+            self.received.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + limit;
+        while !cond() {
+            assert!(std::time::Instant::now() < deadline, "таймаут: {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// 0.9: подключённые `AutoServer`/`AutoClient` в простое не просыпаются
+    /// ни разу (до 0.9 -- каждые 50 мс), а каждое сообщение -- считанные
+    /// пробуждения.
+    #[test]
+    fn idle_worker_does_not_wake_up() {
+        let name = format!("AUTO_IDLE_{}", std::process::id());
+        let server_h = Arc::new(Counting::default());
+        let client_h = Arc::new(Counting::default());
+        let server = AutoServer::start(&name, server_h.clone(), AutoOptions::default()).unwrap();
+        let client = AutoClient::connect(&name, client_h.clone(), AutoOptions::default()).unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            server_h.connected.load(Ordering::Acquire) && client_h.connected.load(Ordering::Acquire)
+        });
+        client.send(b"ping").unwrap();
+        wait_until("доставка", Duration::from_secs(2), || {
+            server_h.received.load(Ordering::Acquire) == 1
+        });
+        thread::sleep(Duration::from_millis(200));
+
+        let (s0, c0) = (server.wakeups(), client.wakeups());
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(server.wakeups() - s0, 0, "сервер просыпался в простое");
+        assert_eq!(client.wakeups() - c0, 0, "клиент просыпался в простое");
+
+        // Одно сообщение -- ограниченное число пробуждений, не тик.
+        client.send(b"ping").unwrap();
+        wait_until("доставка", Duration::from_secs(2), || {
+            server_h.received.load(Ordering::Acquire) == 2
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            server.wakeups() - s0 <= 3,
+            "сервер: {}",
+            server.wakeups() - s0
+        );
+        assert!(
+            client.wakeups() - c0 <= 3,
+            "клиент: {}",
+            client.wakeups() - c0
+        );
+        drop(client);
+        drop(server);
+    }
+
+    /// Ревизия 2, дефект 4: `stop()`/Drop клиента, ждущего `S2C_CONNECT`
+    /// (сервер создал канал, но не принимает), возвращаются сразу -- ожидание
+    /// рукопожатия прерывает `wake`, а не `connect_timeout` (2 с). Заявка при
+    /// этом отозвана: `client_state` снова `IDLE`.
+    #[test]
+    fn stop_during_connect_is_prompt() {
+        struct Quiet;
+        impl AutoHandler for Quiet {}
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+        let name = format!("AUTO_STOPCONN_{}", std::process::id());
+        // Сервер без `wait_for_client`: заявку никто не примет.
+        let server = SharedServer::start(&name).unwrap();
+        let client_state = || {
+            server
+                .view()
+                .control_block()
+                .client_state
+                .load(Ordering::Acquire)
+        };
+        for use_stop in [true, false] {
+            // Лучшая из трёх попыток: единичный всплеск планировщика под
+            // нагрузкой полного прогона -- не то, что проверяется; проверяется,
+            // что остановка не ждёт `connect_timeout` (30 с).
+            let mut best = Duration::MAX;
+            for _ in 0..3 {
+                let client = AutoClient::connect(
+                    &name,
+                    Arc::new(Quiet),
+                    AutoOptions {
+                        connect_timeout: CONNECT_TIMEOUT,
+                        ..AutoOptions::default()
+                    },
+                )
+                .unwrap();
+                wait_until("заявка подана", Duration::from_secs(5), || {
+                    client_state() == crate::constants::HANDSHAKE_CLIENT_HELLO
+                });
+                // `send` будит worker, но подключение не прерывает.
+                client.send(b"queued").unwrap();
+                thread::sleep(Duration::from_millis(50));
+                assert_eq!(
+                    client_state(),
+                    crate::constants::HANDSHAKE_CLIENT_HELLO,
+                    "`send` прервал рукопожатие"
+                );
+                let t0 = std::time::Instant::now();
+                if use_stop {
+                    client.stop();
+                }
+                drop(client);
+                let took = t0.elapsed();
+                assert!(
+                    took < CONNECT_TIMEOUT / 10,
+                    "остановка ждала рукопожатия: {took:?}"
+                );
+                best = best.min(took);
+                assert_eq!(
+                    client_state(),
+                    crate::constants::HANDSHAKE_IDLE,
+                    "заявка не отозвана"
+                );
+            }
+            assert!(
+                best < Duration::from_millis(200),
+                "stop = {use_stop}: лучшая из трёх {best:?}"
+            );
+        }
     }
 }

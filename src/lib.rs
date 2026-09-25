@@ -23,7 +23,7 @@ pub(crate) mod ntapi;
 mod peer_tests;
 
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
-pub use beacon::Beacon;
+pub use beacon::{Beacon, ProcessExit, Waitable, wait_any};
 pub use client::SharedClient;
 /// Лимиты кольца -- нужны потребителям, которые строят свой протокол поверх
 /// `try_send*`/`free_space` (размер кадра, число слотов).
@@ -45,20 +45,29 @@ pub use server::SharedServer;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// Ожидание с периодической проверкой флага остановки.
-/// Возвращает `false` если `running` стал `false` (сигнал остановки).
-pub(crate) fn wait_delay(running: &AtomicBool, delay: Duration) -> bool {
-    if delay.is_zero() {
-        return running.load(Ordering::Acquire);
-    }
+/// Пауза `delay` (отступ после ошибки), прерываемая событием `wake`: без
+/// сна-циклов — поток спит в ядре до срабатывания `wake` или конца паузы.
+/// Срабатывание `wake` без остановки (например, новая команда в очереди) не
+/// укорачивает паузу. `false` — `running` стал `false`.
+pub(crate) fn wait_delay_or(
+    running: &AtomicBool,
+    wake: &win::EventHandle,
+    delay: Duration,
+) -> bool {
     let deadline = Instant::now() + delay;
-    while Instant::now() < deadline {
+    loop {
         if !running.load(Ordering::Acquire) {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(10));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return true;
+        }
+        if wake.wait(Some(left)).is_err() {
+            // Ожидание невозможно (дескриптор испорчен) -- не крутиться.
+            std::thread::sleep(left);
+        }
     }
-    running.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -75,7 +84,7 @@ mod tests {
         let server_thread = thread::spawn(|| -> Result<()> {
             let mut server = SharedServer::start(NAME)?;
             // ожидание клиента
-            server.wait_for_client(Some(Duration::from_secs(2)))?;
+            server.wait_for_client(Some(Duration::from_secs(5)))?;
 
             let mut recv_buffer = Vec::new();
             loop {
@@ -90,13 +99,23 @@ mod tests {
             Ok(())
         });
 
-        thread::sleep(Duration::from_millis(50));
-
         let client_res = (|| -> Result<()> {
-            let client = SharedClient::connect(NAME, Duration::from_secs(2))?;
+            // Сервер поднимается в соседнем потоке: под нагрузкой полного
+            // прогона секции может ещё не быть -- повторяем подключение до
+            // 5 с, а не угадываем фиксированной паузой.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let client = loop {
+                match SharedClient::connect(NAME, Duration::from_secs(2)) {
+                    Ok(client) => break client,
+                    Err(_) if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(err) => return Err(err),
+                }
+            };
             let mut recv = Vec::new();
             let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(1) {
+            while start.elapsed() < Duration::from_secs(5) {
                 if client.poll_server(Some(Duration::from_millis(20)))? {
                     let len = client.receive_from_server(&mut recv)?;
                     if &recv[..len] == b"ping" {

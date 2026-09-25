@@ -259,6 +259,66 @@ fn wait_for_space_is_woken_by_reader_event() {
     );
 }
 
+/// 0.9: штатное отключение читателя будит `wait_for_space` без таймаута
+/// (`DISCONNECT` в наборе ожидания) -- `Err(NotConnected)`, а не вечное
+/// ожидание места, которое уже никто не освободит. В обе стороны.
+#[test]
+fn wait_for_space_is_woken_by_graceful_disconnect() {
+    let big = vec![7u8; 60_000];
+
+    // Сервер ждёт места, клиент уходит.
+    let name = unique_name("DISC_S");
+    let mut server = SharedServer::start(&name).unwrap();
+    let client_thread = thread::spawn(move || {
+        let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let left_at = Instant::now();
+        drop(client); // откат handshake + DISCONNECT
+        left_at
+    });
+    server
+        .wait_for_client(Some(Duration::from_secs(5)))
+        .unwrap();
+    while server.try_send_to_client(&big).is_ok() {}
+    assert_eq!(
+        server.wait_for_space(big.len(), None),
+        Err(ShmError::NotConnected)
+    );
+    let latency = Instant::now().saturating_duration_since(client_thread.join().unwrap());
+    assert!(
+        latency < Duration::from_millis(200),
+        "сервер проснулся через {latency:?}"
+    );
+
+    // Клиент ждёт места, сервер уходит.
+    let name = unique_name("DISC_C");
+    let server_thread = thread::spawn({
+        let name = name.clone();
+        move || {
+            let mut server = SharedServer::start(&name).unwrap();
+            server
+                .wait_for_client(Some(Duration::from_secs(5)))
+                .unwrap();
+            thread::sleep(Duration::from_millis(300));
+            let left_at = Instant::now();
+            drop(server); // IDLE + DISCONNECT
+            left_at
+        }
+    });
+    thread::sleep(Duration::from_millis(50));
+    let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+    while client.try_send_to_server(&big).is_ok() {}
+    assert_eq!(
+        client.wait_for_space(big.len(), None),
+        Err(ShmError::NotConnected)
+    );
+    let latency = Instant::now().saturating_duration_since(server_thread.join().unwrap());
+    assert!(
+        latency < Duration::from_millis(200),
+        "клиент проснулся через {latency:?}"
+    );
+}
+
 /// `free_space()` вне подключения -- ноль, `try_send` -- NotConnected.
 #[test]
 fn not_connected_has_no_space() {
@@ -345,15 +405,8 @@ fn dispatch_client_try_send_is_lossless() {
         bad: AtomicBool::new(false),
         delay: Duration::from_micros(300),
     });
-    let server = DispatchServer::start(
-        &name,
-        server_handler.clone(),
-        DispatchOptions {
-            poll_timeout: Duration::from_millis(20),
-            ..DispatchOptions::default()
-        },
-    )
-    .unwrap();
+    let server =
+        DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default()).unwrap();
     thread::sleep(Duration::from_millis(100));
 
     let client_handler = Arc::new(RecordingClient::default());
@@ -367,7 +420,6 @@ fn dispatch_client_try_send_is_lossless() {
         client_handler,
         DispatchClientOptions {
             max_send_queue: 16,
-            poll_timeout: Duration::from_millis(20),
             ..DispatchClientOptions::default()
         },
     )

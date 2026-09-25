@@ -7,7 +7,7 @@
 Двунаправленный обмен сообщениями через lock-free SPSC кольцевые буферы, поверх прямых вызовов NT API. Чистый Rust-крейт — без C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.8.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
   <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
@@ -23,7 +23,77 @@
 
 ---
 
-## 🆕 Что нового в v0.8.0
+## 🆕 Что нового в v0.9.0
+
+- ✅ **Auto/Dispatch целиком по событиям** (breaking: `poll_timeout` теперь
+  `Option<Duration>`, по умолчанию `None`) — каждый worker, поток лобби и поток
+  ожидания подключения спит в ядре до события: данные, место, отключение,
+  смерть пира, новая команда (`send`/`try_send`/`stop` будят worker безымянным
+  событием) или остановка. Ноль пробуждений в простое; отправка больше не ждёт
+  следующего тика опроса (50 мс). `Some(t)` — необязательный страховочный
+  таймаут.
+- ✅ **Multi-client по событиям** (breaking: `MultiOptions`/`MultiClientOptions::poll_timeout`
+  теперь `Option<Duration>`, по умолчанию `None`; новое `MultiClientOptions::retry_delay`) —
+  тика 50 мс больше нет. Worker-ы сервера (по одному на 21 слот) спят на `CONNECT_REQ` /
+  `DISCONNECT` / `DATA` / handle процесса клиента / безымянном `wake` и просыпаются по
+  таймауту только к ближайшему *дедлайну* (протухший захват слота, разовая проверка
+  брошенного рукопожатия). Смерть клиента — по handle процесса
+  (`on_client_disconnect_reason(PeerDied)`); клиент, не нашедший свободного слота,
+  «толкает» сервер, и захват упавшего клиента снимается ровно на дедлайне. Новые
+  методы по умолчанию `on_client_disconnect_reason` / `on_disconnect_reason`,
+  `MultiServer::is_client_alive`. Тесты доказывают 0 пробуждений за секунду простоя.
+- ✅ **`wait_for_space` без срезов** — одно ожидание в ядре на весь таймаут по
+  `[SPACE, DISCONNECT, процесс пира]`; штатное отключение пира — `Err(NotConnected)`,
+  а не ожидание до таймаута.
+- ✅ **Лобби Dispatch сериализовано** — клиент держит именованный мьютекс `<лобби>_lock`
+  всё рукопожатие с лобби (два одновременных клиента могли прочитать чужой ответ); имя
+  канала наследует namespace лобби (`Global\<hex>`) — межсессионный Dispatch работает;
+  `Beacon::open` отвергает подменённое автосбросное событие с тем же именем.
+- ✅ **`Beacon` — событийное обнаружение сервера** — именованное
+  событие-уведомление с ручным сбросом `<имя>_beacon`: сервер взводит его
+  (`raise`) сразу после создания лобби и сбрасывает (`lower`) до остановки;
+  клиенты спят в `wait()` / `wait_any()` и просыпаются все сразу — никаких
+  попыток подключения, пока сервера нет. `open` создаёт или открывает (порядок
+  запуска любой), `is_raised()` — проверка без ожидания. `Beacon::unnamed()` —
+  безымянное событие того же вида (например, сигнал остановки рядом с маяком
+  в `wait_any`; по имени его не открыть и не занять). `ProcessExit` держит
+  handle процесса и срабатывает при его завершении;
+  `xshm::wait_any(&[&dyn Waitable], timeout)` ждёт маяки и завершения
+  процессов вместе. См. [Обнаружение сервера](#обнаружение-сервера).
+- ✅ **Dispatch: надёжность** — `DispatchServer::start` создаёт лобби
+  синхронно (занятое имя — ошибка, а не молчаливые повторы в фоне); клиент
+  объявляется (`on_client_connect`) в worker-е своего канала **до** первого
+  `on_message` (ранние сообщения раньше приходили от неизвестного клиента и
+  терялись); сообщения, принятые до `disconnect_client`/`stop`, дописываются в
+  кольцо, и пир дочитывает их до своего `on_disconnect` (прощальное сообщение
+  с причиной теперь доходит); `stop()` будит все потоки событием, а не ждёт
+  тика опроса или `channel_connect_timeout`; `DispatchClient::lobby_exists(name)`.
+- ✅ **События места для отправителей** — `DispatchClientHandler::on_space_available()`
+  и `DispatchHandler::on_space_available(client_id)` (по умолчанию ничего):
+  отправитель без потерь, получивший `QueueFull`, спит до освобождения места
+  пиром, а не в цикле со сном. Перед колбэком worker дописывает очередь в
+  освободившееся место.
+- 🐛 **Ревизия 2 (25.09.2026)** — клиент, отключённый сразу после
+  рукопожатия (например, отказ из `on_client_connect`), получает прощание и
+  `on_disconnect`: рукопожатие засчитывается по смене `generation`, даже если
+  сервер уже `IDLE` (раньше клиент откатывался и вечно переподключался к
+  исчезнувшему каналу). Рукопожатие фиксируется CAS-ами с обеих сторон
+  (нет устаревшего `S2C_CONNECT` для следующего клиента); выделенный канал
+  Dispatch не переподключается и после неудачного первого подключения;
+  Multi `disconnect_client` держит claim слота, пока клиент не проснётся
+  (раньше на одном кольце могли оказаться два клиента); `stop()`/Drop не
+  ждут таймаута рукопожатия; `MultiServer::stop()` сигналит клиентам сразу;
+  `DispatchServer::stop()` из колбэка обработчика больше не блокируется.
+  Пир-видимые правила R15–R17 — [`INTEROP.md`](INTEROP.md).
+- 🐛 Имена тестов маяка не были уникальны (`Instant::now().elapsed()` ≈ 0).
+
+> **Нативные (C/C++) пиры:** раскладка памяти и объекты ядра каналов не изменились,
+> но 0.9 больше не «лечит» пропущенные сигналы опросом раз в 50 мс. Что обязана
+> сигналить совместимая реализация, новый объект `<имя>_beacon` и гарантии порядка
+> Dispatch — в [INTEROP.md](INTEROP.md).
+
+## Ранее в v0.8.0
+
 
 - ✅ **Запись без потерь** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` никогда не затирают непрочитанное (`Err(QueueFull)` — кольцо не тронуто); `free_space()` — консервативная оценка места для писателя; `wait_for_space()` ждёт события `SPACE`. Раскладка совместима с 0.7.0 (`SHARED_VERSION` прежний).
 - ✅ **Надёжная детекция смерти пира** — в handshake стороны обмениваются PID, и каждая держит открытый handle процесса другой; убитый/упавший пир замечается за ~1–5 мс (см. [Живость пира](#живость-пира)). Новый `DisconnectReason` (`Graceful` / `PeerDied` / `Local` / `Error`) через колбэки-методы по умолчанию `on_disconnect_reason` / `on_client_disconnect_reason`, аксессоры `is_peer_alive()` / `peer_pid()`, `ShmError::PeerDied` из `wait_for_space` / `poll_*`. Совместимо по wire-формату с пирами 0.7.0 / раннего 0.8.0 (за ними просто нет наблюдения).
@@ -420,8 +490,13 @@ fn main() -> Result<()> {
   занимает `MESSAGE_HEADER_SIZE` (4) + длину payload; в кольце не больше `MAX_MESSAGES` (500)
   сообщений и `RING_CAPACITY` (2 МиБ) байт. Сообщение в 65 535 байт всегда помещается в пустое кольцо.
 - `wait_for_space` спит на событии `SPACE` канала: читатель будит писателя, только когда места
-  стало достаточно. Ожидание нарезано срезами по 50 мс, поэтому работает и с пирами 0.7.0, и с
-  anonymous-сервером (опросом). Мёртвый читатель место не освободит -- всегда задавайте таймаут.
+  стало достаточно. С 0.9 это одно ожидание в ядре по `[SPACE, DISCONNECT, процесс пира]`
+  (без срезов по 50 мс): мёртвый читатель — `Err(PeerDied)`, штатное отключение —
+  `Err(NotConnected)`. Читатель 0.7 будит только опустошив кольцо; упавший читатель без обмена
+  PID не будит ничем — задавайте таймаут. Anonymous-сервер опрашивает раз в 1 мс.
+- Auto/Dispatch сообщают об освободившемся месте событием: `AutoHandler::on_space_available`,
+  `DispatchClientHandler::on_space_available()`, `DispatchHandler::on_space_available(id)` —
+  отправитель, получивший `QueueFull`, ждёт его, а не спит в цикле.
 - Auto/Dispatch асинхронны: `try_send` возвращает `QueueFull`, когда `max_send_queue` принятых
   сообщений ещё ждут места в кольце; принятые lossless-сообщения никогда не вытесняются и пишутся
   путём без перезаписи. Гарантия действует в пределах одного подключения (переподключение
@@ -468,7 +543,7 @@ Layout не менялся: заявка на пробуждение живёт 
 | Single-client | `poll_client` / `poll_server` / `wait_for_space` сразу возвращают `Err(ShmError::PeerDied)`; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
 | Auto | handle процесса пира лежит в наборе ожидания worker-а → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
 | Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
-| Multi-client | слоты умерших клиентов освобождаются на следующей итерации worker-а (без 3-с троттлинга) |
+| Multi-client | handle процесса клиента в наборе ожидания worker-а сервера → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, слот освобождается; `MultiServer::is_client_alive(id)`; клиент видит смерть сервера → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
 
 - Новые колбэки -- **методы по умолчанию**, которые вызывают `on_disconnect` /
   `on_client_disconnect`, поэтому существующие обработчики работают как раньше.
@@ -486,6 +561,44 @@ PID в `ControlBlock.reserved[2]` при создании; клиент пише
 `reserved[3]` до `CLIENT_HELLO`, сервер забирает его `swap(0)`. PID процесса, уже
 мёртвого на момент handshake, игнорируется.
 
+### Обнаружение сервера
+
+Клиенту, который ждёт сервер (например, профайлер ждёт свой вьюер), незачем
+его опрашивать. `Beacon` — именованное событие с ручным сбросом:
+
+```rust
+use xshm::{Beacon, DispatchClient};
+
+// Клиент: спать, пока не появится сервер или не попросят остановиться.
+let lobby = Beacon::open("MyService")?;
+let stop = Beacon::unnamed()?; // взводит наш же путь остановки
+loop {
+    match Beacon::wait_any(&[&stop, &lobby], None)? {
+        Some(1) => {}
+        _ => break, // остановка
+    }
+    match DispatchClient::connect("MyService", registration(), handler(), Default::default()) {
+        Ok(client) => { /* работа, пока канал жив */ }
+        Err(_) if !DispatchClient::lobby_exists("MyService") => {
+            // Сервер упал со взведённым маяком: сбросить маяк за него и
+            // перепроверить — сервер, поднявшийся тем временем, взвёл маяк
+            // уже после создания лобби: либо лобби видно сейчас, либо
+            // разбудит новый взвод.
+            lobby.lower()?;
+            if DispatchClient::lobby_exists("MyService") {
+                lobby.raise()?;
+            }
+        }
+        Err(_) => { /* временная ошибка: отступ (прерываемый `stop`) */ }
+    }
+}
+```
+
+Порядок сервера: сначала лобби (`DispatchServer::start` синхронный), потом
+`raise()`; при остановке — сначала `lower()`, потом остановка.
+`ProcessExit::open(pid)` вместе с `xshm::wait_any` позволяет клиенту, которому
+сервер отказал, спать до завершения процесса этого сервера — тоже без опроса.
+
 ## Константы
 
 Лимиты кольца реэкспортированы из корня крейта
@@ -498,7 +611,7 @@ PID в `ControlBlock.reserved[2]` при создании; клиент пише
 | `MAX_MESSAGE_SIZE` | 65535 | Максимальный размер сообщения (байт) |
 | `MIN_MESSAGE_SIZE` | 2 | Минимальный размер сообщения (байт) |
 | `DEFAULT_MAX_CLIENTS` | 20 | Число слотов `MultiServer` по умолчанию |
-| `MAX_MULTI_CLIENTS` | 31 | Жёсткий предел `MultiServer` (лимит `NtWaitForMultipleObjects`) |
+| `MAX_MULTI_CLIENTS` | 31 | Жёсткий предел `MultiServer` (worker на каждые 21 слот: лимит 64 handle у `NtWaitForMultipleObjects`) |
 
 ## Event Handles для kernel-драйверов
 
@@ -529,6 +642,8 @@ if let Some(handles) = server.get_event_handles() {
 - **Размер сообщения**: от 2 до 65535 байт
 - **Anonymous-серверы**: event handles недоступны (только режим polling)
 - **Число слотов Multi-client**: жёсткий предел 31 одновременный клиент (лимит `NtWaitForMultipleObjects`) — используйте Dispatch-режим, если нужно больше
+- **Таймеры переподключения**: `AutoClient` / `MultiClient` *без подключения* (сервера нет, нет свободного слота) повторяет попытку раз в `reconnect_delay` / `retry_delay`; подключённые каналы в простое не просыпаются. Для обнаружения сервера целиком по событиям — `Beacon`
+- **Без аутентификации**: именованные объекты создаются с NULL DACL — открыть их может любой локальный процесс (с `Global\` — из любого сеанса); не передавайте секреты
 
 ## Структура проекта
 

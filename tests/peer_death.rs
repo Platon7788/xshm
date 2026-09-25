@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 use xshm::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, ClientRegistration, DisconnectReason,
     DispatchClient, DispatchClientHandler, DispatchClientOptions, DispatchHandler, DispatchOptions,
-    DispatchServer, SharedClient, SharedServer, ShmError,
+    DispatchServer, MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler,
+    MultiOptions, MultiServer, SharedClient, SharedServer, ShmError,
 };
 
 const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
@@ -41,6 +42,16 @@ impl DispatchHandler for Noop {
 }
 impl DispatchClientHandler for Noop {
     fn on_connect(&self, _id: u32, _channel: &str) {}
+    fn on_disconnect(&self) {}
+    fn on_message(&self, _data: &[u8]) {}
+}
+impl MultiHandler for Noop {
+    fn on_client_connect(&self, _id: u32) {}
+    fn on_client_disconnect(&self, _id: u32) {}
+    fn on_message(&self, _id: u32, _data: &[u8]) {}
+}
+impl MultiClientHandler for Noop {
+    fn on_connect(&self, _slot: u32) {}
     fn on_disconnect(&self) {}
     fn on_message(&self, _data: &[u8]) {}
 }
@@ -114,6 +125,16 @@ fn child_entry() {
         "dispatch_server" => {
             let server =
                 DispatchServer::start(name, Arc::new(Noop), DispatchOptions::default()).unwrap();
+            linger(forever);
+            server.stop();
+        }
+        "multi_client" => {
+            let _client =
+                MultiClient::connect(name, Arc::new(Noop), MultiClientOptions::default()).unwrap();
+            linger(forever);
+        }
+        "multi_server" => {
+            let server = MultiServer::start(name, Arc::new(Noop), MultiOptions::default()).unwrap();
             linger(forever);
             server.stop();
         }
@@ -225,6 +246,33 @@ impl DispatchHandler for Recorder {
 
 impl DispatchClientHandler for Recorder {
     fn on_connect(&self, _client_id: u32, _channel: &str) {
+        self.connected.store(true, Ordering::Release);
+    }
+    fn on_disconnect(&self) {
+        unreachable!("клиент обязан звать on_disconnect_reason");
+    }
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        self.record(reason);
+    }
+    fn on_message(&self, _data: &[u8]) {}
+}
+
+impl MultiHandler for Recorder {
+    fn on_client_connect(&self, client_id: u32) {
+        self.client_id.store(client_id, Ordering::Release);
+        self.connected.store(true, Ordering::Release);
+    }
+    fn on_client_disconnect(&self, _client_id: u32) {
+        unreachable!("сервер обязан звать on_client_disconnect_reason");
+    }
+    fn on_client_disconnect_reason(&self, _client_id: u32, reason: DisconnectReason) {
+        self.record(reason);
+    }
+    fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+}
+
+impl MultiClientHandler for Recorder {
+    fn on_connect(&self, _slot: u32) {
         self.connected.store(true, Ordering::Release);
     }
     fn on_disconnect(&self) {
@@ -482,4 +530,65 @@ fn dispatch_local_disconnect_reports_local() {
     let (reason, _) = rec.wait_reason(Duration::from_secs(5));
     assert_eq!(reason, DisconnectReason::Local);
     server.stop();
+}
+
+// ─── Multi (0.9: смерть по handle процесса, без опроса) ─────────────────────
+
+/// Сервер Multi видит смерть клиента по удерживаемому handle процесса
+/// (сразу, а не на тике 50 мс / проверке PID раз в 3 с), слот освобождается.
+#[test]
+fn multi_server_sees_client_death() {
+    let name = unique_name("MU_S");
+    let rec = Arc::new(Recorder::default());
+    let server = MultiServer::start(
+        &name,
+        rec.clone(),
+        MultiOptions {
+            max_clients: 2,
+            ..MultiOptions::default()
+        },
+    )
+    .unwrap();
+    let mut peer = Peer::spawn("multi_client", &name);
+    wait_until("child connect", Duration::from_secs(20), || {
+        rec.connected.load(Ordering::Acquire)
+    });
+    let id = rec.client_id.load(Ordering::Acquire);
+    assert_eq!(server.is_client_alive(id), Some(true));
+    let t0 = peer.kill();
+    let (reason, at) = rec.wait_reason(Duration::from_secs(10));
+    assert_eq!(reason, DisconnectReason::PeerDied);
+    report("multi server on_client_disconnect_reason", at - t0);
+    assert_eq!(
+        server.client_count(),
+        0,
+        "слот мёртвого клиента не освобождён"
+    );
+    server.stop();
+}
+
+/// Клиент Multi видит смерть сервера по handle процесса.
+#[test]
+fn multi_client_sees_server_death() {
+    let name = unique_name("MU_C");
+    let mut peer = Peer::spawn("multi_server", &name);
+    let rec = Arc::new(Recorder::default());
+    let client = MultiClient::connect(
+        &name,
+        rec.clone(),
+        MultiClientOptions {
+            // Дочерний сервер может подняться не сразу.
+            retry_delay: Duration::from_millis(50),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    wait_until("connect", Duration::from_secs(20), || {
+        rec.connected.load(Ordering::Acquire)
+    });
+    let t0 = peer.kill();
+    let (reason, at) = rec.wait_reason(Duration::from_secs(10));
+    assert_eq!(reason, DisconnectReason::PeerDied);
+    report("multi client on_disconnect_reason", at - t0);
+    drop(client);
 }

@@ -62,6 +62,32 @@ unsafe extern "system" {
     /// Сброс события в несигнальное состояние
     pub fn NtResetEvent(EventHandle: HANDLE, PreviousState: *mut i32) -> NTSTATUS;
 
+    /// Сведения о событии (0.9: проверка типа существующего маяка)
+    ///
+    /// EventInformationClass: EVENT_BASIC_INFORMATION_CLASS (0)
+    pub fn NtQueryEvent(
+        EventHandle: HANDLE,
+        EventInformationClass: ULONG,
+        EventInformation: PVOID,
+        EventInformationLength: ULONG,
+        ReturnLength: *mut ULONG,
+    ) -> NTSTATUS;
+
+    // ========================================================================
+    // Mutant operations (0.9: сериализация клиентов лобби Dispatch)
+    // ========================================================================
+
+    /// Создание (или открытие с `OBJ_OPENIF`) мьютекса
+    pub fn NtCreateMutant(
+        MutantHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        InitialOwner: BOOLEAN,
+    ) -> NTSTATUS;
+
+    /// Освобождение мьютекса потоком-владельцем
+    pub fn NtReleaseMutant(MutantHandle: HANDLE, PreviousCount: *mut i32) -> NTSTATUS;
+
     // ========================================================================
     // Wait operations
     // ========================================================================

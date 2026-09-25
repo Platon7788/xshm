@@ -34,7 +34,8 @@ fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServ
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client = SharedClient::connect_impl(name, Duration::from_secs(5), announce_pid).unwrap();
+    let client =
+        SharedClient::connect_impl(name, Duration::from_secs(5), announce_pid, None).unwrap();
     (server_thread.join().unwrap(), client)
 }
 
@@ -119,7 +120,7 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client = SharedClient::connect_impl(&name, Duration::from_secs(5), false).unwrap();
+    let client = SharedClient::connect_impl(&name, Duration::from_secs(5), false, None).unwrap();
     let server = server_thread.join().unwrap();
     assert_eq!(server.peer_pid(), None);
     assert_eq!(server.is_peer_alive(), None);

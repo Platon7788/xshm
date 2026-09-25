@@ -250,6 +250,30 @@ pub const NOTIFICATION_EVENT: ULONG = 0;
 pub const OBJ_OPENIF: ULONG = 0x0000_0080;
 /// Информационный успех `OBJ_OPENIF`: объект уже существовал и открыт.
 pub const STATUS_OBJECT_NAME_EXISTS: NTSTATUS = 0x4000_0000;
+/// Имя занято объектом другого типа (например, мьютекс лобби -- событием).
+pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024_u32 as NTSTATUS;
+
+/// `EVENT_INFORMATION_CLASS::EventBasicInformation` для `NtQueryEvent` (0.9).
+pub const EVENT_BASIC_INFORMATION_CLASS: ULONG = 0;
+
+/// Ответ `NtQueryEvent(EventBasicInformation)`: тип события
+/// (`NOTIFICATION_EVENT`/`SYNCHRONIZATION_EVENT`) и текущее состояние.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct EVENT_BASIC_INFORMATION {
+    pub EventType: ULONG,
+    pub EventState: i32,
+}
+
+// ============================================================================
+// Константы для Mutant (мьютекс лобби Dispatch, 0.9)
+// ============================================================================
+
+/// `MUTANT_ALL_ACCESS` = STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | MUTANT_QUERY_STATE.
+pub const MUTANT_ALL_ACCESS: ACCESS_MASK = 0x001F_0001;
+/// Ожидание мьютекса завершилось захватом «брошенного» мьютекса: прежний
+/// поток-владелец завершился, не освободив его. Захват при этом состоялся.
+pub const STATUS_ABANDONED_WAIT_0: NTSTATUS = 0x0000_0080;
 
 // ============================================================================
 // Константы для Wait

@@ -13,12 +13,29 @@ use crate::error::{Result, ShmError};
 use crate::layout::RingHeader;
 use crate::win::{EventHandle, ProcessWatch, wait_any};
 
-/// Максимальный отрезок одного сна в `wait_for_space`: страховка от
-/// потерянного сигнала (читатель старой версии не знает про заявку) --
-/// место всё равно будет замечено не позже чем через этот интервал.
-const SPACE_WAIT_SLICE: Duration = Duration::from_millis(50);
-/// Шаг опроса, когда события нет вовсе (anonymous-сервер).
+/// Шаг опроса, когда событий нет вовсе (anonymous-сервер: секция без имени,
+/// ни одного объекта ядра, кроме самой секции). Это единственный путь
+/// `wait_for_space` с опросом -- и он действует только пока вызывающий сам
+/// блокируется в `wait_for_space`, а не в простое. Именованный канал (0.9+)
+/// ждёт события без нарезки на срезы.
 const SPACE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[cfg(test)]
+thread_local! {
+    /// Число ожиданий в ядре внутри `wait_for_space` на этом потоке: тесты
+    /// доказывают, что ожидание не нарезано на срезы (одно событие -- одно
+    /// ожидание).
+    pub(crate) static SPACE_KERNEL_WAITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Штатное отключение пира для `wait_for_space`: событие `DISCONNECT` (одно
+/// на обе стороны, автосброс) и проверка по разделяемой памяти, что пир
+/// действительно ушёл (его состояние handshake уже не `SERVER_READY`) --
+/// отличает свежий сигнал от устаревшего.
+pub(crate) struct DisconnectWatch<'a> {
+    pub event: &'a EventHandle,
+    pub peer_left: &'a dyn Fn() -> bool,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct WriteOutcome {
@@ -519,20 +536,25 @@ impl RingBuffer {
     /// `payload_len`. `Ok(true)` -- место есть (следующий `try_write_message`
     /// этого писателя пройдёт), `Ok(false)` -- истёк `timeout`,
     /// `Err(PeerDied)` -- процесс читателя умер (место не освободится
-    /// никогда). `timeout = None` -- ждать без ограничения: безопасно только
-    /// при наблюдаемом пире (`peer`), иначе мёртвый читатель подвесит навсегда.
+    /// никогда), `Err(NotConnected)` -- читатель штатно отключился
+    /// (`DISCONNECT`). `timeout = None` -- ждать без ограничения: безопасно
+    /// только при наблюдаемом пире (`peer`), иначе упавший читатель старой
+    /// версии подвесит навсегда -- единственный таймаут тогда тот, что задал
+    /// вызывающий.
     ///
-    /// Пробуждение -- событие `SPACE` направления, которое читатель сигналит
-    /// через `take_space_waiter`, либо сигнал handle процесса-читателя (он
-    /// лежит в том же наборе ожидания). Ожидание нарезается кусками не
-    /// длиннее `SPACE_WAIT_SLICE`, поэтому и без события (anonymous-сервер,
-    /// читатель старой версии, не знающий про заявку) место будет замечено
-    /// опросом.
+    /// Ожидание -- ОДНО `NtWaitForMultipleObjects` на весь остаток таймаута
+    /// (0.9: без нарезки на срезы по 50 мс) по набору `[SPACE, DISCONNECT,
+    /// процесс читателя]`. `SPACE` читатель сигналит, сняв заявку
+    /// (`take_space_waiter`) или опустошив кольцо; читатель старой версии,
+    /// не знающий про заявку, будит писателя только опустошив кольцо -- это
+    /// задержка, но не зависание, пока он читает. Без событий вовсе
+    /// (anonymous-сервер) -- опрос с шагом `SPACE_POLL_INTERVAL`.
     pub(crate) fn wait_for_space(
         &self,
         payload_len: usize,
         space_event: Option<&EventHandle>,
         peer: Option<&ProcessWatch>,
+        disconnect: Option<&DisconnectWatch<'_>>,
         timeout: Option<Duration>,
     ) -> Result<bool> {
         let frame = frame_len(payload_len)?;
@@ -547,47 +569,78 @@ impl RingBuffer {
                 self.disarm_space_waiter();
                 return Ok(true);
             }
-            let slice = match deadline {
+            let remaining = match deadline {
                 Some(deadline) => {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         self.disarm_space_waiter();
                         return Ok(false);
                     }
-                    remaining.min(SPACE_WAIT_SLICE)
+                    Some(remaining)
                 }
-                None => SPACE_WAIT_SLICE,
+                None => None,
             };
-            let peer_died = match (space_event, peer) {
-                // Событие + handle пира в одном ожидании: индекс 1 -- смерть.
-                (Some(event), Some(peer)) => {
-                    match wait_any(&[event.raw_handle(), peer.raw_handle()], Some(slice)) {
-                        Ok(index) => index == Some(1),
-                        Err(err) => {
-                            self.disarm_space_waiter();
-                            return Err(err);
-                        }
-                    }
+
+            let Some(space_event) = space_event else {
+                // Anonymous: объектов ядра нет -- ждать нечего, кроме опроса.
+                std::thread::sleep(
+                    remaining.map_or(SPACE_POLL_INTERVAL, |r| r.min(SPACE_POLL_INTERVAL)),
+                );
+                if peer.is_some_and(ProcessWatch::has_exited)
+                    && !self.free_space().fits(payload_len)
+                {
+                    self.disarm_space_waiter();
+                    return Err(ShmError::PeerDied);
                 }
-                // Результат (сигнал/таймаут) не важен: цикл всё равно
-                // перепроверяет место. Ошибка ядра -- пробрасываем.
-                (Some(event), None) => {
-                    if let Err(err) = event.wait(Some(slice)) {
+                continue;
+            };
+
+            // Индекс 0 -- место (приоритет: при одновременном сигнале NT
+            // отдаёт наименьший индекс), затем отключение, затем смерть.
+            let mut handles = [space_event.raw_handle(), 0, 0];
+            let mut count = 1;
+            let disconnect_index = disconnect.map(|d| {
+                handles[count] = d.event.raw_handle();
+                count += 1;
+                count - 1
+            });
+            let peer_index = peer.map(|p| {
+                handles[count] = p.raw_handle();
+                count += 1;
+                count - 1
+            });
+            #[cfg(test)]
+            SPACE_KERNEL_WAITS.with(|c| c.set(c.get() + 1));
+            match wait_any(&handles[..count], remaining) {
+                Err(err) => {
+                    self.disarm_space_waiter();
+                    return Err(err);
+                }
+                // SPACE или конец таймаута: верх цикла перепроверит место и
+                // дедлайн.
+                Ok(Some(0) | None) => {}
+                Ok(Some(i)) if Some(i) == disconnect_index => {
+                    if let Some(d) = disconnect
+                        && (d.peer_left)()
+                    {
+                        // Событие одно на обе стороны и автосбросное: мы его
+                        // поглотили -- возвращаем взведённым для остальных
+                        // ждущих (worker, `poll_*` другого потока).
+                        let _ = d.event.set();
                         self.disarm_space_waiter();
-                        return Err(err);
+                        return Err(ShmError::NotConnected);
                     }
-                    false
+                    // Устаревший сигнал прошлой сессии -- поглощён, ждём дальше.
                 }
-                (None, peer) => {
-                    std::thread::sleep(slice.min(SPACE_POLL_INTERVAL));
-                    peer.is_some_and(ProcessWatch::has_exited)
+                Ok(Some(i)) => {
+                    debug_assert_eq!(Some(i), peer_index);
+                    // Читатель мог успеть освободить место перед смертью --
+                    // тогда честно отвечаем «место есть».
+                    if !self.free_space().fits(payload_len) {
+                        self.disarm_space_waiter();
+                        return Err(ShmError::PeerDied);
+                    }
                 }
-            };
-            // Читатель мог успеть освободить место перед смертью -- тогда
-            // честно отвечаем «место есть» на следующей итерации.
-            if peer_died && !self.free_space().fits(payload_len) {
-                self.disarm_space_waiter();
-                return Err(ShmError::PeerDied);
             }
         }
     }
@@ -1041,7 +1094,7 @@ mod try_write_tests {
         const LEN: usize = 60_000;
         while ring.try_write_message(&[0u8; LEN]).is_ok() {}
         assert_eq!(
-            ring.wait_for_space(LEN, None, None, Some(Duration::from_millis(20))),
+            ring.wait_for_space(LEN, None, None, None, Some(Duration::from_millis(20))),
             Ok(false)
         );
         assert_eq!(
@@ -1060,15 +1113,164 @@ mod try_write_tests {
             })
         };
         assert_eq!(
-            ring.wait_for_space(LEN, None, None, Some(Duration::from_secs(5))),
+            ring.wait_for_space(LEN, None, None, None, Some(Duration::from_secs(5))),
             Ok(true)
         );
         reader.join().unwrap();
         ring.try_write_message(&[1u8; LEN]).unwrap();
         assert_eq!(
-            ring.wait_for_space(1, None, None, None),
+            ring.wait_for_space(1, None, None, None, None),
             Err(ShmError::MessageTooSmall),
             "длина проверяется до ожидания"
+        );
+    }
+
+    fn kernel_waits() -> u32 {
+        SPACE_KERNEL_WAITS.with(std::cell::Cell::get)
+    }
+
+    /// Заполнить кольцо кадрами по `len` байт.
+    fn fill(ring: &RingBuffer, len: usize) {
+        while ring.try_write_message(&vec![0u8; len]).is_ok() {}
+    }
+
+    /// 0.9: пробуждение по месту -- ОДНО ожидание в ядре на всё время
+    /// ожидания (раньше -- срезы по 50 мс: за 300 мс было бы ~6 пробуждений).
+    #[test]
+    fn wait_for_space_wakes_on_space_without_slicing() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        const LEN: usize = 60_000;
+        fill(&ring, LEN);
+        let space = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let reader = {
+            let (ring, space) = (ring.clone(), space.clone());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(300));
+                let mut out = Vec::new();
+                ring.read_message(&mut out).unwrap();
+                // Читатель 0.8+: снимает заявку и сигналит SPACE.
+                assert!(
+                    ring.take_space_waiter(),
+                    "заявка писателя должна быть видна"
+                );
+                space.set().unwrap();
+            })
+        };
+        let before = kernel_waits();
+        let t0 = Instant::now();
+        assert_eq!(
+            ring.wait_for_space(LEN, Some(&space), None, None, None),
+            Ok(true)
+        );
+        let waited = t0.elapsed();
+        reader.join().unwrap();
+        assert_eq!(kernel_waits() - before, 1, "ожидание нарезано на срезы");
+        assert!(
+            waited >= Duration::from_millis(250),
+            "проснулись раньше места"
+        );
+    }
+
+    /// 0.9: смерть читателя будит писателя сразу и без срезов, даже при
+    /// `timeout = None` (единственное ожидание -- до сигнала процесса).
+    #[test]
+    fn wait_for_space_wakes_on_peer_death_without_slicing() {
+        let (ring, _mem) = make_ring();
+        const LEN: usize = 60_000;
+        fill(&ring, LEN);
+        let space = EventHandle::create_unnamed(false).unwrap();
+        // «Читатель» -- процесс, живущий ~1 с.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .expect("spawn child");
+        let watch = ProcessWatch::open(child.id()).expect("watch child");
+        let before = kernel_waits();
+        let t0 = Instant::now();
+        assert_eq!(
+            ring.wait_for_space(LEN, Some(&space), Some(&watch), None, None),
+            Err(ShmError::PeerDied)
+        );
+        let waited = t0.elapsed();
+        child.wait().unwrap();
+        assert_eq!(kernel_waits() - before, 1, "ожидание нарезано на срезы");
+        assert!(
+            waited >= Duration::from_millis(300),
+            "PeerDied до смерти: {waited:?}"
+        );
+        assert_eq!(
+            ring.header().space_waiter.load(O::Acquire),
+            0,
+            "заявка снята"
+        );
+    }
+
+    /// 0.9: штатное отключение читателя (`DISCONNECT` + состояние handshake)
+    /// будит писателя (`NotConnected`) и возвращает событие взведённым для
+    /// других ждущих; устаревший сигнал (пир на месте) поглощается.
+    #[test]
+    fn wait_for_space_wakes_on_disconnect_and_ignores_stale_signal() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        const LEN: usize = 60_000;
+        fill(&ring, LEN);
+        let space = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let disconnect = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let left = Arc::new(AtomicBool::new(false));
+        let peer_left = {
+            let left = left.clone();
+            move || left.load(O::Acquire)
+        };
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+
+        // Устаревший DISCONNECT (пир на месте), затем настоящее место.
+        disconnect.set().unwrap();
+        let reader = {
+            let (ring, space) = (ring.clone(), space.clone());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                let mut out = Vec::new();
+                ring.read_message(&mut out).unwrap();
+                assert!(ring.take_space_waiter());
+                space.set().unwrap();
+            })
+        };
+        let before = kernel_waits();
+        assert_eq!(
+            ring.wait_for_space(LEN, Some(&space), None, Some(&watch), None),
+            Ok(true)
+        );
+        reader.join().unwrap();
+        assert_eq!(kernel_waits() - before, 2, "устаревший сигнал + место");
+        assert!(
+            !disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "устаревший сигнал поглощён"
+        );
+
+        // Настоящее отключение.
+        fill(&ring, LEN);
+        let leaver = {
+            let disconnect = disconnect.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(150));
+                left.store(true, O::Release);
+                disconnect.set().unwrap();
+            })
+        };
+        let before = kernel_waits();
+        assert_eq!(
+            ring.wait_for_space(LEN, Some(&space), None, Some(&watch), None),
+            Err(ShmError::NotConnected)
+        );
+        leaver.join().unwrap();
+        assert_eq!(kernel_waits() - before, 1);
+        assert!(
+            disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "сигнал отключения возвращён остальным ждущим"
         );
     }
 

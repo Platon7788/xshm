@@ -14,7 +14,7 @@ const MSG_TYPE_REQUEST: u8 = 1;
 const MSG_TYPE_RESPONSE: u8 = 2;
 
 const MAX_NAME_LEN: usize = 64;
-const MAX_CHANNEL_NAME_LEN: usize = 64;
+pub(crate) const MAX_CHANNEL_NAME_LEN: usize = 64;
 
 /// Статус ответа: успех.
 pub const STATUS_OK: u8 = 0;

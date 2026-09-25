@@ -19,14 +19,18 @@ use crate::ntapi::{
     // Types
     CLIENT_ID,
     EVENT_ALL_ACCESS,
+    EVENT_BASIC_INFORMATION,
+    EVENT_BASIC_INFORMATION_CLASS,
     HANDLE,
     LARGE_INTEGER,
+    MUTANT_ALL_ACCESS,
     NOTIFICATION_EVENT,
     NT_CURRENT_PROCESS,
     NTSTATUS,
     // Functions
     NtClose,
     NtCreateEvent,
+    NtCreateMutant,
     NtCreateSection,
     NtMapViewOfSection,
     // Helpers
@@ -34,6 +38,8 @@ use crate::ntapi::{
     NtOpenEvent,
     NtOpenProcess,
     NtOpenSection,
+    NtQueryEvent,
+    NtReleaseMutant,
     NtResetEvent,
     NtSetEvent,
     NtUnmapViewOfSection,
@@ -49,7 +55,9 @@ use crate::ntapi::{
     PVOID,
     SEC_COMMIT,
     SECTION_ALL_ACCESS,
+    STATUS_ABANDONED_WAIT_0,
     STATUS_OBJECT_NAME_EXISTS,
+    STATUS_OBJECT_TYPE_MISMATCH,
     // Constants
     STATUS_SUCCESS,
     STATUS_TIMEOUT,
@@ -186,6 +194,73 @@ impl EventHandle {
         if status != STATUS_SUCCESS && status != STATUS_OBJECT_NAME_EXISTS {
             return Err(status_to_error(status, "NtCreateEvent(notification)"));
         }
+        let event = EventHandle {
+            handle: Handle(handle),
+        };
+        // Существующее событие открыто «как есть» -- любого типа. Автосбросное
+        // событие под именем маяка ломает всех (взвод будит одного ждущего,
+        // `is_raised` начинает сбрасывать маяк), поэтому подмену отвергаем.
+        // Ограничивающий DACL отсекается раньше: `EVENT_ALL_ACCESS` не выдан.
+        if status == STATUS_OBJECT_NAME_EXISTS && event.event_type()? != NOTIFICATION_EVENT {
+            return Err(status_to_error(
+                STATUS_OBJECT_TYPE_MISMATCH,
+                "existing event is not a NotificationEvent",
+            ));
+        }
+        Ok(event)
+    }
+
+    /// Тип события (`NOTIFICATION_EVENT`/`SYNCHRONIZATION_EVENT`) через
+    /// `NtQueryEvent(EventBasicInformation)`.
+    pub fn event_type(&self) -> Result<u32> {
+        let mut info = EVENT_BASIC_INFORMATION::default();
+        let mut returned: u32 = 0;
+        // SAFETY: дескриптор валиден, пока жив `self`; `info` -- `repr(C)`
+        // буфер ровно того размера, что передан; `returned` -- out-параметр
+        // на стеке. Всё живёт до конца вызова.
+        let status = unsafe {
+            NtQueryEvent(
+                self.handle.raw(),
+                EVENT_BASIC_INFORMATION_CLASS,
+                (&raw mut info).cast::<c_void>(),
+                size_of::<EVENT_BASIC_INFORMATION>() as u32,
+                &mut returned,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status_to_error(status, "NtQueryEvent"));
+        }
+        Ok(info.EventType)
+    }
+
+    /// Безымянное событие (`ObjectAttributes = NULL`): не попадает в
+    /// `\BaseNamedObjects`, открыть его по имени из другого процесса нельзя —
+    /// ни угадать, ни занять заранее. Для сигналов внутри процесса (остановка
+    /// потока, «в очереди есть команда»). `notification` — ручной сброс
+    /// (будит всех и остаётся взведённым), иначе автосброс (будит одного
+    /// ждущего и сбрасывается).
+    pub fn create_unnamed(notification: bool) -> Result<Self> {
+        let mut handle: HANDLE = null_mut();
+        let kind = if notification {
+            NOTIFICATION_EVENT
+        } else {
+            SYNCHRONIZATION_EVENT
+        };
+        // SAFETY: `handle` -- валидный out-параметр на стеке; ObjectAttributes
+        // намеренно NULL -- NtCreateEvent это допускает и создаёт безымянный
+        // объект с дескриптором безопасности по умолчанию (токен процесса).
+        let status = unsafe {
+            NtCreateEvent(
+                &mut handle,
+                EVENT_ALL_ACCESS,
+                null_mut(),
+                kind,
+                0, // InitialState = FALSE
+            )
+        };
+        if status != STATUS_SUCCESS || handle.is_null() {
+            return Err(status_to_error(status, "NtCreateEvent(unnamed)"));
+        }
         Ok(EventHandle {
             handle: Handle(handle),
         })
@@ -270,6 +345,116 @@ impl EventHandle {
 
     pub fn raw_handle(&self) -> isize {
         self.handle.as_isize()
+    }
+}
+
+// ============================================================================
+// NamedMutex - NT Mutant (сериализация клиентов лобби, 0.9)
+// ============================================================================
+
+/// Именованный мьютекс ядра (Mutant): create-or-open (`OBJ_OPENIF`), NULL DACL.
+///
+/// Владение мьютексом у Windows -- по ПОТОКУ: освобождать обязан тот же поток,
+/// что захватил. Поэтому guard не `Send` (см. `NamedMutexGuard`). Если
+/// поток-владелец завершился, не освободив мьютекс (в т.ч. процесс убит),
+/// следующий ждущий получает его «брошенным» (`STATUS_ABANDONED_WAIT_0`) --
+/// это тоже успешный захват.
+#[derive(Debug)]
+pub struct NamedMutex {
+    handle: Handle,
+}
+
+// SAFETY: внутри только NT-дескриптор; ожидание/освобождение потокобезопасны
+// на уровне ядра. Привязку владения к потоку соблюдает `NamedMutexGuard`
+// (он не `Send`), сам дескриптор делить между потоками можно.
+unsafe impl Send for NamedMutex {}
+// SAFETY: см. выше.
+unsafe impl Sync for NamedMutex {}
+
+/// Захваченный мьютекс; освобождается в Drop тем же потоком.
+#[derive(Debug)]
+pub struct NamedMutexGuard<'a> {
+    mutex: &'a NamedMutex,
+    /// Захват достался «брошенным»: прежний владелец умер посреди работы
+    /// (лобби Dispatch относится к этому одинаково -- сервер сам заметит
+    /// смерть по handle процесса; флаг нужен тестам).
+    #[cfg_attr(not(test), expect(dead_code, reason = "читается только тестами"))]
+    abandoned: bool,
+    /// Не `Send`: освобождать обязан поток-владелец.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl NamedMutex {
+    /// Создать мьютекс `name` или открыть существующий. Имя, занятое объектом
+    /// другого типа, -- ошибка (`STATUS_OBJECT_TYPE_MISMATCH`).
+    pub fn open_or_create(name: &str) -> Result<Self> {
+        let mut nt_name = NtName::new(name)?;
+        let mut sd = NullDaclSecurityDescriptor::new();
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
+            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            sd.as_ptr(),
+        );
+        let mut handle: HANDLE = null_mut();
+        // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
+        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
+        let status = unsafe {
+            NtCreateMutant(
+                &mut handle,
+                MUTANT_ALL_ACCESS,
+                &mut obj_attr,
+                0, // InitialOwner = FALSE
+            )
+        };
+        if status != STATUS_SUCCESS && status != STATUS_OBJECT_NAME_EXISTS {
+            return Err(status_to_error(status, "NtCreateMutant"));
+        }
+        Ok(Self {
+            handle: Handle(handle),
+        })
+    }
+
+    /// Захватить, ожидая не дольше `timeout`. `Ok(None)` -- таймаут.
+    pub fn lock(&self, timeout: Option<Duration>) -> Result<Option<NamedMutexGuard<'_>>> {
+        let timeout_value: i64 = timeout.map_or(0, duration_to_nt_timeout);
+        let timeout_ptr = if timeout.is_some() {
+            &raw const timeout_value
+        } else {
+            null()
+        };
+        // SAFETY: дескриптор валиден, пока жив `self`; `timeout_ptr` -- NULL
+        // либо указатель на `timeout_value`, живущий до конца вызова.
+        let status = unsafe { NtWaitForSingleObject(self.handle.raw(), 0, timeout_ptr) };
+        let abandoned = match status {
+            STATUS_SUCCESS => false,
+            STATUS_ABANDONED_WAIT_0 => true,
+            STATUS_TIMEOUT => return Ok(None),
+            _ => return Err(status_to_error(status, "NtWaitForSingleObject(mutant)")),
+        };
+        Ok(Some(NamedMutexGuard {
+            mutex: self,
+            abandoned,
+            _not_send: std::marker::PhantomData,
+        }))
+    }
+}
+
+impl NamedMutexGuard<'_> {
+    /// Прежний владелец умер, не освободив мьютекс.
+    #[cfg(test)]
+    pub const fn was_abandoned(&self) -> bool {
+        self.abandoned
+    }
+}
+
+impl Drop for NamedMutexGuard<'_> {
+    fn drop(&mut self) {
+        let mut previous: i32 = 0;
+        // SAFETY: мьютекс захвачен этим потоком (guard не `Send`), дескриптор
+        // жив, пока жив `NamedMutex`, на который ссылается guard.
+        unsafe {
+            let _ = NtReleaseMutant(self.mutex.handle.raw(), &mut previous);
+        }
     }
 }
 
@@ -532,8 +717,10 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
     // STATUS_TIMEOUT (0x102) проверяем ДО диапазона валидных индексов: это
     // значение >= 0 и по чистой случайности совпало бы с индексом 258,
     // если бы handles.len() когда-нибудь превысил этот порог. Сейчас это
-    // не достижимо (максимум 62 хендла из-за MAX_MULTI_CLIENTS = 31), но
-    // порядок веток не должен полагаться на этот внешний инвариант.
+    // не достижимо: ядро принимает не больше MAXIMUM_WAIT_OBJECTS = 64
+    // handle (больше -- STATUS_INVALID_PARAMETER), самый большой набор --
+    // worker Multi (3 * SLOTS_PER_WORKER + wake = 64), -- но порядок веток
+    // не должен полагаться на этот внешний инвариант.
     match status {
         STATUS_TIMEOUT => Ok(None),
         s if s >= 0 && (s as usize) < handles.len() => Ok(Some(s as usize)),
@@ -706,6 +893,80 @@ mod tests {
             Err(ShmError::Corrupted) => {}
             other => panic!("секция 4 КБ должна отвергаться, получено: {other:?}"),
         }
+    }
+
+    /// Мьютекс лобби: второй захват ждёт первого; поток-владелец, умерший без
+    /// освобождения, оставляет мьютекс «брошенным» -- его забирают сразу.
+    #[test]
+    fn named_mutex_serializes_and_survives_abandoned_owner() {
+        let name = format!("Local\\XSHM_TEST_MUTEX_{}", std::process::id());
+        let mutex = NamedMutex::open_or_create(&name).unwrap();
+        let guard = mutex.lock(Some(Duration::from_secs(1))).unwrap().unwrap();
+        assert!(!guard.was_abandoned());
+        {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let other = NamedMutex::open_or_create(&name).unwrap();
+                assert!(
+                    other
+                        .lock(Some(Duration::from_millis(50)))
+                        .unwrap()
+                        .is_none(),
+                    "занятый мьютекс захвачен вторым потоком"
+                );
+            })
+            .join()
+            .unwrap();
+        }
+        drop(guard);
+
+        // Владелец-поток завершается, не освободив мьютекс.
+        {
+            std::thread::spawn(move || {
+                let owner = NamedMutex::open_or_create(&name).unwrap();
+                let guard = owner.lock(Some(Duration::from_secs(1))).unwrap().unwrap();
+                std::mem::forget(guard);
+            })
+            .join()
+            .unwrap();
+        }
+        let t0 = std::time::Instant::now();
+        let guard = mutex.lock(Some(Duration::from_secs(5))).unwrap().unwrap();
+        assert!(guard.was_abandoned(), "ожидался брошенный мьютекс");
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Имя мьютекса, занятое объектом другого типа, -- ошибка, а не чужой объект.
+    #[test]
+    fn named_mutex_rejects_other_object_type() {
+        let name = format!("Local\\XSHM_TEST_MUTEX_TYPE_{}", std::process::id());
+        let _event = EventHandle::create(&name).unwrap();
+        match NamedMutex::open_or_create(&name) {
+            Err(ShmError::WindowsError { code, .. }) => {
+                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH as u32);
+            }
+            other => panic!("ожидалась ошибка типа, получено {other:?}"),
+        }
+    }
+
+    /// Маяк (NotificationEvent), подменённый автосбросным событием, --
+    /// ошибка открытия; честное событие-уведомление открывается.
+    #[test]
+    fn notification_open_rejects_synchronization_event() {
+        let name = format!("Local\\XSHM_TEST_BEACON_TYPE_{}", std::process::id());
+        let _squatter = EventHandle::create(&name).unwrap(); // SynchronizationEvent
+        match EventHandle::open_or_create_notification(&name) {
+            Err(ShmError::WindowsError { code, .. }) => {
+                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH as u32);
+            }
+            other => panic!("подмена маяка не отвергнута: {other:?}"),
+        }
+
+        let fair = format!("Local\\XSHM_TEST_BEACON_OK_{}", std::process::id());
+        let first = EventHandle::open_or_create_notification(&fair).unwrap();
+        let second = EventHandle::open_or_create_notification(&fair).unwrap();
+        assert_eq!(second.event_type().unwrap(), NOTIFICATION_EVENT);
+        drop(first);
     }
 
     #[test]
