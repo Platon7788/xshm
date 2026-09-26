@@ -9,6 +9,7 @@ mod naming;
 mod ring;
 mod server;
 mod shared;
+mod thread_hook;
 mod win;
 
 pub mod auto;
@@ -41,6 +42,7 @@ pub use multi::{
 };
 pub use ring::{FreeSpace, WriteOutcome};
 pub use server::SharedServer;
+pub use thread_hook::{set_thread_start_hook, thread_start_hook};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};

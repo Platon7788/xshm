@@ -92,6 +92,13 @@
 > сигналить совместимая реализация, новый объект `<имя>_beacon` и гарантии порядка
 > Dispatch — в [INTEROP.md](INTEROP.md).
 
+- ✅ **Хук старта рабочих потоков** — `xshm::set_thread_start_hook(Some(f))` на потоке:
+  каждый рабочий поток, который библиотека создаст из него (worker-ы Auto/Dispatch/Multi,
+  канал клиента `DispatchServer`, ожидание канала, отложенный `Drop`), первым делом зовёт
+  `f()`; потоки, порождённые рабочими, наследуют хук. xshm-объекты других потоков не
+  затрагиваются. `prof-shm` так делает свои транспортные потоки внутренними для учёта
+  памяти профайлера. Только Rust API: на проводе ничего не меняется.
+
 ## Ранее в v0.8.0
 
 
@@ -659,6 +666,7 @@ xshm/
 │   │   ├── funcs.rs    # Объявления NT-функций (#[link(name = "ntdll")])
 │   │   └── helpers.rs  # UNICODE_STRING, NtName, конвертация путей
 │   ├── win.rs          # Высокоуровневые обёртки (EventHandle, Mapping, is_process_alive)
+│   ├── thread_hook.rs  # Хук старта рабочих потоков (set_thread_start_hook, 0.9)
 │   ├── server.rs       # Endpoint SharedServer
 │   ├── client.rs       # Endpoint SharedClient
 │   ├── ring.rs          # Lock-free SPSC кольцевой буфер

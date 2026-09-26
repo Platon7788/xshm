@@ -394,7 +394,9 @@ impl MultiServer {
             {
                 builder = builder.name(format!("xsm{group}-{base_name}"));
             }
-            let spawned = builder.spawn(move || server_clone.worker_loop(group as usize, range));
+            let spawned = crate::thread_hook::spawn(builder, move || {
+                server_clone.worker_loop(group as usize, range);
+            });
             match spawned {
                 Ok(handle) => server.worker_handles.lock().unwrap().push(handle),
                 Err(e) => {
@@ -1197,12 +1199,13 @@ impl MultiClient {
         {
             builder = builder.name(format!("xsmc-{base_name}"));
         }
-        let handle = builder
-            .spawn(move || client_worker(&name, &handler, &options, &rx, &shared))
-            .map_err(|e| ShmError::WindowsError {
-                code: e.raw_os_error().unwrap_or(-1) as u32,
-                context: "spawn multi client worker",
-            })?;
+        let handle = crate::thread_hook::spawn(builder, move || {
+            client_worker(&name, &handler, &options, &rx, &shared);
+        })
+        .map_err(|e| ShmError::WindowsError {
+            code: e.raw_os_error().unwrap_or(-1) as u32,
+            context: "spawn multi client worker",
+        })?;
 
         Ok(Self {
             cmd_tx: tx,

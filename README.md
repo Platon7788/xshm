@@ -91,6 +91,13 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 > compatible implementation must signal, the new `<name>_beacon` object and the Dispatch
 > ordering guarantees are specified in [INTEROP.md](INTEROP.md) (in Russian).
 
+- ✅ **Worker thread start hook** — `xshm::set_thread_start_hook(Some(f))` on a thread
+  makes every worker thread the library spawns from it (Auto/Dispatch/Multi workers,
+  the per-client channel of a `DispatchServer`, pending-connect and deferred-drop
+  threads) call `f()` first; workers spawned by workers inherit it. Other threads'
+  xshm objects are unaffected. Used by `prof-shm` to mark its transport threads as
+  profiler-internal for memory accounting. Rust-only: nothing changes on the wire.
+
 ## Previously in v0.8.0
 
 - ✅ **Lossless writes** — `try_send_to_client` / `try_send_to_server` / `try_send` / `try_send_to` never overwrite unread data (`Err(QueueFull)` leaves the ring untouched); `free_space()` gives a conservative writer-side estimate; `wait_for_space()` sleeps on the `SPACE` event. Layout-compatible with 0.7.0 (`SHARED_VERSION` unchanged).
@@ -656,6 +663,7 @@ xshm/
 │   │   ├── funcs.rs    # NT function declarations (#[link(name = "ntdll")])
 │   │   └── helpers.rs  # UNICODE_STRING, NtName, path conversion
 │   ├── win.rs          # High-level wrappers (EventHandle, Mapping, is_process_alive)
+│   ├── thread_hook.rs  # Worker thread start hook (set_thread_start_hook, 0.9)
 │   ├── server.rs       # SharedServer endpoint
 │   ├── client.rs       # SharedClient endpoint
 │   ├── ring.rs         # Lock-free SPSC ring buffer

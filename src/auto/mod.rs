@@ -369,20 +369,19 @@ impl AutoServer {
         {
             builder = builder.name(format!("xsa-{name}"));
         }
-        let join = builder
-            .spawn(move || {
-                server_worker(
-                    &mut server,
-                    join_handler,
-                    options,
-                    rx,
-                    &join_wake,
-                    join_stats,
-                    join_running,
-                    join_gauge,
-                );
-            })
-            .map_err(|err| map_spawn_error(err, "spawn server worker"))?;
+        let join = crate::thread_hook::spawn(builder, move || {
+            server_worker(
+                &mut server,
+                join_handler,
+                options,
+                rx,
+                &join_wake,
+                join_stats,
+                join_running,
+                join_gauge,
+            );
+        })
+        .map_err(|err| map_spawn_error(err, "spawn server worker"))?;
         Ok(Self {
             cmd_tx: tx,
             wake,
@@ -814,21 +813,20 @@ impl AutoClient {
         {
             builder = builder.name(format!("xsc-{name}"));
         }
-        let join = builder
-            .spawn(move || {
-                client_worker(
-                    &name_str,
-                    handler_clone,
-                    options,
-                    rx,
-                    &join_wake,
-                    join_stats,
-                    join_running,
-                    join_gauge,
-                    &mode,
-                );
-            })
-            .map_err(|err| map_spawn_error(err, "spawn client worker"))?;
+        let join = crate::thread_hook::spawn(builder, move || {
+            client_worker(
+                &name_str,
+                handler_clone,
+                options,
+                rx,
+                &join_wake,
+                join_stats,
+                join_running,
+                join_gauge,
+                &mode,
+            );
+        })
+        .map_err(|err| map_spawn_error(err, "spawn client worker"))?;
 
         Ok(Self {
             cmd_tx: tx,

@@ -326,12 +326,13 @@ impl DispatchServer {
         {
             builder = builder.name(format!("xsd-{name}"));
         }
-        let handle = builder
-            .spawn(move || server_clone.worker_loop(&name_owned, lobby))
-            .map_err(|e| ShmError::WindowsError {
-                code: e.raw_os_error().unwrap_or(-1) as u32,
-                context: "spawn dispatch worker",
-            })?;
+        let handle = crate::thread_hook::spawn(builder, move || {
+            server_clone.worker_loop(&name_owned, lobby);
+        })
+        .map_err(|e| ShmError::WindowsError {
+            code: e.raw_os_error().unwrap_or(-1) as u32,
+            context: "spawn dispatch worker",
+        })?;
 
         *server.worker_handle.lock().unwrap() = Some(handle);
 
@@ -790,7 +791,7 @@ impl DispatchServer {
         // было готово к следующему клиенту сразу.
         let stop_event = Arc::clone(&self.stop_event);
         let channel_connect_timeout = self.options.channel_connect_timeout;
-        let join_handle = thread::spawn(move || {
+        let join_handle = crate::thread_hook::spawn(thread::Builder::new(), move || {
             let _ = win::wait_any(
                 &[registered.raw_handle(), stop_event.raw_handle()],
                 Some(channel_connect_timeout),
@@ -803,7 +804,8 @@ impl DispatchServer {
                 server.stop();
                 drop(server);
             }
-        });
+        })
+        .expect("failed to spawn thread");
 
         // Регистрируем handle для join'а в stop(); заодно вычищаем уже
         // завершившиеся записи, чтобы вектор не рос неограниченно на
@@ -941,7 +943,8 @@ impl AutoHandler for AutoProxyHandler {
             // Фактический Drop (и его синхронный join) переносим на ОТДЕЛЬНЫЙ
             // поток -- он не является worker-потоком этого AutoServer, поэтому
             // join там безопасен и не self-join'ится.
-            thread::spawn(move || drop(dispatched_client));
+            crate::thread_hook::spawn(thread::Builder::new(), move || drop(dispatched_client))
+                .expect("failed to spawn thread");
             self.handler
                 .on_client_disconnect_reason(self.client_id, reason);
         }
