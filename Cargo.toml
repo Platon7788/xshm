@@ -2,7 +2,7 @@
 name = "xshm"
 version = "0.9.0"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 description = "High-performance cross-process shared memory IPC using direct NT API calls"
 authors = ["Platon"]
 license = "MIT"
@@ -16,7 +16,7 @@ name = "xshm"
 crate-type = ["rlib"]
 
 [dependencies]
-thiserror = "2"
+thiserror = "2.0.21"
 
 # Без внешних зависимостей для NT API!
 # Используем прямую линковку с ntdll.dll через #[link(name = "ntdll")]

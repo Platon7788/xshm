@@ -222,7 +222,7 @@ namespace выбирается по префиксу:
 ## Требования
 
 - Windows 10/11
-- Rust 1.98+ (stable) — edition 2024, `rust-version = "1.98"` в манифесте
+- Rust 1.99+ (stable) — edition 2024, `rust-version = "1.99"` в манифесте
 - Тулчейн MSVC (MinGW-таргеты убраны в 0.7.0 вместе с C ABI)
 - **Права администратора НЕ требуются** — именованные kernel-объекты session-scoped (префикс `Local\` → `\Sessions\<SessionId>\BaseNamedObjects\`). Повышенные права нужны только при явном использовании префикса `Global\`
 

@@ -249,7 +249,7 @@ impl ChannelState {
     fn try_acquire(&self, frame: usize, max_send_queue: usize) -> bool {
         let admitted = self
             .pending_msgs
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 (cur < max_send_queue).then_some(cur + 1)
             })
             .is_ok();
