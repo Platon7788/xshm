@@ -178,6 +178,19 @@ impl<'a> UnreadProbe<'a> {
     }
 }
 
+/// Граница дочитывания кольца ушедшего пира (Multi, 0.10): кадры
+/// читаются, только пока `read_pos` раньше снимка `write_pos`, сделанного в
+/// момент обнаружения ухода, и не больше `left` штук. Всё, что пир дописал
+/// после снимка, не доставляется: враждебный писатель не удержит читателя
+/// в дочитывании.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DrainBound {
+    /// Снимок `write_pos`.
+    pub(crate) until: u32,
+    /// Сколько кадров ещё можно прочитать.
+    pub(crate) left: u32,
+}
+
 /// Штатное отключение пира для `wait_for_space`: событие `DISCONNECT` (одно
 /// на обе стороны, автосброс) и проверка по разделяемой памяти, что пир
 /// действительно ушёл (его состояние handshake уже не `SERVER_READY`) --
@@ -1241,6 +1254,26 @@ impl RingBuffer {
     /// принимает только `is_empty`.
     pub(crate) fn has_unread(&self) -> bool {
         self.unread_probe().has_unread()
+    }
+
+    /// Читатель: граница дочитывания ушедшего пира -- снимок
+    /// опубликованного `write_pos` (Acquire) и лимит сообщений кольца
+    /// (кадров до снимка не бывает больше; запас -- на законное отставание
+    /// счётчика, см. INTEROP «Изменения 0.10» п. 25).
+    pub(crate) fn drain_snapshot(&self) -> DrainBound {
+        DrainBound {
+            until: self.header().write_pos.load(Ordering::Acquire),
+            left: self.max_messages.saturating_add(1),
+        }
+    }
+
+    /// Читатель: лежит ли следующий кадр до границы `bound` (позиции по
+    /// модулю 2^32: `read_pos` строго «раньше» снимка). Пир, сдвинувший
+    /// `read_pos` за снимок (перезапись старейшего, порча), дочитывание
+    /// заканчивает.
+    pub(crate) fn before_bound(&self, bound: &DrainBound) -> bool {
+        let read = self.header().read_pos.load(Ordering::Acquire);
+        bound.left > 0 && bound.until.wrapping_sub(read).cast_signed() > 0
     }
 
     /// Читатель: дождаться данных (`poll_*`). `Ok(true)` -- в кольце есть

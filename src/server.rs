@@ -16,8 +16,8 @@ use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
 use crate::ring::{
-    DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome, deadline_of,
-    spin_until,
+    DisconnectWatch, DrainBound, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome,
+    deadline_of, spin_until,
 };
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
@@ -911,7 +911,18 @@ impl SharedServer {
         self.ring_rx.has_unread()
     }
 
-    /// Multi: проба кольца от клиента для спина worker-а группы.
+    /// Multi: граница дочитывания кольца от ушедшего клиента (снимок
+    /// `write_pos`).
+    pub(crate) fn client_drain_snapshot(&self) -> DrainBound {
+        self.ring_rx.drain_snapshot()
+    }
+
+    /// Multi: следующий кадр от клиента лежит до границы `bound`.
+    pub(crate) fn client_before_bound(&self, bound: &DrainBound) -> bool {
+        self.ring_rx.before_bound(bound)
+    }
+
+    /// Multi: проба кольца от клиента для спина диспетчера.
     pub(crate) const fn client_ring_probe(&self) -> UnreadProbe<'_> {
         self.ring_rx.unread_probe()
     }

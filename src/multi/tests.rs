@@ -5,6 +5,7 @@ struct TestHandler {
     disconnects: AtomicU32,
     messages: AtomicU32,
     last_reason: Mutex<Option<DisconnectReason>>,
+    errors: Mutex<Vec<(Option<u32>, ShmError)>>,
 }
 
 impl TestHandler {
@@ -14,6 +15,7 @@ impl TestHandler {
             disconnects: AtomicU32::new(0),
             messages: AtomicU32::new(0),
             last_reason: Mutex::new(None),
+            errors: Mutex::new(Vec::new()),
         }
     }
 }
@@ -31,6 +33,9 @@ impl MultiHandler for TestHandler {
     }
     fn on_message(&self, _client_id: u32, _data: &[u8]) {
         self.messages.fetch_add(1, Ordering::AcqRel);
+    }
+    fn on_error(&self, client_id: Option<u32>, err: ShmError) {
+        self.errors.lock().unwrap().push((client_id, err));
     }
 }
 
@@ -1360,4 +1365,293 @@ fn stale_completion_is_not_delivered_to_new_session() {
         Some(DisconnectReason::Graceful)
     );
     dispatcher.release_all();
+}
+
+/// Журнал сервера по слотам (тесты враждебного клиента и паники колбэка).
+#[derive(Default)]
+struct SlotJournal {
+    /// Сообщения по слотам 0..4.
+    messages: [AtomicU32; 4],
+    disconnects: Mutex<Vec<(u32, DisconnectReason, Instant)>>,
+    errors: Mutex<Vec<(Option<u32>, ShmError)>>,
+    /// Слот, чей `on_message` паникует (`u32::MAX` -- никакой).
+    panic_slot: AtomicU32,
+    /// Слот, чей `on_message` медленный (1 мс; `u32::MAX` -- никакой).
+    slow_slot: AtomicU32,
+}
+
+impl SlotJournal {
+    fn new() -> Self {
+        Self {
+            panic_slot: AtomicU32::new(u32::MAX),
+            slow_slot: AtomicU32::new(u32::MAX),
+            ..Self::default()
+        }
+    }
+
+    fn count(&self, slot: u32) -> u32 {
+        self.messages[slot as usize].load(Ordering::Acquire)
+    }
+
+    fn disconnect_of(&self, slot: u32) -> Option<(DisconnectReason, Instant)> {
+        self.disconnects
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _, _)| *id == slot)
+            .map(|&(_, reason, at)| (reason, at))
+    }
+}
+
+impl MultiHandler for SlotJournal {
+    fn on_client_connect(&self, _client_id: u32) {}
+    fn on_client_disconnect(&self, _client_id: u32) {}
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        self.disconnects
+            .lock()
+            .unwrap()
+            .push((client_id, reason, Instant::now()));
+    }
+    fn on_message(&self, client_id: u32, _data: &[u8]) {
+        assert!(
+            client_id != self.panic_slot.load(Ordering::Acquire),
+            "тестовая паника колбэка"
+        );
+        if client_id == self.slow_slot.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(1));
+        }
+        self.messages[client_id as usize].fetch_add(1, Ordering::AcqRel);
+    }
+    fn on_error(&self, client_id: Option<u32>, err: ShmError) {
+        self.errors.lock().unwrap().push((client_id, err));
+    }
+}
+
+/// Fix round 1, п. 1: враждебный клиент сигналит `DISCONNECT` и продолжает
+/// писать в тесном цикле. Дочитывание ограничено снимком `write_pos` в
+/// момент обнаружения: колбэк отключения приходит за ограниченное время, а
+/// другой слот всё это время обслуживается. До исправления `drain_slot`
+/// читал, пока пачки выбирались целиком, -- писатель, успевающий за
+/// читателем, держал единственный поток-диспетчер вечно.
+#[test]
+fn hostile_disconnect_flood_does_not_stall_dispatcher() {
+    let name = unique("HOSTILE_DRAIN");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(
+        &name,
+        journal.clone(),
+        MultiOptions {
+            max_clients: 4,
+            // Маленький лимит сообщений: дочитывание до снимка -- не больше
+            // 65 кадров по 1 мс.
+            layout: ChannelLayout::symmetric(
+                crate::layout::RingConfig::new(64 << 10).max_messages(64),
+            ),
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start");
+    // Честный клиент -- слот 0.
+    let honest = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "честный клиент",
+        Duration::from_secs(5),
+        || honest.is_connected() && honest.slot_id() == 0,
+    );
+
+    // Враждебный клиент -- слот 1: захват, рукопожатие, 50 сообщений, затем
+    // DISCONNECT и поток записи без остановки. Колбэк слота 1 медленный
+    // (1 мс): поток всегда опережает читателя, и без границы дочитывание
+    // выбирало бы полные пачки вечно.
+    const BEFORE: u32 = 50;
+    let slot_name = format!("{name}_1");
+    assert!(try_claim_slot(None, &slot_name, 0xBAD0_0001).unwrap());
+    let flooding = Arc::new(AtomicBool::new(true));
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let flooder = {
+        let flooding = flooding.clone();
+        thread::spawn(move || {
+            let client = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
+            for _ in 0..BEFORE {
+                client.send_to_server(b"before").unwrap();
+            }
+            go_rx.recv().unwrap();
+            client.events().disconnect.set().unwrap();
+            ready_tx.send(Instant::now()).unwrap();
+            let mut written = 0u64;
+            while flooding.load(Ordering::Acquire) {
+                if client.send_to_server(b"flood-flood-flood").is_ok() {
+                    written += 1;
+                }
+            }
+            written
+        })
+    };
+    wait_for(
+        "сообщения до DISCONNECT",
+        Duration::from_secs(5),
+        || journal.count(1) == BEFORE,
+    );
+    journal.slow_slot.store(1, Ordering::Release);
+    go_tx.send(()).unwrap();
+    let signalled_at = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // Пока идёт поток, честный слот обслуживается.
+    let before = journal.count(0);
+    for i in 0..20u32 {
+        honest.send(&i.to_le_bytes()).unwrap();
+        thread::sleep(Duration::from_millis(10));
+    }
+    wait_for(
+        "честный слот обслуживается во время потока",
+        Duration::from_secs(3),
+        || journal.count(0) >= before + 20,
+    );
+    wait_for(
+        "колбэк отключения враждебного слота",
+        Duration::from_secs(3),
+        || journal.disconnect_of(1).is_some(),
+    );
+    let (reason, at) = journal.disconnect_of(1).unwrap();
+    assert_eq!(reason, DisconnectReason::Graceful);
+    assert!(
+        at.saturating_duration_since(signalled_at) < Duration::from_secs(2),
+        "отключение через {:?}",
+        at.saturating_duration_since(signalled_at)
+    );
+    assert!(flooding.load(Ordering::Acquire), "поток шёл всё это время");
+
+    flooding.store(false, Ordering::Release);
+    let written = flooder.join().unwrap();
+    // После обнаружения -- не больше кадров снимка (лимит кольца 64 + 1),
+    // плюс обычные пачки, прочитанные до разбора DISCONNECT; поток
+    // (`written` -- обычно сотни тысяч кадров) не доставлен.
+    let flood_delivered = journal.count(1) - BEFORE;
+    assert!(
+        flood_delivered < 300 && u64::from(flood_delivered) < written,
+        "доставлено из потока {flood_delivered} из {written}"
+    );
+    drop(honest);
+    server.stop();
+}
+
+/// Fix round 1, п. 2 (решение 26): паника `on_message` слота A
+/// перехвачена -- `on_error(Some(A), WorkerPanicked)`, слот A отключён
+/// локально, слот B обслуживается дальше.
+#[test]
+fn panic_in_callback_is_isolated_to_its_slot() {
+    let name = unique("PANIC_ISOLATED");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(
+        &name,
+        journal.clone(),
+        MultiOptions {
+            max_clients: 4,
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start");
+    let a = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for("клиент A", Duration::from_secs(5), || {
+        a.is_connected()
+    });
+    let b = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for("клиент B", Duration::from_secs(5), || {
+        b.is_connected() && server.client_count() == 2
+    });
+    let (slot_a, slot_b) = (a.slot_id(), b.slot_id());
+    journal.panic_slot.store(slot_a, Ordering::Release);
+
+    a.send(b"boom").unwrap();
+    wait_for("on_error слота A", Duration::from_secs(5), || {
+        !journal.errors.lock().unwrap().is_empty()
+    });
+    assert_eq!(
+        journal.errors.lock().unwrap()[0],
+        (
+            Some(slot_a),
+            ShmError::WorkerPanicked {
+                message: "тестовая паника колбэка"
+            }
+        )
+    );
+    wait_for(
+        "слот A отключён",
+        Duration::from_secs(5),
+        || journal.disconnect_of(slot_a).is_some(),
+    );
+    assert_eq!(
+        journal.disconnect_of(slot_a).unwrap().0,
+        DisconnectReason::Local
+    );
+
+    // Слот B жив.
+    for _ in 0..5 {
+        b.send(b"still-alive").unwrap();
+    }
+    wait_for(
+        "сообщения слота B",
+        Duration::from_secs(5),
+        || journal.count(slot_b) == 5,
+    );
+    assert!(server.is_client_connected(slot_b));
+    drop(a);
+    drop(b);
+    server.stop();
+}
+
+/// Fix round 1, п. 3: отказ привязки (инъекция `fail_arms`) повторяется
+/// через `REARM_BACKOFF`, а не навсегда оставляет слот глухим: после
+/// `disconnect_client` привязка `CONNECT_REQ` свободного слота проваливается
+/// один раз, клиент всё равно переподключается; ошибка сообщена один раз.
+#[test]
+fn failed_rearm_is_retried() {
+    let name = unique("REARM");
+    let handler = Arc::new(TestHandler::new());
+    let server = MultiServer::start(&name, handler.clone(), single_slot(1)).expect("start");
+    let recorder = Arc::new(ClientRecorder::default());
+    let client = MultiClient::connect(
+        &name,
+        recorder.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_millis(50),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1
+    });
+
+    server.core.fail_arms.store(1, Ordering::Release);
+    server.disconnect_client(0).unwrap();
+    wait_for(
+        "переподключение после отказа привязки",
+        Duration::from_secs(5),
+        || recorder.connects.load(Ordering::Acquire) == 2 && server.client_count() == 1,
+    );
+    assert_eq!(server.core.fail_arms.load(Ordering::Acquire), 0);
+    let errors = handler.errors.lock().unwrap().clone();
+    assert_eq!(
+        errors,
+        vec![(Some(0), ShmError::InvalidConfig("тестовый отказ привязки"))]
+    );
+    drop(client);
+    server.stop();
 }

@@ -47,7 +47,7 @@ impl<T: ?Sized> RwLockExt<T> for RwLock<T> {
 }
 
 /// Payload паники -> `ShmError::WorkerPanicked`.
-fn panic_error(payload: &(dyn Any + Send)) -> ShmError {
+pub(crate) fn panic_error(payload: &(dyn Any + Send)) -> ShmError {
     let message = payload
         .downcast_ref::<&'static str>()
         .copied()
