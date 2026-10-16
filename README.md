@@ -249,6 +249,40 @@ process worked with NULL DACL; with the default policy the user gets
 `AccessDenied` when the service creates the objects. Use `ObjectSecurity::Everyone`
 (or a `Descriptor`) on the creating side.
 
+## Private Namespace (0.10)
+
+A DACL keeps other users from *opening* your objects, but in the shared
+`\BaseNamedObjects` anyone can still *see* the names and pre-create them (squat).
+`PrivateNamespace` moves a channel, lobby, Multi slots or beacon into a kernel
+object directory that is found by a **boundary descriptor** — boundary name +
+the process user's SID (+ the Low label for `CurrentUserAllowLowIntegrity`) —
+instead of by name. Only processes of the same user can open or create it; for
+everyone else the objects do not exist (`STATUS_OBJECT_NAME_NOT_FOUND`).
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use xshm::{ChannelConfig, ObjectSecurity, PrivateNamespace, SharedClient, SharedServer};
+
+// Both sides call open_or_create with the same boundary and policy.
+let ns = PrivateNamespace::open_or_create("MyApp", "myapp", &ObjectSecurity::default())?;
+// Names inside are relative: no `Local\` / `Global\` (that is `InvalidConfig`).
+let server = SharedServer::start_with("Chan", &ChannelConfig::default().namespace(Arc::clone(&ns)))?;
+
+// Client process:
+let ns = PrivateNamespace::open_or_create("MyApp", "myapp", &ObjectSecurity::default())?;
+let client = SharedClient::connect_in(&ns, "Chan", Duration::from_secs(2))?;
+// Auto / Multi / Dispatch: `namespace: Some(ns)` in their options (Dispatch
+// channels live in the lobby's namespace); beacon: `Beacon::open_in(&ns, name, &policy)`.
+```
+
+The namespace lives while any process holds a handle to it; xshm never deletes
+it (`NtDeletePrivateNamespace`), so a restarted server and a reconnecting client
+meet in the same one. `alias` is diagnostic only (like Win32 `lpAliasPrefix`).
+Same-user processes still pass the boundary — it is not isolation between
+processes of one account. Cross-user setups (SYSTEM service ↔ user) cannot share
+a namespace (different SIDs); use `Global\` + `ObjectSecurity` there.
+
 ## Requirements
 
 - Windows 10/11
@@ -706,6 +740,7 @@ xshm/
 │   ├── error.rs        # Error types
 │   ├── constants.rs    # Protocol constants
 │   ├── naming.rs       # Kernel object naming
+│   ├── namespace.rs    # PrivateNamespace (boundary descriptor, 0.10)
 │   ├── shared.rs       # SharedView for mapped memory
 │   ├── auto/
 │   │   └── mod.rs      # Auto-mode with background workers

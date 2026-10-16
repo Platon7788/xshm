@@ -252,6 +252,42 @@ let options = DispatchOptions { security: ObjectSecurity::Everyone, ..Default::d
 `AccessDenied`, если объекты создаёт служба. Создающей стороне нужна
 `ObjectSecurity::Everyone` (или свой `Descriptor`).
 
+## Частное пространство имён (0.10)
+
+DACL не даёт другим пользователям *открыть* объекты, но в общем
+`\BaseNamedObjects` любой по-прежнему *видит* имена и может занять их заранее.
+`PrivateNamespace` переносит канал, лобби, слоты Multi или маяк в каталог
+объектов ядра, который ищется не по имени, а по **дескриптору границы** — имя
+границы + SID пользователя процесса (+ метка Low для
+`CurrentUserAllowLowIntegrity`). Открыть или создать его может только процесс
+того же пользователя; для остальных объектов просто нет
+(`STATUS_OBJECT_NAME_NOT_FOUND`).
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+use xshm::{ChannelConfig, ObjectSecurity, PrivateNamespace, SharedClient, SharedServer};
+
+// Обе стороны вызывают open_or_create с одной границей и одной политикой.
+let ns = PrivateNamespace::open_or_create("MyApp", "myapp", &ObjectSecurity::default())?;
+// Имена внутри — относительные: без `Local\` / `Global\` (иначе `InvalidConfig`).
+let server = SharedServer::start_with("Chan", &ChannelConfig::default().namespace(Arc::clone(&ns)))?;
+
+// Процесс клиента:
+let ns = PrivateNamespace::open_or_create("MyApp", "myapp", &ObjectSecurity::default())?;
+let client = SharedClient::connect_in(&ns, "Chan", Duration::from_secs(2))?;
+// Auto / Multi / Dispatch: `namespace: Some(ns)` в их опциях (каналы Dispatch —
+// в пространстве лобби); маяк: `Beacon::open_in(&ns, name, &policy)`.
+```
+
+Пространство живёт, пока хоть один процесс держит его handle; xshm его не
+удаляет (`NtDeletePrivateNamespace`), поэтому перезапущенный сервер и
+переподключающийся клиент встречаются в одном и том же. `alias` — только для
+диагностики (как `lpAliasPrefix` у Win32). Процессы того же пользователя
+границу проходят — это не изоляция внутри одной учётной записи. Между
+пользователями (служба SYSTEM ↔ пользователь) общее пространство невозможно
+(разные SID) — там `Global\` + `ObjectSecurity`.
+
 ## Требования
 
 - Windows 10/11
@@ -710,6 +746,7 @@ xshm/
 │   ├── error.rs        # Типы ошибок
 │   ├── constants.rs    # Константы протокола
 │   ├── naming.rs       # Именование kernel-объектов
+│   ├── namespace.rs    # PrivateNamespace (дескриптор границы, 0.10)
 │   ├── shared.rs       # SharedView для mapped-памяти
 │   ├── auto/
 │   │   └── mod.rs      # Auto-режим с фоновыми worker'ами

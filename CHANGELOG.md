@@ -54,6 +54,26 @@
 - `ShmError::AccessDenied` — `STATUS_ACCESS_DENIED` при открытии/создании
   объекта (раньше `WindowsError { code: 0xC0000022 }`). Маяк по-прежнему
   деградирует до режима без состояния, если в секции состояния отказано.
+- **Частное пространство имён** `PrivateNamespace::open_or_create(boundary,
+  alias, &ObjectSecurity) -> Arc<PrivateNamespace>`: каталог объектов ядра,
+  который ищется по дескриптору границы (имя + SID пользователя процесса, для
+  `CurrentUserAllowLowIntegrity` — + метка Low), а не в общем
+  `\BaseNamedObjects`; создать или открыть его может только тот же
+  пользователь. `NtCreatePrivateNamespace` (`ObjectName = NULL`, дескриптор —
+  политика `security`), при коллизии — `NtOpenPrivateNamespace`; `alias` —
+  только диагностика (как Win32 `lpAliasPrefix`, ядро его не использует).
+  Объекты внутри — относительные имена (`RootDirectory` = handle
+  пространства); имя с `Local\`/`Global\`/`\` — `InvalidConfig`. Включается
+  полями `namespace: Option<Arc<PrivateNamespace>>` в `ChannelConfig`
+  (+ метод `namespace`), `AutoOptions`, `MultiOptions`, `MultiClientOptions`,
+  `DispatchOptions` (лобби, `_lock` и каналы клиентов — в пространстве
+  лобби), `DispatchClientOptions`; `SharedClient::connect_in(&ns, name,
+  timeout)`, `Beacon::open_in(&ns, name, &ObjectSecurity)`,
+  `DispatchClient::lobby_exists_in`. Пространство живёт, пока открыт хоть
+  один handle; `Drop` только закрывает handle — `NtDeletePrivateNamespace` не
+  вызывается (пиры остались бы в удалённом каталоге, а перезапущенный сервер
+  создал бы другое пространство). Без пространства — поведение прежнее.
+  Пир-видимо: `INTEROP.md` §b.4, §h п. 7–8, «Изменения 0.10» п. 23.
 
 ### Изменено (несовместимо)
 
@@ -78,7 +98,12 @@
   литералы этих структур без `..Default::default()` больше не собираются.
   `MultiClient`: слот с отказом в доступе перебор не обрывает, итог без
   захвата — `AccessDenied` (приоритет над `NoFreeSlot` и `NotConnected`),
-  а не вечный `NotConnected` «сервера нет» (INTEROP §i.1).
+  а не вечный `NotConnected` «сервера нет» (INTEROP §i.1); при
+  `AccessDenied` клиент всё равно толкает протухшие захваты
+  (`nudge_stale_claims`, слоты с отказом пропускает): захватчик, заранее
+  создавший `B_N` с запрещающим DACL, не отключает освобождение слота
+  упавшего клиента. Поля `namespace` (частное пространство имён) — так же
+  новые публичные поля этих структур и `MultiClientOptions`.
   `SharedServer::start_with_layout` (не выпущен)
   заменён на `start_with(name, &ChannelConfig)`; `SharedEvents::create` —
   внутренний.
