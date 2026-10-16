@@ -99,40 +99,40 @@ impl SharedEvents {
     pub fn open(base: &str) -> Result<Self> {
         Ok(Self {
             s2c: ChannelEvents {
-                data: EventHandle::open(&event_name(
+                data: EventHandle::open_auto_reset(&event_name(
                     base,
                     Direction::ServerToClient,
                     EVENT_DATA_SUFFIX,
                 ))?,
-                space: EventHandle::open(&event_name(
+                space: EventHandle::open_auto_reset(&event_name(
                     base,
                     Direction::ServerToClient,
                     EVENT_SPACE_SUFFIX,
                 ))?,
             },
             c2s: ChannelEvents {
-                data: EventHandle::open(&event_name(
+                data: EventHandle::open_auto_reset(&event_name(
                     base,
                     Direction::ClientToServer,
                     EVENT_DATA_SUFFIX,
                 ))?,
-                space: EventHandle::open(&event_name(
+                space: EventHandle::open_auto_reset(&event_name(
                     base,
                     Direction::ClientToServer,
                     EVENT_SPACE_SUFFIX,
                 ))?,
             },
-            connect_ack: EventHandle::open(&event_name(
+            connect_ack: EventHandle::open_auto_reset(&event_name(
                 base,
                 Direction::ServerToClient,
                 EVENT_CONNECT_SUFFIX,
             ))?,
-            connect_req: EventHandle::open(&event_name(
+            connect_req: EventHandle::open_auto_reset(&event_name(
                 base,
                 Direction::ClientToServer,
                 EVENT_CONNECT_REQ_SUFFIX,
             ))?,
-            disconnect: EventHandle::open(&event_name(
+            disconnect: EventHandle::open_auto_reset(&event_name(
                 base,
                 Direction::ServerToClient,
                 EVENT_DISCONNECT_SUFFIX,

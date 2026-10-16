@@ -12,8 +12,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{
-    ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
-    DispatchHandler, DispatchOptions, DispatchServer, FreeSpace, MAX_MESSAGE_SIZE, RING_CAPACITY,
+    ClientRegistration, DEFAULT_MAX_MESSAGE_SIZE as MAX_MESSAGE_SIZE,
+    DEFAULT_RING_CAPACITY as RING_CAPACITY, DispatchClient, DispatchClientHandler,
+    DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer, FreeSpace,
     SharedClient, SharedServer, ShmError,
 };
 

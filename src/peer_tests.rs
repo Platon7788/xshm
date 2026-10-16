@@ -1,15 +1,14 @@
 //! Обмен PID в handshake (протокол 0.8+) и совместимость со старыми пирами.
 //!
 //! «Старый» пир моделируется так же, как он выглядит в shared memory:
-//! клиент 0.7/0.8.0 не пишет `reserved[RESERVED_CLIENT_PID_INDEX]`
+//! клиент 0.7/0.8.0 не пишет `ControlBlock::client_pid`
 //! (`connect_impl(.., announce_pid = false)`), сервер 0.7/0.8.0 не пишет
-//! `reserved[RESERVED_SERVER_PID_INDEX]` (обнуляем после `start`).
+//! `ControlBlock::server_pid` (обнуляем после `start`).
 
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use crate::constants::{RESERVED_CLIENT_PID_INDEX, RESERVED_SERVER_PID_INDEX};
 use crate::{SharedClient, SharedServer, ShmError};
 
 fn unique(tag: &str) -> String {
@@ -24,7 +23,10 @@ fn unique(tag: &str) -> String {
 fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServer, SharedClient) {
     let mut server = SharedServer::start(name).unwrap();
     if old_server {
-        server.view().control_block().reserved[RESERVED_SERVER_PID_INDEX]
+        server
+            .view()
+            .control_block()
+            .server_pid
             .store(0, Ordering::Release);
     }
     let server_thread = thread::spawn(move || {
@@ -61,7 +63,11 @@ fn new_peers_exchange_pids() {
     assert_eq!(client.is_peer_alive(), Some(true));
     // PID клиента одноразовый: сервер забрал его swap-ом.
     assert_eq!(
-        server.view().control_block().reserved[RESERVED_CLIENT_PID_INDEX].load(Ordering::Acquire),
+        server
+            .view()
+            .control_block()
+            .client_pid
+            .load(Ordering::Acquire),
         0
     );
     roundtrip(&server, &client);
@@ -111,7 +117,10 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
 
     let name = unique("STALE");
     let mut server = SharedServer::start(&name).unwrap();
-    server.view().control_block().reserved[RESERVED_CLIENT_PID_INDEX]
+    server
+        .view()
+        .control_block()
+        .client_pid
         .store(dead_pid, Ordering::Release);
     let server_thread = thread::spawn(move || {
         server
@@ -137,7 +146,11 @@ fn rollback_clears_announced_pid() {
     let err = SharedClient::connect(&name, Duration::from_millis(50)).unwrap_err();
     assert_eq!(err, ShmError::Timeout);
     assert_eq!(
-        server.view().control_block().reserved[RESERVED_CLIENT_PID_INDEX].load(Ordering::Acquire),
+        server
+            .view()
+            .control_block()
+            .client_pid
+            .load(Ordering::Acquire),
         0
     );
 }

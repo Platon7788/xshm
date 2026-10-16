@@ -3,6 +3,7 @@ pub type Result<T> = std::result::Result<T, ShmError>;
 
 /// Ошибки, которые может возвращать библиотека.
 #[derive(thiserror::Error, Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ShmError {
     /// Запрошенная операция недоступна, так как соединение отсутствует.
     #[error("endpoint is not connected")]
@@ -34,6 +35,15 @@ pub enum ShmError {
     /// Не удалось выполнить handshake между участниками.
     #[error("handshake failed")]
     HandshakeFailed,
+    /// Сегмент другого формата разделяемой памяти (`SHARED_VERSION`):
+    /// пир собран с несовместимой версией xshm.
+    #[error("shared memory format {found:#010x} is not supported (expected {expected:#010x})")]
+    VersionMismatch {
+        /// Версия, найденная в сегменте.
+        found: u32,
+        /// Версия этой сборки.
+        expected: u32,
+    },
     /// Системная ошибка Windows (NTSTATUS или Win32 код).
     #[error("windows error {code:#x} while {context}")]
     WindowsError {

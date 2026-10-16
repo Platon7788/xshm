@@ -1,12 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crate::constants::{
-    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, RESERVED_CLIENT_PID_INDEX,
-    RESERVED_SERVER_PID_INDEX, SHARED_MAGIC, SHARED_VERSION,
-};
+use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
+use crate::layout::ChannelLayout;
 use crate::naming::mapping_name;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
 use crate::server::poll_with_peer;
@@ -21,8 +19,8 @@ use crate::win::{Mapping, ProcessWatch, wait_any};
 /// (его снял CAS в `withdraw_hello`) -- трогаем только PID и заголовки.
 fn rollback_handshake(view: &SharedView) {
     // Заявленный PID отзываем вместе с HELLO: иначе клиент старой версии,
-    // пришедший следом, унаследовал бы наш PID (см. RESERVED_CLIENT_PID_INDEX).
-    view.control_block().reserved[RESERVED_CLIENT_PID_INDEX].store(0, Ordering::Release);
+    // пришедший следом, унаследовал бы наш PID (см. `ControlBlock::client_pid`).
+    view.control_block().client_pid.store(0, Ordering::Release);
     let (header_a, header_b) = view.headers();
     header_a
         .handshake_state
@@ -126,7 +124,6 @@ fn wait_ack(
 
 #[derive(Debug)]
 pub struct SharedClient {
-    _mapping: Mapping,
     view: SharedView,
     events: SharedEvents,
     ring_tx: RingBuffer,
@@ -138,6 +135,8 @@ pub struct SharedClient {
     /// `generation` сессии: сервер публикует новый при каждом рукопожатии,
     /// так что расхождение значит «канал/слот уже у другой сессии».
     generation: u32,
+    /// Последним: view и кольца указывают в эту память.
+    _mapping: Mapping,
 }
 
 // SAFETY: см. `SharedServer` -- владеющий `Mapping` плюс атомарные операции в
@@ -145,8 +144,21 @@ pub struct SharedClient {
 unsafe impl Send for SharedClient {}
 
 impl SharedClient {
+    /// Подключиться к каналу `name`, ожидая ответа сервера не дольше
+    /// `timeout`. Раскладку (размеры колец, лимиты) задаёт сервер -- она
+    /// читается из сегмента (`layout`).
+    ///
+    /// Ошибки открытия: `NotReady` -- сервер ещё инициализирует сегмент,
+    /// `VersionMismatch` -- сервер другого формата памяти, `Corrupted` --
+    /// под именем чужой объект или повреждённая раскладка.
     pub fn connect(name: &str, timeout: Duration) -> Result<Self> {
         Self::connect_impl(name, timeout, true, None)
+    }
+
+    /// Раскладка канала, выбранная сервером.
+    #[must_use]
+    pub const fn layout(&self) -> &ChannelLayout {
+        self.view.layout()
     }
 
     /// Подключение, ожидание которого прерывает `interrupt` (worker-ы
@@ -177,18 +189,11 @@ impl SharedClient {
     ) -> Result<Self> {
         let map_name = mapping_name(name);
         let mapping = Mapping::open(&map_name)?;
-        // SAFETY: `Mapping::open` уже проверил, что отображение не меньше
-        // `shared_mapping_size()`, и держит его живым, пока жив `mapping`.
-        let view = unsafe { SharedView::new(mapping.as_ptr()) };
-
-        // Проверка magic и version для валидации shared memory
+        // SAFETY: отображение длиной `mapping.size()` живёт, пока жив
+        // `mapping`, а он переезжает в возвращаемую структуру вместе с view;
+        // адрес view выровнен на гранулу выделения.
+        let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }?;
         let control = view.control_block();
-        if control.magic != SHARED_MAGIC {
-            return Err(ShmError::Corrupted);
-        }
-        if control.version != SHARED_VERSION {
-            return Err(ShmError::HandshakeFailed);
-        }
 
         let events = SharedEvents::open(name)?;
 
@@ -205,7 +210,8 @@ impl SharedClient {
         // Протокол 0.8+: PID клиента -- ДО CLIENT_HELLO, чтобы Release-публикация
         // client_state сделала его видимым серверу вместе с заявкой.
         if announce_pid {
-            control.reserved[RESERVED_CLIENT_PID_INDEX]
+            control
+                .client_pid
                 .store(std::process::id(), Ordering::Release);
         }
 
@@ -241,9 +247,7 @@ impl SharedClient {
         }
 
         // PID сервера (0 -- сервер старой версии: наблюдения нет, как в 0.7).
-        let peer = ProcessWatch::open_peer(
-            control.reserved[RESERVED_SERVER_PID_INDEX].load(Ordering::Acquire),
-        );
+        let peer = ProcessWatch::open_peer(control.server_pid.load(Ordering::Acquire));
 
         let generation = control.generation.load(Ordering::Acquire);
         header_a.connection_gen.store(generation, Ordering::Release);
@@ -255,15 +259,10 @@ impl SharedClient {
             .handshake_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
 
-        // SAFETY: указатели из `SharedView` -- внутрь живого маппинга, выровнены
-        // по layout'у и не пересекаются; `mapping` переезжает в возвращаемую
-        // структуру, поэтому переживает кольца.
-        let ring_tx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
-        // SAFETY: см. выше (встречное кольцо того же маппинга).
-        let ring_rx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
+        let ring_tx = view.ring_b();
+        let ring_rx = view.ring_a();
 
-        let client = Self {
-            _mapping: mapping,
+        Ok(Self {
             view,
             events,
             ring_tx,
@@ -271,9 +270,8 @@ impl SharedClient {
             connected: true,
             peer,
             generation,
-        };
-
-        Ok(client)
+            _mapping: mapping,
+        })
     }
 
     /// Сессия всё ещё наша: `generation` не сменился (ревизия 2). Сменился
@@ -377,7 +375,7 @@ impl SharedClient {
         let len = self.ring_rx.read_message(buffer)?;
         // SPACE -- когда кольцо опустело ИЛИ писатель-сервер ждёт места и
         // его теперь хватает (см. `SharedServer::receive_from_client`).
-        if self.ring_rx.take_space_waiter() || self.ring_rx.message_count() == 0 {
+        if self.ring_rx.take_space_waiter() || self.ring_rx.is_empty() {
             let _ = self.events.s2c.space.set();
         }
         Ok(len)

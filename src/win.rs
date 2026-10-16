@@ -8,13 +8,14 @@
 // Compile-time проверка архитектуры
 #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
 compile_error!("xShm поддерживает только x86 и x86_64 архитектуры!");
+#[cfg(not(windows))]
+compile_error!("xShm поддерживает только Windows (прямые вызовы NT API)!");
 
 use core::ffi::c_void;
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use crate::error::{Result, ShmError};
-use crate::layout::shared_mapping_size;
 use crate::ntapi::{
     // Types
     CLIENT_ID,
@@ -299,6 +300,19 @@ impl EventHandle {
         })
     }
 
+    /// Открытие чужого события канала с проверкой типа: все события канала
+    /// -- автосбросные (`SYNCHRONIZATION_EVENT`). Событие с ручным сбросом,
+    /// заранее созданное под тем же именем чужим процессом (NULL DACL,
+    /// общий namespace), не гасилось бы ожиданием и гоняло бы worker на
+    /// 100% CPU -- `Corrupted` (аудит 2026-10-16).
+    pub fn open_auto_reset(name: &str) -> Result<Self> {
+        let event = Self::open(name)?;
+        if event.event_type()? != SYNCHRONIZATION_EVENT {
+            return Err(ShmError::Corrupted);
+        }
+        Ok(event)
+    }
+
     /// Сигнализация через NtSetEvent
     pub fn set(&self) -> Result<()> {
         let mut previous_state: i32 = 0;
@@ -466,9 +480,9 @@ impl Drop for NamedMutexGuard<'_> {
 pub struct Mapping {
     _handle: Handle,
     view: *mut u8,
-    /// Фактический размер отображённого view (из `NtMapViewOfSection`).
-    /// Проверяется против `shared_mapping_size()` при открытии чужой секции --
-    /// см. `Mapping::open`.
+    /// Фактический размер отображённого view (из `NtMapViewOfSection`,
+    /// округлён до страницы). Граница, против которой `SharedView::attach`
+    /// проверяет раскладку чужого сегмента.
     size: usize,
 }
 
@@ -486,8 +500,7 @@ impl Mapping {
     }
 
     /// Внутренний метод создания секции (общая логика для named и anonymous)
-    fn create_internal(object_name: *mut UNICODE_STRING) -> Result<Self> {
-        let size = shared_mapping_size();
+    fn create_internal(object_name: *mut UNICODE_STRING, size: usize) -> Result<Self> {
         let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr = OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, sd.as_ptr());
 
@@ -570,10 +583,10 @@ impl Mapping {
         })
     }
 
-    /// Создание секции через NtCreateSection с NULL DACL
-    pub fn create(name: &str) -> Result<Self> {
+    /// Создание секции размером `size` байт через NtCreateSection с NULL DACL
+    pub fn create(name: &str, size: usize) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        Self::create_internal(nt_name.as_ptr())
+        Self::create_internal(nt_name.as_ptr(), size)
     }
 
     /// Создание anonymous секции без имени (только через handle)
@@ -593,19 +606,29 @@ impl Mapping {
     /// как anonymous (unnamed) объект. Пустой `UNICODE_STRING` (даже с `Length = 0`)
     /// все равно является указателем на структуру, а не NULL, поэтому создаст
     /// именованную секцию (которая, вероятно, завершится ошибкой из-за невалидного имени).
-    pub fn create_anonymous() -> Result<Self> {
-        Self::create_internal(null_mut())
+    pub fn create_anonymous(size: usize) -> Result<Self> {
+        Self::create_internal(null_mut(), size)
     }
 
-    /// Открытие секции через NtOpenSection.
+    /// Открытие чужой секции целиком.
     ///
-    /// Отображённый view ОБЯЗАН быть не меньше `shared_mapping_size()`: имя в
-    /// `\BaseNamedObjects` может занять кто угодно (NULL DACL, namespace общий),
-    /// и секция меньшего размера превратила бы штатный доступ к ring buffer'ам
-    /// в чтение/запись за пределами отображения. Проверка размера -- граница
-    /// доверия к чужой секции наравне с magic/version (аудит 2026-07-28).
+    /// Размер view (= размер секции, округлённый до страницы) -- граница
+    /// доверия: имя в `\BaseNamedObjects` может занять кто угодно (NULL DACL,
+    /// namespace общий), поэтому раскладку, прочитанную из сегмента,
+    /// `SharedView::attach` сверяет именно с ним, прежде чем трогать кольца.
     pub fn open(name: &str) -> Result<Self> {
-        let required = shared_mapping_size();
+        Self::open_view(name, 0)
+    }
+
+    /// Открытие чужой секции с отображением только заголовка сегмента
+    /// (первая страница): перебор слотов Multi не отображает кольца целиком
+    /// ради чтения `ControlBlock`.
+    pub fn open_header(name: &str) -> Result<Self> {
+        Self::open_view(name, crate::constants::SEGMENT_HEADER_SIZE)
+    }
+
+    /// `view_size = 0` -- секция целиком.
+    fn open_view(name: &str, view_size: usize) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
         let mut obj_attr =
             OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
@@ -625,7 +648,7 @@ impl Mapping {
 
         // Map view
         let mut base_address: PVOID = null_mut();
-        let mut view_size: usize = 0;
+        let mut view_size: usize = view_size;
 
         // SAFETY: дескриптор секции валиден (только что открыт); out-параметры --
         // локальные переменные, живущие до конца вызова.
@@ -648,19 +671,16 @@ impl Mapping {
             return Err(status_to_error(status, "NtMapViewOfSection"));
         }
 
-        let mapping = Mapping {
+        Ok(Mapping {
             _handle: handle,
             view: base_address.cast::<u8>(),
             size: view_size,
-        };
+        })
+    }
 
-        // Проверка ПОСЛЕ конструирования Mapping: так view гарантированно
-        // размапится через Drop, даже если секция окажется слишком мала.
-        if mapping.size < required {
-            return Err(ShmError::Corrupted);
-        }
-
-        Ok(mapping)
+    /// Размер отображённого view в байтах.
+    pub const fn size(&self) -> usize {
+        self.size
     }
 
     pub const fn as_ptr(&self) -> *mut u8 {
@@ -861,10 +881,10 @@ mod tests {
     /// Регрессия (аудит 2026-07-28): `Mapping::open` доверял чужой секции и
     /// не сверял её размер. Любой процесс может первым занять имя в
     /// `\BaseNamedObjects` (NULL DACL, общий namespace) и создать секцию
-    /// меньше `shared_mapping_size()` -- дальнейший штатный доступ к ring
+    /// меньше заявленной раскладки -- дальнейший штатный доступ к ring
     /// buffer'ам ушёл бы ЗА пределы отображения.
     #[test]
-    fn open_rejects_undersized_section() {
+    fn attach_rejects_undersized_section() {
         let name = format!("XSHM_TEST_SMALL_SECTION_{}", std::process::id());
 
         let mut nt_name = NtName::new(&name).expect("nt name");
@@ -889,10 +909,47 @@ mod tests {
         assert_eq!(status, STATUS_SUCCESS, "не удалось создать тестовую секцию");
         let _owner = Handle(handle); // держим секцию живой + RAII-закрытие
 
-        match Mapping::open(&name) {
+        // Формат 0x0002_0000: размер проверяется против раскладки,
+        // записанной в самом сегменте. Враждебная секция 4 КБ, которая
+        // выдаёт себя за опубликованный сегмент на 4 МБ, -- отказ.
+        let mapping = Mapping::open(&name).expect("open");
+        // SAFETY: view не меньше страницы (4 КБ), выровнен; пишем
+        // заголовок, как это сделал бы чужой процесс.
+        let word = |offset: usize| unsafe {
+            &*mapping
+                .as_ptr()
+                .add(offset)
+                .cast::<std::sync::atomic::AtomicU32>()
+        };
+        let relaxed = std::sync::atomic::Ordering::Relaxed;
+        word(4).store(crate::constants::SHARED_VERSION, relaxed);
+        word(64).store(
+            crate::layout::ChannelLayout::DEFAULT.segment_size() as u32,
+            relaxed,
+        );
+        word(0).store(crate::constants::SHARED_MAGIC, relaxed);
+        // SAFETY: отображение живо до конца теста.
+        let attached =
+            unsafe { crate::shared::SharedView::attach(mapping.as_ptr(), mapping.size()) };
+        match attached {
             Err(ShmError::Corrupted) => {}
             other => panic!("секция 4 КБ должна отвергаться, получено: {other:?}"),
         }
+    }
+
+    /// Подменённое событие канала (ручной сброс под именем автосбросного)
+    /// отвергается при открытии, настоящее -- открывается.
+    #[test]
+    fn open_auto_reset_rejects_manual_reset_squatter() {
+        let fake = format!("Local\\XSHM_TEST_SQUAT_{}", std::process::id());
+        let _squatter = EventHandle::open_or_create_notification(&fake).unwrap();
+        assert_eq!(
+            EventHandle::open_auto_reset(&fake).err(),
+            Some(ShmError::Corrupted)
+        );
+        let real = format!("Local\\XSHM_TEST_AUTO_{}", std::process::id());
+        let _owner = EventHandle::create(&real).unwrap();
+        assert!(EventHandle::open_auto_reset(&real).is_ok());
     }
 
     /// Мьютекс лобби: второй захват ждёт первого; поток-владелец, умерший без

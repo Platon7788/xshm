@@ -26,21 +26,43 @@ mod peer_tests;
 pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
 pub use beacon::{Beacon, ProcessExit, Waitable, wait_any};
 pub use client::SharedClient;
-/// Лимиты кольца -- нужны потребителям, которые строят свой протокол поверх
-/// `try_send*`/`free_space` (размер кадра, число слотов).
+/// Лимиты и значения по умолчанию раскладки -- нужны потребителям, которые
+/// строят свой протокол поверх `try_send*`/`free_space` (размер кадра,
+/// число слотов). Фактические параметры канала -- `ChannelLayout`.
 pub use constants::{
-    MAX_MESSAGE_SIZE, MAX_MESSAGES, MESSAGE_HEADER_SIZE, MIN_MESSAGE_SIZE, RING_CAPACITY,
+    DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_MESSAGES, DEFAULT_RING_CAPACITY, FRAME_ALIGN,
+    FRAME_HEADER_SIZE, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE, MIN_RING_CAPACITY, SHARED_VERSION,
 };
 pub use dispatch::{
-    ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
-    DispatchHandler, DispatchOptions, DispatchServer,
+    Admission, ClientRegistration, DEFAULT_LOBBY_LAYOUT, DispatchClient, DispatchClientHandler,
+    DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer,
 };
 pub use error::{DisconnectReason, Result, ShmError};
 pub use events::EventHandles;
+pub use layout::{ChannelLayout, RingConfig, max_payload_for};
+
+/// Ёмкость кольца раскладки по умолчанию (до 0.10 -- единственная).
+#[deprecated(
+    since = "0.10.0",
+    note = "размер кольца настраивается (`ChannelLayout`); значение по умолчанию -- `DEFAULT_RING_CAPACITY`"
+)]
+pub const RING_CAPACITY: usize = DEFAULT_RING_CAPACITY;
+/// Лимит сообщений в кольце раскладки по умолчанию (до 0.10 -- единственный).
+#[deprecated(
+    since = "0.10.0",
+    note = "лимит настраивается по направлениям (`RingConfig::max_messages`); по умолчанию -- `DEFAULT_MAX_MESSAGES`"
+)]
+pub const MAX_MESSAGES: u32 = DEFAULT_MAX_MESSAGES;
+/// Предел payload раскладки по умолчанию (до 0.10 -- жёсткий предел u16).
+#[deprecated(
+    since = "0.10.0",
+    note = "лимит настраивается по направлениям (`RingConfig::max_message_size`, `FreeSpace::max_message_size`); по умолчанию -- `DEFAULT_MAX_MESSAGE_SIZE`"
+)]
+pub const MAX_MESSAGE_SIZE: usize = DEFAULT_MAX_MESSAGE_SIZE;
 pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
-pub use ring::{FreeSpace, WriteOutcome};
+pub use ring::{FreeSpace, WriteOutcome, frame_size};
 pub use server::SharedServer;
 pub use thread_hook::{set_thread_start_hook, thread_start_hook};
 

@@ -1,12 +1,10 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::constants::{
-    HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, RESERVED_CLIENT_PID_INDEX,
-    RESERVED_SERVER_PID_INDEX,
-};
+use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
+use crate::layout::ChannelLayout;
 use crate::naming::mapping_name;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
@@ -14,7 +12,8 @@ use crate::win::{Mapping, ProcessWatch, wait_any};
 
 #[derive(Debug)]
 pub struct SharedServer {
-    _mapping: Mapping,
+    // Порядок полей важен для Drop: кольца и view ссылаются на память
+    // `_mapping`, поэтому он объявлен последним и размапливается последним.
     view: SharedView,
     events: Option<SharedEvents>, // None для anonymous режима
     ring_tx: RingBuffer,
@@ -23,6 +22,7 @@ pub struct SharedServer {
     /// Удерживаемый handle процесса клиента (если клиент 0.8+ передал PID и
     /// процесс удалось открыть) -- для детекции его смерти.
     peer: Option<ProcessWatch>,
+    _mapping: Mapping,
 }
 
 // SAFETY: все поля либо владеющие (`Mapping`), либо синхронизируются через
@@ -30,44 +30,22 @@ pub struct SharedServer {
 unsafe impl Send for SharedServer {}
 
 impl SharedServer {
+    /// Сервер канала `name` с раскладкой по умолчанию (`ChannelLayout::DEFAULT`).
     pub fn start(name: &str) -> Result<Self> {
-        let map_name = mapping_name(name);
-        let mapping = Mapping::create(&map_name)?;
-        // SAFETY: `Mapping` только что создал отображение нужного размера и
-        // держит его живым, пока жив сам (а он переезжает в возвращаемую структуру).
-        let view = unsafe { SharedView::new(mapping.as_ptr()) };
+        Self::start_with_layout(name, ChannelLayout::DEFAULT)
+    }
 
-        // SAFETY: сегмент только что создан этим процессом, клиент к нему ещё не
-        // подключён (его handshake начинается позже), поэтому эксклюзивная ссылка
-        // на control block здесь не алиасится ни другим потоком, ни другим процессом.
-        let control = unsafe { &mut *view.control_block_ptr() };
-        control.reset();
-        // Протокол 0.8+: PID сервера для детекции его смерти клиентом.
-        control.reserved[RESERVED_SERVER_PID_INDEX].store(std::process::id(), Ordering::Release);
-        let generation = control.generation.load(Ordering::Relaxed);
-
-        let (header_a, header_b) = view.headers();
-        header_a.reset(generation);
-        header_b.reset(generation);
-
-        let events = SharedEvents::create(name)?;
-
-        // SAFETY: указатели получены от `SharedView`, т.е. лежат внутри живого
-        // маппинга, выровнены по layout'у и не пересекаются между собой; маппинг
-        // переезжает в возвращаемую структуру и живёт не меньше колец.
-        let ring_tx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
-        // SAFETY: см. выше (второе кольцо, другой диапазон того же маппинга).
-        let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
-
-        Ok(Self {
-            _mapping: mapping,
-            view,
-            events: Some(events),
-            ring_tx,
-            ring_rx,
-            connected: false,
-            peer: None,
-        })
+    /// Сервер канала `name` с заданными параметрами каждого направления.
+    ///
+    /// Клиент подстраивается сам: раскладка записана в сегменте
+    /// (`SharedClient::layout`). `Err(InvalidConfig)` -- `layout` не прошёл
+    /// `ChannelLayout::validate`.
+    pub fn start_with_layout(name: &str, layout: ChannelLayout) -> Result<Self> {
+        layout.validate()?;
+        let mapping = Mapping::create(&mapping_name(name), layout.segment_size())?;
+        let mut server = Self::from_mapping(mapping, layout);
+        server.events = Some(SharedEvents::create(name)?);
+        Ok(server)
     }
 
     /// Создание anonymous сервера без имени (только через handle)
@@ -83,42 +61,43 @@ impl SharedServer {
     /// создаст `UNICODE_STRING` с путем `"\\BaseNamedObjects\\"`, что является
     /// именованной секцией, а не anonymous. Поэтому нужна отдельная функция.
     pub fn start_anonymous() -> Result<Self> {
-        let mapping = Mapping::create_anonymous()?;
-        // SAFETY: `Mapping` только что создал отображение нужного размера и
-        // держит его живым, пока жив сам (а он переезжает в возвращаемую структуру).
-        let view = unsafe { SharedView::new(mapping.as_ptr()) };
+        Self::start_anonymous_with_layout(ChannelLayout::DEFAULT)
+    }
 
-        // SAFETY: сегмент только что создан этим процессом, клиент к нему ещё не
-        // подключён (его handshake начинается позже), поэтому эксклюзивная ссылка
-        // на control block здесь не алиасится ни другим потоком, ни другим процессом.
-        let control = unsafe { &mut *view.control_block_ptr() };
-        control.reset();
-        // Протокол 0.8+: PID сервера для детекции его смерти клиентом.
-        control.reserved[RESERVED_SERVER_PID_INDEX].store(std::process::id(), Ordering::Release);
-        let generation = control.generation.load(Ordering::Relaxed);
+    /// Anonymous-сервер с заданной раскладкой (см. `start_anonymous`).
+    /// Драйвер читает раскладку из `LayoutBlock` сегмента (INTEROP §c).
+    pub fn start_anonymous_with_layout(layout: ChannelLayout) -> Result<Self> {
+        layout.validate()?;
+        let mapping = Mapping::create_anonymous(layout.segment_size())?;
+        Ok(Self::from_mapping(mapping, layout))
+    }
 
-        let (header_a, header_b) = view.headers();
-        header_a.reset(generation);
-        header_b.reset(generation);
-
-        // Events не создаются для anonymous режима - используется polling
-
-        // SAFETY: указатели получены от `SharedView`, т.е. лежат внутри живого
-        // маппинга, выровнены по layout'у и не пересекаются между собой; маппинг
-        // переезжает в возвращаемую структуру и живёт не меньше колец.
-        let ring_tx = unsafe { RingBuffer::new(view.ring_header_a(), view.ring_buffer_a()) };
-        // SAFETY: см. выше (второе кольцо, другой диапазон того же маппинга).
-        let ring_rx = unsafe { RingBuffer::new(view.ring_header_b(), view.ring_buffer_b()) };
-
-        Ok(Self {
-            _mapping: mapping,
+    /// Инициализация свежей секции: сегмент публикуется (`magic`) до
+    /// создания событий -- клиент, открывший секцию раньше событий, получит
+    /// ошибку открытия событий и повторит попытку.
+    fn from_mapping(mapping: Mapping, layout: ChannelLayout) -> Self {
+        // SAFETY: `Mapping` только что создал отображение размером не меньше
+        // `layout.segment_size()` (адрес выровнен на гранулу выделения) и
+        // держит его живым, пока жив сам, а он переезжает в возвращаемую
+        // структуру; layout проверен вызывающим.
+        let view = unsafe { SharedView::initialize(mapping.as_ptr(), layout, std::process::id()) };
+        let ring_tx = view.ring_a();
+        let ring_rx = view.ring_b();
+        Self {
             view,
-            events: None, // No events for anonymous mode
+            events: None,
             ring_tx,
             ring_rx,
             connected: false,
             peer: None,
-        })
+            _mapping: mapping,
+        }
+    }
+
+    /// Раскладка канала (параметры обоих направлений).
+    #[must_use]
+    pub const fn layout(&self) -> &ChannelLayout {
+        self.view.layout()
     }
 
     /// Получить handles событий для передачи в kernel driver
@@ -260,7 +239,7 @@ impl SharedServer {
         // благодаря Acquire-чтению client_state в wait_for_client*). `swap(0)`:
         // значение одноразовое -- клиент старой версии, пришедший следом,
         // не унаследует чужой PID. 0 -- клиент старой версии, наблюдения нет.
-        let client_pid = control.reserved[RESERVED_CLIENT_PID_INDEX].swap(0, Ordering::AcqRel);
+        let client_pid = control.client_pid.swap(0, Ordering::AcqRel);
         let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
 
         let (header_a, header_b) = self.view.headers();
@@ -483,7 +462,7 @@ impl SharedServer {
         // опустело (как раньше) ИЛИ когда писатель оставил заявку и места
         // ему теперь хватает (`try_send`/`wait_for_space` на той стороне).
         if let Some(ref events) = self.events
-            && (self.ring_rx.take_space_waiter() || self.ring_rx.message_count() == 0)
+            && (self.ring_rx.take_space_waiter() || self.ring_rx.is_empty())
         {
             let _ = events.c2s.space.set();
         }
@@ -647,10 +626,7 @@ mod handshake_tests {
         assert_eq!(err, ShmError::Timeout);
         let control = server.view().control_block();
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
-        assert_eq!(
-            control.reserved[RESERVED_CLIENT_PID_INDEX].load(Ordering::Acquire),
-            0
-        );
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
     }
 
     /// Сервер принял клиента и сразу отключил (Drop) до того, как клиент

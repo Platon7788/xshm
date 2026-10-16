@@ -12,7 +12,7 @@
 //! ├─────────────────────────────────────────────────────────────┤
 //! │  Нет lobby. N независимых сегментов-слотов BaseName_0..N-1.  │
 //! │  Клиент пробегает слоты и атомарно захватывает свободный:    │
-//! │    CAS reserved[0]: CLAIM_FREE -> token (на сегменте слота)  │
+//! │    CAS slot_claim: CLAIM_FREE -> token (на сегменте слота)   │
 //! │  Победитель CAS делает обычный handshake SharedClient.       │
 //! ├─────────────────────────────────────────────────────────────┤
 //! │  Slot 0: SharedServer "BaseName_0" ←→ Client A  (claim=tA)  │
@@ -38,18 +38,20 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::auto::{join_unless_self, map_spawn_error};
 use crate::client::{Interrupt, SharedClient};
 use crate::constants::{
-    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, MAX_MESSAGE_SIZE,
-    RESERVED_CLAIM_INDEX, RESERVED_OWNER_PID_INDEX, SHARED_MAGIC, SHARED_VERSION, SLOT_ID_NO_SLOT,
+    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, MAX_RING_CAPACITY,
+    MIN_MESSAGE_SIZE, SLOT_ID_NO_SLOT,
 };
 use crate::error::{DisconnectReason, Result, ShmError};
+use crate::layout::{ChannelLayout, max_payload_for};
 use crate::naming::{Direction, event_name, mapping_name};
 use crate::ring::FreeSpace;
 use crate::server::SharedServer;
@@ -165,6 +167,11 @@ pub struct MultiOptions {
     pub poll_timeout: Option<Duration>,
     /// Количество сообщений для обработки за один цикл
     pub recv_batch: usize,
+    /// Раскладка каждого слота: размер колец и лимиты сообщений по
+    /// направлениям (сервер -> клиент, клиент -> сервер). Каждый слот --
+    /// отдельная секция `layout.segment_size()` байт commit-а, поэтому
+    /// для многих клиентов с короткими сообщениями выгодны маленькие кольца.
+    pub layout: ChannelLayout,
 }
 
 impl Default for MultiOptions {
@@ -173,6 +180,7 @@ impl Default for MultiOptions {
             max_clients: DEFAULT_MAX_CLIENTS,
             poll_timeout: None,
             recv_batch: 32,
+            layout: ChannelLayout::DEFAULT,
         }
     }
 }
@@ -228,7 +236,7 @@ struct ClientSlot {
     session_claim: u32,
     /// Подключён клиент, не передавший PID в handshake (старая версия):
     /// наблюдение за процессом-владельцем claim-а (PID из
-    /// `RESERVED_OWNER_PID_INDEX`) -- тоже handle в наборе ожидания.
+    /// `ControlBlock::slot_owner_pid`) -- тоже handle в наборе ожидания.
     owner_watch: Option<ProcessWatch>,
     /// Подключён без наблюдаемого процесса: момент последней разовой
     /// проверки живости по PID (ограничение частоты, не таймер).
@@ -286,7 +294,11 @@ impl ClientSlot {
     }
 
     fn claim(&self) -> u32 {
-        self.server.view().control_block().reserved[RESERVED_CLAIM_INDEX].load(Ordering::Acquire)
+        self.server
+            .view()
+            .control_block()
+            .slot_claim
+            .load(Ordering::Acquire)
     }
 }
 
@@ -312,28 +324,65 @@ impl Sweep {
 ///
 /// Сервер создаёт N независимых сегментов-слотов `base_name_0..N-1`. Клиент
 /// сам выбирает слот: пробегает слоты и атомарно захватывает первый свободный
-/// через `compare_exchange(CLAIM_FREE -> token)` на `reserved[RESERVED_CLAIM_INDEX]`
+/// через `compare_exchange(CLAIM_FREE -> token)` на `ControlBlock::slot_claim`
 /// сегмента слота, затем выполняет обычный handshake `SharedClient`. Так N
 /// клиентов подключаются ПОЛНОСТЬЮ КОНКУРЕНТНО, захватывая РАЗНЫЕ слоты на
 /// РАЗНОЙ памяти — без общего состояния, без coalescing событий, без коллизий.
+///
+/// Возвращается как `Arc<MultiServer>`; `Drop` последней ручки
+/// останавливает сервер (`stop`). Worker-ы держат только ядро
+/// (`MultiCore`), а не саму ручку, поэтому сервер, который отпустили без
+/// `stop()`, не живёт вечно. Методы ядра доступны через `Deref`.
 pub struct MultiServer {
-    base_name: String,
-    slots: RwLock<Vec<Mutex<ClientSlot>>>,
-    max_clients: u32,
-    running: Arc<AtomicBool>,
-    /// `wake` каждой группы слотов (индекс = номер worker-а): безымянное
-    /// автосбросное событие -- `disconnect_client` (набор ожидания меняется),
-    /// `stop`/Drop.
-    wakes: Vec<EventHandle>,
-    worker_handles: Mutex<Vec<JoinHandle<()>>>,
-    handler: Arc<dyn MultiHandler>,
-    options: MultiOptions,
-    /// Через сколько протухает захват слота без подключения.
-    reserve_timeout: Duration,
-    /// Число пробуждений worker-ов (возвратов из ожидания) -- доказательство
-    /// отсутствия опроса в тестах.
-    wakeups: AtomicU64,
+    core: Arc<MultiCore>,
 }
+
+impl std::ops::Deref for MultiServer {
+    type Target = MultiCore;
+
+    fn deref(&self) -> &MultiCore {
+        &self.core
+    }
+}
+
+impl Drop for MultiServer {
+    fn drop(&mut self) {
+        self.core.stop();
+    }
+}
+
+impl std::fmt::Debug for MultiServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.core, f)
+    }
+}
+
+mod core_type {
+    use super::{Arc, AtomicBool, AtomicU64, ClientSlot, Duration, EventHandle, JoinHandle};
+    use super::{MultiHandler, MultiOptions, Mutex, RwLock};
+
+    /// Состояние сервера, общее для ручки `MultiServer` и worker-ов. Вне
+    /// крейта тип не именуем: его методы доступны через `Deref` ручки.
+    pub struct MultiCore {
+        pub(in crate::multi) base_name: String,
+        pub(in crate::multi) slots: RwLock<Vec<Mutex<ClientSlot>>>,
+        pub(in crate::multi) max_clients: u32,
+        pub(in crate::multi) running: Arc<AtomicBool>,
+        /// `wake` каждой группы слотов (индекс = номер worker-а): безымянное
+        /// автосбросное событие -- `disconnect_client` (набор ожидания
+        /// меняется), `stop`/Drop.
+        pub(in crate::multi) wakes: Vec<EventHandle>,
+        pub(in crate::multi) worker_handles: Mutex<Vec<JoinHandle<()>>>,
+        pub(in crate::multi) handler: Arc<dyn MultiHandler>,
+        pub(in crate::multi) options: MultiOptions,
+        /// Через сколько протухает захват слота без подключения.
+        pub(in crate::multi) reserve_timeout: Duration,
+        /// Число пробуждений worker-ов (возвратов из ожидания) --
+        /// доказательство отсутствия опроса в тестах.
+        pub(in crate::multi) wakeups: AtomicU64,
+    }
+}
+use core_type::MultiCore;
 
 impl MultiServer {
     /// Запуск мультиклиентного сервера
@@ -355,12 +404,14 @@ impl MultiServer {
         if options.max_clients == 0 || options.max_clients > MAX_MULTI_CLIENTS {
             return Err(ShmError::InvalidConfig("max_clients must be in 1..=31"));
         }
+        options.layout.validate()?;
 
         // Создаём N независимых сегментов-слотов. Lobby не нужен — клиенты
         // захватывают слоты сами через атомарный claim (см. doc MultiServer).
         let mut slots = Vec::with_capacity(options.max_clients as usize);
         for slot_id in 0..options.max_clients {
-            let server = SharedServer::start(&format!("{base_name}_{slot_id}"))?;
+            let server =
+                SharedServer::start_with_layout(&format!("{base_name}_{slot_id}"), options.layout)?;
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
 
@@ -369,7 +420,7 @@ impl MultiServer {
             .map(|_| EventHandle::create_unnamed(false))
             .collect::<Result<Vec<_>>>()?;
 
-        let server = Arc::new(Self {
+        let server = Arc::new(MultiCore {
             base_name: base_name.to_owned(),
             slots: RwLock::new(slots),
             max_clients: options.max_clients,
@@ -388,7 +439,10 @@ impl MultiServer {
             let server_clone = server.clone();
             // Имя потока -- только в debug (короткий непрозрачный тег), чтобы в
             // release ни библиотека, ни имя канала не светились в списке потоков.
-            #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+            #[cfg_attr(
+                not(debug_assertions),
+                expect(unused_mut, reason = "имя -- только в debug")
+            )]
             let mut builder = thread::Builder::new();
             #[cfg(debug_assertions)]
             {
@@ -402,17 +456,16 @@ impl MultiServer {
                 Err(e) => {
                     // Уже запущенные worker-ы держат клон Arc -- остановить их.
                     server.stop();
-                    return Err(ShmError::WindowsError {
-                        code: e.raw_os_error().unwrap_or(-1) as u32,
-                        context: "spawn multi worker",
-                    });
+                    return Err(map_spawn_error(e, "spawn multi worker"));
                 }
             }
         }
 
-        Ok(server)
+        Ok(Arc::new(Self { core: server }))
     }
+}
 
+impl MultiCore {
     /// Отправка сообщения конкретному клиенту
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
         let slots = self.slots.read().unwrap();
@@ -475,10 +528,19 @@ impl MultiServer {
 
     /// Принудительное отключение клиента (`on_client_disconnect_reason(Local)`).
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
+        if client_id >= self.max_clients {
+            return Err(ShmError::NotConnected);
+        }
+        self.force_disconnect(client_id, DisconnectReason::Local);
+        Ok(())
+    }
+
+    /// Разорвать подключение слота (если подключён) с причиной `reason`.
+    fn force_disconnect(&self, client_id: u32, reason: DisconnectReason) {
         let slots = self.slots.read().unwrap();
-        let slot_mutex = slots
-            .get(client_id as usize)
-            .ok_or(ShmError::NotConnected)?;
+        let Some(slot_mutex) = slots.get(client_id as usize) else {
+            return;
+        };
         let mut slot = slot_mutex.lock().unwrap();
 
         if slot.connected {
@@ -500,11 +562,8 @@ impl MultiServer {
             drop(slots);
             // Набор ожидания worker-а изменился (слот снова ждёт CONNECT_REQ).
             self.wake_slot(client_id);
-            self.handler
-                .on_client_disconnect_reason(client_id, DisconnectReason::Local);
+            self.handler.on_client_disconnect_reason(client_id, reason);
         }
-
-        Ok(())
     }
 
     /// Получение списка подключённых клиентов
@@ -680,8 +739,11 @@ impl MultiServer {
                 });
                 if due {
                     slot.last_liveness_check = Some(now);
-                    let owner_pid = slot.server.view().control_block().reserved
-                        [RESERVED_OWNER_PID_INDEX]
+                    let owner_pid = slot
+                        .server
+                        .view()
+                        .control_block()
+                        .slot_owner_pid
                         .load(Ordering::Acquire);
                     if !win::is_process_alive(owner_pid) {
                         sweep
@@ -706,7 +768,11 @@ impl MultiServer {
             let due = seen_at + self.reserve_timeout;
             if now >= due {
                 // CAS: если за это время claim сменился, это уже другой захват.
-                let _ = slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+                let _ = slot
+                    .server
+                    .view()
+                    .control_block()
+                    .slot_claim
                     .compare_exchange(claim, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire);
                 slot.claim_seen = None;
             } else {
@@ -760,7 +826,7 @@ impl MultiServer {
         let Some(wake) = self.wakes.get(group) else {
             return;
         };
-        let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+        let mut buffer = Vec::new();
         let mut handles: Vec<isize> = Vec::with_capacity(64);
         let mut sources: Vec<EventSource> = Vec::with_capacity(64);
         // В каком-то кольце осталось больше `recv_batch` сообщений: следующее
@@ -855,7 +921,7 @@ impl MultiServer {
         }
 
         // Handshake -- общий с `SharedServer` (`complete_handshake`): PID
-        // клиента из `reserved[3]` -> удерживаемый handle процесса,
+        // клиента из `ControlBlock::client_pid` -> удерживаемый handle процесса,
         // сброс устаревшего `DISCONNECT`, `S2C_CONNECT`.
         match slot.server.accept_pending() {
             Ok(()) => {
@@ -869,8 +935,11 @@ impl MultiServer {
                 if slot.server.peer_pid().is_none() {
                     // Клиент старой версии не передал PID в handshake, но
                     // PID владельца claim-а он пишет всегда -- наблюдаем его.
-                    let owner_pid = slot.server.view().control_block().reserved
-                        [RESERVED_OWNER_PID_INDEX]
+                    let owner_pid = slot
+                        .server
+                        .view()
+                        .control_block()
+                        .slot_owner_pid
                         .load(Ordering::Acquire);
                     slot.owner_watch = ProcessWatch::open_peer(owner_pid);
                 }
@@ -931,7 +1000,11 @@ impl MultiServer {
                 // клиент мог уже захватить слот, пока мы дочитывали кольцо --
                 // безусловный store отнял бы у него захват. Клиент старой
                 // версии, не снявший claim, освобождается этим CAS.
-                let _ = slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+                let _ = slot
+                    .server
+                    .view()
+                    .control_block()
+                    .slot_claim
                     .compare_exchange(
                         session_claim,
                         CLAIM_FREE,
@@ -965,10 +1038,10 @@ impl MultiServer {
                 return;
             }
             let control = slot.server.view().control_block();
-            let claim = control.reserved[RESERVED_CLAIM_INDEX].load(Ordering::Acquire);
-            let owner = control.reserved[RESERVED_OWNER_PID_INDEX].load(Ordering::Acquire);
+            let claim = control.slot_claim.load(Ordering::Acquire);
+            let owner = control.slot_owner_pid.load(Ordering::Acquire);
             if claim != CLAIM_FREE && slot.watched_pid() == Some(owner) {
-                let _ = control.reserved[RESERVED_CLAIM_INDEX].compare_exchange(
+                let _ = control.slot_claim.compare_exchange(
                     claim,
                     CLAIM_FREE,
                     Ordering::AcqRel,
@@ -1018,7 +1091,7 @@ impl MultiServer {
                 return; // уже обработан (например явным disconnect-событием)
             }
 
-            let claim_field = &slot.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+            let claim_field = &slot.server.view().control_block().slot_claim;
             if claim_field
                 .compare_exchange(
                     expected_claim,
@@ -1073,13 +1146,25 @@ impl MultiServer {
 
         let more = error.is_none() && messages.len() == batch;
 
-        // Отдаём handler-у без lock-а
+        // Отдаём handler-у без lock-а. `stop()` из колбэка: остаток пачки
+        // не доставляем -- после `stop()` колбэков нет.
         for data in &messages {
+            if !self.running.load(Ordering::Acquire) {
+                return false;
+            }
             self.handler.on_message(slot_id, data);
         }
 
         if let Some(err) = error {
+            let corrupted = err == ShmError::Corrupted;
             self.handler.on_error(Some(slot_id), err);
+            if corrupted {
+                // Клиент испортил кольцо: `read_pos` не сдвинется, и без
+                // разрыва слот навсегда остался бы «подключённым», а каждое
+                // `DATA` давало бы новый `on_error`.
+                self.force_disconnect(slot_id, DisconnectReason::Error);
+                return false;
+            }
         }
         more
     }
@@ -1106,7 +1191,7 @@ impl MultiServer {
     }
 }
 
-impl std::fmt::Debug for MultiServer {
+impl std::fmt::Debug for MultiCore {
     /// Ручная реализация: `handler` -- `Arc<dyn MultiHandler>`, у трейта нет
     /// `Debug`. Печатаем то, что реально полезно в логах: имя и заполненность.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1116,12 +1201,6 @@ impl std::fmt::Debug for MultiServer {
             .field("connected", &self.client_count())
             .field("running", &self.running.load(Ordering::Acquire))
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for MultiServer {
-    fn drop(&mut self) {
-        self.stop();
     }
 }
 
@@ -1139,22 +1218,33 @@ enum EventSource {
 // MultiClient — клиент с автоматическим назначением слота
 // ============================================================================
 
-#[derive(Debug)]
-enum ClientCommand {
-    Send(Vec<u8>),
-    Shutdown,
+/// Очередь отправки `MultiClient`, общая для API-потоков и worker-а.
+///
+/// `send` сам соблюдает `max_send_queue` (вытесняя старейшее), поэтому
+/// память ограничена и пока клиент не подключён (раньше mpsc-канал рос без
+/// предела, а лимит применялся только при подключении). `on_overflow`
+/// зовёт worker -- раз на пачку вытесненных.
+#[derive(Debug, Default)]
+struct ClientOutbox {
+    queue: Mutex<VecDeque<Vec<u8>>>,
+    evicted: AtomicU32,
+    /// Лимит размера сообщения кольца клиент -> сервер (`0` -- ещё не
+    /// подключались): длина проверяется в `send` синхронно.
+    max_message: AtomicUsize,
 }
 
 /// Мультиклиент — подключается к базовому имени, получает слот автоматически
 #[derive(Debug)]
 pub struct MultiClient {
-    cmd_tx: Sender<ClientCommand>,
+    outbox: Arc<ClientOutbox>,
+    max_send_queue: usize,
     /// Будит worker: новая команда (`send`/`stop`/Drop). Безымянное,
     /// автосброс.
     wake: Arc<EventHandle>,
     join: Mutex<Option<JoinHandle<()>>>,
     running: Arc<AtomicBool>,
     slot_id: Arc<AtomicU32>,
+    layout: Arc<Mutex<Option<ChannelLayout>>>,
     /// Число пробуждений подключённого worker-а (тесты: ноль в простое).
     #[cfg_attr(
         not(test),
@@ -1179,73 +1269,118 @@ impl MultiClient {
         handler: Arc<dyn MultiClientHandler>,
         options: MultiClientOptions,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel();
+        let outbox = Arc::new(ClientOutbox::default());
         let wake = Arc::new(EventHandle::create_unnamed(false)?);
         let running = Arc::new(AtomicBool::new(true));
         let slot_id = Arc::new(AtomicU32::new(SLOT_ID_NO_SLOT));
+        let layout = Arc::new(Mutex::new(None));
         let wakeups = Arc::new(AtomicU64::new(0));
+        let max_send_queue = options.max_send_queue.max(1);
 
         let shared = ClientShared {
+            outbox: outbox.clone(),
             wake: wake.clone(),
             running: running.clone(),
             slot_id: slot_id.clone(),
+            layout: layout.clone(),
             wakeups: wakeups.clone(),
         };
         let name = base_name.to_owned();
 
-        #[cfg_attr(not(debug_assertions), allow(unused_mut))]
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(unused_mut, reason = "имя -- только в debug")
+        )]
         let mut builder = thread::Builder::new();
         #[cfg(debug_assertions)]
         {
             builder = builder.name(format!("xsmc-{base_name}"));
         }
         let handle = crate::thread_hook::spawn(builder, move || {
-            client_worker(&name, &handler, &options, &rx, &shared);
+            client_worker(&name, &handler, &options, &shared);
         })
-        .map_err(|e| ShmError::WindowsError {
-            code: e.raw_os_error().unwrap_or(-1) as u32,
-            context: "spawn multi client worker",
-        })?;
+        .map_err(|e| map_spawn_error(e, "spawn multi client worker"))?;
 
         Ok(Self {
-            cmd_tx: tx,
+            outbox,
+            max_send_queue,
             wake,
             join: Mutex::new(Some(handle)),
             running,
             slot_id,
+            layout,
             wakeups,
         })
     }
 
-    /// Отправка сообщения серверу
+    /// Отправка сообщения серверу (асинхронно, с перезаписью старейшего в
+    /// кольце). Переполнение очереди (`max_send_queue`) вытесняет самое
+    /// старое неотправленное сообщение (`on_overflow`). Длина проверяется
+    /// синхронно: против лимита кольца слота, когда он известен.
     pub fn send(&self, data: &[u8]) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(ShmError::NotReady);
         }
-        self.cmd_tx
-            .send(ClientCommand::Send(data.to_vec()))
-            .map_err(|_| ShmError::NotReady)?;
-        // Команда уже в канале: worker, проснувшись, её увидит.
+        if data.len() < MIN_MESSAGE_SIZE {
+            return Err(ShmError::MessageTooSmall);
+        }
+        let limit = match self.outbox.max_message.load(Ordering::Acquire) {
+            0 => max_payload_for(MAX_RING_CAPACITY),
+            limit => limit,
+        };
+        if data.len() > limit {
+            return Err(ShmError::MessageTooLarge);
+        }
+        let data = data.to_vec();
+        {
+            let mut queue = self
+                .outbox
+                .queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if queue.len() >= self.max_send_queue {
+                queue.pop_front();
+                self.outbox.evicted.fetch_add(1, Ordering::AcqRel);
+            }
+            queue.push_back(data);
+        }
         let _ = self.wake.set();
         Ok(())
     }
 
     /// Получить назначенный slot_id (SLOT_ID_NO_SLOT если не подключён)
+    #[must_use]
     pub fn slot_id(&self) -> u32 {
         self.slot_id.load(Ordering::Acquire)
     }
 
     /// Проверка подключения
+    #[must_use]
     pub fn is_connected(&self) -> bool {
         self.slot_id.load(Ordering::Acquire) != SLOT_ID_NO_SLOT
     }
 
-    /// Остановка клиента (асинхронно): принятое до вызова дописывается в
-    /// кольцо, worker выходит. Прерывает и паузу между попытками захвата.
+    /// Раскладка слота текущего (или последнего) подключения; `None` --
+    /// ещё ни разу не подключался.
+    #[must_use]
+    pub fn layout(&self) -> Option<ChannelLayout> {
+        *self.layout.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Остановка клиента синхронно: принятое до вызова дописывается в
+    /// кольцо, worker выходит и джойнится -- после возврата колбэков нет.
+    /// Из собственного колбэка -- без ожидания себя.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
-        let _ = self.cmd_tx.send(ClientCommand::Shutdown);
         let _ = self.wake.set();
+        let handle = self
+            .join
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(handle) = handle {
+            join_unless_self(handle);
+        }
     }
 
     /// Число пробуждений подключённого worker-а.
@@ -1258,21 +1393,16 @@ impl MultiClient {
 impl Drop for MultiClient {
     fn drop(&mut self) {
         self.stop();
-        if let Some(handle) = self.join.lock().unwrap().take() {
-            // Drop из собственного колбэка (worker-поток) -- не self-join:
-            // поток уже видит `running == false` и выйдет сам.
-            if handle.thread().id() != thread::current().id() {
-                let _ = handle.join();
-            }
-        }
     }
 }
 
 /// Состояние, общее для `MultiClient` и его worker-а.
 struct ClientShared {
+    outbox: Arc<ClientOutbox>,
     wake: Arc<EventHandle>,
     running: Arc<AtomicBool>,
     slot_id: Arc<AtomicU32>,
+    layout: Arc<Mutex<Option<ChannelLayout>>>,
     wakeups: Arc<AtomicU64>,
 }
 
@@ -1285,68 +1415,65 @@ fn clamp_slot_timeout(requested: Duration) -> Duration {
     requested.min(RESERVE_TIMEOUT.saturating_sub(RESERVE_SAFETY_MARGIN))
 }
 
-/// Кладёт сообщение во внутреннюю send-очередь MultiClient, вытесняя самое
-/// старое при переполнении (`max_send_queue`) вместо неограниченного роста.
-/// Возвращает `true`, если пришлось вытеснить старое сообщение (переполнение).
-fn push_with_cap(queue: &mut VecDeque<Vec<u8>>, data: Vec<u8>, max_send_queue: usize) -> bool {
-    let overflowed = if queue.len() >= max_send_queue {
-        queue.pop_front();
-        true
-    } else {
-        false
-    };
-    queue.push_back(data);
-    overflowed
-}
-
-/// Команды из канала -> очередь отправки; `Shutdown` гасит `running`.
-fn drain_commands(
-    cmd_rx: &Receiver<ClientCommand>,
-    queue: &mut VecDeque<Vec<u8>>,
-    options: &MultiClientOptions,
-    running: &AtomicBool,
-    handler: &Arc<dyn MultiClientHandler>,
-) {
-    while let Ok(cmd) = cmd_rx.try_recv() {
-        match cmd {
-            ClientCommand::Send(data) => {
-                if push_with_cap(queue, data, options.max_send_queue) {
-                    handler.on_overflow(1);
-                }
-            }
-            ClientCommand::Shutdown => running.store(false, Ordering::Release),
-        }
+/// Сообщить о сообщениях, вытесненных отправителями из очереди.
+fn report_evicted(outbox: &ClientOutbox, handler: &Arc<dyn MultiClientHandler>) {
+    let evicted = outbox.evicted.swap(0, Ordering::AcqRel);
+    if evicted > 0 {
+        handler.on_overflow(evicted);
     }
 }
 
 /// Очередь -> кольцо. `send_to_server` пишет с перезаписью старейшего и
 /// места не ждёт; сообщение, которое записать нельзя вовсе (длина вне
-/// пределов), выбрасывается с `on_error` -- иначе оно навсегда застряло бы
-/// в голове очереди.
+/// пределов кольца), выбрасывается с `on_error` -- иначе оно навсегда
+/// застряло бы в голове очереди. `false` -- кольцо испорчено сервером
+/// (`Corrupted`), соединение надо разорвать.
 fn flush_queue(
     client: &SharedClient,
-    queue: &mut VecDeque<Vec<u8>>,
+    outbox: &ClientOutbox,
     handler: &Arc<dyn MultiClientHandler>,
-) {
-    while let Some(data) = queue.pop_front() {
+) -> bool {
+    report_evicted(outbox, handler);
+    loop {
+        let next = outbox
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        let Some(data) = next else {
+            return true;
+        };
         if let Err(err) = client.send_to_server(&data) {
+            let corrupted = err == ShmError::Corrupted;
             handler.on_error(err);
+            if corrupted {
+                return false;
+            }
         }
     }
 }
 
-/// Прочитать всё, что есть в кольце сервера.
-fn receive_all(client: &SharedClient, buffer: &mut Vec<u8>, handler: &Arc<dyn MultiClientHandler>) {
-    loop {
+/// Прочитать всё, что есть в кольце сервера. `false` -- кольцо испорчено
+/// (`Corrupted`): соединение надо разорвать, иначе каждое `DATA` давало
+/// бы новую ошибку, а данные не доставлялись бы никогда.
+fn receive_all(
+    client: &SharedClient,
+    buffer: &mut Vec<u8>,
+    handler: &Arc<dyn MultiClientHandler>,
+    running: &AtomicBool,
+) -> bool {
+    while running.load(Ordering::Acquire) {
         match client.receive_from_server(buffer) {
             Ok(len) => handler.on_message(&buffer[..len]),
             Err(ShmError::QueueEmpty) => break,
             Err(err) => {
+                let corrupted = err == ShmError::Corrupted;
                 handler.on_error(err);
-                break;
+                return !corrupted;
             }
         }
     }
+    true
 }
 
 /// Worker для MultiClient
@@ -1354,15 +1481,16 @@ fn client_worker(
     base_name: &str,
     handler: &Arc<dyn MultiClientHandler>,
     options: &MultiClientOptions,
-    cmd_rx: &Receiver<ClientCommand>,
     shared: &ClientShared,
 ) {
-    let mut buffer = Vec::with_capacity(MAX_MESSAGE_SIZE);
+    let mut buffer = Vec::new();
     let running = &*shared.running;
     let wake = &*shared.wake;
+    let outbox = &*shared.outbox;
     let effective_slot_timeout = clamp_slot_timeout(options.slot_timeout);
 
     while running.load(Ordering::Acquire) {
+        report_evicted(outbox, handler);
         // Шаг 1: атомарно захватываем свободный слот (без централизованного lobby).
         let (slot_id, slot_name, token) = match claim_free_slot(base_name) {
             Ok(v) => v,
@@ -1410,6 +1538,11 @@ fn client_worker(
             }
         };
 
+        let layout = *client.layout();
+        outbox
+            .max_message
+            .store(layout.client_to_server.max_message_size, Ordering::Release);
+        *shared.layout.lock().unwrap_or_else(PoisonError::into_inner) = Some(layout);
         shared.slot_id.store(slot_id, Ordering::Release);
         handler.on_connect(slot_id);
 
@@ -1434,17 +1567,19 @@ fn client_worker(
                 (3, None)
             }
         };
-        let mut send_queue: VecDeque<Vec<u8>> = VecDeque::new();
 
         let reason = loop {
-            drain_commands(cmd_rx, &mut send_queue, options, running, handler);
-            flush_queue(&client, &mut send_queue, handler);
+            if !flush_queue(&client, outbox, handler) {
+                break Some(DisconnectReason::Error);
+            }
             if !running.load(Ordering::Acquire) {
                 // Остановка: принятое до `stop()` уже в кольце -- сервер
                 // дочитает его до DISCONNECT (Drop клиента ниже).
                 break None;
             }
-            receive_all(&client, &mut buffer, handler);
+            if !receive_all(&client, &mut buffer, handler, running) {
+                break Some(DisconnectReason::Error);
+            }
 
             let result = win::wait_any(&handles[..count], options.poll_timeout);
             shared.wakeups.fetch_add(1, Ordering::AcqRel);
@@ -1452,11 +1587,11 @@ fn client_worker(
                 Ok(Some(0)) => {
                     // Штатное отключение сервера: его последние сообщения
                     // доставляем ДО колбэка.
-                    receive_all(&client, &mut buffer, handler);
+                    receive_all(&client, &mut buffer, handler, running);
                     break Some(DisconnectReason::Graceful);
                 }
                 Ok(Some(i)) if Some(i) == peer_index => {
-                    receive_all(&client, &mut buffer, handler);
+                    receive_all(&client, &mut buffer, handler, running);
                     break Some(DisconnectReason::PeerDied);
                 }
                 // DATA, wake или страховочный таймаут -- следующий проход.
@@ -1492,8 +1627,14 @@ fn client_worker(
         if let Some(reason) = reason {
             // Сервер ушёл сам: `DISCONNECT` в ответ не сигналим -- поздний
             // сигнал мог бы достаться уже следующему клиенту этого слота.
-            client.mark_disconnected();
-            handler.on_disconnect_reason(reason);
+            // Исключение -- наш разрыв из-за порчи кольца: тогда штатный
+            // уход (Drop клиента ниже) сигналит `DISCONNECT` сам.
+            if reason != DisconnectReason::Error {
+                client.mark_disconnected();
+            }
+            if running.load(Ordering::Acquire) {
+                handler.on_disconnect_reason(reason);
+            }
         }
         drop(client);
         // Слот освободился у нас — снимаем claim (best-effort), чтобы он сразу
@@ -1540,24 +1681,26 @@ fn next_claim_token() -> u32 {
 /// `Ok(true)` — захвачено нами; `Ok(false)` — слот занят/невалиден;
 /// `Err(_)` — слота с таким именем не существует (сегмент не открылся).
 fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
-    // Сервер создаёт секцию под именем mapping_name(slot_name) — открываем так же.
-    let mapping = Mapping::open(&mapping_name(slot_name))?; // Err => слота нет
-    // SAFETY: `Mapping::open` проверил размер отображения и держит его живым на
-    // всё время жизни `mapping` (а значит и `view`).
-    let view = unsafe { SharedView::new(mapping.as_ptr()) };
-    let control = view.control_block();
-    if control.magic != SHARED_MAGIC || control.version != SHARED_VERSION {
-        return Ok(false); // чужой/повреждённый сегмент — пропускаем
-    }
-    let claimed = control.reserved[RESERVED_CLAIM_INDEX]
+    // Сервер создаёт секцию под именем mapping_name(slot_name) — открываем так же,
+    // но отображаем только заголовок: кольца для захвата не нужны.
+    let mapping = Mapping::open_header(&mapping_name(slot_name))?; // Err => слота нет
+    let Some(control) = SharedView::peek_control(&mapping) else {
+        // Не опубликован (сервер ещё инициализирует), другой формат или
+        // чужой объект -- пропускаем.
+        return Ok(false);
+    };
+    let claimed = control
+        .slot_claim
         .compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
     if claimed {
         // Публикуем свой PID для liveness-проверки сервером (см.
-        // RESERVED_OWNER_PID_INDEX) -- пишем СРАЗУ после успешного захвата,
+        // `ControlBlock::slot_owner_pid`) -- пишем СРАЗУ после успешного захвата,
         // Release гарантирует, что сервер, увидевший claim (Acquire), увидит
         // и корректный PID, а не мусор/значение от предыдущего владельца.
-        control.reserved[RESERVED_OWNER_PID_INDEX].store(std::process::id(), Ordering::Release);
+        control
+            .slot_owner_pid
+            .store(std::process::id(), Ordering::Release);
     }
     Ok(claimed)
     // mapping размапится здесь; захваченный claim остаётся в shared memory.
@@ -1565,11 +1708,10 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
 
 /// Снять собственный claim со слота (CAS token -> FREE), если он всё ещё наш.
 fn release_claim(slot_name: &str, token: u32) {
-    if let Ok(mapping) = Mapping::open(&mapping_name(slot_name)) {
-        // SAFETY: `Mapping::open` проверил размер отображения и держит его живым на
-        // всё время жизни `mapping` (а значит и `view`).
-        let view = unsafe { SharedView::new(mapping.as_ptr()) };
-        let _ = view.control_block().reserved[RESERVED_CLAIM_INDEX].compare_exchange(
+    if let Ok(mapping) = Mapping::open_header(&mapping_name(slot_name))
+        && let Some(control) = SharedView::peek_control(&mapping)
+    {
+        let _ = control.slot_claim.compare_exchange(
             token,
             CLAIM_FREE,
             Ordering::AcqRel,
@@ -1588,17 +1730,13 @@ fn release_claim(slot_name: &str, token: u32) {
 fn nudge_stale_claims(base_name: &str) {
     for slot_id in 0..MAX_MULTI_CLIENTS {
         let slot_name = format!("{base_name}_{slot_id}");
-        let Ok(mapping) = Mapping::open(&mapping_name(&slot_name)) else {
+        let Ok(mapping) = Mapping::open_header(&mapping_name(&slot_name)) else {
             break; // слотов больше нет
         };
-        // SAFETY: `Mapping::open` проверил размер отображения и держит его живым на
-        // всё время жизни `mapping` (а значит и `view`).
-        let view = unsafe { SharedView::new(mapping.as_ptr()) };
-        let control = view.control_block();
-        if control.magic != SHARED_MAGIC || control.version != SHARED_VERSION {
+        let Some(control) = SharedView::peek_control(&mapping) else {
             continue;
-        }
-        let claimed = control.reserved[RESERVED_CLAIM_INDEX].load(Ordering::Acquire) != CLAIM_FREE;
+        };
+        let claimed = control.slot_claim.load(Ordering::Acquire) != CLAIM_FREE;
         let accepted = control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
         if claimed
             && !accepted

@@ -103,26 +103,34 @@ fn clamp_slot_timeout_stays_below_reserve_timeout_with_margin() {
     assert_eq!(clamp_slot_timeout(small), small);
 }
 
-/// Регрессия (аудит API 2026-07-10): раньше `MultiClient` не имел
-/// `max_send_queue` вообще -- внутренняя send-очередь росла неограниченно,
-/// если пир завис/тормозит. Теперь при достижении лимита самое старое
-/// сообщение вытесняется (overwrite-семантика, как у `AutoOptions`).
+/// Регрессия (аудит 2026-10-16): лимит `max_send_queue` действовал только
+/// у подключённого клиента -- пока сервера нет, mpsc-канал рос без
+/// предела. Теперь `send` сам вытесняет старейшее (overwrite-семантика,
+/// как у `AutoOptions`) в любом состоянии, а длина проверяется синхронно.
 #[test]
-fn push_with_cap_evicts_oldest_and_reports_overflow() {
-    let mut queue: VecDeque<Vec<u8>> = VecDeque::new();
-
-    assert!(!push_with_cap(&mut queue, b"a".to_vec(), 2));
-    assert!(!push_with_cap(&mut queue, b"b".to_vec(), 2));
-    assert_eq!(queue.len(), 2);
-
-    // Очередь на пределе -- третья вставка вытесняет самую старую ("a").
-    let overflowed = push_with_cap(&mut queue, b"c".to_vec(), 2);
-    assert!(overflowed);
-    assert_eq!(queue.len(), 2);
-    assert_eq!(
-        queue.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
-        [b"b".as_slice(), b"c".as_slice()]
-    );
+fn send_queue_is_bounded_while_disconnected() {
+    let client = MultiClient::connect(
+        &unique("NO_SERVER_QUEUE"),
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions {
+            max_send_queue: 2,
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("connect");
+    for data in [b"a", b"b", b"c"] {
+        client.send(data).unwrap();
+    }
+    let queued: Vec<Vec<u8>> = client
+        .outbox
+        .queue
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect();
+    assert_eq!(queued, [b"b".to_vec(), b"c".to_vec()]);
+    assert_eq!(client.send(b""), Err(ShmError::MessageTooSmall));
 }
 
 /// Регрессия (аудит 2026-07-10): токены захвата не должны предсказуемо
@@ -204,8 +212,8 @@ fn reclaim_detects_connected_slot_with_dead_owner_process() {
         slot0.connected = true;
         slot0.last_liveness_check = None; // форсируем немедленную проверку
         let control = slot0.server.view().control_block();
-        control.reserved[RESERVED_CLAIM_INDEX].store(STALE_TOKEN, Ordering::Release);
-        control.reserved[RESERVED_OWNER_PID_INDEX].store(dead_pid, Ordering::Release);
+        control.slot_claim.store(STALE_TOKEN, Ordering::Release);
+        control.slot_owner_pid.store(dead_pid, Ordering::Release);
     }
 
     // is_process_alive может не сразу увидеть завершение (см. запас в
@@ -246,8 +254,10 @@ fn reclaim_does_not_flag_connected_slot_with_alive_owner_process() {
         slot0.connected = true;
         slot0.last_liveness_check = None;
         let control = slot0.server.view().control_block();
-        control.reserved[RESERVED_CLAIM_INDEX].store(0xABCD_0001, Ordering::Release);
-        control.reserved[RESERVED_OWNER_PID_INDEX].store(std::process::id(), Ordering::Release);
+        control.slot_claim.store(0xABCD_0001, Ordering::Release);
+        control
+            .slot_owner_pid
+            .store(std::process::id(), Ordering::Release);
     }
 
     let sweep = server.reclaim_stale_claims(0..1, Instant::now());
@@ -274,7 +284,11 @@ fn reclaim_detects_orphaned_connected_slot() {
         let slots = server.slots.read().unwrap();
         let mut slot0 = slots[0].lock().unwrap();
         slot0.connected = true;
-        slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+        slot0
+            .server
+            .view()
+            .control_block()
+            .slot_claim
             .store(CLAIM_FREE, Ordering::Release);
     }
 
@@ -302,7 +316,7 @@ fn handle_orphaned_slot_disconnect_does_not_clobber_racing_new_claim() {
         let slots = server.slots.read().unwrap();
         let mut slot0 = slots[0].lock().unwrap();
         slot0.connected = true;
-        let claim_field = &slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX];
+        let claim_field = &slot0.server.view().control_block().slot_claim;
         claim_field.store(CLAIM_FREE, Ordering::Release);
         claim_field
             .compare_exchange(
@@ -342,7 +356,11 @@ fn handle_orphaned_slot_disconnect_disconnects_when_still_free() {
         let slots = server.slots.read().unwrap();
         let mut slot0 = slots[0].lock().unwrap();
         slot0.connected = true;
-        slot0.server.view().control_block().reserved[RESERVED_CLAIM_INDEX]
+        slot0
+            .server
+            .view()
+            .control_block()
+            .slot_claim
             .store(CLAIM_FREE, Ordering::Release);
     }
 
@@ -865,7 +883,7 @@ fn drop_during_slot_handshake_is_prompt() {
         );
         best = best.min(took);
         assert_eq!(
-            control.reserved[RESERVED_CLAIM_INDEX].load(Ordering::Acquire),
+            control.slot_claim.load(Ordering::Acquire),
             CLAIM_FREE,
             "захват не снят"
         );
