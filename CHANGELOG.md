@@ -117,12 +117,22 @@
   каскад паник в `stop()`/`Drop` (паника при раскрутке — `abort`):
   `panic = "abort"` манифеста xshm потребителя не касается.
 - **`ShmError::WorkerPanicked { message }`** (новый вариант): паника
-  worker-потока не теряется в `let _ = handle.join()` — `DispatchServer::stop`
-  и `MultiServer::stop` передают её в `on_error(None, ..)` обработчика на
-  потоке, вызвавшем `stop()`, до возврата. `message` — литерал паники (иначе
-  общий текст; полный текст печатает panic hook). У `AutoServer`/`AutoClient`/
-  `MultiClient` обработчик живёт только в worker-е — там паника по-прежнему
-  только в panic hook.
+  рабочего потока не теряется в `let _ = handle.join()`. Куда сообщается:
+  - `DispatchHandler::on_error(Some(client_id), ..)` — паника worker-а канала
+    клиента (там идут его `on_client_connect`/`on_message`/
+    `on_space_available`/`on_client_disconnect_reason`), когда канал
+    закрывается: в `DispatchServer::stop` (на потоке, вызвавшем `stop()`, до
+    возврата), в `disconnect_client` (на вызвавшем потоке) или в потоке
+    закрытия после отключения клиента (его `stop()` дожидается);
+  - `DispatchHandler::on_error(None, ..)` — паника потока лобби или
+    фонового потока, в `DispatchServer::stop`;
+  - `MultiHandler::on_error(None, ..)` — паника worker-а группы слотов, в
+    `MultiServer::stop` (на вызвавшем потоке, до возврата).
+
+  `message` — литерал паники (иначе общий текст; полный текст печатает
+  panic hook). У самостоятельных `AutoServer`/`AutoClient` и `MultiClient`
+  обработчик живёт только в worker-е — там паника по-прежнему видна только
+  в panic hook.
 - Раскладка разделяемой памяти (INTEROP §c: размеры, выравнивания и все
   смещения `ControlBlock`/`LayoutBlock`/`RingDescriptor`/`RingHeader`)
   проверяется `const`-утверждениями при каждой сборке, в том числе у
@@ -138,8 +148,9 @@
   `win::Handle` с `NtClose` в `Drop` (`OwnedHandle` закрывал бы через
   `CloseHandle` kernel32). `Waitable: AsHandle + Sealed` с
   `#[diagnostic::on_unimplemented]`; `Beacon`/`ProcessExit` реализуют
-  `AsHandle`. `EventHandle` (тип публичных полей `SharedEvents`)
-  реэкспортирован как `xshm::events::EventHandle`.
+  `AsHandle`. Публичный API `EventHandle` не расширялся: тип по-прежнему
+  не именуем снаружи (`#[expect(unnameable_types)]`), его конструкторы
+  остаются внутренними.
 - Разбор протокола лобби (`dispatch::protocol`) — `split_first_chunk` и
   деструктуризация заголовка вместо индексов.
 - Линты: rust — `raw_borrows_via_references`, `trivial_casts`,

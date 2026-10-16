@@ -4,9 +4,7 @@ use crate::constants::{
 };
 use crate::error::Result;
 use crate::naming::{Direction, event_name};
-/// Событие ядра канала: тип публичных полей [`SharedEvents`]/[`ChannelEvents`]
-/// (их отдаёт `SharedServer::events`), поэтому именуем снаружи.
-pub use crate::win::EventHandle;
+use crate::win::EventHandle;
 
 #[derive(Debug)]
 pub struct ChannelEvents {

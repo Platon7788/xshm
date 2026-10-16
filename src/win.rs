@@ -117,10 +117,10 @@ impl AsRawHandle for Handle {
 
 impl AsHandle for Handle {
     fn as_handle(&self) -> BorrowedHandle<'_> {
-        // SAFETY: `Handle` владеет дескриптором и закрывает его только в
-        // `Drop`; заимствование не переживает `&self`, значит дескриптор
-        // открыт всё время жизни `BorrowedHandle`. NULL/INVALID контракт
-        // `borrow_raw` допускает (ожидание на них вернёт ошибку NT).
+        // SAFETY: `Handle` строится только из дескриптора, который вернул
+        // успешный NT-вызов (создание/открытие объекта), владеет им и
+        // закрывает только в `Drop`; заимствование не переживает `&self`,
+        // значит дескриптор открыт всё время жизни `BorrowedHandle`.
         unsafe { BorrowedHandle::borrow_raw(self.0) }
     }
 }
@@ -154,6 +154,10 @@ const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
 // ============================================================================
 
 #[derive(Debug)]
+#[expect(
+    unnameable_types,
+    reason = "тип публичных полей `SharedEvents` (`SharedServer::events`): конструкторы (NULL DACL) не входят в публичный API"
+)]
 pub struct EventHandle {
     handle: Handle,
 }

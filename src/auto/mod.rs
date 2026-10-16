@@ -521,17 +521,22 @@ impl Endpoint {
     /// влезет) и выходит, поток джойнится -- после возврата колбэков нет.
     /// Из собственного колбэка -- без ожидания себя (`join_unless_self`).
     fn stop(&self) {
+        // Паника worker-а здесь сообщать некуда: обработчик живёт только в
+        // контексте worker-а (`Worker::handler`), а держать его ещё и
+        // здесь -- риск цикла `Arc` (прокси Dispatch ссылаются на свои
+        // каналы). Текст паники уже напечатал panic hook потребителя;
+        // паниковать из `stop()`/`Drop` нельзя. Кому итог нужен (Dispatch,
+        // у которого есть свой обработчик), зовёт `stop_joined`.
+        let _panicked = self.stop_joined();
+    }
+
+    /// `stop`, возвращающий итог join-а: `Err(WorkerPanicked)` -- worker
+    /// завершился паникой (колбэк обработчика). Повторный вызов -- `Ok`.
+    fn stop_joined(&self) -> Result<()> {
         self.running.store(false, Ordering::Release);
         let _ = self.wake.set();
         let handle = self.join.lock_clean().take();
-        if let Some(handle) = handle {
-            // Паника worker-а сообщать некуда: обработчик живёт только в
-            // контексте worker-а (`Worker::handler`), а держать его ещё и
-            // здесь -- риск цикла `Arc` (прокси Dispatch ссылаются на свои
-            // каналы). Текст паники уже напечатал panic hook потребителя;
-            // паниковать из `stop()`/`Drop` нельзя.
-            let _panicked = join_unless_self(handle);
-        }
+        handle.map_or(Ok(()), join_unless_self)
     }
 }
 
@@ -757,6 +762,13 @@ impl AutoServer {
     /// возврата колбэков нет. Повторный вызов и `Drop` после него -- no-op.
     pub fn stop(&self) {
         self.endpoint.stop();
+    }
+
+    /// `stop` с итогом join-а worker-а: `Err(WorkerPanicked)` -- worker
+    /// завершился паникой (колбэк обработчика). Dispatch сообщает её в
+    /// `on_error` своего обработчика с id клиента.
+    pub(crate) fn stop_joined(&self) -> Result<()> {
+        self.endpoint.stop_joined()
     }
 
     #[must_use]

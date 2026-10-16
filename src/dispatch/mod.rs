@@ -295,6 +295,18 @@ struct DispatchedClient {
     disconnected: Arc<AtomicBool>,
 }
 
+impl DispatchedClient {
+    /// Остановить канал (join его worker-а) и уничтожить. Паника worker-а
+    /// канала -- а в нём идут колбэки этого клиента (`on_message`,
+    /// `on_client_connect`, ...) -- уходит в `on_error(Some(client_id), ..)`
+    /// на текущем потоке, а не теряется в `Drop` канала.
+    fn close(self, handler: &dyn DispatchHandler, client_id: u32) {
+        if let Err(err) = self.server.stop_joined() {
+            handler.on_error(Some(client_id), err);
+        }
+    }
+}
+
 /// Общая карта клиентов, доступная и серверу, и proxy-обработчикам.
 type ClientMap = Arc<RwLock<HashMap<u32, DispatchedClient>>>;
 
@@ -524,10 +536,9 @@ impl DispatchCore {
         // и не пересылал больше его сообщения.
         client.disconnected.store(true, Ordering::Release);
         if self.on_own_thread() {
-            retire(&self.background, client);
+            retire(&self.background, &self.handler, client_id, client);
         } else {
-            client.server.stop();
-            drop(client);
+            client.close(&*self.handler, client_id);
         }
         self.handler
             .on_client_disconnect_reason(client_id, DisconnectReason::Local);
@@ -756,8 +767,7 @@ impl DispatchCore {
         let drained: Vec<(u32, DispatchedClient)> = self.clients.write_clean().drain().collect();
         for (id, client) in drained {
             client.disconnected.store(true, Ordering::Release);
-            client.server.stop();
-            drop(client);
+            client.close(&*self.handler, id);
             self.handler
                 .on_client_disconnect_reason(id, DisconnectReason::Local);
         }
@@ -1003,20 +1013,32 @@ impl std::fmt::Debug for DispatchCore {
 /// в worker-е (этом же или чужом канале). Поток не создался (исчерпаны
 /// ресурсы) -- закрываем на месте: из собственного worker-а канала join
 /// себя пропускается (`join_unless_self`), worker выйдет после колбэка.
-fn retire(background: &Background, client: DispatchedClient) {
+/// Паника worker-а канала -- в `on_error(Some(client_id), ..)` из потока
+/// закрытия (`DispatchedClient::close`).
+fn retire(
+    background: &Background,
+    handler: &Arc<dyn DispatchHandler>,
+    client_id: u32,
+    client: DispatchedClient,
+) {
     // Канал в `Option`: при ошибке создания потока замыкание (вместе с
     // каналом) возвращается не всегда, поэтому достаём его сами.
     let slot = Arc::new(Mutex::new(Some(client)));
     let for_thread = Arc::clone(&slot);
+    let thread_handler = Arc::clone(handler);
     let spawned = crate::thread_hook::spawn(thread::Builder::new(), move || {
         let taken = for_thread.lock_clean().take();
-        drop(taken);
+        if let Some(client) = taken {
+            client.close(&*thread_handler, client_id);
+        }
     });
     match spawned {
         Ok(handle) => background.lock_clean().push(handle),
         Err(_) => {
             let taken = slot.lock_clean().take();
-            drop(taken);
+            if let Some(client) = taken {
+                client.close(&**handler, client_id);
+            }
         }
     }
 }
@@ -1104,7 +1126,7 @@ impl AutoHandler for AutoProxyHandler {
             });
             match fresh.then(|| clients.remove(&self.client_id)).flatten() {
                 Some(client) => {
-                    retire(&self.background, client);
+                    retire(&self.background, &self.handler, self.client_id, client);
                     true
                 }
                 None => false,
@@ -2310,6 +2332,72 @@ mod tests {
             "потери"
         );
         server.stop();
+    }
+
+    /// Обработчик, паникующий в `on_message`; ошибки -- в журнал.
+    #[derive(Default)]
+    struct PanickyHandler {
+        client: Mutex<Option<u32>>,
+        panicked: AtomicBool,
+        errors: Mutex<Vec<(Option<u32>, ShmError)>>,
+    }
+
+    impl DispatchHandler for PanickyHandler {
+        fn on_client_connect(&self, client_id: u32, _info: &ClientRegistration) {
+            *self.client.lock().unwrap() = Some(client_id);
+        }
+        fn on_client_disconnect(&self, _client_id: u32) {}
+        fn on_message(&self, _client_id: u32, _data: &[u8]) {
+            self.panicked.store(true, Ordering::Release);
+            panic!("on_message упал (ожидаемо в тесте)");
+        }
+        fn on_error(&self, client_id: Option<u32>, err: ShmError) {
+            self.errors.lock().unwrap().push((client_id, err));
+        }
+    }
+
+    /// Паника колбэка клиента (worker его канала) не теряется в `Drop`
+    /// канала: `stop()` сервера сообщает её в `on_error(Some(id), ..)`.
+    #[test]
+    fn channel_worker_panic_reaches_on_error() {
+        let name = format!("TEST_DISPATCH_PANIC_{}", std::process::id());
+        let handler = Arc::new(PanickyHandler::default());
+        let server = DispatchServer::start(&name, handler.clone(), DispatchOptions::default())
+            .expect("server start");
+        let client_handler = Arc::new(EagerClient {
+            slot: Mutex::new(None),
+            up: AtomicBool::new(false),
+        });
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration {
+                pid: std::process::id(),
+                revision: 1,
+                name: "panicky".into(),
+            },
+            client_handler.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+        wait_for("канал клиента", Duration::from_secs(5), || {
+            client_handler.up.load(Ordering::Acquire)
+        });
+        client.try_send(b"boom").expect("try_send");
+        wait_for("паника в on_message", Duration::from_secs(5), || {
+            handler.panicked.load(Ordering::Acquire)
+        });
+        let id = handler.client.lock().unwrap().expect("on_client_connect");
+        server.stop();
+        assert_eq!(
+            *handler.errors.lock().unwrap(),
+            [(
+                Some(id),
+                ShmError::WorkerPanicked {
+                    message: "on_message упал (ожидаемо в тесте)"
+                }
+            )]
+        );
+        client.stop();
     }
 
     /// Остановка будит потоки сервера событием: `stop()` не ждёт ни

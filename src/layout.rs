@@ -399,6 +399,7 @@ pub struct LayoutBlock {
 // `LayoutBlock` -- от его начала, т.е. от байта 64 сегмента).
 const _: () = {
     assert!(size_of::<RingDescriptor>() == 16);
+    assert!(align_of::<RingDescriptor>() == 4);
     assert!(offset_of!(RingDescriptor, offset) == 0);
     assert!(offset_of!(RingDescriptor, capacity) == 4);
     assert!(offset_of!(RingDescriptor, max_messages) == 8);
