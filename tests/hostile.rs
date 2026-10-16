@@ -14,6 +14,11 @@
 //! (`OpenFileMappingW` по имени `Local\<канал>`), как её видел бы другой
 //! процесс. Генератор -- xorshift64* с фиксированным seed; seed и номер
 //! итерации -- в каждом сообщении об ошибке.
+//!
+//! Фаза Multi портит память параллельно с потоками библиотеки (атомарные
+//! записи теста против `copy_nonoverlapping` payload-а): это модель
+//! межпроцессного пира, а для модели памяти Rust -- гонка данных. Miri и
+//! санитайзеры к этому тесту неприменимы.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -692,14 +697,14 @@ fn multi_epoch(rng: &mut Rng, case: &mut Case, iterations: u32) {
     let victim_probe = Arc::new(MultiProbe::default());
     let victim = MultiClient::connect(&name, victim_probe.clone(), client_options()).unwrap();
     wait_for(
-        "жертва подключена",
+        &format!("жертва подключена; {case:?}"),
         Duration::from_secs(10),
         || victim.is_connected(),
     );
     let honest_probe = Arc::new(MultiProbe::default());
     let honest = MultiClient::connect(&name, honest_probe.clone(), client_options()).unwrap();
     wait_for(
-        "честный подключён",
+        &format!("честный подключён; {case:?}"),
         Duration::from_secs(10),
         || honest.is_connected(),
     );
@@ -767,7 +772,7 @@ fn multi_epoch(rng: &mut Rng, case: &mut Case, iterations: u32) {
     let before = probe.messages[honest_slot as usize].load(Ordering::Acquire);
     honest.send(b"liveness").unwrap();
     wait_for(
-        "честный слот обслуживается",
+        &format!("честный слот обслуживается; {case:?}"),
         Duration::from_secs(5),
         || probe.messages[honest_slot as usize].load(Ordering::Acquire) > before,
     );
@@ -865,6 +870,8 @@ struct StormProbe {
     connected: AtomicBool,
     connects: AtomicU32,
     disconnects: AtomicU32,
+    /// Причины отключения: `Graceful`, `PeerDied`, `Local`, `Error`.
+    reasons: [AtomicU32; 4],
     /// Нарушения чередования (on_connect при подключённом и наоборот).
     violations: AtomicU32,
 }
@@ -876,11 +883,18 @@ impl AutoHandler for StormProbe {
         }
         self.connects.fetch_add(1, Ordering::AcqRel);
     }
-    fn on_disconnect_reason(&self, _reason: DisconnectReason) {
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
         if !self.connected.swap(false, Ordering::AcqRel) {
             self.violations.fetch_add(1, Ordering::AcqRel);
         }
         self.disconnects.fetch_add(1, Ordering::AcqRel);
+        let index = match reason {
+            DisconnectReason::Graceful => 0,
+            DisconnectReason::PeerDied => 1,
+            DisconnectReason::Local => 2,
+            _ => 3,
+        };
+        self.reasons[index].fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -965,10 +979,18 @@ fn handshake_storm() {
     }
     let (connects, disconnects) = last;
     let current = u32::from(probe.connected.load(Ordering::Acquire));
+    let reasons = probe.reasons.each_ref().map(|r| r.load(Ordering::Acquire));
     println!(
         "handshake_storm: {storm:?}, клиент: принято {accepted}, таймаутов {timeouts}; \
-         сервер: on_connect {connects}, on_disconnect_reason {disconnects}, сейчас {current}"
+         сервер: on_connect {connects}, on_disconnect_reason {disconnects}, сейчас {current}; \
+         принято клиентами сверх сессий сервера {}; \
+         причины [Graceful, PeerDied, Local, Error] = {reasons:?}",
+        accepted.saturating_sub(connects)
     );
+    // TODO(Task 22): assert_eq!(accepted, connects) -- несколько ждущих
+    // клиентов засчитывают одно рукопожатие по смене `generation`.
+    // TODO(Task 22): assert_eq!(reasons, [disconnects, 0, 0, 0]) -- только
+    // `Graceful` (сейчас двойной писатель C2S может дать `Error`).
     assert_eq!(
         probe.violations.load(Ordering::Acquire),
         0,

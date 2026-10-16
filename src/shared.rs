@@ -393,4 +393,113 @@ mod tests {
         }
         assert!(attach(&m, len).is_ok());
     }
+
+    /// Ревью Task 18, M6: фаззер разбора чужого сегмента. Каждая итерация --
+    /// честный сегмент, в котором 1..4 случайных слова `ControlBlock`/
+    /// `LayoutBlock` (байты 0..128) заменены значениями из классов
+    /// «граница/около верного/мусор» (раз в 8 итераций -- все 128 байт
+    /// случайны), и случайная длина отображения (обычно около
+    /// `segment_size`, иногда 0..=буфер). Ни паники, ни выхода за границы;
+    /// ответ -- только:
+    /// - `NotReady` -- `magic == 0` (сервер не опубликовал сегмент);
+    /// - `VersionMismatch` -- чужой `version`;
+    /// - `Corrupted` -- всё прочее: длина меньше 128, чужая магия, `flags`,
+    ///   раскладка не прошла §c.2 (ёмкость, лимиты, смещения, пересечение,
+    ///   `segment_size` больше отображения).
+    ///
+    /// Принятый сегмент обязан быть самосогласован: раскладка проходит
+    /// `validate`, оба кольца лежат внутри отображения и не пересекаются.
+    /// 20 000 итераций в debug, 100 000 в release.
+    #[test]
+    fn attach_fuzz_never_panics() {
+        const ITERATIONS: u32 = if cfg!(debug_assertions) {
+            20_000
+        } else {
+            100_000
+        };
+        const BUFFER: usize = 16384;
+        let mut state: u64 = 0x5EED_0018_A77A_C401;
+        let mut next = move || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32
+        };
+        let layout = small();
+        let segment = layout.segment_size();
+        let m = mem(BUFFER);
+        // SAFETY: m живёт до конца теста, буфер больше segment_size.
+        let _view = unsafe { SharedView::initialize(m.0, layout, 1, 0, 0) }.unwrap();
+        let words = |m: &Mem| -> Vec<&std::sync::atomic::AtomicU32> {
+            (0..SEGMENT_HEADER_SIZE / 4)
+                .map(|i| {
+                    // SAFETY: байт i * 4 -- внутри первых 128 байт буфера.
+                    let ptr = unsafe { m.0.add(i * 4) };
+                    // SAFETY: адрес выровнен на 4 (буфер -- на 4096), буфер
+                    // жив весь тест; к словам обращаются только атомарно.
+                    unsafe { std::sync::atomic::AtomicU32::from_ptr(ptr.cast()) }
+                })
+                .collect()
+        };
+        let header = words(&m);
+        let pristine: Vec<u32> = header.iter().map(|w| w.load(Ordering::Relaxed)).collect();
+        let (mut accepted, mut kinds) = (0u32, [0u32; 3]);
+        for i in 0..ITERATIONS {
+            for (word, value) in header.iter().zip(&pristine) {
+                word.store(*value, Ordering::Relaxed);
+            }
+            if next() % 8 == 0 {
+                for word in &header {
+                    word.store(next(), Ordering::Relaxed);
+                }
+            } else {
+                for _ in 0..=next() % 4 {
+                    let index = next() as usize % header.len();
+                    let old = pristine[index];
+                    let value = match next() % 10 {
+                        0 => 0,
+                        1 => u32::MAX,
+                        2 => old.wrapping_add(64 * (1 + next() % 8)),
+                        3 => old.wrapping_sub(64 * (1 + next() % 8)),
+                        4 => 1 << (next() % 32),
+                        5 => !63,
+                        6 => old ^ (1 << (next() % 32)),
+                        7 => next() % 20_000,
+                        _ => next(),
+                    };
+                    header[index].store(value, Ordering::Relaxed);
+                }
+            }
+            let len = match next() % 4 {
+                0 => next() as usize % (BUFFER + 1),
+                _ => (segment + next() as usize % 129).saturating_sub(64),
+            };
+            match attach(&m, len) {
+                Ok(view) => {
+                    accepted += 1;
+                    let layout = *view.layout();
+                    assert!(layout.validate().is_ok(), "итерация {i}");
+                    let s2c_end = view.s2c_offset + 64 + layout.server_to_client.capacity;
+                    let c2s_end = view.c2s_offset + 64 + layout.client_to_server.capacity;
+                    assert!(s2c_end <= len && c2s_end <= len, "итерация {i}");
+                    assert!(
+                        s2c_end <= view.c2s_offset || c2s_end <= view.s2c_offset,
+                        "итерация {i}"
+                    );
+                }
+                Err(ShmError::NotReady) => kinds[0] += 1,
+                Err(ShmError::VersionMismatch { .. }) => kinds[1] += 1,
+                Err(ShmError::Corrupted) => kinds[2] += 1,
+                Err(err) => panic!("итерация {i}: недопустимая ошибка {err:?}"),
+            }
+        }
+        println!(
+            "attach_fuzz: {ITERATIONS} итераций, принято {accepted}, [NotReady, VersionMismatch, Corrupted] = {kinds:?}"
+        );
+        // Генератор доходит до каждого исхода, включая принятые сегменты.
+        assert!(
+            accepted > 0 && kinds.iter().all(|&n| n > 0),
+            "{accepted} {kinds:?}"
+        );
+    }
 }
