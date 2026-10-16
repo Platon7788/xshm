@@ -124,7 +124,8 @@ UTF-16. `OBJECT_ATTRIBUTES.Attributes` всегда содержит `OBJ_CASE_I
 | `P S2C_CONNECT` (connect_ack) | | SynchronizationEvent | FALSE | сервер | клиент | сервер (после handshake, только при удачном CAS фиксации — R16); клиент делает `NtResetEvent` до своей заявки (R15, ревизия 2) | клиент |
 | `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`) | сервер |
 | `P S2C_DISCONNECT` | | SynchronizationEvent | FALSE | сервер | клиент | **обе** стороны при штатном закрытии (одно событие на оба направления, несмотря на `S2C` в имени) | обе стороны |
-| **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`src/win.rs:164-193`) | тем же вызовом | сервер: `NtSetEvent` (raise) / `NtResetEvent` (lower); клиент — `lower` в алгоритме §b.3 | клиенты |
+| **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`src/win.rs:164-193`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
+| **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, NULL DACL; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
 | **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, NULL DACL; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс не трогает |
 | Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`src/win.rs:195-223`) | не открывается по имени | свой процесс | свой процесс |
 | Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`src/win.rs:615-652`) | ядро (при завершении процесса) | сторона, открывшая handle |
@@ -171,16 +172,56 @@ timeout)`; `timeout = NULL` — без конца; иначе относител
 - **Нормативный порядок сервера**: `raise` строго **после** того, как лобби
   (секция + события) создано; `lower` **до** остановки/закрытия лобби. Тогда
   «маяк взведён, лобби нет» бывает только после падения сервера.
-- **Нормативный алгоритм клиента** (`src/beacon.rs:17-22`, пример —
-  README «Server discovery», prof-shm `run`):
+- **Состояние маяка (0.10, `<B>_beacon_state`)** — секция 4096 байт (таблица
+  §b.2), поля `u32` LE, только атомарный доступ:
+
+  | Смещение | Поле | Пишет | Смысл |
+  |---|---|---|---|
+  | 0 | `magic` = `0x4E434258` (`'XBCN'`) | первый открывший: CAS `0 → magic` | иное ненулевое значение — порча: состоянию не доверяют, клиент маяк **не** сбрасывает |
+  | 4 | `generation` | сервер: `+1` в каждом `raise` (SeqCst/locked) | точка линеаризации взвода |
+  | 8 | `server_pid` | сервер, до `generation` | PID взводившего; `0` — не публиковалось |
+  | 12 | `server_start_lo` | сервер, до `server_pid` | младшие 32 бита `CreateTime` процесса сервера (как `server_start_*` §c.1) |
+  | 16 | `server_start_hi` | сервер, до `server_pid` | старшие 32 бита; `0:0` — время неизвестно, сверки нет |
+
+  Остальные байты зарезервированы (нули).
+- **`raise` (сервер, 0.10)**: при верном `magic` — записать
+  `server_start_lo`, `server_start_hi`, затем `server_pid` (release), затем
+  `generation += 1` (атомарный инкремент с полным барьером), и только потом
+  `NtSetEvent`. При неверном `magic` публикация пропускается, `NtSetEvent`
+  выполняется. **Клиент `raise`/`lower` именованного маяка НЕ вызывает**
+  (`raise` клиента записал бы его PID как сервера).
+- **`clear_if_stale` (клиент, 0.10)** — вместо прежнего `lower` клиента:
+  1. `magic` неверный (или маяк безымянный) → `false`, маяк не трогать;
+  2. прочитать `g = generation` (первым), затем `server_pid`,
+     `server_start_lo/hi`;
+  3. `server_pid != 0` и процесс сервера **не подтверждённо мёртв** → `false`,
+     маяк не трогать. «Подтверждённо мёртв» (`win::is_process_gone`):
+     `NtOpenProcess` вернул `STATUS_INVALID_CID (0xC000000B)` /
+     `STATUS_INVALID_PARAMETER (0xC000000D)`, либо процесс сигнален, либо
+     время сервера ненулевое и `CreateTime` открытого процесса другое (PID
+     переиспользован). Нет прав / время не узнать — «жив»;
+  4. `NtResetEvent(маяк)`, полный барьер, повторно прочитать `generation`:
+     `!= g` → `NtSetEvent(маяк)` (новый сервер взвёл маяк между шагами 2 и 4);
+  5. вернуть `true`.
+
+  Корректность: новый сервер увеличивает `generation` **до** `NtSetEvent`,
+  клиент перечитывает его **после** `NtResetEvent`, — либо клиент видит
+  новое поколение и возвращает маяк сам, либо `NtSetEvent` сервера идёт после
+  сброса. `server_pid = 0` (никто не публиковал: секция создана заново после
+  ухода всех держателей, или пир её не пишет) — шаг 3 пропускается, поведение
+  как до 0.10 (сброс с перепроверкой поколения).
+- **Нормативный алгоритм клиента** (`src/beacon.rs`, пример — README
+  «Server discovery», prof-shm `run`):
   1. спать в `wait_any([свой_стоп, маяк], None)`;
   2. маяк взведён → попытаться подключиться;
-  3. не удалось и **лобби нет** (`NtOpenSection` не прошёл) → `lower` маяка
-     «за упавший сервер», затем **повторно** проверить лобби: есть → снова
-     `raise` (его ждут и другие клиенты) и подключаться; нет → к шагу 1.
-     Потерянного пробуждения нет: поднявшийся сервер взводит маяк уже после
-     создания лобби, поэтому клиент либо увидит лобби при перепроверке, либо
-     проснётся от нового взвода.
+  3. не удалось и **лобби нет** (`NtOpenSection` не прошёл) →
+     `clear_if_stale`: `true` → перепроверить лобби (есть — сразу к шагу 2,
+     без ожидания маяка; нет — к шагу 1); `false` (сервер жив) — пауза,
+     прерываемая своим стопом, затем к шагу 1.
+     Потерянного пробуждения нет даже при нескольких клиентах (находка 11):
+     до 0.10 клиент делал `lower` + перепроверку лобби + `raise`, и клиент A
+     мог погасить маяк, только что взведённый новым сервером, — клиент B
+     засыпал навсегда.
 - **Поколения маяка в xshm нет.** «Маяк поколения» — понятие протокола
   prof-shm (отдельный маяк с именем `<лобби>.gen.<016x>`), см. его
   `PROTOCOL.md`.
@@ -661,7 +702,7 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 | API | Суть | Аналог в C/C++ |
 |---|---|---|
 | `AutoOptions/DispatchOptions/DispatchClientOptions::poll_timeout: Option<Duration>` (было `Duration`) | `None` — только события | Не нужен (синхронная реализация); если есть фоновые потоки — ждать без таймаута, но выполнять e.2 |
-| `Beacon::{open, unnamed, raise, lower, wait, wait_any, is_raised}` | Маяк сервера | **Желателен** `open/raise/lower/wait/wait_any/is_raised`, если участвуете в обнаружении (обязателен для prof-shm); `unnamed` — желателен |
+| `Beacon::{open, unnamed, raise, lower, clear_if_stale, wait, wait_any, is_raised}` | Маяк сервера (`clear_if_stale` — 0.10, клиент вместо `lower`) | **Желателен** `open/raise/lower/clear_if_stale/wait/wait_any/is_raised`, если участвуете в обнаружении (обязателен для prof-shm); `unnamed` — желателен |
 | `ProcessExit::{open, pid, has_exited}`, трейт `Waitable`, `xshm::wait_any` | Ждать маяки и выход процессов вместе | Желателен |
 | `DispatchClient::lobby_exists(name)` | Лобби есть? (`NtOpenSection` + размер) | Желателен (нужен для алгоритма маяка) |
 | `DispatchClientHandler::on_space_available()`, `DispatchHandler::on_space_available(id)` | Проброс `SPACE` | Желателен, если у вас есть колбэки |
@@ -716,10 +757,15 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    client_is_connected_false_after_server_disconnect, stop_synchronously_joins_worker}`.
 6. **Маяк**: NotificationEvent `<B>_beacon` с `OBJ_OPENIF` (+ принять
    `STATUS_OBJECT_NAME_EXISTS`), NULL DACL, `InitialState = FALSE`;
-   `raise`/`lower`/`wait`/`wait_any`/`is_raised`; порядок сервера и алгоритм
-   клиента §b.3; `lobby_exists`. Тесты: `beacon::tests::{waiters_wake_together_on_raise_and_lower_resets,
+   `raise`/`lower`/`wait`/`wait_any`/`is_raised`; 0.10 — секция состояния
+   `<B>_beacon_state`, публикация в `raise`, `clear_if_stale` клиента вместо
+   `lower`; порядок сервера и алгоритм клиента §b.3; `lobby_exists`. Тесты:
+   `beacon::tests::{waiters_wake_together_on_raise_and_lower_resets,
    wait_any_reports_which_beacon_fired, client_may_open_before_server,
-   unnamed_beacons_are_private_and_waitable}`; сценарий «маяк упавшего
+   unnamed_beacons_are_private_and_waitable,
+   stale_clear_racing_new_raise_keeps_beacon_raised,
+   clear_if_stale_keeps_live_server, clear_if_stale_lowers_beacon_of_dead_server,
+   corrupted_state_never_lowers_beacon}`; сценарий «маяк упавшего
    сервера» — `prof-shm/tests/live.rs::stale_beacon_is_lowered_and_the_producer_sleeps_until_a_viewer_appears`.
 7. **Ожидание выхода процесса** (`ProcessExit`): удерживаемый handle,
    `SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION`, в том же
@@ -1063,6 +1109,7 @@ R1–R17), §g (фактический прогон).
 | 13 | Личность процесса пира | только PID (`server_pid`/`client_pid`/`slot_owner_pid`): переиспользованный или подделанный PID наблюдался как пир | рядом с каждым PID — время создания процесса (`server_start_*`@36, `client_start_*`@44, `owner_start_*`@52, половины `lo`/`hi`); процесс с тем же PID, но другим `CreateTime` — не пир; `0` — сверки нет. Пир ДОЛЖЕН писать время до соответствующего PID | §c.1 |
 | 14 | `Local\`/без префикса при ошибке `NtQueryInformationProcess(ProcessSessionInformation)` | сессия считалась `0` — объект молча уходил в глобальный `\BaseNamedObjects` (мимо пира из своей сессии, навстречу чужим объектам) | ошибка `WindowsError { context: "NtQueryInformationProcess(session)" }`, объект не создаётся и не открывается | §b.1 |
 | 15 | `C2S_CONNECT_REQ` без `CLIENT_HELLO` (толчок Multi, откатившийся клиент, чужой процесс) у ждущего `SharedServer::wait_for_client`/worker-а Auto/лобби Dispatch | `wait_for_client` возвращал `HandshakeFailed`, worker Auto звал `on_error` | автосбросный сигнал поглощается, ожидание продолжается на остаток таймаута; пиру слать такой сигнал безопасно. Multi (`accept_pending`) — без изменений: claim не трогается | §d.2, §i.3 |
+| 16 | Маяк: клиент, не нашедший лобби при взведённом маяке | `lower` + перепроверка лобби + `raise`: при ≥ 2 клиентах один гасил маяк, только что взведённый новым сервером, — другой спал вечно | новый объект `<B>_beacon_state` (секция `SEC_COMMIT` 4096, `OBJ_OPENIF`, `magic`@0 = `0x4E434258`, `generation`@4, `server_pid`@8, `server_start_lo/hi`@12/16); сервер в `raise` пишет время, PID, `generation += 1`, затем `NtSetEvent`; клиент — `clear_if_stale`: процесс сервера не подтверждённо мёртв — маяк не трогать, иначе `NtResetEvent` и перепроверка `generation` (изменилось — `NtSetEvent` обратно). Клиент `raise`/`lower` не вызывает | §b.2, §b.3 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации

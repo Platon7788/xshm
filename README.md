@@ -576,21 +576,23 @@ use xshm::{Beacon, DispatchClient};
 // Client: sleep until a server appears or we are asked to stop.
 let lobby = Beacon::open("MyService")?;
 let stop = Beacon::unnamed()?; // raised by our own shutdown path
+let mut retry_now = false;
 loop {
-    match Beacon::wait_any(&[&stop, &lobby], None)? {
-        Some(1) => {}
-        _ => break, // stop
+    if !retry_now && Beacon::wait_any(&[&stop, &lobby], None)? != Some(1) {
+        break; // stop
     }
+    retry_now = false;
     match DispatchClient::connect("MyService", registration(), handler(), Default::default()) {
         Ok(client) => { /* work until the channel drops */ }
         Err(_) if !DispatchClient::lobby_exists("MyService") => {
-            // The server crashed with the beacon raised: lower it for it and
-            // re-check — a server that came up meanwhile raised the beacon
-            // after creating its lobby, so either we see the lobby now or the
-            // new raise wakes us.
-            lobby.lower()?;
-            if DispatchClient::lobby_exists("MyService") {
-                lobby.raise()?;
+            // Beacon raised, no lobby: the server may have crashed. Never
+            // `lower()` from a client — `clear_if_stale` resets the beacon only
+            // if the raising server's process is gone, and puts it back if a
+            // new server raised it meanwhile (beacon generation, 0.10).
+            if lobby.clear_if_stale()? {
+                retry_now = DispatchClient::lobby_exists("MyService");
+            } else {
+                /* server process alive: back off (interruptible by `stop`) */
             }
         }
         Err(_) => { /* transient error: back off (interruptible by `stop`) */ }
@@ -599,7 +601,9 @@ loop {
 ```
 
 Server order: create the lobby first (`DispatchServer::start` is synchronous),
-then `raise()`; on shutdown `lower()` first, then stop. `ProcessExit::open(pid)`
+then `raise()`; on shutdown `lower()` first, then stop. Clients never call
+`raise`/`lower` on the named beacon: `raise` publishes the caller as the
+server in `<name>_beacon_state`. `ProcessExit::open(pid)`
 plus `xshm::wait_any` lets a client that was refused by a server sleep until
 that server process exits — still without polling.
 

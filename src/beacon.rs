@@ -15,11 +15,15 @@
 //! бывает только после падения сервера.
 //!
 //! **Сервер упал, не сбросив маяк**: маяк остаётся взведённым. Клиент,
-//! которому при взведённом маяке не удалось подключиться, потому что
-//! сервера нет, сам сбрасывает маяк ([`Beacon::lower`]) и ПОВТОРНО проверяет
-//! сервер: если сервер тем временем поднялся, то взвёл маяк уже после
-//! создания лобби — клиент либо найдёт лобби при повторной проверке, либо
-//! проснётся по новому взводу. Без опроса и без потерянных пробуждений.
+//! которому при взведённом маяке не удалось подключиться, потому что лобби
+//! нет, вызывает [`Beacon::clear_if_stale`] (НЕ [`Beacon::lower`]): рядом с
+//! событием живёт секция состояния `<имя>_beacon_state` с поколением и
+//! личностью (PID + время создания) взводившего сервера. Живой сервер маяк
+//! не теряет; маяк упавшего сбрасывается, а взвод нового сервера,
+//! случившийся между проверкой и сбросом, замечается по сменившемуся
+//! поколению и возвращается. До 0.10 клиент делал `lower` напрямую: при двух
+//! клиентах один гасил маяк, только что взведённый новым сервером, и второй
+//! засыпал навсегда (находка 11).
 //!
 //! Кроме именованного маяка:
 //! - [`Beacon::unnamed`] — безымянное событие того же вида для сигналов
@@ -33,7 +37,9 @@ use std::time::Duration;
 
 use crate::error::Result;
 use crate::naming::has_explicit_namespace;
-use crate::win::{EventHandle, ProcessWatch};
+use std::sync::atomic::{AtomicU32, Ordering, fence};
+
+use crate::win::{EventHandle, Mapping, ProcessWatch, current_process_start_time, is_process_gone};
 
 mod sealed {
     /// Запечатывающий трейт: неименуем снаружи намеренно -- иначе
@@ -67,10 +73,24 @@ pub fn wait_any(objects: &[&dyn Waitable], timeout: Option<Duration>) -> Result<
     crate::win::wait_any(&handles, timeout)
 }
 
+/// Размер секции состояния маяка (одна страница).
+const STATE_SIZE: usize = 4096;
+/// `magic` состояния маяка: `'XBCN'` (байты `58 42 43 4E`, `u32` LE).
+const STATE_MAGIC: u32 = 0x4E43_4258;
+/// Смещения полей состояния (`u32` LE, атомарно).
+const STATE_MAGIC_OFFSET: usize = 0;
+const STATE_GENERATION_OFFSET: usize = 4;
+const STATE_SERVER_PID_OFFSET: usize = 8;
+const STATE_SERVER_START_LO_OFFSET: usize = 12;
+const STATE_SERVER_START_HI_OFFSET: usize = 16;
+
 /// Маяк сервера (см. модуль).
 #[derive(Debug)]
 pub struct Beacon {
     event: EventHandle,
+    /// Секция `<имя>_beacon_state` (0.10): поколение и личность сервера,
+    /// взводившего маяк последним. `None` -- безымянный маяк.
+    state: Option<Mapping>,
 }
 
 impl sealed::Sealed for Beacon {}
@@ -92,6 +112,11 @@ fn beacon_name(base: &str) -> String {
     }
 }
 
+/// Имя секции состояния маяка (тот же namespace, что у события).
+fn beacon_state_name(base: &str) -> String {
+    format!("{}_state", beacon_name(base))
+}
+
 impl Beacon {
     /// Открыть маяк `name` (или создать, если его ещё нет) — и серверу, и
     /// клиентам.
@@ -103,10 +128,26 @@ impl Beacon {
     /// `WindowsError { code: STATUS_OBJECT_TYPE_MISMATCH }`) или объектом с
     /// ограничивающим DACL (`EVENT_ALL_ACCESS` не выдан --
     /// `STATUS_ACCESS_DENIED`): подменённый маяк не открывается.
+    ///
+    /// 0.10: рядом с событием -- секция состояния `<имя>_beacon_state`
+    /// (create-or-open, `SEC_COMMIT`, 4096 байт). Секция, занятая заранее
+    /// объектом другого типа, `SEC_RESERVE`/файлом/образом или меньше
+    /// страницы, -- ошибка (`Corrupted` или код ОС), как и подменённое
+    /// событие.
     pub fn open(name: &str) -> Result<Self> {
-        Ok(Self {
-            event: EventHandle::open_or_create_notification(&beacon_name(name))?,
-        })
+        let event = EventHandle::open_or_create_notification(&beacon_name(name))?;
+        let state = Mapping::open_or_create(&beacon_state_name(name), STATE_SIZE)?;
+        let beacon = Self {
+            event,
+            state: Some(state),
+        };
+        // Новая секция -- нули: `magic` ставит первый открывший (CAS 0 ->
+        // MAGIC). Не ноль и не MAGIC -- порча: CAS не проходит, состоянию не
+        // доверяем (см. `snapshot`), но и не «чиним» его.
+        if let Some(magic) = beacon.state_word(STATE_MAGIC_OFFSET) {
+            let _ = magic.compare_exchange(0, STATE_MAGIC, Ordering::AcqRel, Ordering::Acquire);
+        }
+        Ok(beacon)
     }
 
     /// Безымянный маяк: то же событие-уведомление с ручным сбросом, но без
@@ -121,25 +162,156 @@ impl Beacon {
     pub fn unnamed() -> Result<Self> {
         Ok(Self {
             event: EventHandle::create_unnamed(true)?,
+            state: None,
         })
     }
 
     /// Сервер работает: разбудить всех ждущих и оставить маяк взведённым.
     ///
+    /// 0.10: сначала публикует в состоянии маяка свою личность (PID и время
+    /// создания процесса) и увеличивает `generation`, затем `NtSetEvent` --
+    /// по этому поколению клиент в [`Beacon::clear_if_stale`] замечает
+    /// взвод, случившийся между его проверкой и сбросом. Испорченное
+    /// состояние (`magic` неверный) не мешает взводу: публикация
+    /// пропускается, событие взводится.
+    ///
     /// # Errors
     ///
     /// Ошибка ОС.
     pub fn raise(&self) -> Result<()> {
+        self.publish(std::process::id(), current_process_start_time());
         self.event.set()
     }
 
-    /// Сервер уходит: сбросить маяк.
+    /// Сервер уходит: сбросить маяк. **Только для сервера**: клиент, не
+    /// нашедший лобби при взведённом маяке, вызывает
+    /// [`Beacon::clear_if_stale`] — прямой `lower` клиента может погасить
+    /// маяк нового сервера, поднявшегося за мгновение до сброса.
     ///
     /// # Errors
     ///
     /// Ошибка ОС.
     pub fn lower(&self) -> Result<()> {
         self.event.reset()
+    }
+
+    /// Клиент: маяк взведён, а лобби нет — погасить маяк за упавший сервер,
+    /// не потеряв взвод нового.
+    ///
+    /// Читает `generation` и личность сервера из состояния маяка. Процесс
+    /// сервера не подтверждённо мёртв (жив или нет прав проверить) —
+    /// `Ok(false)`, маяк не трогается: лобби этого сервера появится или он
+    /// сам сбросит маяк. Иначе — `NtResetEvent`, затем повторное чтение
+    /// `generation`: изменилось (новый сервер успел взвести маяк) —
+    /// `NtSetEvent` обратно. `Ok(true)` — маяк был «за упавший сервер» и
+    /// обработан; клиент перепроверяет лобби и снова ждёт маяк.
+    ///
+    /// PID `0` (сервер не публиковал состояние: секция создана заново после
+    /// ухода всех держателей или пир её не пишет) — проверить нечего,
+    /// поведение прежнее: сброс с перепроверкой поколения. Состояние с
+    /// неверным `magic` и безымянный маяк — `Ok(false)` без сброса.
+    ///
+    /// # Errors
+    ///
+    /// Ошибка ОС.
+    pub fn clear_if_stale(&self) -> Result<bool> {
+        match self.snapshot() {
+            Some(snapshot) => self.clear_after(snapshot),
+            None => Ok(false),
+        }
+    }
+
+    /// Слово состояния по смещению; `None` -- безымянный маяк или смещение
+    /// вне отображения (не бывает: view не меньше `STATE_SIZE`).
+    fn state_word(&self, offset: usize) -> Option<&AtomicU32> {
+        let state = self.state.as_ref()?;
+        if !offset.is_multiple_of(4) || offset.checked_add(4)? > state.size() {
+            return None;
+        }
+        let ptr = state.as_ptr().wrapping_add(offset).cast::<u32>();
+        // SAFETY: `ptr` -- внутри отображения (`offset + 4 <= size`) и
+        // выровнен на 4 (view выровнен на страницу, `offset` кратно 4);
+        // отображение живёт, пока жив `self.state`, то есть дольше
+        // возвращаемой ссылки (она заимствует `self`). Доступ к памяти,
+        // общей с другими процессами, -- только атомарный.
+        Some(unsafe { AtomicU32::from_ptr(ptr) })
+    }
+
+    /// Поле доверенного состояния (`magic` верный), иначе `None`.
+    fn trusted_word(&self, offset: usize) -> Option<&AtomicU32> {
+        let magic = self.state_word(STATE_MAGIC_OFFSET)?;
+        if magic.load(Ordering::Acquire) != STATE_MAGIC {
+            return None;
+        }
+        self.state_word(offset)
+    }
+
+    /// Сервер: записать личность и увеличить поколение. Порядок: половины
+    /// времени, затем PID (публикующее поле, как в `ControlBlock`), затем
+    /// `generation` -- клиент, прочитавший новое поколение (`snapshot`),
+    /// видит и личность того же или более позднего взвода.
+    fn publish(&self, pid: u32, start: u64) {
+        let (Some(lo), Some(hi), Some(pid_word), Some(generation)) = (
+            self.trusted_word(STATE_SERVER_START_LO_OFFSET),
+            self.trusted_word(STATE_SERVER_START_HI_OFFSET),
+            self.trusted_word(STATE_SERVER_PID_OFFSET),
+            self.trusted_word(STATE_GENERATION_OFFSET),
+        ) else {
+            return;
+        };
+        let [l0, l1, l2, l3, h0, h1, h2, h3] = start.to_le_bytes();
+        lo.store(u32::from_le_bytes([l0, l1, l2, l3]), Ordering::Release);
+        hi.store(u32::from_le_bytes([h0, h1, h2, h3]), Ordering::Release);
+        pid_word.store(pid, Ordering::Release);
+        // SeqCst: `generation` -- точка линеаризации против перечитывания
+        // клиентом после `NtResetEvent` (`clear_after`); `NtSetEvent` идёт
+        // строго после.
+        generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Снимок состояния: поколение первым, затем личность сервера. `None` --
+    /// безымянный маяк или испорченное состояние.
+    fn snapshot(&self) -> Option<StateSnapshot> {
+        let generation = self
+            .trusted_word(STATE_GENERATION_OFFSET)?
+            .load(Ordering::SeqCst);
+        let server_pid = self
+            .trusted_word(STATE_SERVER_PID_OFFSET)?
+            .load(Ordering::Acquire);
+        let lo = self
+            .trusted_word(STATE_SERVER_START_LO_OFFSET)?
+            .load(Ordering::Acquire);
+        let hi = self
+            .trusted_word(STATE_SERVER_START_HI_OFFSET)?
+            .load(Ordering::Acquire);
+        Some(StateSnapshot {
+            generation,
+            server_pid,
+            server_start: (u64::from(hi) << 32) | u64::from(lo),
+        })
+    }
+
+    /// Вторая половина `clear_if_stale` по готовому снимку (тест
+    /// интерлинии вставляет взвод нового сервера между ними).
+    fn clear_after(&self, snapshot: StateSnapshot) -> Result<bool> {
+        if snapshot.server_pid != 0 && !is_process_gone(snapshot.server_pid, snapshot.server_start)
+        {
+            return Ok(false);
+        }
+        let Some(generation) = self.trusted_word(STATE_GENERATION_OFFSET) else {
+            return Ok(false);
+        };
+        self.event.reset()?;
+        // Сброс (системный вызов) -- до перечитывания поколения: новый
+        // сервер увеличивает `generation` до `NtSetEvent`, поэтому либо его
+        // инкремент виден здесь (вернём маяк сами), либо его `NtSetEvent`
+        // идёт после нашего сброса. SeqCst-барьер запрещает поднять чтение
+        // выше сброса.
+        fence(Ordering::SeqCst);
+        if generation.load(Ordering::SeqCst) != snapshot.generation {
+            self.event.set()?;
+        }
+        Ok(true)
     }
 
     /// Ждать, пока маяк не взведён (`None` — без таймаута). `true` —
@@ -174,6 +346,14 @@ impl Beacon {
     pub fn is_raised(&self) -> Result<bool> {
         self.event.wait(Some(Duration::ZERO))
     }
+}
+
+/// Снимок состояния маяка.
+#[derive(Debug, Clone, Copy)]
+struct StateSnapshot {
+    generation: u32,
+    server_pid: u32,
+    server_start: u64,
 }
 
 /// Наблюдение за завершением процесса: удерживаемый handle
@@ -222,7 +402,7 @@ impl ProcessExit {
 mod tests {
     use super::*;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     /// Уникальное имя в пределах прогона: PID + счётчик (раньше —
     /// `Instant::now().elapsed()`, то есть почти всегда 0: имена тестов
@@ -234,6 +414,103 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         )
+    }
+
+    /// PID и время создания процесса, который уже завершился (дочерний
+    /// `cmd`, handle закрыт): «упавший сервер». Даже если PID успеют
+    /// переиспользовать, время создания не совпадёт.
+    fn dead_process() -> (u32, u64) {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("cmd");
+        let pid = child.id();
+        let start = crate::win::process_start_time(pid).expect("время создания");
+        drop(child.wait());
+        drop(child);
+        (pid, start)
+    }
+
+    /// Находка 11: детерминированная интерлиния «клиент гасит маяк нового
+    /// сервера». Старый сервер взвёл маяк и упал; клиент A прочитал
+    /// состояние (сервер мёртв); новый сервер поднялся и взвёл маяк; A
+    /// сбрасывает маяк «за упавший» -- и обязан заметить новое поколение и
+    /// вернуть маяк. Иначе клиент B, пришедший позже, спит вечно.
+    #[test]
+    fn stale_clear_racing_new_raise_keeps_beacon_raised() {
+        let name = unique("race");
+        let (dead_pid, dead_start) = dead_process();
+        // Клиент A держит маяк с самого начала: иначе с последним handle
+        // исчезли бы и событие, и состояние.
+        let client_a = Beacon::open(&name).unwrap();
+        let old_server = Beacon::open(&name).unwrap();
+        old_server.publish(dead_pid, dead_start);
+        old_server.event.set().unwrap();
+        drop(old_server); // «упал», не сбросив маяк
+
+        assert!(client_a.is_raised().unwrap());
+        let snapshot = client_a.snapshot().expect("состояние маяка");
+
+        let new_server = Beacon::open(&name).unwrap();
+        new_server.raise().unwrap();
+
+        assert!(
+            client_a.clear_after(snapshot).unwrap(),
+            "сервер снимка мёртв"
+        );
+        assert!(
+            client_a.is_raised().unwrap(),
+            "маяк нового сервера погашен -- клиент B уснёт навсегда"
+        );
+        let client_b = Beacon::open(&name).unwrap();
+        assert!(client_b.wait(Some(Duration::ZERO)).unwrap());
+        drop(new_server);
+    }
+
+    /// Сервер жив -- `clear_if_stale` маяк не трогает.
+    #[test]
+    fn clear_if_stale_keeps_live_server() {
+        let name = unique("live");
+        let server = Beacon::open(&name).unwrap();
+        server.raise().unwrap();
+        let client = Beacon::open(&name).unwrap();
+        assert!(!client.clear_if_stale().unwrap(), "сервер жив");
+        assert!(client.is_raised().unwrap());
+    }
+
+    /// Сервер упал (процесса нет) -- клиент гасит маяк.
+    #[test]
+    fn clear_if_stale_lowers_beacon_of_dead_server() {
+        let name = unique("dead");
+        let (dead_pid, dead_start) = dead_process();
+        let server = Beacon::open(&name).unwrap();
+        server.publish(dead_pid, dead_start);
+        server.event.set().unwrap();
+        let client = Beacon::open(&name).unwrap();
+        assert!(client.clear_if_stale().unwrap());
+        assert!(!client.is_raised().unwrap());
+    }
+
+    /// Порча состояния (`magic` неверный, мусор в полях): без паники, маяк
+    /// не трогается -- доверять нечему.
+    #[test]
+    fn corrupted_state_never_lowers_beacon() {
+        let name = unique("corrupt");
+        let (dead_pid, dead_start) = dead_process();
+        let server = Beacon::open(&name).unwrap();
+        server.publish(dead_pid, dead_start);
+        server.event.set().unwrap();
+        let client = Beacon::open(&name).unwrap();
+        client
+            .state_word(STATE_MAGIC_OFFSET)
+            .unwrap()
+            .store(0xDEAD_BEEF, Ordering::Release);
+        assert!(!client.clear_if_stale().unwrap(), "неверный magic");
+        assert!(client.is_raised().unwrap());
+        // Сервер с испорченным состоянием всё равно взводит маяк.
+        server.lower().unwrap();
+        server.raise().unwrap();
+        assert!(client.is_raised().unwrap());
     }
 
     #[test]

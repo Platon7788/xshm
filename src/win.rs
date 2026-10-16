@@ -66,6 +66,8 @@ use crate::ntapi::{
     SECTION_ALL_ACCESS,
     SECTION_BASIC_INFORMATION,
     STATUS_ABANDONED_WAIT_0,
+    STATUS_INVALID_CID,
+    STATUS_INVALID_PARAMETER,
     STATUS_OBJECT_NAME_EXISTS,
     STATUS_OBJECT_TYPE_MISMATCH,
     // Constants
@@ -708,21 +710,80 @@ impl Mapping {
         }
 
         let handle = Handle(section_handle);
+        Self::check_commit(&handle)?;
+        Self::map_section(handle, view_size)
+    }
 
-        // Тип секции -- до отображения: под именем канала враждебный процесс
-        // может держать `SEC_RESERVE` (страницы не выделены -- первое
-        // обращение к ним даёт access violation) или секцию файла/образа.
-        // Сегмент канала всегда `SEC_COMMIT` из файла подкачки.
-        let attributes = Self::section_attributes(&handle)?;
+    /// Секция `name` размером не меньше `size`: создаётся (NULL DACL,
+    /// `SEC_COMMIT`) или, если имя уже занято, открывается (`OBJ_OPENIF`).
+    /// Существующая секция проверяется как чужая: тип `SEC_COMMIT` и view не
+    /// меньше `size`, иначе `Corrupted`. Для объектов, которые создаёт
+    /// первая пришедшая сторона (состояние маяка).
+    pub fn open_or_create(name: &str, size: usize) -> Result<Self> {
+        let mut nt_name = NtName::new(name)?;
+        let mut sd = NullDaclSecurityDescriptor::new();
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(
+            nt_name.as_ptr(),
+            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+            sd.as_ptr(),
+        );
+        let mut section_handle: HANDLE = null_mut();
+        let mut max_size = LARGE_INTEGER {
+            QuadPart: i64::try_from(size)
+                .map_err(|_| ShmError::InvalidConfig("section size exceeds i64::MAX"))?,
+        };
+        // SAFETY: все переданные указатели -- на локальные переменные, живущие
+        // до конца вызова (`obj_attr` держит `nt_name`/`sd`, они тоже живы).
+        let status = unsafe {
+            NtCreateSection(
+                &raw mut section_handle,
+                SECTION_ALL_ACCESS,
+                &raw mut obj_attr,
+                &raw mut max_size,
+                PAGE_READWRITE,
+                SEC_COMMIT,
+                null_mut(),
+            )
+        };
+        if status != STATUS_SUCCESS && status != STATUS_OBJECT_NAME_EXISTS {
+            return Err(status_to_error(status, "NtCreateSection(open-if)"));
+        }
+        if section_handle.is_null() {
+            return Err(status_to_error(
+                0xC000_0008_u32.cast_signed(), // STATUS_INVALID_HANDLE
+                "NtCreateSection returned NULL handle",
+            ));
+        }
+        let handle = Handle(section_handle);
+        if status == STATUS_OBJECT_NAME_EXISTS {
+            // Имя занял кто-то раньше -- секция чужая, проверяем как при open.
+            Self::check_commit(&handle)?;
+        }
+        let mapping = Self::map_section(handle, 0)?;
+        if mapping.size < size {
+            return Err(ShmError::Corrupted);
+        }
+        Ok(mapping)
+    }
+
+    /// Тип секции -- до отображения: под именем канала враждебный процесс
+    /// может держать `SEC_RESERVE` (страницы не выделены -- первое
+    /// обращение к ним даёт access violation) или секцию файла/образа.
+    /// Сегмент канала всегда `SEC_COMMIT` из файла подкачки.
+    fn check_commit(handle: &Handle) -> Result<()> {
+        let attributes = Self::section_attributes(handle)?;
         if attributes & (SEC_RESERVE | SEC_IMAGE | SEC_FILE) != 0 || attributes & SEC_COMMIT == 0 {
             return Err(ShmError::Corrupted);
         }
+        Ok(())
+    }
 
-        // Map view
+    /// Отобразить секцию (`view_size = 0` -- целиком).
+    fn map_section(handle: Handle, view_size: usize) -> Result<Self> {
         let mut base_address: PVOID = null_mut();
         let mut view_size: usize = view_size;
 
-        // SAFETY: дескриптор секции валиден (только что открыт); out-параметры --
+        // SAFETY: дескриптор секции валиден (держит `handle`); out-параметры --
         // локальные переменные, живущие до конца вызова.
         let status = unsafe {
             NtMapViewOfSection(
@@ -918,7 +979,12 @@ impl ProcessWatch {
         if pid == 0 {
             return None; // 0 -- «PID не передан» (пир старой версии)
         }
+        Self::open_status(pid).ok()
+    }
 
+    /// `open` с кодом отказа `NtOpenProcess`: отличает «процесса с таким PID
+    /// нет» (`STATUS_INVALID_CID`/`STATUS_INVALID_PARAMETER`) от «нет прав».
+    fn open_status(pid: u32) -> core::result::Result<Self, NTSTATUS> {
         let mut client_id = CLIENT_ID {
             // PID -- не адрес: собираем «указателеподобное» значение без провенанса
             // (`without_provenance_mut`), а не через `as`-каста целого в указатель.
@@ -940,10 +1006,13 @@ impl ProcessWatch {
                 &raw mut client_id,
             )
         };
-        if open_status != STATUS_SUCCESS || raw_handle.is_null() {
-            return None;
+        if open_status != STATUS_SUCCESS {
+            return Err(open_status);
         }
-        Some(Self {
+        if raw_handle.is_null() {
+            return Err(0xC000_0008_u32.cast_signed()); // STATUS_INVALID_HANDLE
+        }
+        Ok(Self {
             handle: Handle(raw_handle),
             pid,
         })
@@ -1019,6 +1088,29 @@ pub fn is_process_alive(pid: u32, start_time: u64) -> bool {
         }
         start_time == 0 || watch.start_time().is_none_or(|actual| actual == start_time)
     })
+}
+
+/// Процесс `pid`, созданный в `start_time`, подтверждённо не существует
+/// (обратная консервативность к [`is_process_alive`]): `true` ТОЛЬКО если
+/// процесса с таким PID нет вовсе (`NtOpenProcess` ->
+/// `STATUS_INVALID_CID`/`STATUS_INVALID_PARAMETER`), он завершился, или
+/// процесс с этим PID создан в другое время (`start_time != 0`, своё время
+/// известно и не совпало -- PID переиспользован). Любая двусмысленность (нет
+/// прав, время не узнать, PID 0) -- `false`. Для решений «погасить чужой
+/// сигнал за упавший процесс» (маяк): ошибочное «умер» здесь дороже
+/// ошибочного «жив».
+#[must_use]
+pub fn is_process_gone(pid: u32, start_time: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match ProcessWatch::open_status(pid) {
+        Ok(watch) => {
+            watch.has_exited()
+                || (start_time != 0 && watch.start_time().is_some_and(|t| t != start_time))
+        }
+        Err(status) => status == STATUS_INVALID_CID || status == STATUS_INVALID_PARAMETER,
+    }
 }
 
 /// Время создания процесса `pid` (`KERNEL_USER_TIMES::CreateTime`, 100-нс
@@ -1209,6 +1301,55 @@ mod tests {
         let _commit_owner = create_test_section(&commit, SEC_COMMIT);
         assert!(Mapping::open(&commit).is_ok());
         assert!(Mapping::open_header(&commit).is_ok());
+    }
+
+    /// Находка 11 (состояние маяка): `open_or_create` создаёт секцию, второй
+    /// вызов открывает ту же; занятое заранее имя `SEC_RESERVE` -- отказ,
+    /// а не отображение невыделенных страниц.
+    #[test]
+    fn open_or_create_shares_section_and_rejects_reserved_squatter() {
+        let name = format!("Local\\XSHM_TEST_OPENIF_{}", std::process::id());
+        let first = Mapping::open_or_create(&name, 4096).unwrap();
+        let second = Mapping::open_or_create(&name, 4096).unwrap();
+        assert!(first.size() >= 4096 && second.size() >= 4096);
+        // SAFETY: view не меньше страницы, адрес выровнен на страницу и живёт
+        // до конца теста.
+        let a = unsafe { std::sync::atomic::AtomicU32::from_ptr(first.as_ptr().cast()) };
+        // SAFETY: то же для второго отображения.
+        let b = unsafe { std::sync::atomic::AtomicU32::from_ptr(second.as_ptr().cast()) };
+        a.store(0x1234_5678, std::sync::atomic::Ordering::Release);
+        assert_eq!(b.load(std::sync::atomic::Ordering::Acquire), 0x1234_5678);
+
+        let reserved = format!("Local\\XSHM_TEST_OPENIF_RESERVE_{}", std::process::id());
+        let _owner = create_test_section(&reserved, SEC_RESERVE);
+        assert_eq!(
+            Mapping::open_or_create(&reserved, 4096).err(),
+            Some(ShmError::Corrupted)
+        );
+    }
+
+    /// `is_process_gone` консервативен в сторону «жив»: свой процесс и PID 0
+    /// не «исчезли»; завершившийся процесс с закрытым handle -- исчез.
+    #[test]
+    fn is_process_gone_only_for_confirmed_exit() {
+        let me = std::process::id();
+        assert!(!is_process_gone(me, 0));
+        assert!(!is_process_gone(me, current_process_start_time()));
+        assert!(is_process_gone(me, current_process_start_time() ^ 1));
+        assert!(!is_process_gone(0, 0));
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("cmd");
+        let pid = child.id();
+        let start = process_start_time(pid).expect("время создания");
+        drop(child.wait());
+        assert!(
+            is_process_gone(pid, start),
+            "handle ещё открыт, процесс сигнален"
+        );
+        drop(child);
+        assert!(is_process_gone(pid, start), "процесса больше нет");
     }
 
     /// Подменённое событие канала (ручной сброс под именем автосбросного)
