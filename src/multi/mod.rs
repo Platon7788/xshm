@@ -55,7 +55,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
 use crate::naming::{Direction, ObjectPath};
-use crate::ring::FreeSpace;
+use crate::ring::{FreeSpace, SpinPolicy, UnreadProbe, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::shared::SharedView;
@@ -190,6 +190,12 @@ pub struct MultiOptions {
     /// границы (`MultiClientOptions::namespace`). `None` (по умолчанию) --
     /// общий `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
+    /// Спин worker-а группы перед сном в ядре (0.10): до `spin.iterations`
+    /// проверок колец клиент -> сервер всех подключённых слотов группы по
+    /// позициям (и остановки), прежде чем уснуть на наборе событий. Один
+    /// бюджет на каждое засыпание (в простое -- ноль пробуждений). По
+    /// умолчанию -- `SpinPolicy::NONE`. Пиру не виден.
+    pub spin: SpinPolicy,
 }
 
 impl Default for MultiOptions {
@@ -201,6 +207,7 @@ impl Default for MultiOptions {
             layout: ChannelLayout::DEFAULT,
             security: ObjectSecurity::default(),
             namespace: None,
+            spin: SpinPolicy::NONE,
         }
     }
 }
@@ -230,6 +237,11 @@ pub struct MultiClientOptions {
     /// `MultiOptions::namespace`). `None` (по умолчанию) -- общий
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
+    /// Спин подключённого worker-а перед сном в ядре (0.10): до
+    /// `spin.iterations` проверок кольца сервер -> клиент по позициям (и
+    /// новых `send`, и остановки). Один бюджет на каждое засыпание. По
+    /// умолчанию -- `SpinPolicy::NONE`. Пиру не виден.
+    pub spin: SpinPolicy,
 }
 
 impl Default for MultiClientOptions {
@@ -241,6 +253,7 @@ impl Default for MultiClientOptions {
             recv_batch: 32,
             max_send_queue: 256,
             namespace: None,
+            spin: SpinPolicy::NONE,
         }
     }
 }
@@ -838,11 +851,16 @@ impl MultiCore {
     /// снятый с подключения, не закрывается, а уходит в `retired` -- его
     /// закрывает сам worker группы, проснувшись (`reclaim_stale_claims`),
     /// после того как набор прошлого ожидания очищен.
+    ///
+    /// `probes` (0.10, спин) -- пробы колец клиент -> сервер подключённых
+    /// слотов: адреса заголовков в секциях слотов, которые живут столько
+    /// же, сколько события (до join worker-ов).
     fn collect_wait_set<'s>(
         &'s self,
         range: Range<u32>,
         handles: &mut Vec<BorrowedHandle<'s>>,
         sources: &mut Vec<EventSource>,
+        probes: &mut Vec<UnreadProbe<'s>>,
     ) {
         // Продлить заимствование с блокировки слота до `&'s self`.
         let detach = |handle: BorrowedHandle<'_>| -> BorrowedHandle<'s> {
@@ -872,6 +890,14 @@ impl MultiCore {
                     handles.push(detach(peer));
                     sources.push(EventSource::SlotPeer(slot.id));
                 }
+                if self.options.spin.is_enabled() {
+                    let probe = slot.server.client_ring_probe();
+                    // SAFETY: секция слота (а с ней заголовок кольца) живёт до
+                    // join worker-ов, то есть дольше `'s` (обоснование -- в
+                    // документации функции); проба читает только атомарные
+                    // позиции и не зависит от блокировки слота.
+                    probes.push(unsafe { probe.extend() });
+                }
             } else {
                 handles.push(detach(events.connect_req.as_handle()));
                 sources.push(EventSource::SlotConnect(slot.id));
@@ -887,6 +913,7 @@ impl MultiCore {
         let mut buffer = Vec::new();
         let mut handles: Vec<BorrowedHandle<'_>> = Vec::with_capacity(64);
         let mut sources: Vec<EventSource> = Vec::with_capacity(64);
+        let mut probes: Vec<UnreadProbe<'_>> = Vec::with_capacity(SLOTS_PER_WORKER as usize);
         // В каком-то кольце осталось больше `recv_batch` сообщений: следующее
         // ожидание -- нулевое (сперва события, затем добор), без сна.
         let mut backlog = false;
@@ -896,6 +923,7 @@ impl MultiCore {
             // закрывает отложенные handle процессов (`retired`).
             handles.clear();
             sources.clear();
+            probes.clear();
             let sweep = self.reclaim_stale_claims(range.clone(), Instant::now());
             for (slot_id, expected_claim, reason) in sweep.orphaned {
                 // Клиент мог уйти штатно (DISCONNECT, затем снял claim), а
@@ -905,9 +933,27 @@ impl MultiCore {
                 self.handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
             }
 
-            self.collect_wait_set(range.clone(), &mut handles, &mut sources);
+            self.collect_wait_set(range.clone(), &mut handles, &mut sources, &mut probes);
             handles.push(wake.as_handle());
             sources.push(EventSource::Wake);
+
+            // Спин (`MultiOptions::spin`) -- один бюджет на каждое засыпание:
+            // только перед блокирующим ожиданием (без добора `backlog`) и
+            // только при подключённых слотах. Увидели данные в кольце любого
+            // слота группы -- обрабатываем как пробуждение по `DATA`, без
+            // ядра (сигнал `DATA`, если писатель его взвёл, даст потом одно
+            // лишнее пробуждение; сбрасывать его нельзя). В простое бюджет
+            // отспинивается один раз, затем сон без таймаута.
+            if !backlog
+                && !probes.is_empty()
+                && spin_until(self.options.spin, || {
+                    probes.iter().any(UnreadProbe::has_unread)
+                        || !self.running.load(Ordering::Acquire)
+                })
+            {
+                backlog = self.poll_group_slots(range.clone(), &mut buffer);
+                continue;
+            }
 
             let timeout = if backlog {
                 Some(Duration::ZERO)
@@ -1292,6 +1338,9 @@ struct ClientOutbox {
     /// Лимит размера сообщения кольца клиент -> сервер (`0` -- ещё не
     /// подключались): длина проверяется в `send` синхронно.
     max_message: AtomicUsize,
+    /// Счётчик принятых `send` (0.10): спин worker-а прерывается, увидев
+    /// его изменение, не беря lock очереди на каждой итерации.
+    sends: AtomicU32,
 }
 
 /// Мультиклиент — подключается к базовому имени, получает слот автоматически
@@ -1401,6 +1450,7 @@ impl MultiClient {
             }
             queue.push_back(data);
         }
+        self.outbox.sends.fetch_add(1, Ordering::Release);
         let _ = self.wake.set();
         Ok(())
     }
@@ -1528,6 +1578,26 @@ fn receive_all(
     true
 }
 
+/// Спин подключённого `MultiClient` перед сном (`MultiClientOptions::spin`).
+/// `true` -- появились данные от сервера, новый `send` или остановка: в ядро
+/// не уходить. Непустая очередь на входе -- спина нет (`wake` уже взведён).
+fn spin_before_wait(
+    spin: SpinPolicy,
+    outbox: &ClientOutbox,
+    running: &AtomicBool,
+    has_unread: impl Fn() -> bool,
+) -> bool {
+    if !spin.is_enabled() || !outbox.queue.lock_clean().is_empty() {
+        return false;
+    }
+    let sends = outbox.sends.load(Ordering::Acquire);
+    spin_until(spin, || {
+        has_unread()
+            || outbox.sends.load(Ordering::Acquire) != sends
+            || !running.load(Ordering::Acquire)
+    })
+}
+
 /// Worker для MultiClient
 fn client_worker(
     base_name: &str,
@@ -1634,6 +1704,21 @@ fn client_worker(
             }
             if !receive_all(&client, &mut buffer, handler, running) {
                 break Some(DisconnectReason::Error);
+            }
+
+            // Спин (`MultiClientOptions::spin`) -- один бюджет на каждое
+            // засыпание (в простое: один раз, затем сон без таймаута).
+            // Непустая очередь (`send` из колбэка этого прохода) -- без
+            // спина: `wake` уже взведён. Увидели данные -- сверяем сессию,
+            // как после пробуждения (кольцо могло достаться новому клиенту
+            // слота), и читаем без ядра; `DATA` не сбрасываем.
+            if spin_before_wait(options.spin, outbox, running, || {
+                client.has_unread_from_server()
+            }) {
+                if !client.is_session_current() {
+                    break Some(DisconnectReason::Graceful);
+                }
+                continue;
             }
 
             let result = win::wait_any(&handles[..count], options.poll_timeout);

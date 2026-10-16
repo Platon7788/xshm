@@ -66,7 +66,7 @@ pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
 pub use namespace::PrivateNamespace;
-pub use ring::{FreeSpace, WriteOutcome, frame_size};
+pub use ring::{FreeSpace, SpinPolicy, WriteOutcome, frame_size};
 pub use security::ObjectSecurity;
 pub use server::{ChannelConfig, SharedServer};
 pub use thread_hook::{set_thread_start_hook, thread_start_hook};

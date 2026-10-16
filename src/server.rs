@@ -9,7 +9,9 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
+use crate::ring::{
+    DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome, spin_until,
+};
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
@@ -590,6 +592,20 @@ impl SharedServer {
     /// ничем: единственная граница тогда -- `timeout` вызывающего. Без
     /// событий (anonymous) -- опрос с шагом 1 мс.
     pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
+        self.wait_for_space_spin(payload_len, timeout, SpinPolicy::NONE)
+    }
+
+    /// `wait_for_space` со спином перед ожиданием в ядре (0.10): до
+    /// `spin.iterations` перепроверок места по позициям (заявка
+    /// `space_waiter` на время спина не ставится), затем обычное ожидание.
+    /// При `timeout = Some(0)` спина нет. `SpinPolicy::NONE` -- то же, что
+    /// `wait_for_space`.
+    pub fn wait_for_space_spin(
+        &self,
+        payload_len: usize,
+        timeout: Option<Duration>,
+        spin: SpinPolicy,
+    ) -> Result<bool> {
         self.ensure_connected()?;
         let control = self.view.control_block();
         let peer_left = || control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY;
@@ -604,6 +620,7 @@ impl SharedServer {
             self.peer.as_ref(),
             disconnect.as_ref(),
             timeout,
+            spin,
         )
     }
 
@@ -635,12 +652,25 @@ impl SharedServer {
     /// `Err(PeerDied)` -- процесс клиента умер и всё, что он успел записать,
     /// уже прочитано (пока в кольце есть данные, возвращается `Ok(true)`).
     pub fn poll_client(&self, timeout: Option<Duration>) -> Result<bool> {
+        self.poll_client_spin(timeout, SpinPolicy::NONE)
+    }
+
+    /// `poll_client` со спином перед ожиданием в ядре (0.10): до
+    /// `spin.iterations` проверок кольца по позициям, затем обычное
+    /// ожидание `DATA`. Спин сокращает задержку, когда клиент отвечает
+    /// быстрее пробуждения из ядра, ценой занятого ядра CPU на время спина;
+    /// при `timeout = Some(0)` спина нет. `SpinPolicy::NONE` -- то же, что
+    /// `poll_client`.
+    pub fn poll_client_spin(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
         self.ensure_connected()?;
-        if !self.ring_rx.is_empty() {
-            return Ok(true);
-        }
         // Для anonymous режима просто проверяем буфер (polling)
         let Some(events) = self.events.as_ref() else {
+            if !self.ring_rx.is_empty()
+                || (timeout != Some(Duration::ZERO)
+                    && spin_until(spin, || self.ring_rx.has_unread()))
+            {
+                return Ok(true);
+            }
             return match &self.peer {
                 Some(peer) if peer.has_exited() && self.ring_rx.is_empty() => {
                     Err(ShmError::PeerDied)
@@ -648,7 +678,19 @@ impl SharedServer {
                 _ => Ok(false), // Нет данных, но не timeout
             };
         };
-        poll_with_peer(&events.c2s.data, self.peer.as_ref(), &self.ring_rx, timeout)
+        self.ring_rx
+            .wait_for_data(&events.c2s.data, self.peer.as_ref(), timeout, spin)
+    }
+
+    /// Worker-ы (спин перед сном, 0.10): в кольце от клиента есть
+    /// непрочитанное -- по позициям, без барьера.
+    pub(crate) fn has_unread_from_client(&self) -> bool {
+        self.ring_rx.has_unread()
+    }
+
+    /// Multi: проба кольца от клиента для спина worker-а группы.
+    pub(crate) const fn client_ring_probe(&self) -> UnreadProbe<'_> {
+        self.ring_rx.unread_probe()
     }
 
     /// PID процесса клиента, если клиент 0.8+ передал его в handshake.
@@ -694,27 +736,6 @@ impl SharedServer {
     pub(crate) const fn take_peer(&mut self) -> Option<ProcessWatch> {
         self.peer_start = 0;
         self.peer.take()
-    }
-}
-
-/// Общий для сервера и клиента `poll_*`: ждём событие данных ИЛИ смерть пира.
-///
-/// Индекс 0 -- данные (приоритет: при одновременном сигнале NT возвращает
-/// наименьший индекс, так что последние данные мёртвого пира не теряются).
-pub(crate) fn poll_with_peer(
-    data: &crate::win::EventHandle,
-    peer: Option<&ProcessWatch>,
-    ring: &RingBuffer,
-    timeout: Option<Duration>,
-) -> Result<bool> {
-    let Some(peer) = peer else {
-        return data.wait(timeout);
-    };
-    match wait_any(&[data.as_handle(), peer.as_handle()], timeout)? {
-        Some(0) => Ok(true),
-        Some(_) if !ring.is_empty() => Ok(true),
-        Some(_) => Err(ShmError::PeerDied),
-        None => Ok(false),
     }
 }
 

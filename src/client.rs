@@ -8,8 +8,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
-use crate::server::poll_with_peer;
+use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
 
@@ -397,6 +396,17 @@ impl SharedClient {
     /// одно ожидание на весь `timeout`; `DISCONNECT` при `server_state !=
     /// SERVER_READY` -- `Err(NotConnected)`.
     pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
+        self.wait_for_space_spin(payload_len, timeout, SpinPolicy::NONE)
+    }
+
+    /// `wait_for_space` со спином перед ожиданием в ядре (0.10; семантика
+    /// -- `SharedServer::wait_for_space_spin`).
+    pub fn wait_for_space_spin(
+        &self,
+        payload_len: usize,
+        timeout: Option<Duration>,
+        spin: SpinPolicy,
+    ) -> Result<bool> {
         self.ensure_connected()?;
         let control = self.view.control_block();
         let peer_left = || control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY;
@@ -410,6 +420,7 @@ impl SharedClient {
             self.peer.as_ref(),
             Some(&disconnect),
             timeout,
+            spin,
         )
     }
 
@@ -433,17 +444,23 @@ impl SharedClient {
         Ok(len)
     }
 
+    /// Ждать данных от сервера (семантика -- `SharedServer::poll_client`).
     pub fn poll_server(&self, timeout: Option<Duration>) -> Result<bool> {
+        self.poll_server_spin(timeout, SpinPolicy::NONE)
+    }
+
+    /// `poll_server` со спином перед ожиданием в ядре (0.10; семантика --
+    /// `SharedServer::poll_client_spin`).
+    pub fn poll_server_spin(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
         self.ensure_connected()?;
-        if !self.ring_rx.is_empty() {
-            return Ok(true);
-        }
-        poll_with_peer(
-            &self.events.s2c.data,
-            self.peer.as_ref(),
-            &self.ring_rx,
-            timeout,
-        )
+        self.ring_rx
+            .wait_for_data(&self.events.s2c.data, self.peer.as_ref(), timeout, spin)
+    }
+
+    /// Worker-ы (спин перед сном, 0.10): в кольце от сервера есть
+    /// непрочитанное -- по позициям, без барьера.
+    pub(crate) fn has_unread_from_server(&self) -> bool {
+        self.ring_rx.has_unread()
     }
 
     /// PID процесса сервера, если сервер 0.8+ опубликовал его.

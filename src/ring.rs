@@ -14,6 +14,7 @@
 //! выравниванием -- мусор пира даёт `Corrupted`, а не зависание, панику или
 //! выход за пределы кольца.
 
+use std::marker::PhantomData;
 use std::os::windows::io::AsHandle;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering, compiler_fence, fence};
@@ -37,6 +38,100 @@ thread_local! {
     /// доказывают, что ожидание не нарезано на срезы (одно событие -- одно
     /// ожидание).
     pub(crate) static SPACE_KERNEL_WAITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Число ожиданий в ядре внутри `wait_for_data` (`poll_*`) на этом
+    /// потоке: тесты спина доказывают, что данные, пришедшие во время
+    /// спина, читаются без сна в ядре.
+    pub(crate) static DATA_KERNEL_WAITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Политика спина перед ожиданием в ядре (0.10).
+///
+/// Перед тем как уснуть на событии (`DATA` у читателя, `SPACE` у писателя)
+/// поток до `iterations` раз перепроверяет кольцо по позициям, с
+/// `std::hint::spin_loop` между проверками. Данные (место), появившиеся за
+/// это время, забираются без системного вызова и без переключения
+/// контекста: задержка падает с единиц микросекунд до сотен наносекунд
+/// ценой занятого ядра CPU на время спина.
+///
+/// Бюджет -- один на каждое засыпание, а не на каждую проверку: поток,
+/// которому нечего делать, отспинивает бюджет один раз и спит в ядре без
+/// таймаута, как и без спина (в простое -- ноль пробуждений). По умолчанию
+/// -- [`SpinPolicy::NONE`]: спина нет, поведение 0.9.
+///
+/// Только локальная политика ожидания: формат памяти и протокол сигналов
+/// не меняются, пиру спин не виден.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpinPolicy {
+    /// Число проверок кольца до ожидания в ядре (`0` -- без спина).
+    pub iterations: u32,
+}
+
+impl SpinPolicy {
+    /// Без спина -- сразу ожидание в ядре (по умолчанию).
+    pub const NONE: Self = Self { iterations: 0 };
+
+    /// Спин на `iterations` проверок.
+    #[must_use]
+    pub const fn new(iterations: u32) -> Self {
+        Self { iterations }
+    }
+
+    /// Спин включён (`iterations > 0`).
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        self.iterations > 0
+    }
+}
+
+/// Спин: до `spin.iterations` раз вызвать `ready`, пока он не вернёт
+/// `true` (`std::hint::spin_loop` между вызовами). `true` -- условие
+/// выполнено до исчерпания бюджета, `false` -- бюджет исчерпан (или спин
+/// выключен) и вызывающий уходит в обычное ожидание в ядре.
+///
+/// `ready` обязан быть дешёвым (атомарные чтения без блокировок) и сам
+/// включать проверку остановки, если поток её ждёт: так задержка `stop()`
+/// ограничена одной итерацией, а не всем бюджетом.
+pub(crate) fn spin_until(spin: SpinPolicy, mut ready: impl FnMut() -> bool) -> bool {
+    for _ in 0..spin.iterations {
+        if ready() {
+            return true;
+        }
+        std::hint::spin_loop();
+    }
+    false
+}
+
+/// Проба «есть непрочитанные данные» по позициям одного кольца -- для
+/// спина worker-а Multi, который перебирает кольца нескольких слотов, не
+/// беря их блокировок. Хранит только адрес `RingHeader` в отображении.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UnreadProbe<'a> {
+    header: NonNull<RingHeader>,
+    _ring: PhantomData<&'a RingHeader>,
+}
+
+impl<'a> UnreadProbe<'a> {
+    /// Та же проба с другим временем жизни.
+    ///
+    /// # Safety
+    /// Отображение, в котором лежит заголовок кольца, живо всё время `'b`.
+    pub(crate) const unsafe fn extend<'b>(self) -> UnreadProbe<'b> {
+        UnreadProbe {
+            header: self.header,
+            _ring: PhantomData,
+        }
+    }
+
+    /// В кольце есть опубликованный непрочитанный кадр
+    /// (`write_pos != read_pos`, Acquire). Без барьера: «пусто» здесь --
+    /// лишь повод спинить дальше, а перед сном читатель всё равно
+    /// подтверждает пустоту через `confirm_empty`.
+    pub(crate) fn has_unread(&self) -> bool {
+        // SAFETY: заголовок валиден всё время `'a` (инвариант конструктора
+        // `RingBuffer::unread_probe` / контракт `extend`); поля атомарные.
+        let header = unsafe { self.header.as_ref() };
+        header.write_pos.load(Ordering::Acquire) != header.read_pos.load(Ordering::Acquire)
+    }
 }
 
 /// Штатное отключение пира для `wait_for_space`: событие `DISCONNECT` (одно
@@ -703,6 +798,11 @@ impl RingBuffer {
     /// по набору `[SPACE, DISCONNECT, процесс читателя]`. `SPACE` читатель
     /// сигналит, сняв заявку (`take_space_waiter`) или опустошив кольцо. Без
     /// событий вовсе (anonymous-сервер) -- опрос с шагом `SPACE_POLL_INTERVAL`.
+    ///
+    /// `spin` (0.10): до заявки -- один бюджет спина на вызов с
+    /// перепроверкой места по позициям; заявка `space_waiter` во время спина
+    /// НЕ ставится (читатель не тратит на нас сигнал). При нулевом таймауте
+    /// спина нет: вызов не блокирующий.
     pub(crate) fn wait_for_space(
         &self,
         payload_len: usize,
@@ -710,9 +810,15 @@ impl RingBuffer {
         peer: Option<&ProcessWatch>,
         disconnect: Option<&DisconnectWatch<'_>>,
         timeout: Option<Duration>,
+        spin: SpinPolicy,
     ) -> Result<bool> {
         let frame = self.frame_len(payload_len)?;
         let deadline = timeout.map(|t| Instant::now() + t);
+        if timeout != Some(Duration::ZERO)
+            && spin_until(spin, || self.free_space().fits(payload_len))
+        {
+            return Ok(true);
+        }
         loop {
             if self.free_space().fits(payload_len) {
                 return Ok(true);
@@ -810,6 +916,61 @@ impl RingBuffer {
         let read = header.read_pos.load(Ordering::Acquire);
         let write = header.write_pos.load(Ordering::Acquire);
         read == write && self.confirm_empty(write)
+    }
+
+    /// Проба непрочитанных данных этого кольца для спина (см.
+    /// `UnreadProbe`).
+    pub(crate) const fn unread_probe(&self) -> UnreadProbe<'_> {
+        UnreadProbe {
+            header: self.header,
+            _ring: PhantomData,
+        }
+    }
+
+    /// Дешёвая проверка «есть непрочитанное» по позициям, без барьера --
+    /// для спина (`UnreadProbe::has_unread`). Решение «пусто, можно спать»
+    /// принимает только `is_empty`.
+    pub(crate) fn has_unread(&self) -> bool {
+        self.unread_probe().has_unread()
+    }
+
+    /// Читатель: дождаться данных (`poll_*`). `Ok(true)` -- в кольце есть
+    /// кадр ИЛИ сигнален `DATA` (возможно, устаревший: вызывающий читает
+    /// до `QueueEmpty`), `Ok(false)` -- истёк `timeout`, `Err(PeerDied)` --
+    /// процесс писателя завершился и всё, что он записал, прочитано.
+    ///
+    /// Порядок: `is_empty` (с барьером, Dekker-пара с `commit`), затем
+    /// `spin` -- один бюджет на вызов с проверкой по позициям, затем ОДНО
+    /// ожидание в ядре по `[DATA, процесс писателя]` (индекс 0 -- данные:
+    /// при одновременном сигнале последние данные мёртвого пира не
+    /// теряются). Спин, увидевший кадр, возвращает `Ok(true)` без ядра;
+    /// `DATA`, который писатель мог при этом взвести, остаётся взведённым и
+    /// даст позже одно лишнее пробуждение -- сбрасывать его нельзя (можно
+    /// потерять сигнал следующего кадра). При нулевом таймауте спина нет.
+    pub(crate) fn wait_for_data(
+        &self,
+        data: &EventHandle,
+        peer: Option<&ProcessWatch>,
+        timeout: Option<Duration>,
+        spin: SpinPolicy,
+    ) -> Result<bool> {
+        if !self.is_empty() {
+            return Ok(true);
+        }
+        if timeout != Some(Duration::ZERO) && spin_until(spin, || self.has_unread()) {
+            return Ok(true);
+        }
+        #[cfg(test)]
+        DATA_KERNEL_WAITS.with(|c| c.set(c.get() + 1));
+        let Some(peer) = peer else {
+            return data.wait(timeout);
+        };
+        match wait_any(&[data.as_handle(), peer.as_handle()], timeout)? {
+            Some(0) => Ok(true),
+            Some(_) if !self.is_empty() => Ok(true),
+            Some(_) => Err(ShmError::PeerDied),
+            None => Ok(false),
+        }
     }
 }
 
@@ -1585,7 +1746,14 @@ mod try_write_tests {
         const LEN: usize = 60_000;
         while ring.try_write_message(&[0u8; LEN]).is_ok() {}
         assert_eq!(
-            ring.wait_for_space(LEN, None, None, None, Some(Duration::from_millis(20))),
+            ring.wait_for_space(
+                LEN,
+                None,
+                None,
+                None,
+                Some(Duration::from_millis(20)),
+                SpinPolicy::NONE
+            ),
             Ok(false)
         );
         assert_eq!(
@@ -1604,13 +1772,20 @@ mod try_write_tests {
             })
         };
         assert_eq!(
-            ring.wait_for_space(LEN, None, None, None, Some(Duration::from_secs(5))),
+            ring.wait_for_space(
+                LEN,
+                None,
+                None,
+                None,
+                Some(Duration::from_secs(5)),
+                SpinPolicy::NONE
+            ),
             Ok(true)
         );
         reader.join().unwrap();
         ring.try_write_message(&[1u8; LEN]).unwrap();
         assert_eq!(
-            ring.wait_for_space(0, None, None, None, None),
+            ring.wait_for_space(0, None, None, None, None, SpinPolicy::NONE),
             Err(ShmError::MessageTooSmall),
             "длина проверяется до ожидания"
         );
@@ -1651,7 +1826,7 @@ mod try_write_tests {
         let before = kernel_waits();
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_space(LEN, Some(&space), None, None, None),
+            ring.wait_for_space(LEN, Some(&space), None, None, None, SpinPolicy::NONE),
             Ok(true)
         );
         let waited = t0.elapsed();
@@ -1680,7 +1855,14 @@ mod try_write_tests {
         let before = kernel_waits();
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_space(LEN, Some(&space), Some(&watch), None, None),
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                Some(&watch),
+                None,
+                None,
+                SpinPolicy::NONE
+            ),
             Err(ShmError::PeerDied)
         );
         let waited = t0.elapsed();
@@ -1732,7 +1914,14 @@ mod try_write_tests {
         };
         let before = kernel_waits();
         assert_eq!(
-            ring.wait_for_space(LEN, Some(&space), None, Some(&watch), None),
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                None,
+                Some(&watch),
+                None,
+                SpinPolicy::NONE
+            ),
             Ok(true)
         );
         reader.join().unwrap();
@@ -1754,7 +1943,14 @@ mod try_write_tests {
         };
         let before = kernel_waits();
         assert_eq!(
-            ring.wait_for_space(LEN, Some(&space), None, Some(&watch), None),
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                None,
+                Some(&watch),
+                None,
+                SpinPolicy::NONE
+            ),
             Err(ShmError::NotConnected)
         );
         leaver.join().unwrap();
@@ -1897,5 +2093,161 @@ mod try_write_tests {
         }
         let full_ns = t.elapsed().as_nanos() as f64 / f64::from(ITERS);
         println!("try_write on full ring (QueueFull): {full_ns:.1} ns");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Спин перед ожиданием в ядре (0.10, `SpinPolicy`).
+    use super::overflow_race_tests::make_ring;
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering as O;
+    use std::thread;
+
+    /// Бюджет, заведомо перекрывающий задержку писателя ниже (десятки мс)
+    /// на любом x86: даже при ~3 нс на итерацию -- больше 0,5 с.
+    const LONG_SPIN: SpinPolicy = SpinPolicy::new(200_000_000);
+    /// Задержка писателя/читателя: спин уже идёт, когда данные (место)
+    /// появляются.
+    const PEER_DELAY: Duration = Duration::from_millis(20);
+    const LEN: usize = 60_000;
+
+    fn data_waits() -> u32 {
+        DATA_KERNEL_WAITS.with(std::cell::Cell::get)
+    }
+
+    fn space_waits() -> u32 {
+        SPACE_KERNEL_WAITS.with(std::cell::Cell::get)
+    }
+
+    /// Писатель в другом потоке: через `PEER_DELAY` кладёт кадр и, как
+    /// требует протокол, сигналит `DATA` при `was_empty`.
+    fn spawn_writer(ring: &Arc<RingBuffer>, data: &Arc<EventHandle>) -> thread::JoinHandle<()> {
+        let (ring, data) = (Arc::clone(ring), Arc::clone(data));
+        thread::spawn(move || {
+            thread::sleep(PEER_DELAY);
+            if ring.try_write_message(&[7u8; 16]).unwrap().was_empty {
+                data.set().unwrap();
+            }
+        })
+    }
+
+    #[test]
+    fn spin_policy_defaults_to_none() {
+        assert_eq!(SpinPolicy::default(), SpinPolicy::NONE);
+        assert!(!SpinPolicy::NONE.is_enabled());
+        assert!(SpinPolicy::new(1).is_enabled());
+        assert!(
+            !spin_until(SpinPolicy::NONE, || true),
+            "без бюджета -- ни одной проверки"
+        );
+        let mut calls = 0;
+        assert!(!spin_until(SpinPolicy::new(5), || {
+            calls += 1;
+            false
+        }));
+        assert_eq!(calls, 5, "бюджет -- ровно `iterations` проверок");
+    }
+
+    /// Данные, появившиеся во время спина, читаются без ожидания в ядре; без
+    /// спина тот же сценарий -- ровно одно ожидание (счётчик честный).
+    #[test]
+    fn spin_sees_data_without_kernel_wait() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        let data = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let mut out = Vec::new();
+
+        let writer = spawn_writer(&ring, &data);
+        let before = data_waits();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(Duration::from_secs(5)), LONG_SPIN),
+            Ok(true)
+        );
+        writer.join().unwrap();
+        assert_eq!(data_waits() - before, 0, "спин ушёл в ядро");
+        assert_eq!(ring.read_message(&mut out), Ok(16));
+        // Сигнал писателя спин не трогает: остался взведённым (одно лишнее
+        // пробуждение потом), а не сброшен -- сброс мог бы потерять сигнал.
+        assert!(data.wait(Some(Duration::ZERO)).unwrap());
+
+        // Контроль: без спина -- одно ожидание в ядре до сигнала писателя.
+        let writer = spawn_writer(&ring, &data);
+        let before = data_waits();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(Duration::from_secs(5)), SpinPolicy::NONE),
+            Ok(true)
+        );
+        writer.join().unwrap();
+        assert_eq!(data_waits() - before, 1);
+        assert_eq!(ring.read_message(&mut out), Ok(16));
+    }
+
+    /// Бюджет исчерпан без данных -- одно обычное ожидание в ядре (не
+    /// повторный спин); нулевой таймаут не спинит вовсе.
+    #[test]
+    fn exhausted_spin_falls_back_to_single_kernel_wait() {
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let before = data_waits();
+        assert_eq!(
+            ring.wait_for_data(
+                &data,
+                None,
+                Some(Duration::from_millis(30)),
+                SpinPolicy::new(1_000)
+            ),
+            Ok(false)
+        );
+        assert_eq!(data_waits() - before, 1);
+
+        let t0 = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(Duration::ZERO), LONG_SPIN),
+            Ok(false)
+        );
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "нулевой таймаут спинил: {:?}",
+            t0.elapsed()
+        );
+    }
+
+    /// Место, освобождённое читателем во время спина (без заявки и без
+    /// `SPACE`), видно без ожидания в ядре; заявка на время спина не
+    /// ставится.
+    #[test]
+    fn spin_sees_space_without_kernel_wait() {
+        let (ring, _mem) = make_ring();
+        let ring = Arc::new(ring);
+        while ring.try_write_message(&[0u8; LEN]).is_ok() {}
+        let space = EventHandle::create_unnamed(false).unwrap();
+        let reader = {
+            let ring = Arc::clone(&ring);
+            thread::spawn(move || {
+                thread::sleep(PEER_DELAY);
+                let mut out = Vec::new();
+                ring.read_message(&mut out).unwrap();
+                // Заявки нет -- будить некого.
+                assert!(!ring.take_space_waiter());
+            })
+        };
+        let before = space_waits();
+        assert_eq!(
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                None,
+                None,
+                Some(Duration::from_secs(5)),
+                LONG_SPIN
+            ),
+            Ok(true)
+        );
+        reader.join().unwrap();
+        assert_eq!(space_waits() - before, 0, "спин ушёл в ядро");
+        assert_eq!(ring.header().space_waiter.load(O::Acquire), 0);
+        ring.try_write_message(&[1u8; LEN]).unwrap();
     }
 }

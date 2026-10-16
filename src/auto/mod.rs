@@ -10,7 +10,7 @@ use crate::constants::{MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
-use crate::ring::{FreeSpace, WriteOutcome, frame_size};
+use crate::ring::{FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::sync_ext::{LockExt, join_worker};
@@ -119,6 +119,13 @@ pub struct AutoOptions {
     /// умолчанию) -- общий `\BaseNamedObjects`. Worker держит ссылку, пока
     /// жив: пространство не исчезает, пока его кто-то использует.
     pub namespace: Option<Arc<PrivateNamespace>>,
+    /// Спин worker-а перед сном в ядре (0.10): подключённый worker, которому
+    /// нечего делать, до `spin.iterations` раз проверяет входящее кольцо по
+    /// позициям (и новые `send`/`try_send`, и остановку), прежде чем уснуть
+    /// на наборе событий. Один бюджет на каждое засыпание: в простое worker
+    /// отспинивает его один раз и спит без таймаута. По умолчанию --
+    /// `SpinPolicy::NONE` (без спина). Пиру не виден.
+    pub spin: SpinPolicy,
 }
 
 impl Default for AutoOptions {
@@ -132,6 +139,7 @@ impl Default for AutoOptions {
             layout: ChannelLayout::DEFAULT,
             security: ObjectSecurity::default(),
             namespace: None,
+            spin: SpinPolicy::NONE,
         }
     }
 }
@@ -631,6 +639,31 @@ impl Worker {
         ok
     }
 
+    /// Спин перед сном (`AutoOptions::spin`). `true` -- во входящем кольце
+    /// появились данные, пришла новая отправка или остановка: в ядро не
+    /// уходить, а сделать ещё один проход цикла.
+    ///
+    /// Вызывается ровно один раз перед каждым ожиданием в ядре, только у
+    /// подключённого worker-а, только когда проход ничего не оставил
+    /// несделанным (`more_pending == false`). Поэтому бюджет -- один на
+    /// засыпание: worker в простое отспинивает его один раз и спит на
+    /// наборе событий без таймаута (ноль пробуждений, как без спина).
+    ///
+    /// Непустая очередь отправки на входе -- спина нет: её голова либо ждёт
+    /// `SPACE` (тогда спин по `pending_msgs` закончился бы сразу и крутил
+    /// цикл), либо поставлена колбэком этого прохода -- тогда `wake` уже
+    /// взведён и ожидание вернётся сразу. Данные, увиденные спином, оставляют
+    /// `DATA` взведённым (одно лишнее пробуждение потом); сбрасывать его
+    /// нельзя -- можно потерять сигнал следующего кадра.
+    fn spin_before_wait(&self, has_unread: impl Fn() -> bool) -> bool {
+        if !self.options.spin.is_enabled() || !self.outbox.lock().is_empty() {
+            return false;
+        }
+        spin_until(self.options.spin, || {
+            has_unread() || self.gauge.pending_msgs.load(Ordering::Acquire) > 0 || !self.running()
+        })
+    }
+
     /// Обработать результат ожидания подключённого worker-а. `None` --
     /// соединение живо, `Some(reason)` -- разорвано (уже доставлено всё,
     /// что пир успел записать; колбэк отключения -- за вызывающим).
@@ -870,6 +903,10 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
             }
             if outcome.more_pending || !worker.running() {
                 // Ещё есть данные (или остановка) -- не блокируемся.
+                break 'session None;
+            }
+            // Спин -- один бюджет на засыпание (см. `spin_before_wait`).
+            if worker.spin_before_wait(|| server.has_unread_from_client()) {
                 break 'session None;
             }
             // Набор -- заимствование событий сервера на одно ожидание
@@ -1136,6 +1173,10 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 break Some(DisconnectReason::Error);
             }
             if outcome.more_pending {
+                continue;
+            }
+            // Спин -- один бюджет на засыпание (см. `spin_before_wait`).
+            if worker.spin_before_wait(|| client.has_unread_from_server()) {
                 continue;
             }
             let set = WaitSet::new(
@@ -1793,6 +1834,64 @@ mod lossless_tests {
         );
         drop(client);
         drop(server);
+    }
+
+    /// 0.10: спин включён -- обмен работает (ping-pong через колбэк), а в
+    /// простое worker отспинивает бюджет один раз и спит в ядре: ноль
+    /// пробуждений, как без спина. `stop()` во время спина не ждёт бюджета.
+    #[test]
+    fn idle_worker_with_spin_does_not_wake_up() {
+        /// Сервер отвечает эхом из своего колбэка.
+        struct Echo {
+            server: Mutex<Option<Arc<AutoServer>>>,
+            counting: Counting,
+        }
+        impl AutoHandler for Echo {
+            fn on_connect(&self) {
+                self.counting.on_connect();
+            }
+            fn on_message(&self, direction: ChannelKind, payload: &[u8]) {
+                self.counting.on_message(direction, payload);
+                if let Some(server) = self.server.lock().unwrap().as_ref() {
+                    server.send(payload).unwrap();
+                }
+            }
+        }
+        let options = || AutoOptions {
+            spin: SpinPolicy::new(20_000),
+            ..AutoOptions::default()
+        };
+        let name = format!("AUTO_IDLE_SPIN_{}", std::process::id());
+        let server_h = Arc::new(Echo {
+            server: Mutex::new(None),
+            counting: Counting::default(),
+        });
+        let client_h = Arc::new(Counting::default());
+        let server = Arc::new(AutoServer::start(&name, server_h.clone(), options()).unwrap());
+        *server_h.server.lock().unwrap() = Some(Arc::clone(&server));
+        let client = AutoClient::connect(&name, client_h.clone(), options()).unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            server_h.counting.connected.load(Ordering::Acquire)
+                && client_h.connected.load(Ordering::Acquire)
+        });
+        for round in 1..=100u64 {
+            client.send(b"ping").unwrap();
+            wait_until("эхо", Duration::from_secs(2), || {
+                client_h.received.load(Ordering::Acquire) == round
+            });
+        }
+        thread::sleep(Duration::from_millis(200));
+
+        let (s0, c0) = (server.wakeups(), client.wakeups());
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(server.wakeups() - s0, 0, "сервер просыпался в простое");
+        assert_eq!(client.wakeups() - c0, 0, "клиент просыпался в простое");
+
+        let t0 = std::time::Instant::now();
+        client.stop();
+        *server_h.server.lock().unwrap() = None;
+        server.stop();
+        assert!(t0.elapsed() < Duration::from_secs(2), "stop ждал спина");
     }
 
     /// Ревизия 2, дефект 4: `stop()`/Drop клиента, ждущего `S2C_CONNECT`

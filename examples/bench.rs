@@ -4,9 +4,10 @@
 //! cargo run --release --example bench -- throughput 16
 //! cargo run --release --example bench -- throughput 16 5
 //! cargo run --release --example bench -- latency 4096 5 --ring 1048576 --max-messages 64
+//! cargo run --release --example bench -- latency 16 5 --spin 2000
 //! ```
 //!
-//! `bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>]`
+//! `bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>]`
 //!
 //! Каждый прогон печатает строку `mode size msgs/s MiB/s p50_us p99_us layout`:
 //! - `throughput` -- `SharedServer` -> `SharedClient`, два потока одного
@@ -34,6 +35,10 @@
 //! ёмкость (лимит размера сообщения урезается до вмещаемого кольцом и
 //! поднимается до `size`), `--max-messages` -- только лимит числа сообщений.
 //!
+//! `--spin <iterations>` (0.10) -- спин перед ожиданием в ядре на обеих
+//! сторонах (`poll_*_spin`, `wait_for_space_spin`); по умолчанию 0 -- без
+//! спина. Значение печатается в колонке `layout` (`spin=N`).
+//!
 //! Проверка данных: при `size >= 8` первые 8 байт payload -- сквозной номер
 //! сообщения `u64` (LE), получатель сверяет порядок (потеря, повтор,
 //! перестановка -- ошибка и ненулевой код выхода). При `size < 8` номер не
@@ -47,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use xshm::{
     ChannelConfig, ChannelLayout, DEFAULT_MAX_MESSAGE_SIZE, RingConfig, SharedClient, SharedServer,
-    ShmError, frame_size, max_payload_for,
+    ShmError, SpinPolicy, frame_size, max_payload_for,
 };
 
 type BenchError = Box<dyn Error + Send + Sync>;
@@ -82,6 +87,7 @@ struct Args {
     runs: usize,
     ring: Option<usize>,
     max_messages: Option<u32>,
+    spin: SpinPolicy,
 }
 
 /// Результат одного прогона.
@@ -96,9 +102,10 @@ struct Sample {
 fn main() -> BenchResult<()> {
     let args = parse_args()?;
     let ring = resolve_ring(&args)?;
-    let layout_desc = describe(&ring);
+    let layout_desc = format!("{},spin={}", describe(&ring), args.spin.iterations);
     let config = ChannelConfig::new(ChannelLayout::symmetric(ring));
     let name = format!("XSHM_BENCH_{}_{}", std::process::id(), args.size);
+    let spin = args.spin;
 
     let samples = match args.mode {
         Mode::Throughput => {
@@ -106,9 +113,9 @@ fn main() -> BenchResult<()> {
                 (THROUGHPUT_BYTES / args.size).clamp(THROUGHPUT_MIN_MSGS, THROUGHPUT_MAX_MSGS);
             // Один полный круг по кольцу (+1 кадр), но не меньше минимума.
             let warmup = (ring.capacity / frame_size(args.size)).max(THROUGHPUT_WARMUP_MIN) + 1;
-            run_throughput(&name, &config, args.size, total, warmup, args.runs)?
+            run_throughput(&name, &config, args.size, total, warmup, args.runs, spin)?
         }
-        Mode::Latency => run_latency(&name, &config, args.size, args.runs)?,
+        Mode::Latency => run_latency(&name, &config, args.size, args.runs, spin)?,
     };
 
     let mode = match args.mode {
@@ -156,7 +163,7 @@ fn main() -> BenchResult<()> {
 }
 
 fn usage() -> BenchError {
-    "использование: bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>]"
+    "использование: bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>]"
         .into()
 }
 
@@ -164,6 +171,7 @@ fn parse_args() -> BenchResult<Args> {
     let mut positional = Vec::new();
     let mut ring = None;
     let mut max_messages = None;
+    let mut spin = SpinPolicy::NONE;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -174,6 +182,10 @@ fn parse_args() -> BenchResult<Args> {
             "--max-messages" => {
                 let v = it.next().ok_or_else(usage)?;
                 max_messages = Some(v.parse::<u32>().map_err(|_| usage())?);
+            }
+            "--spin" => {
+                let v = it.next().ok_or_else(usage)?;
+                spin = SpinPolicy::new(v.parse::<u32>().map_err(|_| usage())?);
             }
             _ => positional.push(arg),
         }
@@ -207,6 +219,7 @@ fn parse_args() -> BenchResult<Args> {
         runs,
         ring,
         max_messages,
+        spin,
     })
 }
 
@@ -321,12 +334,12 @@ fn check(buf: &[u8], len: usize, size: usize, expected: u64, side: &str) -> Benc
 }
 
 /// Отправка без перезаписи: при полном кольце -- ждать места в ядре.
-fn send_s2c(server: &SharedServer, payload: &[u8]) -> BenchResult<()> {
+fn send_s2c(server: &SharedServer, payload: &[u8], spin: SpinPolicy) -> BenchResult<()> {
     loop {
         match server.try_send_to_client(payload) {
             Ok(_) => return Ok(()),
             Err(ShmError::QueueFull) => {
-                if !server.wait_for_space(payload.len(), Some(STEP_TIMEOUT))? {
+                if !server.wait_for_space_spin(payload.len(), Some(STEP_TIMEOUT), spin)? {
                     return Err("таймаут ожидания места (сервер)".into());
                 }
             }
@@ -335,12 +348,12 @@ fn send_s2c(server: &SharedServer, payload: &[u8]) -> BenchResult<()> {
     }
 }
 
-fn send_c2s(client: &SharedClient, payload: &[u8]) -> BenchResult<()> {
+fn send_c2s(client: &SharedClient, payload: &[u8], spin: SpinPolicy) -> BenchResult<()> {
     loop {
         match client.try_send_to_server(payload) {
             Ok(_) => return Ok(()),
             Err(ShmError::QueueFull) => {
-                if !client.wait_for_space(payload.len(), Some(STEP_TIMEOUT))? {
+                if !client.wait_for_space_spin(payload.len(), Some(STEP_TIMEOUT), spin)? {
                     return Err("таймаут ожидания места (клиент)".into());
                 }
             }
@@ -350,12 +363,12 @@ fn send_c2s(client: &SharedClient, payload: &[u8]) -> BenchResult<()> {
 }
 
 /// Принять одно сообщение от сервера, ожидая его в ядре.
-fn recv_s2c(client: &SharedClient, buf: &mut Vec<u8>) -> BenchResult<usize> {
+fn recv_s2c(client: &SharedClient, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
     loop {
         match client.receive_from_server(buf) {
             Ok(len) => return Ok(len),
             Err(ShmError::QueueEmpty) => {
-                if !client.poll_server(Some(STEP_TIMEOUT))? {
+                if !client.poll_server_spin(Some(STEP_TIMEOUT), spin)? {
                     return Err(timeout_error("клиент", client.receive_from_server(buf)));
                 }
             }
@@ -364,12 +377,12 @@ fn recv_s2c(client: &SharedClient, buf: &mut Vec<u8>) -> BenchResult<usize> {
     }
 }
 
-fn recv_c2s(server: &SharedServer, buf: &mut Vec<u8>) -> BenchResult<usize> {
+fn recv_c2s(server: &SharedServer, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
     loop {
         match server.receive_from_client(buf) {
             Ok(len) => return Ok(len),
             Err(ShmError::QueueEmpty) => {
-                if !server.poll_client(Some(STEP_TIMEOUT))? {
+                if !server.poll_client_spin(Some(STEP_TIMEOUT), spin)? {
                     return Err(timeout_error("сервер", server.receive_from_client(buf)));
                 }
             }
@@ -433,6 +446,7 @@ fn run_throughput(
     total: usize,
     warmup: usize,
     runs: usize,
+    spin: SpinPolicy,
 ) -> BenchResult<Vec<Sample>> {
     let (warmed_tx, warmed_rx) = mpsc::channel::<()>();
     let (server, client) =
@@ -442,14 +456,14 @@ fn run_throughput(
             let mut ends = Vec::with_capacity(runs);
             for _ in 0..runs {
                 for _ in 0..warmup {
-                    let len = recv_s2c(&client, &mut buf)?;
+                    let len = recv_s2c(&client, &mut buf, spin)?;
                     check(&buf, len, size, expected, "клиент")?;
                     expected += 1;
                 }
                 // Сервер мог уже упасть -- тогда его ошибку вернёт join.
                 let _ = warmed_tx.send(());
                 for _ in 0..total {
-                    let len = recv_s2c(&client, &mut buf)?;
+                    let len = recv_s2c(&client, &mut buf, spin)?;
                     check(&buf, len, size, expected, "клиент")?;
                     expected += 1;
                     black_box(&buf);
@@ -466,7 +480,7 @@ fn run_throughput(
         for _ in 0..runs {
             for _ in 0..warmup {
                 stamp(&mut payload, seq);
-                send_s2c(&server, &payload)?;
+                send_s2c(&server, &payload, spin)?;
                 seq += 1;
             }
             warmed_rx
@@ -477,7 +491,7 @@ fn run_throughput(
             starts.push(Instant::now());
             for _ in 0..total {
                 stamp(&mut payload, seq);
-                send_s2c(&server, &payload)?;
+                send_s2c(&server, &payload, spin)?;
                 seq += 1;
             }
         }
@@ -509,6 +523,7 @@ fn run_latency(
     config: &ChannelConfig,
     size: usize,
     runs: usize,
+    spin: SpinPolicy,
 ) -> BenchResult<Vec<Sample>> {
     let rounds = LATENCY_WARMUP + LATENCY_ITERS;
     let (server, client) = connect_pair(name, config, move |client| -> BenchResult<Vec<Sample>> {
@@ -526,8 +541,8 @@ fn run_latency(
                 }
                 stamp(&mut payload, seq);
                 let t0 = Instant::now();
-                send_c2s(&client, &payload)?;
-                let len = recv_s2c(&client, &mut buf)?;
+                send_c2s(&client, &payload, spin)?;
+                let len = recv_s2c(&client, &mut buf, spin)?;
                 let dt = t0.elapsed();
                 check(&buf, len, size, seq, "клиент (эхо)")?;
                 seq += 1;
@@ -550,9 +565,9 @@ fn run_latency(
     let echoed = (|| -> BenchResult<()> {
         let mut buf = Vec::with_capacity(size);
         for expected in 0..(runs * rounds) as u64 {
-            let len = recv_c2s(&server, &mut buf)?;
+            let len = recv_c2s(&server, &mut buf, spin)?;
             check(&buf, len, size, expected, "сервер")?;
-            send_s2c(&server, &buf[..len])?;
+            send_s2c(&server, &buf[..len], spin)?;
         }
         Ok(())
     })();

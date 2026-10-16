@@ -441,6 +441,61 @@ fn idle_server_and_client_do_not_wake_up() {
     server.stop();
 }
 
+/// 0.10: спин включён у сервера и клиента -- обмен работает (данные,
+/// увиденные спином, обрабатываются без ядра), а в простое бюджет
+/// отспинивается один раз: ноль пробуждений, как без спина.
+#[test]
+fn idle_with_spin_does_not_wake_up() {
+    let name = unique("IDLE_SPIN");
+    let server_handler = Arc::new(TestHandler::new());
+    let server = MultiServer::start(
+        &name,
+        server_handler.clone(),
+        MultiOptions {
+            spin: SpinPolicy::new(20_000),
+            ..single_slot(4)
+        },
+    )
+    .expect("start");
+    let recorder = Arc::new(ClientRecorder::default());
+    let client = MultiClient::connect(
+        &name,
+        recorder.clone(),
+        MultiClientOptions {
+            spin: SpinPolicy::new(20_000),
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("client connect");
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1 && client.is_connected()
+    });
+
+    for round in 1..=50 {
+        client.send(b"ping").unwrap();
+        wait_for(
+            "сообщение серверу",
+            Duration::from_secs(2),
+            || server_handler.messages.load(Ordering::Acquire) == round,
+        );
+        server.send_to(client.slot_id(), b"pong").unwrap();
+        wait_for(
+            "сообщение клиенту",
+            Duration::from_secs(2),
+            || recorder.messages.load(Ordering::Acquire) == round,
+        );
+    }
+
+    thread::sleep(HANDSHAKE_VERIFY_DELAY + Duration::from_millis(300));
+    let (s0, c0) = (server.wakeups(), client.wakeups());
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(server.wakeups() - s0, 0, "сервер просыпался в простое");
+    assert_eq!(client.wakeups() - c0, 0, "клиент просыпался в простое");
+
+    drop(client);
+    server.stop();
+}
+
 /// Протухший захват (клиент упал между CAS и подключением) освобождается по
 /// ДЕДЛАЙНУ `reserve_timeout`: сервер просыпается от «толчка» и затем ровно
 /// один раз -- в момент дедлайна, без тика.

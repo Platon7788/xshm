@@ -37,7 +37,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::ring::FreeSpace;
+use crate::ring::{FreeSpace, SpinPolicy};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker};
@@ -226,6 +226,10 @@ pub struct DispatchOptions {
     /// (`DispatchClientOptions::namespace`). `None` (по умолчанию) -- общий
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
+    /// Спин worker-а каждого клиентского канала перед сном (0.10, см.
+    /// `AutoOptions::spin`). Лобби не спинит никогда. По умолчанию --
+    /// `SpinPolicy::NONE`.
+    pub spin: SpinPolicy,
 }
 
 /// Раскладка лобби по умолчанию: регистрация -- одно короткое сообщение в
@@ -249,6 +253,7 @@ impl Default for DispatchOptions {
             lobby_layout: DEFAULT_LOBBY_LAYOUT,
             security: ObjectSecurity::default(),
             namespace: None,
+            spin: SpinPolicy::NONE,
         }
     }
 }
@@ -278,6 +283,10 @@ pub struct DispatchClientOptions {
     /// `DispatchOptions::namespace`). `None` (по умолчанию) -- общий
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
+    /// Спин worker-а выделенного канала перед сном (0.10, см.
+    /// `AutoOptions::spin`). Регистрация в лобби не спинит. По умолчанию --
+    /// `SpinPolicy::NONE`.
+    pub spin: SpinPolicy,
 }
 
 impl Default for DispatchClientOptions {
@@ -291,6 +300,7 @@ impl Default for DispatchClientOptions {
             max_send_queue: 256,
             security: ObjectSecurity::default(),
             namespace: None,
+            spin: SpinPolicy::NONE,
         }
     }
 }
@@ -1034,6 +1044,7 @@ impl DispatchCore {
             // Канал клиента наследует политику и пространство имён лобби.
             security: self.options.security.clone(),
             namespace: self.options.namespace.clone(),
+            spin: self.options.spin,
             ..AutoOptions::default()
         };
 
@@ -1425,6 +1436,7 @@ impl DispatchClient {
             recv_batch: options.recv_batch,
             // Канал -- в пространстве имён лобби (0.10).
             namespace: options.namespace.clone(),
+            spin: options.spin,
             ..AutoOptions::default()
         };
 
