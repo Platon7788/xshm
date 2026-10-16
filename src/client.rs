@@ -109,17 +109,19 @@ fn wait_ack(
     mut interrupt: Option<&mut Interrupt<'_>>,
 ) -> AckWait {
     let accepted = || view.control_block().generation.load(Ordering::Acquire) != generation_before;
-    let deadline = Instant::now() + timeout;
+    // Таймаут, непредставимый как `Instant` (`Duration::MAX`), -- ждать без
+    // дедлайна, а не паниковать на переполнении.
+    let deadline = crate::ring::deadline_of(Some(timeout));
     loop {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
+        let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        if left.is_some_and(|left| left.is_zero()) {
             return AckWait::Abandoned(ShmError::Timeout);
         }
         let fired = match interrupt.as_deref_mut() {
-            Some(int) => wait_any(&[events.connect_ack.as_handle(), int.wake], Some(left)),
+            Some(int) => wait_any(&[events.connect_ack.as_handle(), int.wake], left),
             None => events
                 .connect_ack
-                .wait(Some(left))
+                .wait(left)
                 .map(|signaled| signaled.then_some(0)),
         };
         match fired {

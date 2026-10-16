@@ -162,6 +162,11 @@
 
 ### Исправлено (аудит 16.10.2026)
 
+- **Low** Паника на переполнении `Instant` при огромном таймауте
+  (`Duration::MAX`) в `SharedClient::connect`/`connect_in` и в ожидании места
+  (`wait_for_space*`): таймаут, непредставимый как `Instant`, теперь значит
+  «без дедлайна» (`ring::deadline_of`), как уже было в `poll_*`.
+
 - **High** Ложный `Corrupted` при `max_messages = 1`: читатель уменьшает
   `message_count` после CAS `read_pos`, и писатель в этом окне видел пустое
   по позициям кольцо с `count == max_messages` — `write_message` отвечал

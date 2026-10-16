@@ -839,7 +839,7 @@ impl RingBuffer {
         spin: SpinPolicy,
     ) -> Result<bool> {
         let frame = self.frame_len(payload_len)?;
-        let deadline = timeout.map(|t| Instant::now() + t);
+        let deadline = deadline_of(timeout);
         if timeout != Some(Duration::ZERO)
             && spin_until(spin, deadline, || self.free_space().fits(payload_len))
         {
@@ -1817,6 +1817,24 @@ mod try_write_tests {
             ring.wait_for_space(0, None, None, None, None, SpinPolicy::NONE),
             Err(ShmError::MessageTooSmall),
             "длина проверяется до ожидания"
+        );
+    }
+
+    #[test]
+    fn huge_space_timeout_does_not_overflow_instant() {
+        // `Duration::MAX` непредставим как `Instant`: ожидание без дедлайна,
+        // а не паника на переполнении (место есть -- возврат сразу).
+        let (ring, _mem) = make_ring();
+        assert_eq!(
+            ring.wait_for_space(
+                16,
+                None,
+                None,
+                None,
+                Some(Duration::MAX),
+                SpinPolicy::new(64)
+            ),
+            Ok(true)
         );
     }
 
