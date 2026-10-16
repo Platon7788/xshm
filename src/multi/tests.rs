@@ -642,7 +642,8 @@ fn stop_is_prompt() {
     let name = unique("PROMPT");
     let server =
         MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(31)).expect("start");
-    assert_eq!(server.wakes.len(), 2, "31 слот -- два worker-а");
+    // 0.10: 31 слот -- один поток-диспетчер (до 0.10 -- два worker-а).
+    assert_eq!(server.worker_handles.lock().unwrap().len(), 1);
     let client = MultiClient::connect(
         &name,
         Arc::new(ClientRecorder::default()),
@@ -769,10 +770,12 @@ fn disconnect_client_notifies_client_and_frees_slot() {
     server.stop();
 }
 
-/// Слоты второй группы (второй worker) обслуживаются так же: 24 клиента на
-/// 31 слоте, каждый обменивается сообщением.
+/// Слоты за прежней границей группы worker-а (21 слот до 0.10) обслуживаются
+/// так же: 24 клиента на 31 слоте, каждый обменивается сообщением.
 #[test]
 fn clients_across_two_worker_groups() {
+    /// Слотов в группе worker-а до 0.10 (`SLOTS_PER_WORKER`, удалён).
+    const SLOTS_PER_WORKER: u32 = 21;
     let name = unique("GROUPS");
     let handler = Arc::new(TestHandler::new());
     let server = MultiServer::start(&name, handler.clone(), single_slot(31)).expect("start");
@@ -1091,4 +1094,270 @@ fn drop_during_slot_handshake_is_prompt() {
         best < Duration::from_millis(200),
         "лучшая из трёх: {best:?}"
     );
+}
+
+/// Сколько рабочих потоков xshm стартовало с хуком теста
+/// `two_hundred_fifty_six_slots_one_thread`.
+static STARTED_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+fn count_thread_start() {
+    STARTED_THREADS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Task 17: сервер на 256 слотов -- один поток-диспетчер (до 0.10 --
+/// 13 worker-ов по 21 слоту). Потоки считает хук старта рабочих потоков
+/// (`set_thread_start_hook`), поставленный на потоке теста: его получают
+/// только потоки, созданные отсюда, -- параллельные тесты счёт не портят.
+/// Слот 255 обслуживается тем же потоком: клиент подключается к нему и
+/// обменивается сообщениями.
+#[test]
+fn two_hundred_fifty_six_slots_one_thread() {
+    let name = unique("SLOTS256");
+    let handler = Arc::new(TestHandler::new());
+    crate::thread_hook::set_thread_start_hook(Some(count_thread_start));
+    let before = STARTED_THREADS.load(Ordering::SeqCst);
+    let server = MultiServer::start(
+        &name,
+        handler.clone(),
+        MultiOptions {
+            max_clients: MAX_MULTI_CLIENTS,
+            layout: ChannelLayout::symmetric(crate::layout::RingConfig::new(4096)),
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start 256");
+    crate::thread_hook::set_thread_start_hook(None);
+    // Хук зовётся первой строкой нового потока -- дать ему стартовать.
+    wait_for(
+        "старт диспетчера",
+        Duration::from_secs(5),
+        || STARTED_THREADS.load(Ordering::SeqCst) > before,
+    );
+    thread::sleep(Duration::from_millis(200));
+    let grown = STARTED_THREADS.load(Ordering::SeqCst) - before;
+    assert!(grown <= 2, "256 слотов -- {grown} потоков");
+    assert_eq!(grown, 1, "один поток-диспетчер");
+
+    // Слоты 0..255 заняты захватами -- клиент получит последний слот.
+    for slot_id in 0..MAX_MULTI_CLIENTS - 1 {
+        assert!(try_claim_slot(None, &format!("{name}_{slot_id}"), 0xC1A1_1000 + slot_id).unwrap());
+    }
+    let recorder = Arc::new(ClientRecorder::default());
+    let client = MultiClient::connect(&name, recorder.clone(), MultiClientOptions::default())
+        .expect("client");
+    wait_for(
+        "подключение к слоту 255",
+        Duration::from_secs(5),
+        || client.is_connected(),
+    );
+    assert_eq!(client.slot_id(), MAX_MULTI_CLIENTS - 1);
+    client.send(b"ping").unwrap();
+    wait_for(
+        "сообщение со слота 255",
+        Duration::from_secs(2),
+        || handler.messages.load(Ordering::Acquire) == 1,
+    );
+    server.send_to(client.slot_id(), b"pong").unwrap();
+    wait_for(
+        "ответ на слот 255",
+        Duration::from_secs(2),
+        || recorder.messages.load(Ordering::Acquire) == 1,
+    );
+    drop(client);
+    server.stop();
+}
+
+/// Обработчик с медленным слотом: `on_message` слота `slow` спит 50 мс.
+struct SlowSlotHandler {
+    slow: AtomicU32,
+    slow_done: AtomicU32,
+    /// Первое сообщение другого слота: когда и сколько медленных к тому
+    /// моменту обработано.
+    fast_seen: Mutex<Option<(Instant, u32)>>,
+}
+
+impl MultiHandler for SlowSlotHandler {
+    fn on_client_connect(&self, _client_id: u32) {}
+    fn on_client_disconnect(&self, _client_id: u32) {}
+    fn on_message(&self, client_id: u32, _data: &[u8]) {
+        if client_id == self.slow.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(50));
+            self.slow_done.fetch_add(1, Ordering::AcqRel);
+        } else {
+            let mut seen = self.fast_seen.lock().unwrap();
+            if seen.is_none() {
+                *seen = Some((Instant::now(), self.slow_done.load(Ordering::Acquire)));
+            }
+        }
+    }
+}
+
+/// Task 17, честная ротация: медленный `on_message` слота A (50 мс на
+/// сообщение, 40 сообщений -- 2 с работы) не задерживает сообщение слота B
+/// дольше пары кругов: за круг -- не больше `recv_batch` (2) сообщений слота.
+#[test]
+fn slow_slot_does_not_stall_other_slots() {
+    let name = unique("FAIR");
+    let handler = Arc::new(SlowSlotHandler {
+        slow: AtomicU32::new(u32::MAX),
+        slow_done: AtomicU32::new(0),
+        fast_seen: Mutex::new(None),
+    });
+    let server = MultiServer::start(
+        &name,
+        handler.clone(),
+        MultiOptions {
+            max_clients: 4,
+            recv_batch: 2,
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start");
+    let slow = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "медленный клиент",
+        Duration::from_secs(5),
+        || slow.is_connected(),
+    );
+    handler.slow.store(slow.slot_id(), Ordering::Release);
+    let fast = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "быстрый клиент",
+        Duration::from_secs(5),
+        || fast.is_connected() && server.client_count() == 2,
+    );
+
+    for i in 0..40u32 {
+        slow.send(&i.to_le_bytes()).unwrap();
+    }
+    wait_for(
+        "медленный слот в работе",
+        Duration::from_secs(5),
+        || handler.slow_done.load(Ordering::Acquire) >= 1,
+    );
+    let t0 = Instant::now();
+    fast.send(b"fast").unwrap();
+    wait_for(
+        "сообщение быстрого слота",
+        Duration::from_secs(5),
+        || handler.fast_seen.lock().unwrap().is_some(),
+    );
+    let (at, slow_before) = handler.fast_seen.lock().unwrap().unwrap();
+    let latency = at - t0;
+    assert!(
+        latency < Duration::from_millis(1000),
+        "быстрый слот ждал {latency:?}"
+    );
+    assert!(
+        slow_before < 20,
+        "быстрый слот ждал почти всю очередь медленного: {slow_before} из 40"
+    );
+    drop(fast);
+    drop(slow);
+    server.stop();
+}
+
+/// Task 17, устаревшее завершение: `DISCONNECT` первой сессии извлечён из
+/// порта, но не обработан, а слот тем временем отключён и подключён снова
+/// (новая привязка `DISCONNECT`). Старое завершение отбрасывается по
+/// поколению -- новую сессию оно не отключает; поглощённый сигнал при
+/// снятии привязки возвращается; своё `DISCONNECT` новая сессия получает.
+///
+/// Диспетчер ведётся вручную на ядре остановленного сервера (порт жив,
+/// потока нет), смена сессий -- флагом `connected` под блокировкой слота.
+#[test]
+fn stale_completion_is_not_delivered_to_new_session() {
+    let name = unique("STALE_COMPLETION");
+    let handler = Arc::new(TestHandler::new());
+    let server = MultiServer::start(&name, handler.clone(), single_slot(1)).expect("start");
+    stop_workers(&server);
+    let set_connected = |connected: bool| {
+        server.slots.read().unwrap()[0].lock().unwrap().connected = connected;
+    };
+    let disconnect_set = || {
+        let slots = server.slots.read().unwrap();
+        let slot = slots[0].lock().unwrap();
+        slot.server.events().unwrap().disconnect.set().unwrap();
+    };
+    let disconnect_signalled = || {
+        let slots = server.slots.read().unwrap();
+        let slot = slots[0].lock().unwrap();
+        slot.server
+            .events()
+            .unwrap()
+            .disconnect
+            .wait(Some(Duration::ZERO))
+            .unwrap()
+    };
+    // Пост остановки мог остаться в порту (диспетчер вышел по `running`, не
+    // дойдя до ожидания) -- убрать.
+    let mut leftover = Vec::new();
+    server
+        .port
+        .wait_batch(&mut leftover, Some(Duration::ZERO))
+        .unwrap();
+    assert!(leftover.iter().all(|c| c.key == WAKE_KEY));
+    let mut dispatcher = Dispatcher::new(&server.core);
+    dispatcher.reconcile(0); // свободный слот: CONNECT_REQ
+    set_connected(true);
+    dispatcher.reconcile(0); // сессия 1: DISCONNECT, DATA
+
+    // Сессия 1: DISCONNECT сработал, завершение извлечено, не обработано.
+    disconnect_set();
+    let mut old = Vec::new();
+    server
+        .port
+        .wait_batch(&mut old, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(old.len(), 1);
+    assert_eq!(old[0].key, WaitKind::Disconnect.key(0));
+
+    // Отключение и новая сессия на том же слоте.
+    set_connected(false);
+    dispatcher.reconcile(0);
+    assert!(
+        disconnect_signalled(),
+        "поглощённый снятой привязкой DISCONNECT не возвращён"
+    );
+    // (`wait` выше и погасил сигнал -- как сброс DISCONNECT рукопожатием.)
+    set_connected(true);
+    dispatcher.reconcile(0); // сессия 2: новая привязка DISCONNECT
+
+    let stale = server.stale_completions.load(Ordering::Relaxed);
+    dispatcher.complete(old[0]);
+    assert_eq!(
+        server.stale_completions.load(Ordering::Relaxed),
+        stale + 1,
+        "старое завершение не отброшено"
+    );
+    assert!(server.slots.read().unwrap()[0].lock().unwrap().connected);
+    assert_eq!(handler.disconnects.load(Ordering::Acquire), 0);
+
+    // Своё DISCONNECT новая сессия получает.
+    disconnect_set();
+    let mut fresh = Vec::new();
+    server
+        .port
+        .wait_batch(&mut fresh, Some(Duration::from_secs(1)))
+        .unwrap();
+    assert_eq!(fresh.len(), 1);
+    assert_ne!(fresh[0].tag, old[0].tag, "поколение не сменилось");
+    dispatcher.complete(fresh[0]);
+    assert!(!server.slots.read().unwrap()[0].lock().unwrap().connected);
+    assert_eq!(handler.disconnects.load(Ordering::Acquire), 1);
+    assert_eq!(
+        *handler.last_reason.lock().unwrap(),
+        Some(DisconnectReason::Graceful)
+    );
+    dispatcher.release_all();
 }

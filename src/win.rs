@@ -990,9 +990,9 @@ pub fn wait_any(
     // значение >= 0 и по чистой случайности совпало бы с индексом 258,
     // если бы handles.len() когда-нибудь превысил этот порог. Сейчас это
     // не достижимо: ядро принимает не больше MAXIMUM_WAIT_OBJECTS = 64
-    // handle (больше -- STATUS_INVALID_PARAMETER), самый большой набор --
-    // worker Multi (3 * SLOTS_PER_WORKER + wake = 64), -- но порядок веток
-    // не должен полагаться на этот внешний инвариант.
+    // handle (больше -- STATUS_INVALID_PARAMETER), а наборы крейта -- единицы
+    // handle (Multi-сервер с 0.10 ждёт на порту завершения), -- но порядок
+    // веток не должен полагаться на этот внешний инвариант.
     match status {
         STATUS_TIMEOUT => Ok(None),
         s if let Ok(index) = usize::try_from(s)

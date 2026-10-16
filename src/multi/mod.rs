@@ -24,17 +24,39 @@
 //! N клиентов подключаются ПОЛНОСТЬЮ КОНКУРЕНТНО: CAS на разной памяти,
 //! без общего состояния, без coalescing событий, без коллизий слотов.
 //!
-//! # Событийная модель (0.9)
+//! # Событийная модель (0.9; 0.10 -- один поток-диспетчер)
 //!
 //! Ни сервер, ни клиент не просыпаются в простое (`poll_timeout = None` по
-//! умолчанию). Worker сервера (один на каждые `SLOTS_PER_WORKER` слотов)
-//! спит в `NtWaitForMultipleObjects` по набору: у свободного слота --
-//! `C2S_CONNECT_REQ`, у подключённого -- `S2C_DISCONNECT`, `C2S_DATA` и handle
-//! процесса клиента; последним -- безымянное событие `wake` группы
-//! (`disconnect_client`, `stop`). Таймаут ожидания -- ровно до ближайшего
-//! ДЕДЛАЙНА (протухший захват слота, разовая проверка брошенного
-//! рукопожатия), а не тик. Клиент спит по `[S2C_DISCONNECT, S2C_DATA,
-//! процесс сервера, wake]`; `send`/`stop` будят его своим событием.
+//! умолчанию). Сервер (0.10) обслуживает ВСЕ слоты одним потоком-диспетчером
+//! на своём порту завершения (`reactor::CompletionPort`, не общий реактор):
+//! каждый объект ожидания слота привязан к порту пакетом ожидания с ключом
+//! (слот, вид) и меткой-поколением -- у свободного слота `C2S_CONNECT_REQ`,
+//! у подключённого `S2C_DISCONNECT`, `C2S_DATA` и handle процесса клиента.
+//! `disconnect_client`/`stop` будят диспетчер постом в порт
+//! (`NtSetIoCompletion`, ключ `WAKE_KEY`). Таймаут ожидания порта -- ровно
+//! до ближайшего ДЕДЛАЙНА (протухший захват слота, разовая проверка
+//! брошенного рукопожатия), а не тик. Колбэки всех слотов выполняются
+//! последовательно на этом потоке, данные слотов читаются по кругу (не
+//! больше `recv_batch` сообщений слота за круг). Клиент спит по
+//! `[S2C_DISCONNECT, S2C_DATA, процесс сервера, wake]`; `send`/`stop` будят
+//! его своим событием.
+//!
+//! # Привязки одноразовые: порядок перепривязки
+//!
+//! Привязка пакета -- ожидание: сработав, она потребляет сигнал
+//! автосбросного события и снимается. Диспетчер -- единственный ждущий
+//! `C2S_CONNECT_REQ` и `C2S_DATA` на стороне сервера, поэтому сигнал,
+//! пришедший между срабатыванием и перепривязкой, остаётся в событии и
+//! будит новую привязку сразу (`AlreadySignaled`). `C2S_DATA` перепривязывается
+//! ДО чтения кольца, а «пусто» решается только по позициям
+//! (`read_message` -> `confirm_empty`): писатель, опубликовавший кадр после
+//! этой проверки, сигналит `DATA` в уже привязанный пакет. Снятие привязки
+//! (`WaitPacket::cancel`), потребившей сигнал (`FiredNotDelivered` или
+//! извлечённой, но ещё не обработанной -- `AlreadyDelivered`), возвращает
+//! сигнал (`NtSetEvent`) для `CONNECT_REQ`/`DISCONNECT` и перечитывает кольцо
+//! для `DATA`; лишний сигнал безопасен, потерянный -- нет. Пакет, чья
+//! метка-поколение устарела (снят или перепривязан), отбрасывается:
+//! завершение прежней сессии не попадает в новую.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -55,6 +77,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
 use crate::naming::{Direction, ObjectPath};
+use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
 use crate::ring::{FreeSpace, SpinPolicy, UnreadProbe, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -71,14 +94,21 @@ pub const DEFAULT_MAX_CLIENTS: u32 = 20;
 /// `0..MAX_MULTI_CLIENTS` до первого отсутствующего -- предел ограничивает
 /// цену перебора. Сервер публикует число слотов в `ControlBlock::slot_count`
 /// каждого слота -- это подсказка (диагностика), клиенты по ней перебор не
-/// ограничивают. Worker-ы делятся по `SLOTS_PER_WORKER`: 256 слотов --
-/// 13 worker-ов.
+/// ограничивают. Все слоты (до 256) обслуживает один поток-диспетчер на
+/// порту завершения (0.10; до 0.10 -- worker на каждые 21 слот).
 pub const MAX_MULTI_CLIENTS: u32 = 256;
 
-/// Слотов на один worker-поток: подключённый слот кладёт в набор ожидания до
-/// 3 handle (`S2C_DISCONNECT`, `C2S_DATA`, процесс клиента), плюс одно
-/// событие `wake` группы: 3 * 21 + 1 = 64 = `MAXIMUM_WAIT_OBJECTS`.
-const SLOTS_PER_WORKER: u32 = 21;
+/// Видов ожидания у слота (`WaitKind`): ключ пакета -- `slot * WAIT_KINDS +
+/// вид`, для 256 слотов -- меньше 1024.
+const WAIT_KINDS: usize = 4;
+
+/// Ключ поста «пробуждение» (`NtSetIoCompletion`): `disconnect_client`,
+/// `stop`, `force_disconnect`. Вне диапазона ключей слотов. Метка поста --
+/// номер слота, чей набор ожиданий изменился, или `WAKE_ANY`.
+const WAKE_KEY: usize = usize::MAX;
+
+/// Метка поста `WAKE_KEY` без конкретного слота (`stop`/Drop).
+const WAKE_ANY: usize = usize::MAX;
 
 /// Таймаут, после которого «зависшая» резервация слота освобождается
 /// (клиент захватил claim, но не подключился к слоту).
@@ -102,11 +132,21 @@ const HANDSHAKE_VERIFY_DELAY: Duration = RESERVE_SAFETY_MARGIN;
 
 /// Ограничение частоты разовой проверки живости по PID для клиента без
 /// наблюдаемого процесса (старая версия + процесс не открылся). Это не
-/// таймер: проверка делается только при пробуждении worker-а по другой
+/// таймер: проверка делается только при пробуждении диспетчера по другой
 /// причине и не чаще этого периода (`NtOpenProcess` дороже atomic load).
 const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 
-/// Callback-интерфейс для обработки событий мультиклиентного сервера
+/// Callback-интерфейс для обработки событий мультиклиентного сервера.
+///
+/// # Один поток на все слоты (0.10)
+///
+/// Все колбэки всех слотов вызываются последовательно на одном
+/// потоке-диспетчере сервера. Данные слотов читаются по кругу: за круг --
+/// не больше `MultiOptions::recv_batch` сообщений слота, так что болтливый
+/// клиент не заслоняет остальных. Но **медленный колбэк задерживает всех
+/// клиентов**: пока выполняется `on_message` одного слота, сообщения,
+/// подключения и отключения остальных ждут. Долгую обработку выносите из
+/// колбэка (своя очередь, пул потоков).
 pub trait MultiHandler: Send + Sync + 'static {
     /// Вызывается при подключении нового клиента
     fn on_client_connect(&self, client_id: u32);
@@ -166,14 +206,17 @@ pub trait MultiClientHandler: Send + Sync + 'static {
 pub struct MultiOptions {
     /// Максимальное количество одновременных клиентов
     pub max_clients: u32,
-    /// Страховочный таймаут ожидания worker-а. `None` (по умолчанию, 0.9+)
-    /// -- только события и дедлайны: worker спит в ядре до подключения,
+    /// Страховочный таймаут ожидания потока-диспетчера. `None` (по
+    /// умолчанию, 0.9+) -- только события и дедлайны: диспетчер спит в
+    /// ядре до подключения,
     /// данных, отключения, смерти клиента, `disconnect_client`/`stop` или
     /// ближайшего дедлайна освобождения слота -- ни одного пробуждения в
     /// простое. `Some(t)` -- дополнительно просыпаться не реже `t` (для
     /// корректности не нужно). До 0.9 -- `Duration` (50 мс, опрос).
     pub poll_timeout: Option<Duration>,
-    /// Количество сообщений для обработки за один цикл
+    /// Сколько сообщений слота обрабатывается за один круг диспетчера
+    /// (0.10: круг обходит все слоты с данными по очереди -- честная
+    /// ротация; см. [`MultiHandler`]).
     pub recv_batch: usize,
     /// Раскладка каждого слота: размер колец и лимиты сообщений по
     /// направлениям (сервер -> клиент, клиент -> сервер). Каждый слот --
@@ -190,12 +233,12 @@ pub struct MultiOptions {
     /// границы (`MultiClientOptions::namespace`). `None` (по умолчанию) --
     /// общий `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
-    /// Спин worker-а группы перед сном в ядре (0.10): до `spin.iterations`
-    /// проверок колец клиент -> сервер всех подключённых слотов группы по
-    /// позициям (и остановки), прежде чем уснуть на наборе событий. Один
+    /// Спин потока-диспетчера перед сном в ядре (0.10): до
+    /// `spin.iterations` проверок колец клиент -> сервер всех подключённых
+    /// слотов по позициям (и остановки), прежде чем уснуть на порту. Один
     /// бюджет на каждое засыпание (в простое -- ноль пробуждений). После
-    /// удачного спина данные читаются, а набор событий группы всё равно
-    /// опрашивается (нулевой таймаут) -- болтливый слот не заслоняет
+    /// удачного спина данные читаются, а порт всё равно опрашивается
+    /// (нулевой таймаут) до следующего спина -- болтливый слот не заслоняет
     /// `CONNECT_REQ`/`DISCONNECT`/смерть процесса остальных.
     ///
     /// Во время спина `CONNECT_REQ`, `DISCONNECT` и смерть клиентов не
@@ -293,9 +336,12 @@ struct ClientSlot {
     /// Подключён без наблюдаемого процесса: момент последней разовой
     /// проверки живости по PID (ограничение частоты, не таймер).
     last_liveness_check: Option<Instant>,
-    /// Handle процессов отключённых клиентов, которые ещё могут лежать в
-    /// наборе ожидания спящего worker-а: закрывать ожидаемый handle нельзя,
-    /// worker очищает список после пробуждения.
+    /// Handle процессов отключённых клиентов: закрываются в начале
+    /// следующего прохода диспетчера (`reclaim_stale_claims`), а не под
+    /// блокировкой вызывающего `disconnect_client`. Пакет ожидания, ещё
+    /// привязанный к такому процессу, закрытия не боится -- ядро держит
+    /// ссылку на объект до срабатывания или отмены привязки; снимает её
+    /// диспетчер при сверке слота (`Dispatcher::reconcile`).
     retired: Vec<ProcessWatch>,
 }
 
@@ -330,7 +376,7 @@ impl ClientSlot {
     }
 
     /// Разорвать подключение слота на стороне сервера: состояния handshake
-    /// -> IDLE, handle процессов -> в `retired` (закроет worker).
+    /// -> IDLE, handle процессов -> в `retired` (закроет диспетчер).
     fn reset_connection(&mut self) {
         self.connected = false;
         self.claim_seen = None;
@@ -354,13 +400,13 @@ impl ClientSlot {
     }
 }
 
-/// Итог прохода обслуживания слотов группы.
+/// Итог прохода обслуживания слотов.
 #[derive(Debug, Default)]
 struct Sweep {
     /// Осиротевшие подключённые слоты: `(slot_id, ожидаемый claim, причина)`.
     orphaned: Vec<(u32, u32, DisconnectReason)>,
     /// Ближайший дедлайн (освобождение протухшего захвата, проверка
-    /// рукопожатия) -- до него и ждёт worker.
+    /// рукопожатия) -- до него и ждёт диспетчер.
     next_deadline: Option<Instant>,
 }
 
@@ -382,9 +428,12 @@ impl Sweep {
 /// РАЗНОЙ памяти — без общего состояния, без coalescing событий, без коллизий.
 ///
 /// Возвращается как `Arc<MultiServer>`; `Drop` последней ручки
-/// останавливает сервер (`stop`). Worker-ы держат только ядро
+/// останавливает сервер (`stop`). Поток-диспетчер держит только ядро
 /// (`MultiCore`), а не саму ручку, поэтому сервер, который отпустили без
 /// `stop()`, не живёт вечно. Методы ядра доступны через `Deref`.
+///
+/// Все слоты обслуживает один поток (0.10): колбэки -- последовательно на
+/// нём (см. [`MultiHandler`] о медленных колбэках).
 pub struct MultiServer {
     core: Arc<MultiCore>,
 }
@@ -410,11 +459,11 @@ impl std::fmt::Debug for MultiServer {
 }
 
 mod core_type {
-    use super::{Arc, AtomicBool, AtomicU64, ClientSlot, Duration, EventHandle, JoinHandle};
+    use super::{Arc, AtomicBool, AtomicU64, ClientSlot, CompletionPort, Duration, JoinHandle};
     use super::{MultiHandler, MultiOptions, Mutex, RwLock};
 
-    /// Состояние сервера, общее для ручки `MultiServer` и worker-ов. Вне
-    /// крейта тип не именуем: его методы доступны через `Deref` ручки.
+    /// Состояние сервера, общее для ручки `MultiServer` и потока-диспетчера.
+    /// Вне крейта тип не именуем: его методы доступны через `Deref` ручки.
     #[expect(
         unnameable_types,
         reason = "ядро -- деталь реализации: методы доступны через `Deref` ручки `MultiServer`"
@@ -424,18 +473,23 @@ mod core_type {
         pub(in crate::multi) slots: RwLock<Vec<Mutex<ClientSlot>>>,
         pub(in crate::multi) max_clients: u32,
         pub(in crate::multi) running: Arc<AtomicBool>,
-        /// `wake` каждой группы слотов (индекс = номер worker-а): безымянное
-        /// автосбросное событие -- `disconnect_client` (набор ожидания
-        /// меняется), `stop`/Drop.
-        pub(in crate::multi) wakes: Vec<EventHandle>,
+        /// Свой порт завершения потока-диспетчера (не общий реактор): к нему
+        /// привязаны объекты ожидания всех слотов; `disconnect_client`/`stop`
+        /// будят диспетчер постом `WAKE_KEY`.
+        pub(in crate::multi) port: CompletionPort,
+        /// Поток-диспетчер (один; вектор -- чтобы `stop` забирал его один раз).
         pub(in crate::multi) worker_handles: Mutex<Vec<JoinHandle<()>>>,
         pub(in crate::multi) handler: Arc<dyn MultiHandler>,
         pub(in crate::multi) options: MultiOptions,
         /// Через сколько протухает захват слота без подключения.
         pub(in crate::multi) reserve_timeout: Duration,
-        /// Число пробуждений worker-ов (возвратов из ожидания) --
+        /// Число пробуждений диспетчера (возвратов из ожидания порта) --
         /// доказательство отсутствия опроса в тестах.
         pub(in crate::multi) wakeups: AtomicU64,
+        /// Отброшенные устаревшие завершения (снятая или перепривязанная
+        /// привязка) -- тесты.
+        #[cfg(test)]
+        pub(in crate::multi) stale_completions: AtomicU64,
     }
 }
 use core_type::MultiCore;
@@ -480,51 +534,38 @@ impl MultiServer {
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
 
-        let groups = options.max_clients.div_ceil(SLOTS_PER_WORKER);
-        let wakes = (0..groups)
-            .map(|_| EventHandle::create_unnamed(false))
-            .collect::<Result<Vec<_>>>()?;
-
         let server = Arc::new(MultiCore {
             base_name: base_name.to_owned(),
             slots: RwLock::new(slots),
             max_clients: options.max_clients,
             running: Arc::new(AtomicBool::new(true)),
-            wakes,
+            port: CompletionPort::new()?,
             worker_handles: Mutex::new(Vec::new()),
             handler,
             options,
             reserve_timeout,
             wakeups: AtomicU64::new(0),
+            #[cfg(test)]
+            stale_completions: AtomicU64::new(0),
         });
 
-        for group in 0..groups {
-            let first = group * SLOTS_PER_WORKER;
-            let range = first..(first + SLOTS_PER_WORKER).min(server.max_clients);
-            let server_clone = server.clone();
-            // Имя потока -- только в debug (короткий непрозрачный тег), чтобы в
-            // release ни библиотека, ни имя канала не светились в списке потоков.
-            #[cfg_attr(
-                not(debug_assertions),
-                expect(unused_mut, reason = "имя -- только в debug")
-            )]
-            let mut builder = thread::Builder::new();
-            #[cfg(debug_assertions)]
-            {
-                builder = builder.name(format!("xsm{group}-{base_name}"));
-            }
-            let spawned = crate::thread_hook::spawn(builder, move || {
-                server_clone.worker_loop(group as usize, range);
-            });
-            match spawned {
-                Ok(handle) => server.worker_handles.lock_clean().push(handle),
-                Err(e) => {
-                    // Уже запущенные worker-ы держат клон Arc -- остановить их.
-                    server.stop();
-                    return Err(map_spawn_error(e, "spawn multi worker"));
-                }
-            }
+        let server_clone = server.clone();
+        // Имя потока -- только в debug (короткий непрозрачный тег), чтобы в
+        // release ни библиотека, ни имя канала не светились в списке потоков.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(unused_mut, reason = "имя -- только в debug")
+        )]
+        let mut builder = thread::Builder::new();
+        #[cfg(debug_assertions)]
+        {
+            builder = builder.name(format!("xsm-{base_name}"));
         }
+        let handle = crate::thread_hook::spawn(builder, move || {
+            Dispatcher::new(&server_clone).run();
+        })
+        .map_err(|e| map_spawn_error(e, "spawn multi dispatcher"))?;
+        server.worker_handles.lock_clean().push(handle);
 
         Ok(Arc::new(Self { core: server }))
     }
@@ -625,7 +666,7 @@ impl MultiCore {
             }
             drop(slot);
             drop(slots);
-            // Набор ожидания worker-а изменился (слот снова ждёт CONNECT_REQ).
+            // Набор ожиданий слота изменился (слот снова ждёт CONNECT_REQ) -- диспетчер сверит привязки.
             self.wake_slot(client_id);
             self.handler.on_client_disconnect_reason(client_id, reason);
         }
@@ -677,12 +718,13 @@ impl MultiCore {
 
     /// Остановка сервера.
     ///
-    /// Синхронно дожидается выхода worker-потоков перед возвратом — после
+    /// Синхронно дожидается выхода потока-диспетчера перед возвратом — после
     /// return ни один callback (`on_message`/`on_client_connect`/`on_error`)
     /// больше не будет вызван -- вызывающий может сразу после возврата
-    /// освободить состояние, на которое ссылается handler. Worker-ы спят в
-    /// ядре без таймаута -- их будит событие `wake`, поэтому `stop()`
-    /// возвращается сразу. Идемпотентна: повторный вызов — no-op.
+    /// освободить состояние, на которое ссылается handler. Диспетчер спит в
+    /// ядре без таймаута -- его будит пост в порт, поэтому `stop()`
+    /// возвращается сразу (как только вернётся выполняемый колбэк).
+    /// Идемпотентна: повторный вызов — no-op.
     ///
     /// Ревизия 2: подключённым клиентам `DISCONNECT` сигналится сразу здесь
     /// (состояние `IDLE` -> `DISCONNECT`, как `disconnect_client`, без
@@ -691,23 +733,25 @@ impl MultiCore {
     /// кто-то держал `Arc<MultiServer>`.
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
-        for wake in &self.wakes {
-            let _ = wake.set();
-        }
-        // Self-join исключён: если последний `Arc` отпустил сам worker (Drop
-        // на его потоке), свой handle не джойним -- поток уже выходит.
+        // Отказ поста возможен только при негодном порте -- тогда диспетчер
+        // не спит в нём и выйдет по `running` на ближайшем витке.
+        let _ = self.port.post(WAKE_KEY, WAKE_ANY);
+        // Self-join исключён: если последний `Arc` отпустил сам диспетчер
+        // (Drop на его потоке), свой handle не джойним -- поток уже выходит
+        // и, выходя, снимает свои привязки, возвращая потреблённые сигналы
+        // (`Dispatcher::release_all`), -- `DISCONNECT` ниже клиент получит.
         let handles: Vec<_> = self.worker_handles.lock_clean().drain(..).collect();
         for handle in handles {
             if handle.thread().id() != thread::current().id()
                 && let Err(err) = join_worker(handle)
             {
-                // Паника worker-а (колбэк обработчика) -- не молча: на
+                // Паника диспетчера (колбэк обработчика) -- не молча: на
                 // потоке, вызвавшем `stop()`, до возврата из него.
                 self.handler.on_error(None, err);
             }
         }
-        // Worker-ы остановлены (кроме, возможно, вызывающего -- он выйдет по
-        // `running`): отключаем подключённые слоты под их mutex-ами.
+        // Диспетчер остановлен (или это он сам -- выйдет по `running`):
+        // отключаем подключённые слоты под их mutex-ами.
         let slots = self.slots.read_clean();
         for slot_mutex in slots.iter() {
             let mut slot = slot_mutex.lock_clean();
@@ -734,26 +778,25 @@ impl MultiCore {
         }
     }
 
-    /// Число пробуждений worker-ов (тесты: ноль в простое).
+    /// Число пробуждений диспетчера (тесты: ноль в простое).
     #[cfg(test)]
     pub(crate) fn wakeups(&self) -> u64 {
         self.wakeups.load(Ordering::Acquire)
     }
 
-    /// Разбудить worker группы, обслуживающей слот.
+    /// Разбудить диспетчер: набор ожиданий слота изменился (слот отключён
+    /// не им) -- он сверит привязки слота (`Dispatcher::reconcile`).
     fn wake_slot(&self, slot_id: u32) {
-        if let Some(wake) = self.wakes.get((slot_id / SLOTS_PER_WORKER) as usize) {
-            let _ = wake.set();
-        }
+        let _ = self.port.post(WAKE_KEY, slot_id as usize);
     }
 
-    /// Обслуживание слотов группы (вызывается после каждого пробуждения, до
-    /// сборки нового набора ожидания). Никаких собственных пробуждений не
+    /// Обслуживание слотов `range` (диспетчер зовёт его в начале каждого
+    /// витка, для всех слотов). Никаких собственных пробуждений не
     /// планирует, кроме ДЕДЛАЙНОВ в `Sweep::next_deadline`.
     ///
     /// - **не подключён, claim занят** -- захват без подключения. Дедлайн
     ///   `first_seen + reserve_timeout`; наступил -- CAS(claim -> FREE).
-    ///   «Первое наблюдение» случается при любом пробуждении worker-а, в том
+    ///   «Первое наблюдение» случается при любом пробуждении диспетчера, в том
     ///   числе от «толчка» клиента, не нашедшего свободного слота
     ///   (`nudge_stale_claims`), так что протухший захват не ждёт тика.
     /// - **подключён, claim снят** -- «осиротевший» слот (брошенное
@@ -782,8 +825,8 @@ impl MultiCore {
                 continue;
             };
             let mut slot = slot_mutex.lock_clean();
-            // Worker проснулся -- handle отключённых клиентов больше не в
-            // ожидании, их можно закрыть.
+            // Новый проход диспетчера -- handle отключённых клиентов можно
+            // закрыть (привязку к процессу ядро держит по ссылке на объект).
             slot.retired.clear();
             let claim = slot.claim();
             if slot.connected {
@@ -852,194 +895,24 @@ impl MultiCore {
         sweep
     }
 
-    /// Набор ожидания группы: у подключённого слота -- `S2C_DISCONNECT`,
-    /// `C2S_DATA`, процесс клиента (если наблюдается); у свободного --
-    /// `C2S_CONNECT_REQ`. При одновременном сигнале NT отдаёт наименьший
-    /// индекс; на `DISCONNECT` и смерть процесса кольцо всё равно дочитывается
-    /// до колбэка, поэтому порядок внутри слота не теряет данных.
+    /// Пробы колец клиент -> сервер подключённых слотов (спин диспетчера):
+    /// `(слот, проба)`.
     ///
-    /// Дескрипторы заимствуются на время жизни `&self`, а не блокировок
-    /// слота: ожидание идёт уже без них. Это честно, потому что объекты
-    /// живут дольше ожидания: события и секции слотов создаются в `start` и
-    /// уничтожаются только после join worker-ов, а handle процесса клиента,
-    /// снятый с подключения, не закрывается, а уходит в `retired` -- его
-    /// закрывает сам worker группы, проснувшись (`reclaim_stale_claims`),
-    /// после того как набор прошлого ожидания очищен.
-    ///
-    /// `probes` (0.10, спин) -- пробы колец клиент -> сервер подключённых
-    /// слотов: адреса заголовков в секциях слотов, которые живут столько
-    /// же, сколько события (до join worker-ов).
-    fn collect_wait_set<'s>(
-        &'s self,
-        range: Range<u32>,
-        handles: &mut Vec<BorrowedHandle<'s>>,
-        sources: &mut Vec<EventSource>,
-        probes: &mut Vec<UnreadProbe<'s>>,
-    ) {
-        // Продлить заимствование с блокировки слота до `&'s self`.
-        let detach = |handle: BorrowedHandle<'_>| -> BorrowedHandle<'s> {
-            // SAFETY: дескриптор открыт всё время жизни `'s` (обоснование --
-            // в документации функции: слоты живут до join worker-ов, handle
-            // процесса закрывает только этот worker после ожидания).
-            unsafe { BorrowedHandle::borrow_raw(handle.as_raw_handle()) }
-        };
+    /// Пробы -- адреса заголовков колец в секциях слотов; секции создаются
+    /// в `start` и уничтожаются только вместе с ядром, то есть после join
+    /// диспетчера, -- дольше `'s`. Проба читает только атомарные позиции и
+    /// от блокировки слота не зависит.
+    fn collect_probes<'s>(&'s self, probes: &mut Vec<(u32, UnreadProbe<'s>)>) {
         let slots = self.slots.read_clean();
-        for slot_id in range {
-            let Some(slot_mutex) = slots.get(slot_id as usize) else {
-                continue;
-            };
+        for slot_mutex in slots.iter() {
             let slot = slot_mutex.lock_clean();
-            // Слоты всегда named (MultiServer::start поднимает
-            // SharedServer::start), но на anonymous-слоте событий нет --
-            // молча пропускаем вместо паники в worker-потоке.
-            let Some(events) = slot.server.events() else {
-                continue;
-            };
             if slot.connected {
-                handles.push(detach(events.disconnect.as_handle()));
-                sources.push(EventSource::SlotDisconnect(slot.id));
-                handles.push(detach(events.c2s.data.as_handle()));
-                sources.push(EventSource::SlotData);
-                if let Some(peer) = slot.peer_handle() {
-                    handles.push(detach(peer));
-                    sources.push(EventSource::SlotPeer(slot.id));
-                }
-                if self.options.spin.is_enabled() {
-                    let probe = slot.server.client_ring_probe();
-                    // SAFETY: секция слота (а с ней заголовок кольца) живёт до
-                    // join worker-ов, то есть дольше `'s` (обоснование -- в
-                    // документации функции); проба читает только атомарные
-                    // позиции и не зависит от блокировки слота.
-                    probes.push(unsafe { probe.extend() });
-                }
-            } else {
-                handles.push(detach(events.connect_req.as_handle()));
-                sources.push(EventSource::SlotConnect(slot.id));
+                let probe = slot.server.client_ring_probe();
+                // SAFETY: секция слота (а с ней заголовок кольца) живёт до
+                // уничтожения ядра, то есть дольше `'s` (см. документацию
+                // функции); проба читает только атомарные позиции.
+                probes.push((slot.id, unsafe { probe.extend() }));
             }
-        }
-    }
-
-    /// Worker loop группы слотов `range`: спит до события или дедлайна.
-    fn worker_loop(&self, group: usize, range: Range<u32>) {
-        let Some(wake) = self.wakes.get(group) else {
-            return;
-        };
-        let mut buffer = Vec::new();
-        let mut handles: Vec<BorrowedHandle<'_>> = Vec::with_capacity(64);
-        let mut sources: Vec<EventSource> = Vec::with_capacity(64);
-        let mut probes: Vec<UnreadProbe<'_>> = Vec::with_capacity(SLOTS_PER_WORKER as usize);
-        // В каком-то кольце осталось больше `recv_batch` сообщений: следующее
-        // ожидание -- нулевое (сперва события, затем добор), без сна.
-        let mut backlog = false;
-
-        while self.running.load(Ordering::Acquire) {
-            // Набор прошлого ожидания -- до `reclaim_stale_claims`: тот
-            // закрывает отложенные handle процессов (`retired`).
-            handles.clear();
-            sources.clear();
-            probes.clear();
-            let sweep = self.reclaim_stale_claims(range.clone(), Instant::now());
-            for (slot_id, expected_claim, reason) in sweep.orphaned {
-                // Клиент мог уйти штатно (DISCONNECT, затем снял claim), а
-                // worker проснулся по другой причине раньше, чем разобрал его
-                // DISCONNECT: всё, что клиент успел записать, -- до колбэка.
-                self.drain_slot(slot_id, &mut buffer);
-                self.handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
-            }
-
-            self.collect_wait_set(range.clone(), &mut handles, &mut sources, &mut probes);
-            handles.push(wake.as_handle());
-            sources.push(EventSource::Wake);
-
-            // Спин (`MultiOptions::spin`) -- один бюджет на каждое засыпание:
-            // только перед блокирующим ожиданием (без добора `backlog`) и
-            // только при подключённых слотах. Увидели данные в кольце любого
-            // слота группы -- читаем их, но ожидание НЕ пропускаем: оно идёт
-            // с нулевым таймаутом. Иначе один болтливый слот, чьё кольцо
-            // каждый раз непусто к концу спина, навсегда держал бы worker вне
-            // `wait_any`: ни `CONNECT_REQ`, ни `DISCONNECT`, ни смерти
-            // процесса для остальных слотов группы.
-            //
-            // Нулевое ожидание после спина идёт БЕЗ событий `DATA`: данные
-            // только что прочитаны, а NT отдаёт наименьший сигнальный индекс
-            // -- `DATA` болтливого слота (его писатель взводит сигнал к концу
-            // почти каждого спина) иначе всегда выигрывал бы у `CONNECT_REQ`
-            // и смерти процесса слотов с большими индексами. Пропущенный
-            // `DATA` остаётся взведённым (вручную его не сбрасываем) и даст
-            // одно лишнее пробуждение перед сном. В простое бюджет
-            // отспинивается один раз, затем сон без таймаута.
-            let spun = !backlog
-                && !probes.is_empty()
-                && spin_until(self.options.spin, None, || {
-                    probes.iter().any(UnreadProbe::has_unread)
-                        || !self.running.load(Ordering::Acquire)
-                });
-            if spun {
-                backlog = self.poll_group_slots(range.clone(), &mut buffer);
-                let mut keep = sources
-                    .iter()
-                    .map(|source| !matches!(source, EventSource::SlotData));
-                handles.retain(|_| keep.next().unwrap_or(true));
-                sources.retain(|source| !matches!(source, EventSource::SlotData));
-            }
-
-            let timeout = if backlog || spun {
-                Some(Duration::ZERO)
-            } else {
-                let until_deadline = sweep
-                    .next_deadline
-                    .map(|at| at.saturating_duration_since(Instant::now()));
-                match (self.options.poll_timeout, until_deadline) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                }
-            };
-
-            let result = win::wait_any(&handles, timeout);
-            self.wakeups.fetch_add(1, Ordering::AcqRel);
-            match result {
-                Ok(Some(index)) => {
-                    if let Some(&source) = sources.get(index)
-                        && self.handle_event(source, range.clone(), &mut buffer)
-                    {
-                        backlog = true;
-                    }
-                }
-                Ok(None) => {
-                    // Дедлайн (его обработает проход в начале цикла) или
-                    // добор данных сверх `recv_batch`.
-                    if backlog {
-                        backlog = self.poll_group_slots(range.clone(), &mut buffer);
-                    }
-                }
-                Err(err) => {
-                    self.handler.on_error(None, err);
-                }
-            }
-        }
-    }
-
-    /// Обработка события. `true` -- в кольцах группы остались сообщения.
-    fn handle_event(&self, source: EventSource, range: Range<u32>, buffer: &mut Vec<u8>) -> bool {
-        match source {
-            EventSource::SlotConnect(slot_id) => {
-                self.handle_slot_connect(slot_id);
-                false
-            }
-            // Данные одного слота -- добор по всей группе: без этого
-            // занятой слот с меньшим индексом мог бы «затенять» остальных
-            // (NT отдаёт наименьший сигнальный индекс).
-            EventSource::SlotData => self.poll_group_slots(range, buffer),
-            EventSource::SlotDisconnect(slot_id) => {
-                self.handle_slot_disconnect(slot_id, buffer);
-                false
-            }
-            EventSource::SlotPeer(slot_id) => {
-                self.handle_slot_peer_died(slot_id, buffer);
-                false
-            }
-            // Набор ожидания изменился или остановка -- верх цикла разберётся.
-            EventSource::Wake => false,
         }
     }
 
@@ -1108,8 +981,8 @@ impl MultiCore {
             };
             let slot = slot_mutex.lock_clean();
             if !slot.connected {
-                // Слот уже отключён локально (`disconnect_client`), а worker
-                // спал на старом наборе и поглотил сигнал, адресованный
+                // Слот уже отключён локально (`disconnect_client`), а привязка
+                // диспетчера ещё стояла и поглотила сигнал, адресованный
                 // КЛИЕНТУ (событие одно на обе стороны). Возвращаем его.
                 if let Some(events) = slot.server.events() {
                     let _ = events.disconnect.set();
@@ -1183,8 +1056,8 @@ impl MultiCore {
                     Ordering::Acquire,
                 );
             }
-            // Handle процесса обязан уйти из набора ожидания в любом случае:
-            // он сигнален навсегда и иначе будил бы worker без конца.
+            // Handle процесса обязан уйти из привязок в любом случае:
+            // он сигнален навсегда и иначе будил бы диспетчер без конца.
             slot.reset_connection();
             true
         };
@@ -1303,27 +1176,6 @@ impl MultiCore {
         }
         more
     }
-
-    /// Пачка сообщений с каждого подключённого слота группы. `true` -- где-то
-    /// остались сообщения.
-    fn poll_group_slots(&self, range: Range<u32>, buffer: &mut Vec<u8>) -> bool {
-        let slot_ids: Vec<u32> = {
-            let slots = self.slots.read_clean();
-            range
-                .filter(|&id| {
-                    slots
-                        .get(id as usize)
-                        .is_some_and(|slot| slot.lock_clean().connected)
-                })
-                .collect()
-        };
-
-        let mut more = false;
-        for slot_id in slot_ids {
-            more |= self.receive_from_slot(slot_id, buffer);
-        }
-        more
-    }
 }
 
 impl std::fmt::Debug for MultiCore {
@@ -1339,14 +1191,417 @@ impl std::fmt::Debug for MultiCore {
     }
 }
 
-/// Источник события для worker loop
-#[derive(Clone, Copy, Debug)]
-enum EventSource {
-    SlotConnect(u32),
-    SlotData,
-    SlotDisconnect(u32),
-    SlotPeer(u32),
-    Wake,
+// ============================================================================
+// Поток-диспетчер MultiServer (0.10): все слоты на одном порту завершения
+// ============================================================================
+
+/// Вид ожидания слота -- часть ключа пакета.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaitKind {
+    /// `C2S_CONNECT_REQ` свободного слота.
+    Connect,
+    /// `S2C_DISCONNECT` подключённого слота (событие одно на обе стороны).
+    Disconnect,
+    /// `C2S_DATA` подключённого слота.
+    Data,
+    /// Процесс клиента (объект уведомления: сигнал не потребляется).
+    Peer,
+}
+
+impl WaitKind {
+    const ALL: [Self; WAIT_KINDS] = [Self::Connect, Self::Disconnect, Self::Data, Self::Peer];
+
+    /// Индекс вида в ключе и в `SlotWaits::arms`.
+    const fn index(self) -> usize {
+        match self {
+            Self::Connect => 0,
+            Self::Disconnect => 1,
+            Self::Data => 2,
+            Self::Peer => 3,
+        }
+    }
+
+    /// Ключ пакета: `slot * WAIT_KINDS + вид` (для 256 слотов < 1024, на x86
+    /// тоже без переполнения).
+    const fn key(self, slot_id: u32) -> usize {
+        slot_id as usize * WAIT_KINDS + self.index()
+    }
+
+    /// Ключ -> (слот, вид); `None` -- не ключ слота.
+    fn decode(key: usize) -> Option<(u32, Self)> {
+        let slot_id = u32::try_from(key / WAIT_KINDS).ok()?;
+        let kind = *Self::ALL.get(key % WAIT_KINDS)?;
+        Some((slot_id, kind))
+    }
+}
+
+/// Одна привязка (вид ожидания слота) диспетчера.
+///
+/// Метка пакета (`ApcContext`) -- поколение привязки: растёт при каждой
+/// привязке, поэтому завершение, извлечённое из порта после отмены или
+/// перепривязки, по метке не совпадает и отбрасывается (`take`).
+#[derive(Debug, Default)]
+struct Arm {
+    /// Пакет создаётся при первой привязке и затем переиспользуется.
+    packet: Option<WaitPacket>,
+    /// Поколение последней привязки -- метка её пакета.
+    generation: usize,
+    /// Пакет привязан, и его завершение ещё не обработано.
+    armed: bool,
+    /// Объект привязки (адрес handle): у процесса клиента он меняется между
+    /// сессиями -- другой объект перепривязывается.
+    target: usize,
+}
+
+impl Arm {
+    /// Привязать пакет к `target` с ключом `key` и новым поколением.
+    fn arm(&mut self, port: &CompletionPort, target: BorrowedHandle<'_>, key: usize) -> Result<()> {
+        let packet = match &mut self.packet {
+            Some(packet) => packet,
+            slot @ None => slot.insert(WaitPacket::new()?),
+        };
+        let generation = self.generation.wrapping_add(1);
+        port.arm(packet, target.as_raw_handle(), key, generation)?;
+        self.generation = generation;
+        self.armed = true;
+        self.target = target.as_raw_handle().addr();
+        Ok(())
+    }
+
+    /// Снять привязку: `true` -- сигнал объекта потреблён и до обработчика
+    /// не дойдёт (пакет вынут из очереди или уже извлечён, но ещё не
+    /// обработан -- его завершение будет отброшено по поколению).
+    fn cancel(&mut self) -> bool {
+        if !self.armed {
+            return false;
+        }
+        self.armed = false;
+        self.packet
+            .as_ref()
+            .is_some_and(|packet| packet.cancel() != CancelOutcome::NotFired)
+    }
+
+    /// Принять завершение с меткой `tag`: `true` -- это текущая привязка
+    /// (она снята -- ядро потребило сигнал), `false` -- устаревшее.
+    const fn take(&mut self, tag: usize) -> bool {
+        if self.armed && self.generation == tag {
+            self.armed = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Привязки одного слота и его место в очереди чтения.
+#[derive(Debug, Default)]
+struct SlotWaits {
+    /// По видам: индекс -- `WaitKind::index`.
+    arms: [Arm; WAIT_KINDS],
+    /// Слот стоит в очереди чтения `Dispatcher::ready`.
+    queued: bool,
+}
+
+/// Поток-диспетчер: привязки всех слотов, очередь чтения (честная
+/// ротация) и буферы. Живёт только на своём потоке; ядро -- по ссылке
+/// (поток держит `Arc<MultiCore>`, а не ручку `MultiServer`).
+struct Dispatcher<'a> {
+    core: &'a MultiCore,
+    /// Привязки по слотам (индекс -- номер слота).
+    waits: Vec<SlotWaits>,
+    /// Слоты, в кольцах которых могут быть данные: обходятся по кругу, не
+    /// больше `recv_batch` сообщений слота за круг.
+    ready: VecDeque<u32>,
+    /// Пачка завершений из порта.
+    completions: Vec<Completion>,
+    /// Буфер чтения сообщений.
+    buffer: Vec<u8>,
+}
+
+impl<'a> Dispatcher<'a> {
+    fn new(core: &'a MultiCore) -> Self {
+        Self {
+            core,
+            waits: (0..core.max_clients)
+                .map(|_| SlotWaits::default())
+                .collect(),
+            ready: VecDeque::new(),
+            completions: Vec::new(),
+            buffer: Vec::new(),
+        }
+    }
+
+    /// Цикл диспетчера: проход дедлайнов, спин, ожидание порта до события
+    /// или ближайшего дедлайна, обработка завершений, круг чтения.
+    fn run(&mut self) {
+        let core = self.core;
+        for slot_id in 0..core.max_clients {
+            self.reconcile(slot_id);
+        }
+        let mut probes: Vec<(u32, UnreadProbe<'a>)> = Vec::new();
+
+        while core.running.load(Ordering::Acquire) {
+            let sweep = core.reclaim_stale_claims(0..core.max_clients, Instant::now());
+            for (slot_id, expected_claim, reason) in sweep.orphaned {
+                // Клиент мог уйти штатно (DISCONNECT, затем снял claim), а
+                // диспетчер разобрал проход раньше его DISCONNECT: всё, что
+                // клиент успел записать, -- до колбэка.
+                core.drain_slot(slot_id, &mut self.buffer);
+                core.handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
+                self.reconcile(slot_id);
+            }
+
+            // Спин (`MultiOptions::spin`) -- один бюджет на каждое засыпание:
+            // только когда очередь чтения пуста (иначе сна и так не будет) и
+            // есть подключённые слоты. Увидели данные -- читаем их кругом, а
+            // ожидание порта всё равно идёт, с нулевым таймаутом: завершения
+            // `CONNECT_REQ`/`DISCONNECT`/смерти процесса других слотов
+            // разбираются до следующего спина (болтливый слот не заслоняет
+            // их -- Task 12). Порт отдаёт всю очередь пачкой, приоритета
+            // «меньшего индекса», как у `NtWaitForMultipleObjects`, нет.
+            let mut spun = false;
+            if self.ready.is_empty() && core.options.spin.is_enabled() {
+                core.collect_probes(&mut probes);
+                spun = !probes.is_empty()
+                    && spin_until(core.options.spin, None, || {
+                        probes.iter().any(|(_, probe)| probe.has_unread())
+                            || !core.running.load(Ordering::Acquire)
+                    });
+                if spun {
+                    for &(slot_id, ref probe) in &probes {
+                        if probe.has_unread() {
+                            self.enqueue(slot_id);
+                        }
+                    }
+                    self.round();
+                }
+                probes.clear();
+            }
+            if !core.running.load(Ordering::Acquire) {
+                break;
+            }
+
+            let timeout = if spun || !self.ready.is_empty() {
+                Some(Duration::ZERO)
+            } else {
+                let until_deadline = sweep
+                    .next_deadline
+                    .map(|at| at.saturating_duration_since(Instant::now()));
+                match (core.options.poll_timeout, until_deadline) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            };
+
+            let result = core.port.wait_batch(&mut self.completions, timeout);
+            // Одно пробуждение на каждый возврат из ожидания порта.
+            core.wakeups.fetch_add(1, Ordering::AcqRel);
+            match result {
+                Ok(_) => {
+                    let completions = std::mem::take(&mut self.completions);
+                    for &completion in &completions {
+                        // `stop()` из колбэка: дальше колбэков нет.
+                        if !core.running.load(Ordering::Acquire) {
+                            break;
+                        }
+                        self.complete(completion);
+                    }
+                    self.completions = completions;
+                }
+                Err(err) => core.handler.on_error(None, err),
+            }
+            // Таймаут (дедлайн) разберёт проход в начале витка.
+            if !self.ready.is_empty() {
+                self.round();
+            }
+        }
+        self.release_all();
+    }
+
+    /// Поставить слот в очередь чтения (если его там нет).
+    fn enqueue(&mut self, slot_id: u32) {
+        if let Some(waits) = self.waits.get_mut(slot_id as usize)
+            && !waits.queued
+        {
+            waits.queued = true;
+            self.ready.push_back(slot_id);
+        }
+    }
+
+    /// Один круг чтения: каждый слот, стоявший в очереди к началу круга, --
+    /// пачка до `recv_batch`; выбрал пачку целиком -- в конец очереди
+    /// (честная ротация), нет -- кольцо пусто по позициям (`read_message`
+    /// подтвердил пустоту `confirm_empty`), и слот уходит из очереди: его
+    /// `DATA` привязан (перепривязка идёт до чтения), следующий кадр
+    /// разбудит порт.
+    fn round(&mut self) {
+        let core = self.core;
+        for _ in 0..self.ready.len() {
+            if !core.running.load(Ordering::Acquire) {
+                return;
+            }
+            let Some(slot_id) = self.ready.pop_front() else {
+                return;
+            };
+            if core.receive_from_slot(slot_id, &mut self.buffer) {
+                self.ready.push_back(slot_id);
+            } else if let Some(waits) = self.waits.get_mut(slot_id as usize) {
+                waits.queued = false;
+            }
+        }
+    }
+
+    /// Завершение из порта: пробуждение (`WAKE_KEY`) или сработавшая
+    /// привязка слота. Устаревшее (поколение не совпало) отбрасывается.
+    fn complete(&mut self, completion: Completion) {
+        let core = self.core;
+        if completion.key == WAKE_KEY {
+            // `WAKE_ANY` -- остановка: её разберёт проверка `running`.
+            if completion.tag != WAKE_ANY
+                && let Ok(slot_id) = u32::try_from(completion.tag)
+            {
+                self.reconcile(slot_id);
+            }
+            return;
+        }
+        let current = WaitKind::decode(completion.key).and_then(|(slot_id, kind)| {
+            let arm = self
+                .waits
+                .get_mut(slot_id as usize)?
+                .arms
+                .get_mut(kind.index())?;
+            arm.take(completion.tag).then_some((slot_id, kind))
+        });
+        let Some((slot_id, kind)) = current else {
+            // Relaxed: тестовая статистика, ничего не публикует.
+            #[cfg(test)]
+            core.stale_completions.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        match kind {
+            WaitKind::Connect => core.handle_slot_connect(slot_id),
+            WaitKind::Disconnect => core.handle_slot_disconnect(slot_id, &mut self.buffer),
+            WaitKind::Peer => core.handle_slot_peer_died(slot_id, &mut self.buffer),
+            // Перепривязка -- в `reconcile` ниже, ДО чтения кольца.
+            WaitKind::Data => {}
+        }
+        self.reconcile(slot_id);
+    }
+
+    /// Свести привязки слота с его состоянием: свободный -- ждёт
+    /// `CONNECT_REQ`; подключённый -- `DISCONNECT`, `DATA` и процесс
+    /// клиента (handshake-PID, иначе владелец claim-а). Лишние привязки
+    /// снимаются, недостающие ставятся.
+    ///
+    /// Потерянных сигналов нет: снятая привязка, потребившая сигнал
+    /// автосбросного события, возвращает его (`CONNECT_REQ`, `DISCONNECT`
+    /// -- `NtSetEvent`; `DISCONNECT` адресован и клиенту) или перечитывает
+    /// кольцо (`DATA`); поставленная привязка `DATA` всегда сопровождается
+    /// чтением кольца (перепривязка -- до чтения). Handle и события
+    /// заимствуются под блокировкой слота, привязка -- тоже под ней
+    /// (handle процесса закрывается только под ней же); колбэк ошибки --
+    /// после блокировок.
+    fn reconcile(&mut self, slot_id: u32) {
+        let core = self.core;
+        let mut failure = None;
+        let mut recheck = false;
+        {
+            let slots = core.slots.read_clean();
+            let (Some(slot_mutex), Some(waits)) = (
+                slots.get(slot_id as usize),
+                self.waits.get_mut(slot_id as usize),
+            ) else {
+                return;
+            };
+            let slot = slot_mutex.lock_clean();
+            // Слоты всегда named (`start_slot`), но на anonymous-слоте событий
+            // нет -- молча пропускаем вместо паники в диспетчере.
+            let Some(events) = slot.server.events() else {
+                return;
+            };
+            for kind in WaitKind::ALL {
+                let desired = match kind {
+                    WaitKind::Connect => (!slot.connected).then(|| events.connect_req.as_handle()),
+                    WaitKind::Disconnect => slot.connected.then(|| events.disconnect.as_handle()),
+                    WaitKind::Data => slot.connected.then(|| events.c2s.data.as_handle()),
+                    WaitKind::Peer => slot.connected.then(|| slot.peer_handle()).flatten(),
+                };
+                let Some(arm) = waits.arms.get_mut(kind.index()) else {
+                    continue;
+                };
+                let target = desired.map(|handle| handle.as_raw_handle().addr());
+                if arm.armed && target != Some(arm.target) && arm.cancel() {
+                    // Сигнал потреблён снятой привязкой -- вернуть.
+                    match kind {
+                        WaitKind::Connect => {
+                            let _ = events.connect_req.set();
+                        }
+                        WaitKind::Disconnect => {
+                            let _ = events.disconnect.set();
+                        }
+                        WaitKind::Data => recheck = true,
+                        WaitKind::Peer => {}
+                    }
+                }
+                if !arm.armed
+                    && let Some(handle) = desired
+                {
+                    match arm.arm(&core.port, handle, kind.key(slot_id)) {
+                        Ok(()) => recheck |= kind == WaitKind::Data,
+                        Err(err) => failure = Some(err),
+                    }
+                }
+            }
+        }
+        if recheck {
+            self.enqueue(slot_id);
+        }
+        if let Some(err) = failure {
+            // Без привязки слот не услышит своё событие: сообщить. Отказ
+            // возможен только при негодном handle/порте.
+            core.handler.on_error(Some(slot_id), err);
+        }
+    }
+
+    /// Выход диспетчера: снять все привязки, вернув потреблённые сигналы
+    /// `CONNECT_REQ`/`DISCONNECT`. Важно для `stop()` из колбэка (и Drop
+    /// последней ручки на этом потоке): `stop` сигналит `DISCONNECT`
+    /// клиентам, пока привязки ещё стоят, -- поглощённый сигнал вернётся.
+    fn release_all(&mut self) {
+        let slots = self.core.slots.read_clean();
+        for (slot_mutex, waits) in slots.iter().zip(self.waits.iter_mut()) {
+            let slot = slot_mutex.lock_clean();
+            let events = slot.server.events();
+            for kind in WaitKind::ALL {
+                let Some(arm) = waits.arms.get_mut(kind.index()) else {
+                    continue;
+                };
+                if arm.cancel()
+                    && let Some(events) = events
+                {
+                    match kind {
+                        WaitKind::Connect => {
+                            let _ = events.connect_req.set();
+                        }
+                        WaitKind::Disconnect => {
+                            let _ = events.disconnect.set();
+                        }
+                        // Читателя больше нет; процесс -- объект уведомления.
+                        WaitKind::Data | WaitKind::Peer => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for Dispatcher<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dispatcher")
+            .field("slots", &self.waits.len())
+            .field("ready", &self.ready.len())
+            .finish_non_exhaustive()
+    }
 }
 
 // ============================================================================
