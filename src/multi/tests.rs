@@ -537,12 +537,8 @@ fn client_waiting_for_slot_gets_it_after_stale_claim_deadline() {
 #[test]
 fn stop_is_prompt() {
     let name = unique("PROMPT");
-    let server = MultiServer::start(
-        &name,
-        Arc::new(TestHandler::new()),
-        single_slot(MAX_MULTI_CLIENTS),
-    )
-    .expect("start");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(31)).expect("start");
     assert_eq!(server.wakes.len(), 2, "31 слот -- два worker-а");
     let client = MultiClient::connect(
         &name,
@@ -676,8 +672,7 @@ fn disconnect_client_notifies_client_and_frees_slot() {
 fn clients_across_two_worker_groups() {
     let name = unique("GROUPS");
     let handler = Arc::new(TestHandler::new());
-    let server =
-        MultiServer::start(&name, handler.clone(), single_slot(MAX_MULTI_CLIENTS)).expect("start");
+    let server = MultiServer::start(&name, handler.clone(), single_slot(31)).expect("start");
     const N: usize = 24;
     let recorders: Vec<Arc<ClientRecorder>> = (0..N)
         .map(|_| Arc::new(ClientRecorder::default()))
@@ -713,6 +708,71 @@ fn clients_across_two_worker_groups() {
             .all(|r| r.messages.load(Ordering::Acquire) == 1)
     });
     drop(clients);
+    server.stop();
+}
+
+/// Находка 24: слоты за прежним пределом 31 доступны клиенту -- он
+/// перебирает столько слотов, сколько сервер опубликовал в `slot_count`.
+#[test]
+fn client_claims_slot_beyond_31() {
+    let name = unique("BEYOND31");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(40)).expect("start");
+    {
+        let slots = server.slots.read().unwrap();
+        for slot in slots.iter().take(39) {
+            let slot = slot.lock().unwrap();
+            let claim = &slot.server.view().control_block().slot_claim;
+            claim
+                .compare_exchange(CLAIM_FREE, 0xB0B0_0001, Ordering::AcqRel, Ordering::Acquire)
+                .expect("слот свободен");
+        }
+    }
+    let client = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for("подключение", Duration::from_secs(5), || {
+        client.is_connected()
+    });
+    assert_eq!(client.slot_id(), 39);
+    drop(client);
+    server.stop();
+}
+
+/// Порча `slot_count` (враждебный пир): значение больше `MAX_MULTI_CLIENTS`
+/// ограничивается пределом, перебор не паникует и не выходит за границы;
+/// все слоты заняты -- `NoFreeSlot`, слота 0 нет -- `NotConnected`.
+#[test]
+fn corrupted_slot_count_is_clamped() {
+    assert_eq!(scan_limit(0), None);
+    assert_eq!(scan_limit(7), Some(7));
+    assert_eq!(scan_limit(MAX_MULTI_CLIENTS), Some(MAX_MULTI_CLIENTS));
+    assert_eq!(scan_limit(MAX_MULTI_CLIENTS + 1), Some(MAX_MULTI_CLIENTS));
+    assert_eq!(scan_limit(u32::MAX), Some(MAX_MULTI_CLIENTS));
+
+    let name = unique("SLOTCOUNT");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    stop_workers(&server);
+    {
+        let slots = server.slots.read().unwrap();
+        for slot in slots.iter() {
+            let slot = slot.lock().unwrap();
+            let control = slot.server.view().control_block();
+            assert_eq!(control.slot_count.load(Ordering::Acquire), 2);
+            control.slot_claim.store(0xB0B0_0002, Ordering::Release);
+            control.slot_count.store(u32::MAX, Ordering::Release);
+        }
+    }
+    assert_eq!(claim_free_slot(&name).unwrap_err(), ShmError::NoFreeSlot);
+    nudge_stale_claims(&name); // не паникует на испорченном числе
+    assert_eq!(
+        claim_free_slot(&unique("NO_SERVER")).unwrap_err(),
+        ShmError::NotConnected
+    );
     server.stop();
 }
 

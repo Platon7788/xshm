@@ -44,6 +44,10 @@ impl SharedView {
     /// (`win::current_process_start_time`, `0` -- не сообщать); пишется
     /// вместе с `server_pid` до `magic`.
     ///
+    /// `slot_count` -- Multi: число слотов сервера (`max_clients`), его
+    /// клиент читает из слота 0, чтобы знать, сколько слотов перебирать;
+    /// `0` -- сегмент не Multi. Пишется до `magic`.
+    ///
     /// Ошибки: `Corrupted` -- нулевой `base`; `InvalidConfig` -- значение
     /// раскладки не помещается в `u32` поля `LayoutBlock` (проверенная
     /// раскладка всегда помещается). При ошибке `magic` не публикуется.
@@ -52,6 +56,7 @@ impl SharedView {
         layout: ChannelLayout,
         server_pid: u32,
         server_start: u64,
+        slot_count: u32,
     ) -> Result<Self> {
         let segment_size = u32::try_from(layout.segment_size())
             .map_err(|_| ShmError::InvalidConfig("segment size does not fit into u32"))?;
@@ -83,7 +88,7 @@ impl SharedView {
         control.client_start_hi.store(0, Ordering::Relaxed);
         control.owner_start_lo.store(0, Ordering::Relaxed);
         control.owner_start_hi.store(0, Ordering::Relaxed);
-        control.slot_count.store(0, Ordering::Relaxed);
+        control.slot_count.store(slot_count, Ordering::Relaxed);
 
         let block = view.layout_block();
         block.segment_size.store(segment_size, Ordering::Relaxed);
@@ -301,7 +306,7 @@ mod tests {
         let layout = small();
         let m = mem(layout.segment_size());
         // SAFETY: m живёт до конца теста, размер = segment_size.
-        let _server = unsafe { SharedView::initialize(m.0, layout, 42, 0) }.unwrap();
+        let _server = unsafe { SharedView::initialize(m.0, layout, 42, 0, 0) }.unwrap();
         // SAFETY: см. выше.
         let view = unsafe { SharedView::attach(m.0, layout.segment_size()) }.unwrap();
         assert_eq!(*view.layout(), layout);
@@ -316,7 +321,7 @@ mod tests {
         let m = mem(len);
         assert_eq!(attach(&m, len).unwrap_err(), ShmError::NotReady);
         // SAFETY: см. выше.
-        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0) }.unwrap();
+        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0, 0) }.unwrap();
         // Сегмент меньше заявленного.
         assert_eq!(attach(&m, len - 1).unwrap_err(), ShmError::Corrupted);
         // Чужая версия.

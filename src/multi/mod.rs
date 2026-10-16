@@ -64,10 +64,13 @@ use crate::win::{self, EventHandle, Mapping, ProcessWatch};
 /// Максимальное количество клиентов по умолчанию
 pub const DEFAULT_MAX_CLIENTS: u32 = 20;
 
-/// Жёсткий предел числа слотов. Слоты делятся между worker-потоками по
-/// `SLOTS_PER_WORKER` (предел `NtWaitForMultipleObjects` -- 64 handle на
-/// одно ожидание), так что 31 слот -- два worker-а.
-pub const MAX_MULTI_CLIENTS: u32 = 31;
+/// Жёсткий предел числа слотов. Его задаёт протокол перебора, а не лимит
+/// 64 handle у `NtWaitForMultipleObjects`: сервер публикует число слотов в
+/// `ControlBlock::slot_count` каждого слота, клиент перебирает
+/// `0..min(slot_count, MAX_MULTI_CLIENTS)` -- предел ограничивает цену
+/// перебора и порчу поля враждебным пиром. Worker-ы делятся по
+/// `SLOTS_PER_WORKER`: 256 слотов -- 13 worker-ов.
+pub const MAX_MULTI_CLIENTS: u32 = 256;
 
 /// Слотов на один worker-поток: подключённый слот кладёт в набор ожидания до
 /// 3 handle (`S2C_DISCONNECT`, `C2S_DATA`, процесс клиента), плюс одно
@@ -408,7 +411,7 @@ impl MultiServer {
         reserve_timeout: Duration,
     ) -> Result<Arc<Self>> {
         if options.max_clients == 0 || options.max_clients > MAX_MULTI_CLIENTS {
-            return Err(ShmError::InvalidConfig("max_clients must be in 1..=31"));
+            return Err(ShmError::InvalidConfig("max_clients must be in 1..=256"));
         }
         options.layout.validate()?;
 
@@ -416,8 +419,12 @@ impl MultiServer {
         // захватывают слоты сами через атомарный claim (см. doc MultiServer).
         let mut slots = Vec::with_capacity(options.max_clients as usize);
         for slot_id in 0..options.max_clients {
-            let server =
-                SharedServer::start_with_layout(&format!("{base_name}_{slot_id}"), options.layout)?;
+            // Каждый слот публикует число слотов: клиент читает его из слота 0.
+            let server = SharedServer::start_slot(
+                &format!("{base_name}_{slot_id}"),
+                options.layout,
+                options.max_clients,
+            )?;
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
 
@@ -1750,7 +1757,10 @@ fn release_claim(slot_name: &str, token: u32) {
 /// захватом и подключением клиент не держит слот, пока сервер спит, -- без
 /// какого-либо тика на сервере.
 fn nudge_stale_claims(base_name: &str) {
-    for slot_id in 0..MAX_MULTI_CLIENTS {
+    let Ok(limit) = slot_scan_limit(base_name) else {
+        return; // сервера нет -- толкать некого
+    };
+    for slot_id in 0..limit {
         let slot_name = format!("{base_name}_{slot_id}");
         let Ok(mapping) = Mapping::open_header(&mapping_name(&slot_name)) else {
             break; // слотов больше нет
@@ -1773,12 +1783,33 @@ fn nudge_stale_claims(base_name: &str) {
     }
 }
 
+/// Сколько слотов перебирать по опубликованному `slot_count`. Поле пишет
+/// пир (враждебный -- что угодно): `0` -- число не опубликовано (`None`),
+/// значение больше `MAX_MULTI_CLIENTS` ограничивается пределом.
+fn scan_limit(slot_count: u32) -> Option<u32> {
+    (slot_count != 0).then(|| slot_count.min(MAX_MULTI_CLIENTS))
+}
+
+/// Граница перебора слотов сервера `base_name`: `slot_count` слота 0
+/// (`scan_limit`). Слот 0 не открылся -- `Err(NotConnected)` (сервер не
+/// запущен). Слот 0 ещё не опубликован или число не сообщает -- перебор до
+/// `MAX_MULTI_CLIENTS` (циклы и так останавливаются на первом отсутствующем
+/// слоте).
+fn slot_scan_limit(base_name: &str) -> Result<u32> {
+    let mapping = Mapping::open_header(&mapping_name(&format!("{base_name}_0")))
+        .map_err(|_| ShmError::NotConnected)?;
+    let published = SharedView::peek_control(&mapping)
+        .and_then(|control| scan_limit(control.slot_count.load(Ordering::Acquire)));
+    Ok(published.unwrap_or(MAX_MULTI_CLIENTS))
+}
+
 /// Пробегает слоты `base_name_0..` и атомарно захватывает первый свободный.
 /// Конкурентные клиенты захватывают РАЗНЫЕ слоты (CAS на разной памяти).
 fn claim_free_slot(base_name: &str) -> Result<(u32, String, u32)> {
+    let limit = slot_scan_limit(base_name)?;
     let token = next_claim_token();
     let mut saw_slot = false;
-    for slot_id in 0..MAX_MULTI_CLIENTS {
+    for slot_id in 0..limit {
         let slot_name = format!("{base_name}_{slot_id}");
         match try_claim_slot(&slot_name, token) {
             Ok(true) => return Ok((slot_id, slot_name, token)),

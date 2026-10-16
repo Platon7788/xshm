@@ -283,7 +283,10 @@ pub struct ControlBlock {
     pub owner_start_lo: AtomicU32,
     /// Старшая половина `owner_start`.
     pub owner_start_hi: AtomicU32,
-    /// Резерв под число слотов Multi; сейчас всегда `0`.
+    /// Multi: число слотов сервера (`max_clients`), одинаковое во всех его
+    /// слотах; пишется в `initialize` до `magic`. Клиент читает его из слота
+    /// 0 и перебирает `0..min(slot_count, MAX_MULTI_CLIENTS)`. `0` -- сегмент
+    /// не Multi (или пир число не публикует).
     pub slot_count: AtomicU32,
 }
 

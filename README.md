@@ -128,7 +128,7 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 - Clean start guarantee: buffers reset on each new connection with generation tracking
 - Handler traits instead of callback structs: `AutoHandler`, `MultiHandler`, `MultiClientHandler`, `DispatchHandler`, `DispatchClientHandler`
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`), automatic reconnect
-- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (31) clients via lock-free concurrent slot claim
+- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (256) clients via lock-free concurrent slot claim
 - **Dispatch mode**: single lobby + dynamic per-client channel, no fixed slot count at all
 - **Direct NT API**: static linking with ntdll.dll, no external dependencies
 - **Static CRT**: TLS and CRT statically linked, no runtime DLL dependencies
@@ -197,7 +197,7 @@ sequenceDiagram
 
 | | Single-client | Auto | Multi-client | Dispatch |
 |---|:---:|:---:|:---:|:---:|
-| Clients per server | 1 | 1 | up to 31 (fixed slots) | unbounded |
+| Clients per server | 1 | 1 | up to 256 (fixed slots) | unbounded |
 | Threading | none — caller-driven | background worker | background worker per slot | lobby worker + per-client worker |
 | Reconnect | manual | automatic | automatic (re-claim) | automatic |
 | Connect cost | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 lobby round-trip + 1 handshake |
@@ -322,7 +322,7 @@ fn main() -> Result<()> {
 
 ### Multi-client mode
 
-Fixed pool of slots (default 20, hard cap 31). Clients concurrently claim a
+Fixed pool of slots (default 20, hard cap 256). Clients concurrently claim a
 free slot via lock-free CAS — no central lobby, no negotiation round-trip:
 
 ```mermaid
@@ -619,7 +619,7 @@ The ring limits below are re-exported from the crate root
 | `MAX_MESSAGE_SIZE` | 65535 | Max message size (bytes) |
 | `MIN_MESSAGE_SIZE` | 2 | Min message size (bytes) |
 | `DEFAULT_MAX_CLIENTS` | 20 | Default slot count for `MultiServer` |
-| `MAX_MULTI_CLIENTS` | 31 | Hard cap for `MultiServer` (one worker per 21 slots: 64-handle `NtWaitForMultipleObjects` limit) |
+| `MAX_MULTI_CLIENTS` | 256 | Hard cap for `MultiServer`, set by the slot-scan protocol (the server publishes `slot_count` in every slot, clients scan `0..min(slot_count, 256)`), not by the 64-handle wait limit — workers are split per 21 slots (256 slots = 13 threads) |
 
 ## Event Handles for Kernel Drivers
 
@@ -649,7 +649,7 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **Windows only**: Uses direct NT API calls, relies on x86/x86_64 TSO memory ordering (not portable to ARM/RISC-V without rework)
 - **Message size**: 2 to 65535 bytes
 - **Anonymous servers**: No event handles available (polling mode only)
-- **Multi-client slot count**: hard cap of 31 concurrent clients (`NtWaitForMultipleObjects` limit) — use Dispatch mode if you need more
+- **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan; every 21 slots add a worker thread) — use Dispatch mode if you need more
 - **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* (no server, no free slot) retries every `reconnect_delay` / `retry_delay`; connected channels never wake while idle. Use `Beacon` for fully event-driven discovery
 - **No authentication**: named objects use a NULL DACL — any local process (any session with `Global\`) can open them; do not send secrets
 

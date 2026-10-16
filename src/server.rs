@@ -61,9 +61,15 @@ impl SharedServer {
     /// (`SharedClient::layout`). `Err(InvalidConfig)` -- `layout` не прошёл
     /// `ChannelLayout::validate`.
     pub fn start_with_layout(name: &str, layout: ChannelLayout) -> Result<Self> {
+        Self::start_slot(name, layout, 0)
+    }
+
+    /// Сервер канала `name`, публикующий в `ControlBlock::slot_count` число
+    /// `slot_count` (Multi: `max_clients`; `0` -- не Multi).
+    pub(crate) fn start_slot(name: &str, layout: ChannelLayout, slot_count: u32) -> Result<Self> {
         layout.validate()?;
         let mapping = Mapping::create(&mapping_name(name), layout.segment_size())?;
-        let mut server = Self::from_mapping(mapping, layout)?;
+        let mut server = Self::from_mapping(mapping, layout, slot_count)?;
         server.events = Some(SharedEvents::create(name)?);
         Ok(server)
     }
@@ -89,13 +95,13 @@ impl SharedServer {
     pub fn start_anonymous_with_layout(layout: ChannelLayout) -> Result<Self> {
         layout.validate()?;
         let mapping = Mapping::create_anonymous(layout.segment_size())?;
-        Self::from_mapping(mapping, layout)
+        Self::from_mapping(mapping, layout, 0)
     }
 
     /// Инициализация свежей секции: сегмент публикуется (`magic`) до
     /// создания событий -- клиент, открывший секцию раньше событий, получит
     /// ошибку открытия событий и повторит попытку.
-    fn from_mapping(mapping: Mapping, layout: ChannelLayout) -> Result<Self> {
+    fn from_mapping(mapping: Mapping, layout: ChannelLayout, slot_count: u32) -> Result<Self> {
         // SAFETY: `Mapping` только что создал отображение размером не меньше
         // `layout.segment_size()` (адрес выровнен на гранулу выделения) и
         // держит его живым, пока жив сам, а он переезжает в возвращаемую
@@ -106,6 +112,7 @@ impl SharedServer {
                 layout,
                 std::process::id(),
                 crate::win::current_process_start_time(),
+                slot_count,
             )
         }?;
         let ring_tx = view.ring_a();

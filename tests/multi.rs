@@ -478,3 +478,55 @@ fn test_multi_oversubscription() {
     println!("[TEST] Oversubscription: PASSED (filled {N}, no double-assignment)");
     drop(clients);
 }
+
+/// Находка 24: предел `MAX_MULTI_CLIENTS` -- 256 слотов (протокол перебора
+/// по `slot_count`, а не лимит 64 handle): 256 принимается, 0 и 257 -- нет,
+/// клиент подключается к серверу на 256 слотов.
+#[test]
+fn test_multi_slot_cap_is_256() {
+    use xshm::multi::MAX_MULTI_CLIENTS;
+    use xshm::{ChannelLayout, RingConfig};
+    assert_eq!(MAX_MULTI_CLIENTS, 256);
+    // Маленькие кольца: 256 сегментов по умолчанию -- гигабайт секций.
+    let options = |max_clients| MultiOptions {
+        max_clients,
+        layout: ChannelLayout::symmetric(RingConfig::new(64 << 10)),
+        ..MultiOptions::default()
+    };
+    for bad in [0, MAX_MULTI_CLIENTS + 1] {
+        assert!(
+            matches!(
+                MultiServer::start(
+                    &unique_name("CAP_BAD"),
+                    Arc::new(TestServerHandler::new()),
+                    options(bad),
+                ),
+                Err(ShmError::InvalidConfig(_))
+            ),
+            "max_clients = {bad} должен отвергаться"
+        );
+    }
+
+    let base_name = unique_name("CAP_256");
+    let server_handler = Arc::new(TestServerHandler::new());
+    let server = MultiServer::start(
+        &base_name,
+        server_handler.clone(),
+        options(MAX_MULTI_CLIENTS),
+    )
+    .expect("MultiServer start на 256 слотов");
+    let client_handler = Arc::new(TestClientHandler::new());
+    let client = MultiClient::connect(
+        &base_name,
+        client_handler.clone(),
+        MultiClientOptions::default(),
+    )
+    .expect("MultiClient connect");
+    assert!(
+        client_handler.wait_for_connect(Duration::from_secs(5)),
+        "клиент должен подключиться"
+    );
+    assert!(server_handler.wait_for_connects(1, Duration::from_secs(5)));
+    drop(client);
+    server.stop();
+}
