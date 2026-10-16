@@ -241,7 +241,86 @@ pub struct ControlBlock {
     pub server_pid: AtomicU32,
     /// PID клиента: пишется до `CLIENT_HELLO`, сервер забирает `swap(0)`.
     pub client_pid: AtomicU32,
-    pub reserved: [AtomicU32; 7],
+    /// Время создания процесса-сервера (`KERNEL_USER_TIMES::CreateTime`,
+    /// 100-нс FILETIME), младшая половина. Пишется в `initialize` до
+    /// `magic` вместе с `server_pid`; `0` -- сервер время не сообщил.
+    pub server_start_lo: AtomicU32,
+    /// Старшая половина `server_start`.
+    pub server_start_hi: AtomicU32,
+    /// Время создания процесса-клиента, младшая половина: пишется до
+    /// `client_pid`/`CLIENT_HELLO`, сервер забирает парой с `client_pid`
+    /// (`swap(0)`), откат handshake обнуляет.
+    pub client_start_lo: AtomicU32,
+    /// Старшая половина `client_start`.
+    pub client_start_hi: AtomicU32,
+    /// Multi: время создания процесса, захватившего слот, младшая половина;
+    /// пишется сразу после CAS `slot_claim`, до `slot_owner_pid`.
+    pub owner_start_lo: AtomicU32,
+    /// Старшая половина `owner_start`.
+    pub owner_start_hi: AtomicU32,
+    /// Резерв под число слотов Multi; сейчас всегда `0`.
+    pub slot_count: AtomicU32,
+}
+
+/// Склеить 64-битное время из половин `lo`/`hi` (на i686 атомарной 64-битной
+/// записи нет -- поля хранятся двумя `u32`).
+#[must_use]
+pub(crate) const fn join_time(lo: u32, hi: u32) -> u64 {
+    (lo as u64) | ((hi as u64) << 32)
+}
+
+/// Разбить 64-битное время на половины `(lo, hi)`.
+#[must_use]
+pub(crate) const fn split_time(time: u64) -> (u32, u32) {
+    (time as u32, (time >> 32) as u32)
+}
+
+impl ControlBlock {
+    /// Время создания процесса-сервера. Неизменно после публикации `magic`
+    /// (клиент уже прочитал его с Acquire в `attach`), Acquire здесь -- с
+    /// запасом.
+    #[must_use]
+    pub(crate) fn server_start_time(&self) -> u64 {
+        join_time(
+            self.server_start_lo.load(Ordering::Acquire),
+            self.server_start_hi.load(Ordering::Acquire),
+        )
+    }
+
+    /// Клиент: заявить время своего процесса. Вызывать ДО записи
+    /// `client_pid` (Release) -- она публикует обе половины.
+    pub(crate) fn announce_client_start(&self, time: u64) {
+        let (lo, hi) = split_time(time);
+        self.client_start_lo.store(lo, Ordering::Release);
+        self.client_start_hi.store(hi, Ordering::Release);
+    }
+
+    /// Сервер: забрать время клиента (одноразово, как `client_pid`). Вызывать
+    /// ПОСЛЕ `client_pid.swap` (AcqRel), иначе половины могут быть ещё не
+    /// видны.
+    pub(crate) fn take_client_start(&self) -> u64 {
+        join_time(
+            self.client_start_lo.swap(0, Ordering::AcqRel),
+            self.client_start_hi.swap(0, Ordering::AcqRel),
+        )
+    }
+
+    /// Клиент Multi: заявить время своего процесса после захвата слота.
+    /// Вызывать ДО записи `slot_owner_pid` (Release).
+    pub(crate) fn announce_owner_start(&self, time: u64) {
+        let (lo, hi) = split_time(time);
+        self.owner_start_lo.store(lo, Ordering::Release);
+        self.owner_start_hi.store(hi, Ordering::Release);
+    }
+
+    /// Время владельца claim-а. Читать ПОСЛЕ Acquire-чтения `slot_owner_pid`.
+    #[must_use]
+    pub(crate) fn owner_start_time(&self) -> u64 {
+        join_time(
+            self.owner_start_lo.load(Ordering::Acquire),
+            self.owner_start_hi.load(Ordering::Acquire),
+        )
+    }
 }
 
 /// Дескриптор одного кольца в `LayoutBlock`.
@@ -327,7 +406,13 @@ mod tests {
         assert_eq!(offset_of!(ControlBlock, slot_owner_pid), 24);
         assert_eq!(offset_of!(ControlBlock, server_pid), 28);
         assert_eq!(offset_of!(ControlBlock, client_pid), 32);
-        assert_eq!(offset_of!(ControlBlock, reserved), 36);
+        assert_eq!(offset_of!(ControlBlock, server_start_lo), 36);
+        assert_eq!(offset_of!(ControlBlock, server_start_hi), 40);
+        assert_eq!(offset_of!(ControlBlock, client_start_lo), 44);
+        assert_eq!(offset_of!(ControlBlock, client_start_hi), 48);
+        assert_eq!(offset_of!(ControlBlock, owner_start_lo), 52);
+        assert_eq!(offset_of!(ControlBlock, owner_start_hi), 56);
+        assert_eq!(offset_of!(ControlBlock, slot_count), 60);
     }
 
     #[test]

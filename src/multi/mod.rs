@@ -745,7 +745,8 @@ impl MultiCore {
                         .control_block()
                         .slot_owner_pid
                         .load(Ordering::Acquire);
-                    if !win::is_process_alive(owner_pid) {
+                    let owner_start = slot.server.view().control_block().owner_start_time();
+                    if !win::is_process_alive(owner_pid, owner_start) {
                         sweep
                             .orphaned
                             .push((slot.id, claim, DisconnectReason::PeerDied));
@@ -941,7 +942,8 @@ impl MultiCore {
                         .control_block()
                         .slot_owner_pid
                         .load(Ordering::Acquire);
-                    slot.owner_watch = ProcessWatch::open_peer(owner_pid);
+                    let owner_start = slot.server.view().control_block().owner_start_time();
+                    slot.owner_watch = ProcessWatch::open_peer(owner_pid, owner_start);
                 }
                 let id = slot.id;
                 drop(slot);
@@ -1694,6 +1696,10 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
         .compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire)
         .is_ok();
     if claimed {
+        // Находка 23: время создания своего процесса -- ДО PID, чья
+        // Release-запись публикует обе половины: сервер, прочитавший
+        // `slot_owner_pid` (Acquire), отличит переиспользованный PID.
+        control.announce_owner_start(win::current_process_start_time());
         // Публикуем свой PID для liveness-проверки сервером (см.
         // `ControlBlock::slot_owner_pid`) -- пишем СРАЗУ после успешного захвата,
         // Release гарантирует, что сервер, увидевший claim (Acquire), увидит

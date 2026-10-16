@@ -229,10 +229,30 @@ B+64   кольцо C2S           ┘ ёмкость c2s.capacity
 | 24 | `slot_owner_pid` | Multi: PID захватившего (бывш. `reserved[1]`) |
 | 28 | `server_pid` | PID сервера (бывш. `reserved[2]`) |
 | 32 | `client_pid` | PID клиента, одноразовый `swap(0)` (бывш. `reserved[3]`) |
-| 36 | `reserved[7]` | нули |
+| 36 | `server_start_lo` | Время создания процесса-сервера (`KERNEL_USER_TIMES::CreateTime`, 100-нс FILETIME), младшие 32 бита. Пишет сервер при инициализации **до** `magic` вместе с `server_pid` |
+| 40 | `server_start_hi` | старшие 32 бита `server_start` |
+| 44 | `client_start_lo` | Время создания процесса-клиента, младшие 32 бита. Пишет клиент **до** `client_pid` (т.е. до `CLIENT_HELLO`); сервер забирает парой сразу после `swap(client_pid, 0)` — `swap(0)` обеих половин; откат handshake клиентом обнуляет вместе с `client_pid` |
+| 48 | `client_start_hi` | старшие 32 бита `client_start` |
+| 52 | `owner_start_lo` | Multi: время создания процесса, захватившего слот, младшие 32 бита. Пишет клиент сразу после CAS `slot_claim`, **до** `slot_owner_pid` (Release) |
+| 56 | `owner_start_hi` | старшие 32 бита `owner_start` |
+| 60 | `slot_count` | резерв (число слотов Multi); сервер пишет `0` |
 
 Смещения полей 0.9 не сдвинулись — `reserved[N]` в тексте ниже означает поле
 с тем же смещением (`reserved[0]` = `slot_claim` и т.д.).
+
+**Время создания процесса** (0.10, находка 23 аудита). 64-битное значение
+хранится двумя `u32` (атомарной 64-битной записи на x86 нет): пишущий
+записывает `lo`, затем `hi`, затем публикующее поле с release (`magic`,
+`client_pid`, `slot_owner_pid`); читающий читает публикующее поле с acquire,
+затем `lo | hi << 32`. `0` — «время не сообщено» (пир старой версии или
+запрос не удался): сверки нет, поведение как в 0.9. Иначе наблюдатель,
+открыв процесс по PID, сверяет его `CreateTime` (`NtQueryInformationProcess(
+ProcessTimes)`, право `PROCESS_QUERY_LIMITED_INFORMATION`): процесс с другим
+временем — **не пир** (PID переиспользован после смерти пира или подделан) —
+handle процесса не удерживается, разовая проверка Multi считает владельца
+слота умершим. Время, которое узнать не удалось, — handle тоже не
+удерживается (личность не подтверждена), а разовая проверка консервативно
+считает процесс живым.
 
 ### c.2 `LayoutBlock` (смещение 64, 64 байта) — новое
 
@@ -385,7 +405,8 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    1. `g0 = generation` (Acquire) — **до** заявки;
    2. `NtResetEvent(S2C_CONNECT)` — сигнал чужого/брошенного рукопожатия не
       должен подтвердить нашу заявку;
-   3. свой PID в `reserved[3]` (Release);
+   3. (0.10) время создания своего процесса в `client_start_lo`/`hi`, затем
+      свой PID в `reserved[3]` (Release) (§c.1);
    4. `client_state = CLIENT_HELLO` (Release, store) → `handshake_state =
       CLIENT_HELLO` в обоих заголовках;
    5. `NtSetEvent(C2S_CONNECT_REQ)`;
@@ -408,7 +429,8 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 4. **Сервер** видит `CONNECT_REQ`, проверяет `client_state == CLIENT_HELLO`
    (иначе — `HandshakeFailed`, который поток лобби **игнорирует**: лобби
    цело и не пересоздаётся, см. шаг 2), выполняет `complete_handshake`
-   (`src/server.rs`; ревизия 2 — R16): `swap(reserved[3], 0)` → сброс обоих
+   (`src/server.rs`; ревизия 2 — R16): `swap(reserved[3], 0)` → (0.10)
+   `swap(client_start_lo/hi, 0)` → сброс обоих
    заголовков колец с `generation+1` → публикация `generation` (Release) →
    `handshake_state = SERVER_READY` в заголовки → `server_state =
    SERVER_READY` → **фиксация** `CAS client_state: CLIENT_HELLO →
@@ -822,7 +844,8 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 `ControlBlock.reserved[0]` — claim (`0` = свободен, иначе token клиента),
 `reserved[1]` — PID владельца claim-а, `reserved[3]` — PID клиента для
 handshake (0.8+), `reserved[2]` — PID сервера. Захват: `CAS reserved[0]:
-0 → token` (AcqRel), сразу за ним `store reserved[1] = PID` (Release);
+0 → token` (AcqRel), сразу за ним (0.10) `owner_start_lo`/`hi` и `store
+reserved[1] = PID` (Release, §c.1);
 освобождение клиентом — `CAS token → 0`.
 
 ### i.2 Сервер: кто что ждёт
@@ -1036,6 +1059,7 @@ R1–R17), §g (фактический прогон).
 | 10 | Читатель кольца | доверял `message_count` | пустота — по `write_pos == read_pos`; кадр сверяется с `write_pos`, лимитом и выравниванием; мусор — `Corrupted` и разрыв | §c.5 |
 | 11 | Лобби Dispatch | 2 × 2 МиБ | по умолчанию 2 × 16 КиБ (самоописываемая раскладка — клиенту безразлично) | §c.2 |
 | 12 | Отказ Dispatch-сервера | только ошибки | также политика (`DispatchHandler::admit` → `Reject`) и лимит `max_clients` (по умолчанию 64): ответ `STATUS_REJECTED` | §d |
+| 13 | Личность процесса пира | только PID (`server_pid`/`client_pid`/`slot_owner_pid`): переиспользованный или подделанный PID наблюдался как пир | рядом с каждым PID — время создания процесса (`server_start_*`@36, `client_start_*`@44, `owner_start_*`@52, половины `lo`/`hi`); процесс с тем же PID, но другим `CreateTime` — не пир; `0` — сверки нет. Пир ДОЛЖЕН писать время до соответствующего PID | §c.1 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации

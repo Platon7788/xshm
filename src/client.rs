@@ -11,6 +11,23 @@ use crate::server::poll_with_peer;
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
 
+#[cfg(test)]
+thread_local! {
+    /// Тесты: подменить заявляемое время создания процесса (имитация
+    /// подделанного или устаревшего `client_start`).
+    pub(crate) static FORGED_START_TIME: core::cell::Cell<Option<u64>> =
+        const { core::cell::Cell::new(None) };
+}
+
+/// Время создания текущего процесса, заявляемое в `client_start_*`.
+fn announced_start_time() -> u64 {
+    #[cfg(test)]
+    if let Some(forged) = FORGED_START_TIME.with(core::cell::Cell::get) {
+        return forged;
+    }
+    crate::win::current_process_start_time()
+}
+
 /// Откат клиентской стороны handshake в IDLE (заявка не принята).
 ///
 /// Вызывается на всех неуспешных путях `SharedClient::connect`: без него в
@@ -18,9 +35,11 @@ use crate::win::{Mapping, ProcessWatch, wait_any};
 /// за живую заявку на подключение. `client_state` здесь уже НЕ `CLIENT_HELLO`
 /// (его снял CAS в `withdraw_hello`) -- трогаем только PID и заголовки.
 fn rollback_handshake(view: &SharedView) {
-    // Заявленный PID отзываем вместе с HELLO: иначе клиент старой версии,
-    // пришедший следом, унаследовал бы наш PID (см. `ControlBlock::client_pid`).
+    // Заявленные PID и время процесса отзываем вместе с HELLO: иначе клиент
+    // старой версии, пришедший следом, унаследовал бы их (см.
+    // `ControlBlock::client_pid`).
     view.control_block().client_pid.store(0, Ordering::Release);
+    view.control_block().announce_client_start(0);
     let (header_a, header_b) = view.headers();
     header_a
         .handshake_state
@@ -175,10 +194,10 @@ impl SharedClient {
     /// (нужно тестам совместимости версий).
     ///
     /// Порядок (ревизия 2, INTEROP §d.2 шаг 3a, R15): запомнить `generation`
-    /// -> сбросить `S2C_CONNECT` -> PID в `reserved[3]` -> `client_state =
-    /// CLIENT_HELLO` -> заголовки -> `C2S_CONNECT_REQ` -> ждать
-    /// `S2C_CONNECT`. Рукопожатие состоялось, если `generation` сменился --
-    /// даже когда сервер уже успел отключить нас (`server_state == IDLE`):
+    /// -> сбросить `S2C_CONNECT` -> время процесса (`client_start_*`) -> PID
+    /// (`client_pid`) -> `client_state = CLIENT_HELLO` -> заголовки
+    /// -> `C2S_CONNECT_REQ` -> ждать `S2C_CONNECT`. Рукопожатие состоялось,
+    /// если `generation` сменился -- даже когда сервер уже успел отключить нас (`server_state == IDLE`):
     /// тогда `DISCONNECT` взведён, и worker дочитает кольцо (прощальное
     /// сообщение), а не потеряет его в откате.
     pub(crate) fn connect_impl(
@@ -209,7 +228,10 @@ impl SharedClient {
 
         // Протокол 0.8+: PID клиента -- ДО CLIENT_HELLO, чтобы Release-публикация
         // client_state сделала его видимым серверу вместе с заявкой.
+        // Находка 23: время создания процесса -- ДО `client_pid`, чью
+        // Release-запись сервер забирает AcqRel-`swap`-ом вместе с половинами.
         if announce_pid {
+            control.announce_client_start(announced_start_time());
             control
                 .client_pid
                 .store(std::process::id(), Ordering::Release);
@@ -247,7 +269,10 @@ impl SharedClient {
         }
 
         // PID сервера (0 -- сервер старой версии: наблюдения нет, как в 0.7).
-        let peer = ProcessWatch::open_peer(control.server_pid.load(Ordering::Acquire));
+        let peer = ProcessWatch::open_peer(
+            control.server_pid.load(Ordering::Acquire),
+            control.server_start_time(),
+        );
 
         let generation = control.generation.load(Ordering::Acquire);
         header_a.connection_gen.store(generation, Ordering::Release);
@@ -419,7 +444,7 @@ impl Drop for SharedClient {
         if self.connected {
             // R14: сначала своё состояние -> IDLE, потом `DISCONNECT`.
             // Ревизия 2: CAS `SERVER_READY -> IDLE`, а не store -- не затирает
-            // `CLIENT_HELLO` следующего клиента. `reserved[3]` не трогаем:
+            // `CLIENT_HELLO` следующего клиента. `client_pid` не трогаем:
             // наш PID сервер уже забрал (`swap` в рукопожатии), а следующий
             // клиент мог записать туда свой.
             let _ = self.view.control_block().client_state.compare_exchange(

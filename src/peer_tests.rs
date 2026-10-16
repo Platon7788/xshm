@@ -165,3 +165,59 @@ fn disconnect_drops_peer_watch() {
     assert_eq!(server.is_peer_alive(), None);
     drop(client);
 }
+
+/// Находка 23: клиент сообщил чужое время создания процесса (подмена PID
+/// или PID, переиспользованный после смерти пира) -- сервер не принимает
+/// процесс с этим PID за живого клиента.
+#[test]
+fn client_with_forged_start_time_is_reported_dead() {
+    let name = unique("FORGE");
+    let mut server = SharedServer::start(&name).unwrap();
+    let server_thread = thread::spawn(move || {
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+    });
+    thread::sleep(Duration::from_millis(30));
+    let forged = crate::win::current_process_start_time().wrapping_add(1);
+    crate::client::FORGED_START_TIME.with(|cell| cell.set(Some(forged)));
+    let client = SharedClient::connect_impl(&name, Duration::from_secs(5), true, None);
+    crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
+    let client = client.unwrap();
+    let server = server_thread.join().unwrap();
+    assert_ne!(server.is_peer_alive(), Some(true));
+    assert_eq!(server.peer_pid(), None);
+    // Время одноразовое, как и PID: сервер забрал его парой.
+    let control = server.view().control_block();
+    assert_eq!(control.client_start_lo.load(Ordering::Acquire), 0);
+    assert_eq!(control.client_start_hi.load(Ordering::Acquire), 0);
+    roundtrip(&server, &client);
+}
+
+/// Тест-порча (Review Focus 1/4): мусор в старшей половине времени сервера
+/// не даёт клиенту принять процесс с этим PID за живой сервер.
+#[test]
+fn corrupted_server_start_hi_is_not_a_live_server() {
+    let name = unique("CORRUPT");
+    let mut server = SharedServer::start(&name).unwrap();
+    let control = server.view().control_block();
+    let hi = control.server_start_hi.load(Ordering::Acquire);
+    control
+        .server_start_hi
+        .store(hi ^ 0xDEAD_BEEF, Ordering::Release);
+    let server_thread = thread::spawn(move || {
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+    });
+    thread::sleep(Duration::from_millis(30));
+    let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+    let server = server_thread.join().unwrap();
+    assert_ne!(client.is_peer_alive(), Some(true));
+    assert_eq!(client.peer_pid(), None);
+    // Честное время клиента сервер принимает.
+    assert_eq!(server.is_peer_alive(), Some(true));
+    roundtrip(&server, &client);
+}

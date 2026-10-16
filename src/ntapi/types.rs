@@ -305,10 +305,6 @@ pub const SectionBasicInformation: ULONG = 0;
     non_upper_case_globals,
     reason = "имя значения перечисления NT API воспроизводится дословно"
 )]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- время создания процесса (T4)")
-)]
 pub const ProcessTimes: ULONG = 4;
 
 /// `TOKEN_INFORMATION_CLASS::TokenUser` -- SID пользователя токена.
@@ -352,10 +348,6 @@ pub struct SECTION_BASIC_INFORMATION {
 /// единицах; `CreateTime` -- абсолютное время создания процесса (FILETIME).
 #[repr(C)]
 #[derive(Copy, Clone)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- время создания процесса (T4)")
-)]
 pub struct KERNEL_USER_TIMES {
     pub CreateTime: LARGE_INTEGER,
     pub ExitTime: LARGE_INTEGER,

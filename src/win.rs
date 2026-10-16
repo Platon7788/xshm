@@ -23,6 +23,7 @@ use crate::ntapi::{
     EVENT_BASIC_INFORMATION,
     EVENT_BASIC_INFORMATION_CLASS,
     HANDLE,
+    KERNEL_USER_TIMES,
     LARGE_INTEGER,
     MUTANT_ALL_ACCESS,
     NOTIFICATION_EVENT,
@@ -40,6 +41,7 @@ use crate::ntapi::{
     NtOpenProcess,
     NtOpenSection,
     NtQueryEvent,
+    NtQueryInformationProcess,
     NtQuerySection,
     NtReleaseMutant,
     NtResetEvent,
@@ -55,6 +57,7 @@ use crate::ntapi::{
     PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_SYNCHRONIZE,
     PVOID,
+    ProcessTimes,
     SEC_COMMIT,
     SEC_FILE,
     SEC_IMAGE,
@@ -70,6 +73,7 @@ use crate::ntapi::{
     STATUS_WAIT_0,
     SYNCHRONIZATION_EVENT,
     SectionBasicInformation,
+    ULONG,
     UNICODE_STRING,
     VIEW_UNMAP,
     WAIT_ANY,
@@ -866,8 +870,25 @@ impl ProcessWatch {
     /// «сразу умер»): живой пир не мог бы прислать HELLO из мёртвого процесса,
     /// значит PID устаревший (например, остался от упавшего посреди handshake
     /// клиента), и честный ответ -- «неизвестно».
-    pub fn open_peer(pid: u32) -> Option<Self> {
-        Self::open(pid).filter(|watch| !watch.has_exited())
+    ///
+    /// Находка 23: `start_time` -- время создания процесса пира
+    /// (`KERNEL_USER_TIMES::CreateTime`), которое тот сообщил в сегменте.
+    /// `0` -- пир время не сообщил (старая версия): сверки нет. Иначе процесс
+    /// с этим PID, созданный в другое время (PID переиспользован после смерти
+    /// пира или подделан), -- НЕ пир: `None`, пир считается умершим. Время,
+    /// которое не удалось узнать, тоже даёт `None` -- подтвердить личность
+    /// пира нечем, а наблюдать чужой процесс хуже, чем не наблюдать никого.
+    pub fn open_peer(pid: u32, start_time: u64) -> Option<Self> {
+        Self::open(pid)
+            .filter(|watch| !watch.has_exited())
+            .filter(|watch| start_time == 0 || watch.start_time() == Some(start_time))
+    }
+
+    /// Время создания наблюдаемого процесса (`CreateTime`, 100-нс FILETIME);
+    /// `None` -- запрос не удался.
+    #[must_use]
+    pub fn start_time(&self) -> Option<u64> {
+        query_start_time(self.handle.raw())
     }
 
     pub const fn pid(&self) -> u32 {
@@ -902,11 +923,72 @@ impl ProcessWatch {
 /// ("жив"). Возвращает `false` ТОЛЬКО если handle открылся и процесс
 /// сигнален. Для надёжной детекции смерти держите `ProcessWatch` с момента
 /// подключения.
-pub fn is_process_alive(pid: u32) -> bool {
+///
+/// Находка 23: `start_time != 0` -- время создания, сообщённое владельцем
+/// PID. Открывшийся процесс, созданный в ДРУГОЕ время, -- уже не тот
+/// процесс (PID переиспользован): `false`. Время, которое не удалось
+/// узнать, -- двусмысленность, `true`.
+#[must_use]
+pub fn is_process_alive(pid: u32, start_time: u64) -> bool {
     if pid == 0 {
         return true; // 0 не бывает PID пользовательского процесса
     }
-    ProcessWatch::open(pid).is_none_or(|watch| !watch.has_exited())
+    ProcessWatch::open(pid).is_none_or(|watch| {
+        if watch.has_exited() {
+            return false;
+        }
+        start_time == 0 || watch.start_time().is_none_or(|actual| actual == start_time)
+    })
+}
+
+/// Время создания процесса `pid` (`KERNEL_USER_TIMES::CreateTime`, 100-нс
+/// FILETIME). `None` -- PID 0, процесс не открылся (нет прав, не существует)
+/// или запрос не удался.
+#[must_use]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "разовая сверка по PID; в библиотеке пока только тесты"
+    )
+)]
+pub fn process_start_time(pid: u32) -> Option<u64> {
+    ProcessWatch::open(pid)?.start_time()
+}
+
+/// Время создания текущего процесса; `0` -- запрос не удался (тогда пиру
+/// сообщается «время неизвестно», и он не сверяет его).
+#[must_use]
+pub fn current_process_start_time() -> u64 {
+    query_start_time(NT_CURRENT_PROCESS).unwrap_or(0)
+}
+
+/// `NtQueryInformationProcess(ProcessTimes)` -> `CreateTime`. Нулевое время
+/// трактуется как «неизвестно» (`None`): `0` в сегменте зарезервирован под
+/// «не сообщено».
+fn query_start_time(process: HANDLE) -> Option<u64> {
+    let mut times = KERNEL_USER_TIMES::default();
+    let mut returned: ULONG = 0;
+    // SAFETY: буфер -- локальная структура ровно того размера, что передан
+    // (32 байта на обеих разрядностях -- проверено тестом раскладки в
+    // `ntapi`); `process` -- валидный handle с правом
+    // PROCESS_QUERY_LIMITED_INFORMATION или псевдо-handle текущего процесса.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessTimes,
+            core::ptr::from_mut(&mut times).cast(),
+            size_of::<KERNEL_USER_TIMES>() as ULONG,
+            &mut returned,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return None;
+    }
+    // SAFETY: LARGE_INTEGER -- объединение одинаковых по размеру i64 и пары
+    // u32; любое битовое значение допустимо для `QuadPart`.
+    let create_time = unsafe { times.CreateTime.QuadPart };
+    Some(create_time as u64).filter(|&time| time != 0)
 }
 
 #[cfg(test)]
@@ -915,7 +997,26 @@ mod tests {
 
     #[test]
     fn own_process_is_alive() {
-        assert!(is_process_alive(std::process::id()));
+        assert!(is_process_alive(std::process::id(), 0));
+    }
+
+    /// Находка 23: процесс с тем же PID, но другим временем создания -- не
+    /// пир (PID переиспользован или подделан). Точное время -- пир.
+    #[test]
+    fn start_time_mismatch_is_not_the_peer() {
+        let me = std::process::id();
+        let start = current_process_start_time();
+        assert_ne!(start, 0);
+        assert_eq!(process_start_time(me), Some(start));
+
+        assert!(ProcessWatch::open_peer(me, start.wrapping_add(1)).is_none());
+        assert!(!is_process_alive(me, start.wrapping_add(1)));
+
+        assert!(ProcessWatch::open_peer(me, start).is_some());
+        assert!(is_process_alive(me, start));
+        // 0 -- пир время не сообщил: поведение как до 0.10.
+        assert!(ProcessWatch::open_peer(me, 0).is_some());
+        assert!(is_process_alive(me, 0));
     }
 
     /// Регрессия (аудит 2026-07-28): `Mapping::open` доверял чужой секции и
@@ -1122,7 +1223,7 @@ mod tests {
     fn pid_zero_is_conservatively_alive() {
         // 0 не бывает PID пользовательского процесса — не должен читаться
         // как "подтверждённо мёртв".
-        assert!(is_process_alive(0));
+        assert!(is_process_alive(0, 0));
     }
 
     /// Регрессия (аудит 2026-07-10, orphan-слот bug): для РЕАЛЬНО завершённого
@@ -1141,7 +1242,7 @@ mod tests {
         // открываемым ещё короткое время после выхода, пока wait() полностью
         // не разрешит завершение с точки зрения ядра.
         for _ in 0..50 {
-            if !is_process_alive(pid) {
+            if !is_process_alive(pid, 0) {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));

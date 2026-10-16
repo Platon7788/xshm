@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
-use crate::layout::{ChannelLayout, ControlBlock, LayoutBlock, RingConfig, RingHeader};
+use crate::layout::{ChannelLayout, ControlBlock, LayoutBlock, RingConfig, RingHeader, split_time};
 use crate::ring::RingBuffer;
 
 /// Типизированная проекция на отображённый сегмент.
@@ -39,7 +39,16 @@ impl SharedView {
     /// отображения размером не менее `layout.segment_size()` байт, которое
     /// остаётся отображённым всё время жизни результата; `layout` проверен
     /// (`ChannelLayout::validate`).
-    pub unsafe fn initialize(base: *mut u8, layout: ChannelLayout, server_pid: u32) -> Self {
+    ///
+    /// `server_start` -- время создания процесса-сервера
+    /// (`win::current_process_start_time`, `0` -- не сообщать); пишется
+    /// вместе с `server_pid` до `magic`.
+    pub unsafe fn initialize(
+        base: *mut u8,
+        layout: ChannelLayout,
+        server_pid: u32,
+        server_start: u64,
+    ) -> Self {
         let view = Self {
             base: NonNull::new(base).expect("shared mapping pointer must be valid"),
             layout,
@@ -61,6 +70,14 @@ impl SharedView {
         control.slot_owner_pid.store(0, Ordering::Relaxed);
         control.server_pid.store(server_pid, Ordering::Relaxed);
         control.client_pid.store(0, Ordering::Relaxed);
+        let (start_lo, start_hi) = split_time(server_start);
+        control.server_start_lo.store(start_lo, Ordering::Relaxed);
+        control.server_start_hi.store(start_hi, Ordering::Relaxed);
+        control.client_start_lo.store(0, Ordering::Relaxed);
+        control.client_start_hi.store(0, Ordering::Relaxed);
+        control.owner_start_lo.store(0, Ordering::Relaxed);
+        control.owner_start_hi.store(0, Ordering::Relaxed);
+        control.slot_count.store(0, Ordering::Relaxed);
 
         let block = view.layout_block();
         block
@@ -284,7 +301,7 @@ mod tests {
         let layout = small();
         let m = mem(layout.segment_size());
         // SAFETY: m живёт до конца теста, размер = segment_size.
-        let _server = unsafe { SharedView::initialize(m.0, layout, 42) };
+        let _server = unsafe { SharedView::initialize(m.0, layout, 42, 0) };
         // SAFETY: см. выше.
         let view = unsafe { SharedView::attach(m.0, layout.segment_size()) }.unwrap();
         assert_eq!(*view.layout(), layout);
@@ -299,7 +316,7 @@ mod tests {
         let m = mem(len);
         assert_eq!(attach(&m, len).unwrap_err(), ShmError::NotReady);
         // SAFETY: см. выше.
-        let view = unsafe { SharedView::initialize(m.0, layout, 1) };
+        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0) };
         // Сегмент меньше заявленного.
         assert_eq!(attach(&m, len - 1).unwrap_err(), ShmError::Corrupted);
         // Чужая версия.

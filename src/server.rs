@@ -80,7 +80,14 @@ impl SharedServer {
         // `layout.segment_size()` (адрес выровнен на гранулу выделения) и
         // держит его живым, пока жив сам, а он переезжает в возвращаемую
         // структуру; layout проверен вызывающим.
-        let view = unsafe { SharedView::initialize(mapping.as_ptr(), layout, std::process::id()) };
+        let view = unsafe {
+            SharedView::initialize(
+                mapping.as_ptr(),
+                layout,
+                std::process::id(),
+                crate::win::current_process_start_time(),
+            )
+        };
         let ring_tx = view.ring_a();
         let ring_rx = view.ring_b();
         Self {
@@ -240,6 +247,10 @@ impl SharedServer {
         // значение одноразовое -- клиент старой версии, пришедший следом,
         // не унаследует чужой PID. 0 -- клиент старой версии, наблюдения нет.
         let client_pid = control.client_pid.swap(0, Ordering::AcqRel);
+        // Находка 23: время создания процесса клиента -- парой с PID и тоже
+        // одноразово; половины видны после AcqRel-`swap` выше (клиент пишет
+        // их до `client_pid`). `0` -- клиент время не сообщил.
+        let client_start = control.take_client_start();
         let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
 
         let (header_a, header_b) = self.view.headers();
@@ -281,7 +292,7 @@ impl SharedServer {
                 .store(HANDSHAKE_IDLE, Ordering::Release);
             return Err(ShmError::HandshakeFailed);
         }
-        self.peer = ProcessWatch::open_peer(client_pid);
+        self.peer = ProcessWatch::open_peer(client_pid, client_start);
 
         // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
         // опросом `server_state`.
