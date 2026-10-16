@@ -585,9 +585,15 @@ impl RingBuffer {
     /// кольцо пустым -- а пустое кольцо кадр принимает всегда (вместе с
     /// наихудшим PAD, `RingConfig::validate`). PAD-кадры вытесняются как
     /// обычные, но в `overwritten`/`drop_count` не попадают. `Corrupted` --
-    /// только по позициям и заголовкам кадров, не по счётчику. Лимит
-    /// сообщений -- по правилу `admits` (Task 18, решение 28): до `RECOUNT_MAX`
-    /// -- пересчёт по кадрам, выше -- счётчик с запасом на отставание.
+    /// только по позициям и заголовкам кадров, не по счётчику.
+    ///
+    /// Лимит сообщений (`admits`, Task 18, решение 28, INTEROP §c.5): при
+    /// `max_messages <= RECOUNT_MAX` (64) он точный -- счётчик на пределе
+    /// пересчитывается по кадрам, и после записи в кольце не больше
+    /// `max_messages` сообщений; выше порога вытеснение начинается только
+    /// при `message_count > max_messages` -- кольцо может кратковременно
+    /// держать `max_messages + 1` сообщение (запас на законное отставание
+    /// счётчика). Гарантия -- при честном читателе.
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
         let total = self.frame_len(payload.len())?;
         let header = self.header();
@@ -641,9 +647,14 @@ impl RingBuffer {
     ///   копируются до публикации `write_pos`, читатель видит сообщение
     ///   целиком или не видит вовсе;
     /// - `QueueFull` -- не хватает байт (`frame_size(len)`, а если кадр не
-    ///   помещается до конца кольца -- PAD на остаток + кадр) или занято
-    ///   `max_messages` слотов; проверка консервативна (см. `free_space`),
-    ///   ложных успехов нет, ложный `QueueFull` возможен только если читатель
+    ///   помещается до конца кольца -- PAD на остаток + кадр) или исчерпан
+    ///   лимит сообщений (`admits`, решение 28): при `max_messages <=
+    ///   RECOUNT_MAX` (64) лимит точный -- `QueueFull`, когда в кольце по
+    ///   кадрам `max_messages` сообщений (отставший счётчик пересчитывается);
+    ///   выше порога -- при `message_count > max_messages`, то есть кольцо
+    ///   может кратковременно держать `max_messages + 1` сообщение
+    ///   (`free_space` консервативно считает лимитом `max_messages`). Ложных
+    ///   успехов нет, ложный `QueueFull` возможен только если читатель
     ///   освободил место в тот же момент -- повтор увидит его;
     /// - длина вне `MIN_MESSAGE_SIZE..=max_message_size` --
     ///   `MessageTooSmall`/`MessageTooLarge` (кадр максимальной длины всегда
@@ -3356,6 +3367,42 @@ mod lagging_count_tests {
         assert_eq!(seen.len(), BIG as usize + 1);
         assert_eq!(seen[..2], [2, 3]);
         assert_eq!(seen[seen.len() - 3..], [200, 201, 202]);
+    }
+
+    /// Fix round 2: ровно на пороге `max_messages == RECOUNT_MAX` действует
+    /// пересчёт (`<=` в `admits`): в окне отставания запись принимается, а
+    /// при настоящих 64 сообщениях `try_write_message` -- `QueueFull` без
+    /// запаса `+1` (правило «по счётчику» его бы дало).
+    #[test]
+    fn recount_applies_exactly_at_recount_max() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(8192).max_messages(RECOUNT_MAX));
+        let header = ring.header();
+        for seq in 0..RECOUNT_MAX {
+            ring.try_write_message(&[seq as u8; LEN]).unwrap();
+        }
+        // Честно полное: 64 сообщения, счётчик 64 -- запаса нет.
+        assert_eq!(
+            ring.try_write_message(&[100u8; LEN]),
+            Err(ShmError::QueueFull),
+            "на пороге лимит точный"
+        );
+        // Окно отставания: читатель сдвинул read_pos, счётчик ещё 64.
+        let read = header.read_pos.load(Ordering::Acquire);
+        header
+            .read_pos
+            .store(read + frame_size(LEN) as u32, Ordering::Release);
+        ring.try_write_message(&[101u8; LEN]).unwrap();
+        ring.decrement_count();
+        assert_eq!(header.message_count.load(Ordering::Acquire), RECOUNT_MAX);
+        // Снова 64 настоящих сообщения: QueueFull, без +1.
+        assert_eq!(
+            ring.try_write_message(&[102u8; LEN]),
+            Err(ShmError::QueueFull)
+        );
+        let seen = drain(&ring);
+        assert_eq!(seen.len(), RECOUNT_MAX as usize);
+        assert_eq!(seen[0], 1);
+        assert_eq!(seen[seen.len() - 1], 101);
     }
 
     /// Бенчмарк ревью Task 18 (I1): запись с перезаписью на пределе лимита
