@@ -2,15 +2,16 @@
 //! (`ObjectSecurity`), по умолчанию -- владелец (пользователь процесса) +
 //! SYSTEM вместо NULL DACL.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use xshm::{
     AutoHandler, AutoOptions, AutoServer, Beacon, ChannelConfig, ClientRegistration,
-    DispatchHandler, DispatchOptions, DispatchServer, MultiHandler, MultiOptions, MultiServer,
-    ObjectSecurity, SharedClient, SharedServer, ShmError,
+    DispatchHandler, DispatchOptions, DispatchServer, MultiClient, MultiClientHandler,
+    MultiClientOptions, MultiHandler, MultiOptions, MultiServer, ObjectSecurity, SharedClient,
+    SharedServer, ShmError,
 };
 
 // Своё объявление `NtQuerySecurityObject`: тесту нужно прочитать DACL
@@ -32,6 +33,8 @@ unsafe extern "system" {
 
 /// `DACL_SECURITY_INFORMATION`.
 const DACL_SECURITY_INFORMATION: u32 = 4;
+/// `LABEL_SECURITY_INFORMATION` -- метка целостности (SACL).
+const LABEL_SECURITY_INFORMATION: u32 = 0x10;
 /// `SE_DACL_PRESENT` в `Control` дескриптора.
 const SE_DACL_PRESENT: u16 = 0x0004;
 
@@ -44,9 +47,8 @@ fn unique_name(tag: &str) -> String {
     )
 }
 
-/// DACL объекта по дескриптору: `None` -- NULL DACL (доступ всем),
-/// `Some(n)` -- DACL из `n` записей.
-fn dacl_ace_count(handle: isize) -> Option<u16> {
+/// Self-relative дескриптор объекта по handle (части `information`).
+fn query_security(handle: isize, information: u32) -> Vec<u8> {
     let raw = core::ptr::without_provenance_mut(handle.cast_unsigned());
     let mut buffer = vec![0u32; 256];
     let mut needed = 0u32;
@@ -56,14 +58,20 @@ fn dacl_ace_count(handle: isize) -> Option<u16> {
     let status = unsafe {
         NtQuerySecurityObject(
             raw,
-            DACL_SECURITY_INFORMATION,
+            information,
             buffer.as_mut_ptr().cast(),
             length,
             &raw mut needed,
         )
     };
     assert_eq!(status, 0, "NtQuerySecurityObject: {status:#x}");
-    let bytes: Vec<u8> = buffer.iter().flat_map(|w| w.to_le_bytes()).collect();
+    buffer.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// DACL объекта по дескриптору: `None` -- NULL DACL (доступ всем),
+/// `Some(n)` -- DACL из `n` записей.
+fn dacl_ace_count(handle: isize) -> Option<u16> {
+    let bytes = query_security(handle, DACL_SECURITY_INFORMATION);
     // Self-relative SECURITY_DESCRIPTOR: Control @2, OffsetDacl @16.
     let control = u16::from_le_bytes([bytes[2], bytes[3]]);
     assert_ne!(control & SE_DACL_PRESENT, 0, "DACL обязан присутствовать");
@@ -233,11 +241,102 @@ fn low_integrity_policy_creates_working_channel() {
     let name = unique_name("LOW");
     let config = ChannelConfig::default().security(ObjectSecurity::CurrentUserAllowLowIntegrity);
     let mut server = SharedServer::start_with(&name, &config).unwrap();
+
+    // Метка у созданного объекта: SACL @12, одна SYSTEM_MANDATORY_LABEL_ACE
+    // (тип 0x11, маска NO_WRITE_UP = 1) для S-1-16-4096.
+    let sd = query_security(server.section_handle(), LABEL_SECURITY_INFORMATION);
+    let sacl = u32::from_le_bytes([sd[12], sd[13], sd[14], sd[15]]) as usize;
+    assert_ne!(sacl, 0, "метка целостности обязана быть");
+    assert_eq!(
+        u16::from_le_bytes([sd[sacl + 4], sd[sacl + 5]]),
+        1,
+        "одна ACE"
+    );
+    let ace = &sd[sacl + 8..];
+    assert_eq!(ace[0], 0x11, "SYSTEM_MANDATORY_LABEL_ACE_TYPE");
+    assert_eq!(
+        u32::from_le_bytes([ace[4], ace[5], ace[6], ace[7]]),
+        1,
+        "NO_WRITE_UP"
+    );
+    assert_eq!(
+        &ace[8..20],
+        &[1, 1, 0, 0, 0, 0, 0, 16, 0x00, 0x10, 0, 0],
+        "S-1-16-4096 (Low)"
+    );
+
     let client = thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)));
     server
         .wait_for_client(Some(Duration::from_secs(5)))
         .unwrap();
     client.join().unwrap().unwrap();
+}
+
+/// Ревью T9 (важное 1): `MultiClient` против сервера, чей DACL его не
+/// включает, сообщает `AccessDenied`, а не `NotConnected` («сервера нет»).
+#[test]
+fn multi_client_reports_access_denied() {
+    #[derive(Default)]
+    struct Errors(Mutex<Vec<ShmError>>);
+    impl MultiClientHandler for Errors {
+        fn on_connect(&self, _slot_id: u32) {}
+        fn on_disconnect(&self) {}
+        fn on_message(&self, _data: &[u8]) {}
+        fn on_error(&self, err: ShmError) {
+            self.0.lock().unwrap().push(err);
+        }
+    }
+
+    let name = unique_name("MULTI_DENIED");
+    let server = MultiServer::start(
+        &name,
+        Arc::new(Quiet),
+        MultiOptions {
+            max_clients: 3,
+            security: deny_all(),
+            ..MultiOptions::default()
+        },
+    )
+    .unwrap();
+    let errors = Arc::new(Errors::default());
+    let client = MultiClient::connect(
+        &name,
+        errors.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_millis(20),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while errors.0.lock().unwrap().len() < 2 {
+        assert!(Instant::now() < deadline, "нет on_error");
+        thread::sleep(Duration::from_millis(5));
+    }
+    client.stop();
+    let seen = errors.0.lock().unwrap().clone();
+    assert!(
+        seen.iter().all(|e| *e == ShmError::AccessDenied),
+        "ожидался только AccessDenied, получено {seen:?}"
+    );
+    server.stop();
+
+    // Сервера нет -- по-прежнему NotConnected (отказ в доступе не путается
+    // с отсутствием слотов).
+    let absent = Arc::new(Errors::default());
+    let client = MultiClient::connect(
+        &unique_name("MULTI_ABSENT"),
+        absent.clone(),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while absent.0.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "нет on_error");
+        thread::sleep(Duration::from_millis(5));
+    }
+    client.stop();
+    assert_eq!(absent.0.lock().unwrap()[0], ShmError::NotConnected);
 }
 
 #[test]

@@ -73,7 +73,13 @@
   может создать его первой) нужна `ObjectSecurity::Everyone` или свой
   `ObjectSecurity::Descriptor` (например, SYSTEM + группа `Users`). То же для
   песочниц Low integrity — `CurrentUserAllowLowIntegrity`, для AppContainer —
-  `Descriptor` с SID пакета. `SharedServer::start_with_layout` (не выпущен)
+  `Descriptor` с SID пакета. Новые публичные поля `security` в
+  `AutoOptions`, `MultiOptions`, `DispatchOptions` и `DispatchClientOptions`:
+  литералы этих структур без `..Default::default()` больше не собираются.
+  `MultiClient`: слот с отказом в доступе перебор не обрывает, итог без
+  захвата — `AccessDenied` (приоритет над `NoFreeSlot` и `NotConnected`),
+  а не вечный `NotConnected` «сервера нет» (INTEROP §i.1).
+  `SharedServer::start_with_layout` (не выпущен)
   заменён на `start_with(name, &ChannelConfig)`; `SharedEvents::create` —
   внутренний.
 - Формат памяти `0x00020000`: `LayoutBlock` (смещение 64) с дескрипторами

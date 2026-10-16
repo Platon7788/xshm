@@ -468,9 +468,10 @@ impl DispatchServer {
             return Err(ShmError::InvalidConfig("max_clients must be at least 1"));
         }
         options.channel_layout.validate()?;
-        let lobby = SharedServer::start_slot(name, options.lobby_layout, 0, &options.security)?;
-        let lobby_lock =
-            NamedMutex::open_or_create(&lobby_lock_name(name), &options.security.attributes()?)?;
+        let security = options.security.attributes()?;
+        let lobby = SharedServer::start_slot(name, options.lobby_layout, 0, &security)?;
+        let lobby_lock = NamedMutex::open_or_create(&lobby_lock_name(name), &security)?;
+
         let stop_event = Arc::new(EventHandle::create_unnamed(true)?);
         let running = Arc::new(AtomicBool::new(true));
 
@@ -784,12 +785,9 @@ impl DispatchCore {
             // ошибки (с отступом, прерываемым остановкой).
             let mut lobby_server = match first.take() {
                 Some(lobby) => lobby,
-                None => match SharedServer::start_slot(
-                    base_name,
-                    self.options.lobby_layout,
-                    0,
-                    &self.options.security,
-                ) {
+                None => match self.options.security.attributes().and_then(|security| {
+                    SharedServer::start_slot(base_name, self.options.lobby_layout, 0, &security)
+                }) {
                     Ok(s) => s,
                     Err(err) => {
                         self.handler.on_error(None, err);

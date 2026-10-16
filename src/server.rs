@@ -8,7 +8,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::naming::mapping_name;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
-use crate::security::ObjectSecurity;
+use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
 
@@ -121,23 +121,23 @@ impl SharedServer {
     /// # Ok::<(), xshm::ShmError>(())
     /// ```
     pub fn start_with(name: &str, config: &ChannelConfig) -> Result<Self> {
-        Self::start_slot(name, config.layout, 0, &config.security)
+        Self::start_slot(name, config.layout, 0, &config.security.attributes()?)
     }
 
     /// Сервер канала `name`, публикующий в `ControlBlock::slot_count` число
     /// `slot_count` (Multi: `max_clients`; `0` -- не Multi). Дескриптор
-    /// строится один раз на секцию и все события канала.
+    /// `security` -- общий для секции и всех событий канала (Multi строит его
+    /// один раз на все слоты).
     pub(crate) fn start_slot(
         name: &str,
         layout: ChannelLayout,
         slot_count: u32,
-        security: &ObjectSecurity,
+        security: &SecurityAttributes,
     ) -> Result<Self> {
         layout.validate()?;
-        let security = security.attributes()?;
-        let mapping = Mapping::create(&mapping_name(name), layout.segment_size(), &security)?;
+        let mapping = Mapping::create(&mapping_name(name), layout.segment_size(), security)?;
         let mut server = Self::from_mapping(mapping, layout, slot_count)?;
-        server.events = Some(SharedEvents::create(name, &security)?);
+        server.events = Some(SharedEvents::create(name, security)?);
         Ok(server)
     }
 

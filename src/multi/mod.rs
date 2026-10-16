@@ -425,6 +425,8 @@ impl MultiServer {
         // Создаём N независимых сегментов-слотов. Lobby не нужен — клиенты
         // захватывают слоты сами через атомарный claim (см. doc MultiServer).
         let mut slots = Vec::with_capacity(options.max_clients as usize);
+        // Дескриптор -- один на все слоты (токен процесса читается один раз).
+        let security = options.security.attributes()?;
         for slot_id in 0..options.max_clients {
             // Каждый слот публикует число слотов -- подсказка для диагностики,
             // перебор клиента им не ограничивается.
@@ -432,7 +434,7 @@ impl MultiServer {
                 &format!("{base_name}_{slot_id}"),
                 options.layout,
                 options.max_clients,
-                &options.security,
+                &security,
             )?;
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
@@ -1797,21 +1799,31 @@ fn nudge_stale_claims(base_name: &str) {
 /// `MAX_MULTI_CLIENTS`. `ControlBlock::slot_count` границей НЕ служит: его
 /// может переписать любой клиент с доступом к слоту, и `slot_count = 1` в слоте 0
 /// закрыл бы остальные слоты для всех -- отказ в обслуживании.
+///
+/// 0.10: слот, в доступе к которому отказано (`AccessDenied` -- DACL
+/// сервера не включает этого пользователя), перебор НЕ завершает: слот
+/// существует, просто чужой. Конец перебора -- любая другая ошибка
+/// открытия (слота нет). Приоритет итоговой ошибки, если ни один слот не
+/// захвачен: `AccessDenied` (был хоть один отказ в доступе) > `NoFreeSlot`
+/// (слоты есть, все заняты) > `NotConnected` (ни одного слота -- сервер не
+/// запущен). Иначе клиент пользователя против службы SYSTEM с политикой по
+/// умолчанию видел бы вечный `NotConnected` -- неотличимо от «сервера нет».
 fn claim_free_slot(base_name: &str) -> Result<(u32, String, u32)> {
     let token = next_claim_token();
     let mut saw_slot = false;
+    let mut denied = false;
     for slot_id in 0..MAX_MULTI_CLIENTS {
         let slot_name = format!("{base_name}_{slot_id}");
         match try_claim_slot(&slot_name, token) {
             Ok(true) => return Ok((slot_id, slot_name, token)),
-            Ok(false) => {
-                saw_slot = true;
-                continue;
-            }
+            Ok(false) => saw_slot = true,
+            Err(ShmError::AccessDenied) => denied = true,
             Err(_) => break, // слотов больше нет
         }
     }
-    if saw_slot {
+    if denied {
+        Err(ShmError::AccessDenied) // слоты есть, но DACL их не даёт
+    } else if saw_slot {
         Err(ShmError::NoFreeSlot) // сервер есть, но все слоты заняты
     } else {
         Err(ShmError::NotConnected) // сервер не запущен (нет ни одного слота)

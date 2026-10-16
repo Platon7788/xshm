@@ -689,7 +689,8 @@ impl AutoServer {
     /// Поднять канал `name` (раскладка -- `options.layout`) и worker,
     /// который принимает клиентов и обслуживает их по событиям.
     pub fn start(name: &str, handler: Arc<dyn AutoHandler>, options: AutoOptions) -> Result<Self> {
-        let mut server = SharedServer::start_slot(name, options.layout, 0, &options.security)?;
+        let mut server =
+            SharedServer::start_slot(name, options.layout, 0, &options.security.attributes()?)?;
         let layout = *server.layout();
         let endpoint = Endpoint::spawn(
             handler,
