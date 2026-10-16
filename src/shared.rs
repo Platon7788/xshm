@@ -163,13 +163,16 @@ impl SharedView {
                     .checked_add(size_of::<RingHeader>() + ring.capacity)
                     .is_some_and(|end| end <= segment_size)
         };
+        if !ring_ok(s2c_offset, &server_to_client) || !ring_ok(c2s_offset, &client_to_server) {
+            return Err(ShmError::Corrupted);
+        }
+        // Концы колец -- только после `ring_ok`: он доказал `offset + 64 +
+        // capacity <= segment_size` без переполнения. Раньше сумма
+        // считалась до проверки, и смещение пира у верхней границы `u32`
+        // переполняло `usize` на i686 (паника в debug -- Task 18).
         let s2c_end = s2c_offset + size_of::<RingHeader>() + server_to_client.capacity;
         let c2s_end = c2s_offset + size_of::<RingHeader>() + client_to_server.capacity;
-        let disjoint = s2c_end <= c2s_offset || c2s_end <= s2c_offset;
-        if !ring_ok(s2c_offset, &server_to_client)
-            || !ring_ok(c2s_offset, &client_to_server)
-            || !disjoint
-        {
+        if !(s2c_end <= c2s_offset || c2s_end <= s2c_offset) {
             return Err(ShmError::Corrupted);
         }
 
@@ -366,6 +369,28 @@ mod tests {
             .c2s
             .max_message_size
             .store((cap / 2 - 8) as u32, Ordering::Relaxed);
+        assert!(attach(&m, len).is_ok());
+    }
+
+    /// Task 18 (найдено `tests/hostile.rs` на i686): смещение кольца у
+    /// верхней границы `u32` -- `Corrupted`, а не переполнение `usize` при
+    /// вычислении конца кольца (на 32-битной сборке `offset + 64 +
+    /// capacity` не помещается в `usize`: паника в debug, мусор в release).
+    #[test]
+    fn attach_rejects_ring_offset_near_u32_max() {
+        let layout = small();
+        let len = layout.segment_size();
+        let m = mem(len);
+        // SAFETY: m живёт до конца теста, размер = segment_size.
+        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0, 0) }.unwrap();
+        let block = view.layout_block();
+        for ring in [&block.s2c, &block.c2s] {
+            let saved = ring.offset.load(Ordering::Relaxed);
+            // Кратно 64 и >= 128: проходит все проверки, кроме границы.
+            ring.offset.store(!63, Ordering::Relaxed);
+            assert_eq!(attach(&m, len).unwrap_err(), ShmError::Corrupted);
+            ring.offset.store(saved, Ordering::Relaxed);
+        }
         assert!(attach(&m, len).is_ok());
     }
 }
