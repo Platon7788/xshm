@@ -278,7 +278,8 @@ impl SharedClient {
     ///
     /// Процесс сервера наблюдается (PID и время создания из сегмента, как
     /// у `ProcessWatch::open_peer`): сервер умер, не ответив, --
-    /// `Err(PeerDied)` с тем же откатом заявки, что у таймаута. Сервер без
+    /// `Err(PeerDied)` с тем же откатом заявки, что у таймаута, в том числе
+    /// если он умер раньше, чем future открыл его процесс. Сервер без
     /// PID (старая версия) или процесс, который не открылся (другая сессия
     /// без прав), не наблюдается -- тогда границу задаёт только таймаут
     /// исполнителя.
@@ -532,10 +533,25 @@ impl ConnectFuture {
                 });
             }
             let control = hello.view.control_block();
-            self.server = ProcessWatch::open_peer(
+            let (pid, start) = (
                 control.server_pid.load(Ordering::Acquire),
                 control.server_start_time(),
             );
+            self.server = ProcessWatch::open_peer(pid, start);
+            // Task 18 (Task 16 N1): `open_peer` не наблюдает уже мёртвый
+            // процесс («неизвестно» -- верно для PID из рукопожатия). Здесь
+            // PID -- сервер, владеющий открытым сегментом: подтверждённо
+            // ушедший (`is_process_gone`: процесса нет, он завершён или PID
+            // занят процессом с другим временем создания) -- `PeerDied` с
+            // откатом, как при таймауте. Иначе future ждал бы вечно.
+            // Двусмысленность (нет прав, PID 0) -- без наблюдения, как раньше.
+            if self.server.is_none() && crate::win::is_process_gone(pid, start) {
+                return Poll::Ready(if hello.withdraw() {
+                    Ok(hello.finish())
+                } else {
+                    Err(ShmError::PeerDied)
+                });
+            }
             self.hello = Some(hello);
         }
         let Some(hello) = self.hello.as_ref() else {
@@ -979,5 +995,45 @@ mod tests {
             .client_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
         assert!(!withdraw_hello(view, before));
+    }
+
+    /// Task 18 (Task 16 N1): сервер умер раньше, чем `connect_async` открыл
+    /// его процесс. Окно воспроизводится детерминированно: в сегменте --
+    /// PID и время создания уже завершившегося процесса (сегмент и события
+    /// живы, как если бы их держал кто-то ещё). Future обязан ответить
+    /// `PeerDied` с откатом заявки на первом же опросе, а не ждать вечно
+    /// `S2C_CONNECT`, который никто не пошлёт.
+    #[test]
+    fn connect_async_sees_server_dead_before_open() {
+        let name = format!("XSHM_ASYNC_DEAD_SERVER_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+
+        // Завершившийся процесс: PID и время создания, затем ни одного handle.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let watch = ProcessWatch::open(pid).unwrap();
+        let start = watch.start_time().unwrap();
+        child.wait().unwrap();
+        drop(watch);
+        drop(child);
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+
+        let mut future = std::pin::pin!(SharedClient::connect_async(&name));
+        let mut cx = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(Err(ShmError::PeerDied)) => {}
+            Poll::Ready(other) => panic!("ожидался PeerDied: {:?}", other.map(drop)),
+            Poll::Pending => panic!("смерть сервера до open_peer не замечена"),
+        }
+        // Откат, как у таймаута: заявки и PID клиента в сегменте нет.
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
     }
 }
