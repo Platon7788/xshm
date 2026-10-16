@@ -22,19 +22,36 @@
 //! ядро потребляет сигнал сразу, сообщает `AlreadySignaled = TRUE` и всё
 //! равно ставит пакет в порт (проверено тестом
 //! `port_already_signaled_packet_is_queued`): отдельно будить не нужно.
-//! Отмена регистрации, проигравшая гонку с сигналом, сигнал тоже теряет
-//! (пакет вынимается из очереди вместе с потреблённым сигналом).
+//!
+//! # Отмена: потреблён ли сигнал
+//!
+//! Отмена двухшаговая (проверено тестами на x64 и i686):
+//! `NtCancelWaitCompletionPacket(.., RemoveSignaledPacket = FALSE)` отвечает
+//! `STATUS_SUCCESS` -- ожидание снято до сигнала (сигнал цел),
+//! `STATUS_PENDING` -- сигнал потреблён, пакет стоит в очереди порта (тогда
+//! вторым шагом `TRUE` пакет вынимается), `STATUS_CANCELLED` -- пакет уже
+//! извлечён из порта (или не привязывался). Итог -- [`CancelOutcome`]:
+//! `Registration::cancel` сообщает его владельцу, чтобы async API (Task 16)
+//! мог вернуть потреблённый сигнал автосбросного события (`NtSetEvent`) или
+//! перепроверить кольцо. Сам реактор сигналы не восстанавливает -- он не
+//! знает, что за объект ждёт.
 //!
 //! # Ключи и гонка отмены
 //!
 //! Ключ пакета -- не указатель, а пара (индекс слота таблицы, поколение
 //! слота): `KeyContext` = индекс, `ApcContext` = поколение -- оба полного
 //! размера указателя, на x86 тоже. Снятие регистрации (срабатывание или
-//! `Drop`) увеличивает поколение слота. `NtCancelWaitCompletionPacket` может
-//! проиграть гонку: поток реактора уже извлёк пакет, но ещё не дошёл до
-//! таблицы. Тогда он находит слот пустым или с новым поколением и молча
-//! отбрасывает пакет -- ни обращения к освобождённому, ни пробуждения чужого
-//! `Waker`.
+//! отмена) увеличивает поколение слота. Отмена может проиграть гонку: поток
+//! реактора уже извлёк пакет, но ещё не дошёл до таблицы. Тогда он находит
+//! слот пустым или с новым поколением и молча отбрасывает пакет -- ни
+//! обращения к освобождённому, ни пробуждения чужого `Waker`.
+//!
+//! Обратная гонка: реактор уже вынул запись из таблицы и будит `Waker` вне
+//! блокировки, а отмена в это время видит слот снятым и возвращается
+//! (`CancelOutcome::AlreadyDelivered`). Поэтому после возврата из отмены
+//! или `Drop` возможно **не более одного** уже начатого пробуждения --
+//! контракт `Waker` допускает ложные пробуждения. Ждать его в `Drop` нельзя:
+//! `Drop` из самого `Waker` на потоке `xsr` зависал бы навсегда.
 
 use std::mem::MaybeUninit;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
@@ -42,18 +59,18 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 
 use crate::auto::map_spawn_error;
-use crate::error::Result;
+use crate::error::{Result, ShmError};
 use crate::ntapi::{
     FILE_IO_COMPLETION_INFORMATION, GENERIC_ALL, HANDLE, IO_COMPLETION_ALL_ACCESS, NTSTATUS,
     NtAssociateWaitCompletionPacket, NtCancelWaitCompletionPacket, NtCreateIoCompletion,
     NtCreateWaitCompletionPacket, NtRemoveIoCompletionEx, NtSetIoCompletion, STATUS_CANCELLED,
-    STATUS_SUCCESS, STATUS_TIMEOUT, ULONG, duration_to_nt_timeout,
+    STATUS_PENDING, STATUS_SUCCESS, STATUS_TIMEOUT, ULONG, duration_to_nt_timeout,
 };
 use crate::sync_ext::LockExt;
 use crate::win::{Handle, status_to_error};
@@ -82,21 +99,24 @@ pub(crate) struct Completion {
     pub(crate) tag: usize,
 }
 
-/// Исход `NtCancelWaitCompletionPacket(.., RemoveSignaledPacket = TRUE)`
-/// (коды проверены тестом `port_cancel_outcomes`).
+/// Исход двухшаговой отмены ожидания (коды проверены тестами
+/// `port_cancel_outcomes` и `registration_cancel_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CancelOutcome {
-    /// `STATUS_SUCCESS`: привязка снята -- либо ожидание ещё не сработало
-    /// (сигнал не потреблён), либо сработало и пакет вынут из очереди
-    /// порта (сигнал потреблён и потерян). Ядро эти случаи не различает.
-    Cancelled,
-    /// `STATUS_CANCELLED`: снимать нечего -- пакет уже извлечён из порта
-    /// или не привязывался.
-    NotAssociated,
-    /// Иной код (`STATUS_PENDING` бывает только при `RemoveSignaledPacket =
-    /// FALSE`: пакет остался в очереди). Его извлечение отбросит владелец
-    /// ключа.
-    Other(NTSTATUS),
+    /// Ожидание снято до сигнала (`STATUS_SUCCESS` при `FALSE`): сигнал
+    /// объекта не потреблён, `Waker` не будится.
+    NotFired,
+    /// Сигнал потреблён, но не доставлен: пакет вынут из очереди порта
+    /// (`STATUS_PENDING`, затем `TRUE`) или извлечён реактором уже после
+    /// снятия записи (будет отброшен как устаревший). `Waker` не будится;
+    /// у автосбросного события сигнал потерян -- его возвращает владелец
+    /// (`NtSetEvent`) или перепроверяет состояние сам.
+    FiredNotDelivered,
+    /// Пакет уже извлечён из порта (`STATUS_CANCELLED`): у [`Registration`]
+    /// -- `Waker` разбужен или вот-вот будет (ровно один раз). У голого
+    /// [`WaitPacket`] -- то же, что «извлечён своим владельцем» или «не
+    /// привязывался».
+    AlreadyDelivered,
 }
 
 /// Свой порт завершения ввода-вывода (IOCP) с ожиданием объектов через
@@ -334,16 +354,31 @@ impl WaitPacket {
         self.already_signaled
     }
 
-    /// Снять привязку; поставленный в очередь пакет вынимается
-    /// (`RemoveSignaledPacket = TRUE`).
+    /// Снять привязку в два шага (см. модуль): `RemoveSignaledPacket =
+    /// FALSE` различает «не сработало» / «сработало, в очереди» / «уже
+    /// извлечено»; во втором случае `TRUE` вынимает пакет из очереди.
     pub(crate) fn cancel(&self) -> CancelOutcome {
-        // SAFETY: дескриптор пакета жив, пока жив `self`.
-        let status = unsafe { NtCancelWaitCompletionPacket(self.handle.raw(), 1) };
-        match status {
-            STATUS_SUCCESS => CancelOutcome::Cancelled,
-            STATUS_CANCELLED => CancelOutcome::NotAssociated,
-            other => CancelOutcome::Other(other),
+        match self.cancel_raw(false) {
+            STATUS_SUCCESS => CancelOutcome::NotFired,
+            STATUS_PENDING => match self.cancel_raw(true) {
+                // Между шагами пакет успел извлечь владелец порта.
+                STATUS_CANCELLED => CancelOutcome::AlreadyDelivered,
+                // `STATUS_SUCCESS`: вынут из очереди. Иной код невозможен
+                // при живом дескрипторе -- считаем сигнал потреблённым,
+                // а доставку несостоявшейся: недоставленный пакет придёт
+                // и будет отброшен по ключу.
+                _ => CancelOutcome::FiredNotDelivered,
+            },
+            // `STATUS_CANCELLED` (уже извлечён / не привязывался); иной код
+            // невозможен при живом дескрипторе.
+            _ => CancelOutcome::AlreadyDelivered,
         }
+    }
+
+    /// Один вызов `NtCancelWaitCompletionPacket`.
+    fn cancel_raw(&self, remove_signaled: bool) -> NTSTATUS {
+        // SAFETY: дескриптор пакета жив, пока жив `self`.
+        unsafe { NtCancelWaitCompletionPacket(self.handle.raw(), u8::from(remove_signaled)) }
     }
 }
 
@@ -411,8 +446,9 @@ impl Table {
 /// бесконечно ждёт порт и не останавливается. Поток держит только
 /// `&'static Reactor` -- никаких сильных ссылок на объекты пользователя,
 /// кроме `Waker`, который вынут из таблицы и сейчас будится. Регистрации
-/// (`Waker` + пакет) живут в таблице, пока владелец не снимет их `Drop`-ом
-/// или они не сработают.
+/// (`Waker` + пакет) живут в таблице, пока владелец не снимет их (отмена,
+/// `Drop`) или они не сработают. В крейте доступен только общий экземпляр
+/// [`Reactor::global`]: реактор на канал -- лишний вечный поток.
 #[derive(Debug)]
 pub(crate) struct Reactor {
     port: CompletionPort,
@@ -440,22 +476,27 @@ impl Reactor {
         if let Some(reactor) = GLOBAL.get() {
             return Ok(reactor);
         }
-        let reactor = Self::new()?;
+        let reactor = Self::start()?;
         Ok(GLOBAL.get_or_init(|| reactor))
     }
 
-    /// Отдельный реактор со своим потоком (до конца процесса; тесты
-    /// изолируют им счётчики). При отказе запуска потока порт остаётся
-    /// неосвобождённым -- редкий отказ ОС, не стоит `unsafe`-возврата
-    /// утёкшей памяти.
-    pub(crate) fn new() -> Result<&'static Self> {
-        let port = CompletionPort::new()?;
-        let reactor: &'static Self = Box::leak(Box::new(Self {
-            port,
+    /// Реактор без потока: порт и пустая таблица.
+    fn unstarted() -> Result<Self> {
+        Ok(Self {
+            port: CompletionPort::new()?,
             table: Mutex::new(Table::default()),
             #[cfg(test)]
             stale: AtomicU64::new(0),
-        }));
+        })
+    }
+
+    /// Реактор со своим потоком (до конца процесса). Экземпляр уходит в
+    /// поток в `Box` и становится `&'static` уже там: если поток не
+    /// запустился (отказ `spawn` или паника хука старта), замыкание с
+    /// `Box` уничтожается и порт закрывается -- ничего не утекает.
+    fn start() -> Result<&'static Self> {
+        let reactor = Box::new(Self::unstarted()?);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
         // Имя потока -- только в debug (короткий непрозрачный тег).
         let thread_name = String::from("xsr");
         #[cfg_attr(
@@ -470,9 +511,17 @@ impl Reactor {
         #[cfg(not(debug_assertions))]
         drop(thread_name);
         // `JoinHandle` отпускается: поток живёт до конца процесса.
-        crate::thread_hook::spawn(builder, move || reactor.run())
-            .map_err(|err| map_spawn_error(err, "spawn reactor thread"))?;
-        Ok(reactor)
+        crate::thread_hook::spawn(builder, move || {
+            let reactor: &'static Self = Box::leak(reactor);
+            // Получатель ждёт в `start` -- отправка не отказывает; поток
+            // работает в любом случае.
+            let _ = started_tx.send(reactor);
+            reactor.run();
+        })
+        .map_err(|err| map_spawn_error(err, "spawn reactor thread"))?;
+        started_rx.recv().map_err(|_| ShmError::WorkerPanicked {
+            message: "reactor thread exited before start (thread start hook panicked)",
+        })
     }
 
     /// Зарегистрировать одноразовое ожидание объекта `handle`: при его
@@ -513,39 +562,44 @@ impl Reactor {
         })
     }
 
-    /// Цикл потока реактора: бесконечное ожидание порта, пачка пакетов ->
-    /// записи из таблицы (под блокировкой) -> пробуждение (без неё).
+    /// Цикл потока реактора: бесконечное ожидание порта и обработка пачек.
     fn run(&self) {
         let mut batch = Vec::with_capacity(BATCH_LEN);
-        let mut fired: Vec<Entry> = Vec::with_capacity(BATCH_LEN);
+        let mut fired = Vec::with_capacity(BATCH_LEN);
         loop {
             if self.port.wait_batch(&mut batch, None).is_err() {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
             }
-            {
-                let mut table = self.table.lock_clean();
-                for completion in &batch {
-                    match table.take(completion.key, completion.tag) {
-                        Some(entry) => fired.push(entry),
-                        // Устаревший пакет: регистрация уже снята (и,
-                        // возможно, слот занят новой) -- отбрасываем.
-                        #[cfg(test)]
-                        None => {
-                            // Relaxed: тестовая статистика.
-                            self.stale.fetch_add(1, Ordering::Relaxed);
-                        }
-                        #[cfg(not(test))]
-                        None => {}
+            self.process(&batch, &mut fired);
+        }
+    }
+
+    /// Пачка пакетов -> записи из таблицы (под блокировкой) -> пробуждение
+    /// (без неё).
+    fn process(&self, batch: &[Completion], fired: &mut Vec<Entry>) {
+        {
+            let mut table = self.table.lock_clean();
+            for completion in batch {
+                match table.take(completion.key, completion.tag) {
+                    Some(entry) => fired.push(entry),
+                    // Устаревший пакет: регистрация уже снята (и, возможно,
+                    // слот занят новой) -- отбрасываем.
+                    #[cfg(test)]
+                    None => {
+                        // Relaxed: тестовая статистика.
+                        self.stale.fetch_add(1, Ordering::Relaxed);
                     }
+                    #[cfg(not(test))]
+                    None => {}
                 }
             }
-            for Entry { waker, packet } in fired.drain(..) {
-                // Паника чужого `Waker` не должна убить общий поток.
-                drop(catch_unwind(AssertUnwindSafe(|| waker.wake())));
-                // Пакет извлечён -- отмена в `Drop` ничего не найдёт.
-                drop(packet);
-            }
+        }
+        for Entry { waker, packet } in fired.drain(..) {
+            // Паника чужого `Waker` не должна убить общий поток.
+            drop(catch_unwind(AssertUnwindSafe(|| waker.wake())));
+            // Пакет извлечён -- отмена в `Drop` ничего не найдёт.
+            drop(packet);
         }
     }
 
@@ -557,9 +611,14 @@ impl Reactor {
 }
 
 /// Одноразовая регистрация ожидания в [`Reactor`]. Сработала -- снята
-/// реактором; `Drop` несработавшей отменяет пакет
-/// (`NtCancelWaitCompletionPacket`, `RemoveSignaledPacket = TRUE`) и
-/// закрывает его. После возврата из `Drop` `Waker` не будится никогда.
+/// реактором (`Waker` будится ровно один раз). Несработавшую снимает
+/// [`Registration::cancel`] (с исходом) или `Drop` (исход отбрасывается):
+/// двухшаговая отмена пакета, затем его закрытие.
+///
+/// После возврата из отмены или `Drop` возможно не более одного уже
+/// начатого пробуждения (реактор вынул запись и будит `Waker` вне
+/// блокировки) -- ровно случай `CancelOutcome::AlreadyDelivered`; контракт
+/// `Waker` допускает такое ложное пробуждение.
 #[derive(Debug)]
 pub(crate) struct Registration {
     reactor: &'static Reactor,
@@ -599,6 +658,47 @@ impl Registration {
         true
     }
 
+    /// Снять регистрацию и узнать, что стало с сигналом.
+    ///
+    /// - `NotFired` -- сигнал объекта цел, `Waker` не будится;
+    /// - `FiredNotDelivered` -- сигнал потреблён, `Waker` не будится: у
+    ///   автосбросного события владелец возвращает сигнал (`NtSetEvent`) или
+    ///   перепроверяет состояние (кольцо) сам -- async API, Task 16;
+    /// - `AlreadyDelivered` -- реактор уже снял регистрацию, `Waker` разбужен
+    ///   или вот-вот будет (ровно один раз).
+    pub(crate) fn cancel(self) -> CancelOutcome {
+        let outcome = self.cancel_inner();
+        // Снята -- повторный проход `Drop` не нужен (ресурсов у самой
+        // регистрации нет: ссылка и два числа).
+        std::mem::forget(self);
+        outcome
+    }
+
+    /// Снятие записи из таблицы и отмена её пакета (вне блокировки).
+    fn cancel_inner(&self) -> CancelOutcome {
+        let entry = self
+            .reactor
+            .table
+            .lock_clean()
+            .take(self.index, self.generation);
+        let Some(Entry { waker, packet }) = entry else {
+            return CancelOutcome::AlreadyDelivered;
+        };
+        // Запись снята нами -- реактор её не найдёт и не разбудит. Пакет,
+        // извлечённый им до снятия (`AlreadyDelivered` на уровне пакета),
+        // будет отброшен как устаревший: сигнал потреблён, не доставлен.
+        let outcome = match packet.cancel() {
+            CancelOutcome::NotFired => CancelOutcome::NotFired,
+            CancelOutcome::FiredNotDelivered | CancelOutcome::AlreadyDelivered => {
+                CancelOutcome::FiredNotDelivered
+            }
+        };
+        // Закрытие пакета и `Drop` `Waker` (код пользователя) -- вне блокировки.
+        drop(packet);
+        drop(waker);
+        outcome
+    }
+
     /// Ключ пакета регистрации (тесты гонки отмены).
     #[cfg(test)]
     const fn key(&self) -> Completion {
@@ -611,20 +711,14 @@ impl Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        let entry = self
-            .reactor
-            .table
-            .lock_clean()
-            .take(self.index, self.generation);
-        // Отмена пакета и `Drop` `Waker` -- вне блокировки.
-        drop(entry);
+        let _ = self.cancel_inner();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::ShmError;
+
     use crate::win::EventHandle;
     use std::future::Future;
     use std::pin::{Pin, pin};
@@ -790,7 +884,7 @@ mod tests {
 
     #[test]
     fn cancelled_registration_never_wakes() {
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let event = EventHandle::create_unnamed(false).unwrap();
         let counter = Counter::new();
         let registration = reactor
@@ -807,7 +901,7 @@ mod tests {
 
     #[test]
     fn idle_reactor_does_not_wake_up() {
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let events: Vec<_> = (0..4)
             .map(|_| EventHandle::create_unnamed(false).unwrap())
             .collect();
@@ -835,7 +929,7 @@ mod tests {
     #[test]
     fn thousand_registrations_one_thread() {
         const N: usize = 1000;
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let events: Vec<_> = (0..N)
             .map(|_| EventHandle::create_unnamed(false).unwrap())
             .collect();
@@ -879,7 +973,7 @@ mod tests {
     /// старым ключом руками (`post`), ровно как его оставило бы ядро.
     #[test]
     fn stale_completion_is_dropped() {
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let first_event = EventHandle::create_unnamed(false).unwrap();
         let second_event = EventHandle::create_unnamed(false).unwrap();
         let first = Counter::new();
@@ -913,10 +1007,11 @@ mod tests {
 
     /// Постановление 1, живая гонка: сигнал и сразу `Drop`. Порядок не
     /// управляем (поток реактора может успеть или нет), поэтому проверяем
-    /// инвариант: после возврата из `Drop` waker больше не будится никогда.
+    /// честный инвариант: waker разбужен не более одного раза -- и до
+    /// `Drop`, и после него (одно уже начатое пробуждение допустимо).
     #[test]
-    fn drop_racing_completion_never_wakes_after_drop() {
-        let reactor = Reactor::new().unwrap();
+    fn drop_racing_completion_wakes_at_most_once() {
+        let reactor = Reactor::start().unwrap();
         let event = EventHandle::create_unnamed(false).unwrap();
         let mut seen = Vec::new();
         for _ in 0..300 {
@@ -926,14 +1021,13 @@ mod tests {
                 .unwrap();
             event.set().unwrap();
             drop(registration);
-            seen.push((counter.get(), counter));
+            seen.push(counter);
             // Сигнал, не доставленный из-за отмены, гасим к следующему кругу.
             let _ = event.reset();
         }
         sync(reactor);
-        for (at_drop, counter) in &seen {
-            assert!(*at_drop <= 1);
-            assert_eq!(counter.get(), *at_drop, "пробуждение после Drop");
+        for counter in &seen {
+            assert!(counter.get() <= 1, "больше одного пробуждения");
         }
     }
 
@@ -941,7 +1035,7 @@ mod tests {
     /// будится ровно один раз, сигнал автосбросного события потреблён.
     #[test]
     fn already_signaled_wakes_exactly_once() {
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let event = EventHandle::create_unnamed(false).unwrap();
         event.set().unwrap();
         let counter = Counter::new();
@@ -980,30 +1074,41 @@ mod tests {
         let port = CompletionPort::new().unwrap();
         let event = EventHandle::create_unnamed(false).unwrap();
 
+        // Сырые коды первого шага (`RemoveSignaledPacket = FALSE`) -- то, на
+        // чём стоит двухшаговая отмена; проверяются и на i686.
+        let packet = port.associate_raw(event.raw_handle(), 10, 0).unwrap();
+        assert_eq!(packet.cancel_raw(false), STATUS_SUCCESS, "не сработало");
+        let packet = port.associate_raw(event.raw_handle(), 11, 0).unwrap();
+        event.set().unwrap();
+        assert_eq!(packet.cancel_raw(false), STATUS_PENDING, "в очереди");
+        assert_eq!(packet.cancel_raw(true), STATUS_SUCCESS, "вынут");
+        assert_eq!(packet.cancel_raw(false), STATUS_CANCELLED, "снимать нечего");
+        assert_eq!(port.wait(Some(Duration::from_millis(50))).unwrap(), None);
+
         // Не привязывался -- снимать нечего.
         let fresh = WaitPacket::new().unwrap();
-        assert_eq!(fresh.cancel(), CancelOutcome::NotAssociated);
+        assert_eq!(fresh.cancel(), CancelOutcome::AlreadyDelivered);
 
-        // Ожидание не сработало -- отмена снимает его; повторная -- нечего.
+        // Ожидание не сработало -- отмена снимает его, сигнал цел.
         let packet = port.associate_raw(event.raw_handle(), 1, 0).unwrap();
         assert!(!packet.already_signaled());
-        assert_eq!(packet.cancel(), CancelOutcome::Cancelled);
-        assert_eq!(packet.cancel(), CancelOutcome::NotAssociated);
+        assert_eq!(packet.cancel(), CancelOutcome::NotFired);
+        assert_eq!(packet.cancel(), CancelOutcome::AlreadyDelivered);
         event.set().unwrap();
         assert!(
             event.wait(Some(Duration::ZERO)).unwrap(),
             "сигнал не потреблён"
         );
 
-        // Сработало и стоит в очереди -- отмена вынимает пакет из очереди
-        // (тот же `STATUS_SUCCESS`), сигнал потерян.
+        // Сработало и стоит в очереди -- `PENDING`, затем `TRUE` вынимает
+        // пакет; сигнал потреблён.
         let packet = port.associate_raw(event.raw_handle(), 2, 0).unwrap();
         event.set().unwrap();
         assert!(
             !event.wait(Some(Duration::ZERO)).unwrap(),
             "сигнал потреблён"
         );
-        assert_eq!(packet.cancel(), CancelOutcome::Cancelled);
+        assert_eq!(packet.cancel(), CancelOutcome::FiredNotDelivered);
         assert_eq!(port.wait(Some(Duration::from_millis(50))).unwrap(), None);
 
         // Пакет уже извлечён -- отменять нечего; сработавший пакет можно
@@ -1011,7 +1116,7 @@ mod tests {
         let mut packet = port.associate_raw(event.raw_handle(), 3, 0).unwrap();
         event.set().unwrap();
         assert_eq!(port.wait(Some(DEADLINE)).unwrap(), Some(3));
-        assert_eq!(packet.cancel(), CancelOutcome::NotAssociated);
+        assert_eq!(packet.cancel(), CancelOutcome::AlreadyDelivered);
         let target = raw_handle(event.raw_handle());
         port.arm(&mut packet, target, 4, 0).unwrap();
         assert!(port.arm(&mut packet, target, 5, 0).is_err());
@@ -1037,46 +1142,155 @@ mod tests {
     }
 
     /// Постановление 4: закрытый/негодный handle -- `Err`, не паника.
+    ///
+    /// Значение только что закрытого handle при параллельном прогоне может
+    /// сразу занять объект другого теста (таблица handle раздаёт
+    /// освобождённые значения LIFO), и регистрация законно удалась бы --
+    /// а то и съела бы чужой сигнал. Поэтому проверяем значения, которые
+    /// заведомо не заняты: NULL и записи таблицы далеко за её реальным
+    /// размером (для ядра закрытый handle -- ровно такая свободная запись).
+    /// Ядро на закрытом handle проверено отдельно: `STATUS_INVALID_HANDLE`
+    /// (отчёт T15). Принимается любой `Err`.
     #[test]
     fn closed_handle_is_error() {
-        let reactor = Reactor::new().unwrap();
+        let reactor = Reactor::start().unwrap();
         let counter = Counter::new();
-        // Таблица handle ядра раздаёт освобождённые значения LIFO: закрытый
-        // последним достанется пакету самой `register`. Поэтому закрываем
-        // проверяемый первым, а второй -- после: пакет займёт значение
-        // второго, проверяемое останется закрытым. При параллельном прогоне
-        // значение может успеть занять объект другого теста (регистрация
-        // тогда законно удаётся) -- повторяем; последовательно хватает
-        // первой попытки.
-        let closed_is_error = (0..50).any(|_| {
-            let closed = EventHandle::create_unnamed(false).unwrap();
-            let decoy = EventHandle::create_unnamed(false).unwrap();
-            let raw = closed.raw_handle();
-            drop(closed);
-            drop(decoy);
-            match reactor.register(raw, Waker::noop().clone()) {
-                Err(ShmError::WindowsError { code, .. }) => {
-                    assert_eq!(code, 0xC000_0008, "STATUS_INVALID_HANDLE");
-                    true
-                }
-                Err(other) => panic!("неожиданная ошибка {other:?}"),
-                Ok(_reused) => false,
-            }
-        });
-        assert!(closed_is_error, "закрытый handle ни разу не дал ошибку");
-        // Пустой и несуществующий handle -- `STATUS_INVALID_HANDLE`.
-        for handle in [0, 0x00FF_FFF0] {
-            match reactor.register(handle, counter.waker()) {
-                Err(ShmError::WindowsError { code, context }) => {
-                    assert_eq!(code, 0xC000_0008, "handle {handle:#x}");
-                    assert_eq!(context, "NtAssociateWaitCompletionPacket");
-                }
-                other => panic!("handle {handle:#x}: ожидалась ошибка, получено {other:?}"),
-            }
+        // Свой закрытый объект: его значение не используем (см. выше), но
+        // проверяемые значения выбраны выше любого выданного.
+        let closed = EventHandle::create_unnamed(false).unwrap();
+        let ceiling = closed.raw_handle();
+        drop(closed);
+        for handle in [0, 0x00FF_FFF0, 0x03FF_FFF0] {
+            assert!(handle == 0 || handle > ceiling);
+            let result = reactor.register(handle, counter.waker());
+            assert!(result.is_err(), "handle {handle:#x}: {result:?}");
         }
         sync(reactor);
         assert_eq!(counter.get(), 0);
         // Неудачные регистрации вернули слот: таблица не растёт.
         assert_eq!(reactor.table.lock_clean().slots.len(), 1);
+    }
+
+    /// Реактор без потока: тест сам решает, когда извлекать пакеты.
+    fn manual_reactor() -> &'static Reactor {
+        Box::leak(Box::new(Reactor::unstarted().unwrap()))
+    }
+
+    /// Один оборот цикла реактора вручную.
+    fn turn(reactor: &Reactor) -> usize {
+        let mut batch = Vec::new();
+        let mut fired = Vec::new();
+        let count = reactor
+            .port
+            .wait_batch(&mut batch, Some(Duration::from_millis(100)))
+            .unwrap();
+        reactor.process(&batch, &mut fired);
+        count
+    }
+
+    /// Ruling 22: не сработало -- `NotFired`, сигнал цел.
+    #[test]
+    fn registration_cancel_not_fired() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        assert_eq!(registration.cancel(), CancelOutcome::NotFired);
+        event.set().unwrap();
+        assert_eq!(turn(reactor), 0, "отменённый пакет попал в порт");
+        assert_eq!(counter.get(), 0);
+        assert!(event.wait(Some(Duration::ZERO)).unwrap(), "сигнал цел");
+    }
+
+    /// Ruling 22: сработало, пакет в очереди, реактор его ещё не извлёк --
+    /// `FiredNotDelivered` (путь `STATUS_PENDING` -> `TRUE`), пакет вынут,
+    /// waker не будится, сигнал потреблён.
+    #[test]
+    fn registration_cancel_fired_not_delivered() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        event.set().unwrap();
+        assert!(
+            !event.wait(Some(Duration::ZERO)).unwrap(),
+            "сигнал потреблён"
+        );
+        assert_eq!(registration.cancel(), CancelOutcome::FiredNotDelivered);
+        assert_eq!(turn(reactor), 0, "пакет не вынут из очереди");
+        assert_eq!(counter.get(), 0);
+    }
+
+    /// Ruling 22: пакет уже извлечён реактором, но запись снята отменой
+    /// раньше, чем он дошёл до таблицы -- `FiredNotDelivered`, пакет
+    /// отброшен как устаревший, waker не будится.
+    #[test]
+    fn registration_cancel_after_dequeue_before_lookup() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        event.set().unwrap();
+        let mut batch = Vec::new();
+        assert_eq!(
+            reactor.port.wait_batch(&mut batch, Some(DEADLINE)).unwrap(),
+            1
+        );
+        assert_eq!(registration.cancel(), CancelOutcome::FiredNotDelivered);
+        reactor.process(&batch, &mut Vec::new());
+        assert_eq!(reactor.stale_completions(), 1);
+        assert_eq!(counter.get(), 0);
+    }
+
+    /// Ruling 22: реактор уже доставил -- `AlreadyDelivered`, waker
+    /// разбужен ровно один раз.
+    #[test]
+    fn registration_cancel_already_delivered() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        event.set().unwrap();
+        assert_eq!(turn(reactor), 1);
+        assert_eq!(counter.get(), 1);
+        assert_eq!(registration.cancel(), CancelOutcome::AlreadyDelivered);
+        assert_eq!(counter.get(), 1);
+    }
+
+    /// Живая гонка отмены с потоком реактора: исход отмены точно говорит,
+    /// будет ли пробуждение (`AlreadyDelivered` -- ровно одно, иначе --
+    /// ни одного).
+    #[test]
+    fn cancel_outcome_matches_delivery() {
+        let reactor = Reactor::start().unwrap();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let mut seen = Vec::new();
+        for _ in 0..300 {
+            let counter = Counter::new();
+            let registration = reactor
+                .register(event.raw_handle(), counter.waker())
+                .unwrap();
+            event.set().unwrap();
+            seen.push((registration.cancel(), counter));
+            let _ = event.reset();
+        }
+        sync(reactor);
+        for (outcome, counter) in &seen {
+            let expected = usize::from(*outcome == CancelOutcome::AlreadyDelivered);
+            assert_eq!(counter.get(), expected, "{outcome:?}");
+            assert_ne!(
+                *outcome,
+                CancelOutcome::NotFired,
+                "событие взведено до отмены"
+            );
+        }
     }
 }

@@ -382,13 +382,6 @@ impl Default for KERNEL_USER_TIMES {
 /// `IO_STATUS_BLOCK`: в NT `Status` объединён с `Pointer` -- для `repr(C)`
 /// раскладка совпадает, поскольку `Information` выравнивает поле до указателя.
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-    )
-)]
 pub struct IO_STATUS_BLOCK {
     pub Status: NTSTATUS,
     pub Information: ULONG_PTR,
@@ -396,18 +389,18 @@ pub struct IO_STATUS_BLOCK {
 
 /// Элемент, извлекаемый `NtRemoveIoCompletionEx`.
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-    )
-)]
 pub struct FILE_IO_COMPLETION_INFORMATION {
     pub KeyContext: PVOID,
     pub ApcContext: PVOID,
     pub IoStatusBlock: IO_STATUS_BLOCK,
 }
+
+// Ядро пишет массив `FILE_IO_COMPLETION_INFORMATION` с этим шагом: ошибка
+// раскладки = запись за буфер (`NtRemoveIoCompletionEx`).
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<FILE_IO_COMPLETION_INFORMATION>() == 32);
+#[cfg(target_pointer_width = "32")]
+const _: () = assert!(size_of::<FILE_IO_COMPLETION_INFORMATION>() == 16);
 
 /// SID с атрибутами (часть `TOKEN_USER`).
 #[repr(C)]
@@ -454,3 +447,6 @@ pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32.cast_signed();
 /// Операция отменена; `NtCancelWaitCompletionPacket` -- «снимать нечего»:
 /// пакет уже извлечён из порта или не привязывался.
 pub const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32.cast_signed();
+/// Операция не завершена; `NtCancelWaitCompletionPacket(.., FALSE)` --
+/// ожидание сработало (сигнал потреблён), пакет стоит в очереди порта.
+pub const STATUS_PENDING: NTSTATUS = 0x0000_0103;
