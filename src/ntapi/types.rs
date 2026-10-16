@@ -281,3 +281,176 @@ pub const STATUS_ABANDONED_WAIT_0: NTSTATUS = 0x0000_0080;
 
 /// WaitAny - вернуться когда любой объект сигнализирован
 pub const WAIT_ANY: ULONG = 1;
+
+// ============================================================================
+// Сведения о секции, времени процесса, токене и ACL (0.10)
+// ============================================================================
+
+/// Указатель на SID (непрозрачная структура переменной длины).
+pub type PSID = PVOID;
+/// Непрозрачный дескриптор границы частного пространства имён
+/// (`RtlCreateBoundaryDescriptor`).
+#[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+pub type POBJECT_BOUNDARY_DESCRIPTOR = PVOID;
+
+/// `SECTION_INFORMATION_CLASS::SectionBasicInformation` для `NtQuerySection`.
+#[expect(
+    non_upper_case_globals,
+    reason = "имя значения перечисления NT API воспроизводится дословно"
+)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")
+)]
+pub const SectionBasicInformation: ULONG = 0;
+
+/// `PROCESSINFOCLASS::ProcessTimes` -- `KERNEL_USER_TIMES` процесса.
+#[expect(
+    non_upper_case_globals,
+    reason = "имя значения перечисления NT API воспроизводится дословно"
+)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- время создания процесса (T4)")
+)]
+pub const ProcessTimes: ULONG = 4;
+
+/// `TOKEN_INFORMATION_CLASS::TokenUser` -- SID пользователя токена.
+#[expect(
+    non_upper_case_globals,
+    reason = "имя значения перечисления NT API воспроизводится дословно"
+)]
+#[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+pub const TokenUser: ULONG = 1;
+
+/// Секция с резервированием страниц без фиксации (`NtCreateSection`).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
+)]
+pub const SEC_RESERVE: ULONG = 0x0400_0000;
+/// Секция-образ исполняемого файла.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
+)]
+pub const SEC_IMAGE: ULONG = 0x0100_0000;
+/// Секция, отображающая файл (а не файл подкачки).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
+)]
+pub const SEC_FILE: ULONG = 0x0080_0000;
+
+/// Полный доступ к порту завершения ввода-вывода
+/// (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+)]
+pub const IO_COMPLETION_ALL_ACCESS: ACCESS_MASK = 0x001F_0003;
+/// Общее право «всё» (так создают пакеты ожидания завершения).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+)]
+pub const GENERIC_ALL: ACCESS_MASK = 0x1000_0000;
+
+/// Ответ `NtQuerySection(SectionBasicInformation)`.
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")
+)]
+pub struct SECTION_BASIC_INFORMATION {
+    pub BaseAddress: PVOID,
+    pub AllocationAttributes: ULONG,
+    pub MaximumSize: LARGE_INTEGER,
+}
+
+/// Ответ `NtQueryInformationProcess(ProcessTimes)`: времена в 100-нс
+/// единицах; `CreateTime` -- абсолютное время создания процесса (FILETIME).
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- время создания процесса (T4)")
+)]
+pub struct KERNEL_USER_TIMES {
+    pub CreateTime: LARGE_INTEGER,
+    pub ExitTime: LARGE_INTEGER,
+    pub KernelTime: LARGE_INTEGER,
+    pub UserTime: LARGE_INTEGER,
+}
+
+impl Default for KERNEL_USER_TIMES {
+    fn default() -> Self {
+        let zero = LARGE_INTEGER { QuadPart: 0 };
+        Self {
+            CreateTime: zero,
+            ExitTime: zero,
+            KernelTime: zero,
+            UserTime: zero,
+        }
+    }
+}
+
+/// `IO_STATUS_BLOCK`: в NT `Status` объединён с `Pointer` -- для `repr(C)`
+/// раскладка совпадает, поскольку `Information` выравнивает поле до указателя.
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+)]
+pub struct IO_STATUS_BLOCK {
+    pub Status: NTSTATUS,
+    pub Information: ULONG_PTR,
+}
+
+/// Элемент, извлекаемый `NtRemoveIoCompletionEx`.
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+)]
+pub struct FILE_IO_COMPLETION_INFORMATION {
+    pub KeyContext: PVOID,
+    pub ApcContext: PVOID,
+    pub IoStatusBlock: IO_STATUS_BLOCK,
+}
+
+/// SID с атрибутами (часть `TOKEN_USER`).
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
+)]
+pub struct SID_AND_ATTRIBUTES {
+    pub Sid: PSID,
+    pub Attributes: ULONG,
+}
+
+/// Ответ `NtQueryInformationToken(TokenUser)`; за структурой в буфере
+/// следует сам SID, на который указывает `User.Sid`.
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
+)]
+pub struct TOKEN_USER {
+    pub User: SID_AND_ATTRIBUTES,
+}
+
+/// Заголовок ACL; записи ACE следуют за ним в том же буфере.
+#[repr(C)]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
+)]
+pub struct ACL {
+    pub AclRevision: u8,
+    pub Sbz1: u8,
+    pub AclSize: u16,
+    pub AceCount: u16,
+    pub Sbz2: u16,
+}

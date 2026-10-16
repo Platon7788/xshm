@@ -1,11 +1,21 @@
 //! Прямые объявления NT функций из ntdll.dll
 //!
-//! Статическая линковка через #[link(name = "ntdll")].
+//! Импорт через `#[link(name = "ntdll", kind = "raw-dylib")]`: линкер сам
+//! строит таблицу импорта, `ntdll.lib` из Windows SDK не нужна.
 //! Никакого GetProcAddress, никакого TLS.
+//!
+//! На x86 `raw-dylib` по умолчанию импортирует stdcall-функции под
+//! декорированными именами (`_NtClose@4`), а ntdll экспортирует их без
+//! декорации -- загрузчик падает с `STATUS_ENTRYPOINT_NOT_FOUND`. Поэтому на
+//! x86 явно `import_name_type = "undecorated"` (на x64 атрибут запрещён).
 
 use super::types::*;
 
-#[link(name = "ntdll")]
+#[cfg_attr(
+    target_arch = "x86",
+    link(name = "ntdll", kind = "raw-dylib", import_name_type = "undecorated")
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "ntdll", kind = "raw-dylib"))]
 unsafe extern "system" {
     // ========================================================================
     // Handle operations
@@ -170,6 +180,189 @@ unsafe extern "system" {
         DaclPresent: BOOLEAN,
         Dacl: PVOID,
         DaclDefaulted: BOOLEAN,
+    ) -> NTSTATUS;
+
+    /// Установка SACL (метка целостности) в Security Descriptor
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn RtlSetSaclSecurityDescriptor(
+        SecurityDescriptor: *mut SECURITY_DESCRIPTOR,
+        SaclPresent: BOOLEAN,
+        Sacl: *mut ACL,
+        SaclDefaulted: BOOLEAN,
+    ) -> NTSTATUS;
+
+    /// Инициализация пустого ACL в буфере длины `AclLength`
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn RtlCreateAcl(Acl: *mut ACL, AclLength: ULONG, AclRevision: ULONG) -> NTSTATUS;
+
+    /// Добавление разрешающей записи ACE для SID
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn RtlAddAccessAllowedAce(
+        Acl: *mut ACL,
+        AceRevision: ULONG,
+        AccessMask: ACCESS_MASK,
+        Sid: PSID,
+    ) -> NTSTATUS;
+
+    /// Добавление обязательной метки (SYSTEM_MANDATORY_LABEL_ACE) в SACL
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn RtlAddMandatoryAce(
+        Acl: *mut ACL,
+        AceRevision: ULONG,
+        AceFlags: ULONG,
+        Sid: PSID,
+        AceType: u8,
+        AccessMask: ACCESS_MASK,
+    ) -> NTSTATUS;
+
+    /// Длина SID в байтах
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn RtlLengthSid(Sid: PSID) -> ULONG;
+
+    // ========================================================================
+    // Section/Token queries (0.10)
+    // ========================================================================
+
+    /// Сведения о секции (SectionBasicInformation: реальный размер, атрибуты)
+    #[expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")]
+    pub fn NtQuerySection(
+        SectionHandle: HANDLE,
+        SectionInformationClass: ULONG,
+        SectionInformation: PVOID,
+        SectionInformationLength: usize,
+        ReturnLength: *mut usize,
+    ) -> NTSTATUS;
+
+    /// Открытие токена процесса
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn NtOpenProcessToken(
+        ProcessHandle: HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        TokenHandle: *mut HANDLE,
+    ) -> NTSTATUS;
+
+    /// Запрос сведений о токене (TokenUser -- SID пользователя)
+    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
+    pub fn NtQueryInformationToken(
+        TokenHandle: HANDLE,
+        TokenInformationClass: ULONG,
+        TokenInformation: PVOID,
+        TokenInformationLength: ULONG,
+        ReturnLength: *mut ULONG,
+    ) -> NTSTATUS;
+
+    // ========================================================================
+    // Private namespaces (0.10)
+    // ========================================================================
+
+    /// Создание дескриптора границы; NULL при нехватке памяти
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn RtlCreateBoundaryDescriptor(
+        Name: *const UNICODE_STRING,
+        Flags: ULONG,
+    ) -> POBJECT_BOUNDARY_DESCRIPTOR;
+
+    /// Добавление SID в дескриптор границы (может перевыделить дескриптор)
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn RtlAddSIDToBoundaryDescriptor(
+        BoundaryDescriptor: *mut POBJECT_BOUNDARY_DESCRIPTOR,
+        RequiredSid: PSID,
+    ) -> NTSTATUS;
+
+    /// Освобождение дескриптора границы
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn RtlDeleteBoundaryDescriptor(BoundaryDescriptor: POBJECT_BOUNDARY_DESCRIPTOR);
+
+    /// Создание частного пространства имён
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn NtCreatePrivateNamespace(
+        NamespaceHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        BoundaryDescriptor: POBJECT_BOUNDARY_DESCRIPTOR,
+    ) -> NTSTATUS;
+
+    /// Открытие существующего частного пространства имён
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn NtOpenPrivateNamespace(
+        NamespaceHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        BoundaryDescriptor: POBJECT_BOUNDARY_DESCRIPTOR,
+    ) -> NTSTATUS;
+
+    /// Пометка частного пространства имён на удаление
+    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
+    pub fn NtDeletePrivateNamespace(NamespaceHandle: HANDLE) -> NTSTATUS;
+
+    // ========================================================================
+    // IO completion и пакеты ожидания завершения (0.10)
+    // ========================================================================
+
+    /// Создание порта завершения ввода-вывода
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+    )]
+    pub fn NtCreateIoCompletion(
+        IoCompletionHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+        Count: ULONG,
+    ) -> NTSTATUS;
+
+    /// Извлечение до `Count` пакетов из порта
+    ///
+    /// Timeout: NULL = бесконечно, отрицательное = относительное (100ns units)
+    #[expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")]
+    pub fn NtRemoveIoCompletionEx(
+        IoCompletionHandle: HANDLE,
+        IoCompletionInformation: *mut FILE_IO_COMPLETION_INFORMATION,
+        Count: ULONG,
+        NumEntriesRemoved: *mut ULONG,
+        Timeout: *const i64,
+        Alertable: BOOLEAN,
+    ) -> NTSTATUS;
+
+    /// Постановка пакета в порт
+    #[expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")]
+    pub fn NtSetIoCompletion(
+        IoCompletionHandle: HANDLE,
+        KeyContext: PVOID,
+        ApcContext: PVOID,
+        IoStatus: NTSTATUS,
+        IoStatusInformation: ULONG_PTR,
+    ) -> NTSTATUS;
+
+    /// Создание пакета ожидания завершения
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+    )]
+    pub fn NtCreateWaitCompletionPacket(
+        WaitCompletionPacketHandle: *mut HANDLE,
+        DesiredAccess: ACCESS_MASK,
+        ObjectAttributes: *mut OBJECT_ATTRIBUTES,
+    ) -> NTSTATUS;
+
+    /// Привязка пакета: при сигнале `TargetObjectHandle` пакет попадёт в порт
+    #[expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")]
+    pub fn NtAssociateWaitCompletionPacket(
+        WaitCompletionPacketHandle: HANDLE,
+        IoCompletionHandle: HANDLE,
+        TargetObjectHandle: HANDLE,
+        KeyContext: PVOID,
+        ApcContext: PVOID,
+        IoStatus: NTSTATUS,
+        IoStatusInformation: ULONG_PTR,
+        AlreadySignaled: *mut BOOLEAN,
+    ) -> NTSTATUS;
+
+    /// Отмена привязки пакета
+    #[expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")]
+    pub fn NtCancelWaitCompletionPacket(
+        WaitCompletionPacketHandle: HANDLE,
+        RemoveSignaledPacket: BOOLEAN,
     ) -> NTSTATUS;
 }
 
