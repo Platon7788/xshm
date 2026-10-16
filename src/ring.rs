@@ -822,9 +822,14 @@ mod overflow_race_tests {
     }
 
     pub(super) fn make_ring() -> (RingBuffer, RingMem) {
+        make_ring_with(&RingConfig::DEFAULT)
+    }
+
+    /// Кольцо с произвольной (проверенной) конфигурацией.
+    pub(super) fn make_ring_with(config: &RingConfig) -> (RingBuffer, RingMem) {
+        config.validate().unwrap();
         let header_size = size_of::<RingHeader>();
-        let total = header_size + RING_CAPACITY;
-        let config = RingConfig::DEFAULT;
+        let total = header_size + config.capacity;
         let layout = Layout::from_size_align(total, 64).unwrap();
         // SAFETY: ненулевой размер; зануление валидно для AtomicU32 полей.
         let ptr = unsafe { alloc_zeroed(layout) };
@@ -835,7 +840,7 @@ mod overflow_race_tests {
         // SAFETY: data сразу за заголовком, в пределах выделения.
         let data = unsafe { ptr.add(header_size) };
         // SAFETY: header и data валидны, не пересекаются, живут пока жив RingMem.
-        let ring = unsafe { RingBuffer::new(header, data, &config) }.unwrap();
+        let ring = unsafe { RingBuffer::new(header, data, config) }.unwrap();
         (ring, RingMem { ptr, layout })
     }
 
@@ -949,7 +954,7 @@ mod overflow_race_tests {
 
 #[cfg(test)]
 mod try_write_tests {
-    use super::overflow_race_tests::{RING_CAPACITY, make_ring};
+    use super::overflow_race_tests::{RING_CAPACITY, make_ring, make_ring_with};
     use super::*;
 
     const MAX_MESSAGES: u32 = DEFAULT_MAX_MESSAGES;
@@ -1315,6 +1320,12 @@ mod try_write_tests {
 
             // Писатель кладёт следующий кадр, пока счётчик ещё 1.
             let outcome = write(&ring, &[2u8; 16]).unwrap();
+            // Перепроверка читателя по устаревшему снимку после барьера
+            // обязана провалиться: кадр опубликован.
+            assert!(
+                !ring.confirm_empty(snapshot_write),
+                "{path}: перепроверка не увидела новый write_pos"
+            );
             // Читатель досчитывает message_count.
             ring.decrement_count();
 
@@ -1331,6 +1342,83 @@ mod try_write_tests {
                 Some(ShmError::QueueEmpty)
             );
         }
+    }
+
+    /// Ветка вытеснения `write_message` (лимит сообщений), пока читатель
+    /// «замер» между CAS `read_pos` и `decrement_count`: писатель вытесняет
+    /// следующий за забранным кадр, кольцо НЕ пусто -- сигнал не нужен
+    /// (`was_empty == false`), а устаревший снимок читателя перепроверкой
+    /// не подтверждается; читатель дочитывает всё, новый кадр -- последним.
+    #[test]
+    fn data_signal_on_eviction_by_count_with_reader_mid_step() {
+        let (ring, _mem) = make_ring();
+        let header = ring.header();
+        let mut out = Vec::new();
+        for i in 0..MAX_MESSAGES {
+            ring.write_message(&i.to_le_bytes()).unwrap();
+        }
+        // Читатель забрал кадр 0 (CAS), счётчик ещё MAX_MESSAGES.
+        let read0 = header.read_pos.load(O::Acquire);
+        let write0 = header.write_pos.load(O::Acquire);
+        let frame = ring.frame_at(read0, write0).unwrap().unwrap();
+        header
+            .read_pos
+            .compare_exchange(read0, read0 + frame.total, O::AcqRel, O::Acquire)
+            .unwrap();
+
+        let outcome = ring.write_message(&u32::MAX.to_le_bytes()).unwrap();
+        assert_eq!(outcome.overwritten, 1, "лимит сообщений -- вытеснение");
+        assert!(
+            !outcome.was_empty,
+            "читатель не выбрал всё до кадра -- он не уснёт, сигнал не нужен"
+        );
+        assert!(!ring.confirm_empty(write0), "снимок устарел -- кадр виден");
+        ring.decrement_count();
+
+        // Кадр 1 вытеснен; читатель получает 2..MAX_MESSAGES и новый кадр.
+        for i in 2..MAX_MESSAGES {
+            assert_eq!(ring.read_message(&mut out).unwrap(), 4);
+            assert_eq!(out, i.to_le_bytes());
+        }
+        assert_eq!(ring.read_message(&mut out).unwrap(), 4);
+        assert_eq!(out, u32::MAX.to_le_bytes());
+        assert_eq!(
+            ring.read_message(&mut out).err(),
+            Some(ShmError::QueueEmpty)
+        );
+    }
+
+    /// Ветка вытеснения по байтам, опустошающая кольцо: писатель сам выбрал
+    /// всё до своего кадра (`read_pos ==` прежнему `write_pos`) -- решение
+    /// «сигналить» верно (читатель с прежним снимком «пусто» иначе уснул
+    /// бы), снимок до записи перепроверкой не подтверждается.
+    #[test]
+    fn data_signal_on_eviction_by_bytes_that_empties_ring() {
+        let config = RingConfig::new(4096);
+        let (ring, _mem) = make_ring_with(&config);
+        let header = ring.header();
+        let mut out = Vec::new();
+        const LEN: usize = 3000;
+        ring.write_message(&[1u8; LEN]).unwrap();
+        let write0 = header.write_pos.load(O::Acquire);
+
+        let outcome = ring.write_message(&[2u8; LEN]).unwrap();
+        assert_eq!(
+            outcome.overwritten, 1,
+            "два кадра по 3000 в 4 КиБ не входят"
+        );
+        assert!(
+            outcome.was_empty,
+            "вытеснение выбрало всё до кадра -- read_pos == прежний write_pos"
+        );
+        assert_eq!(header.read_pos.load(O::Acquire), write0);
+        assert!(!ring.confirm_empty(write0), "снимок устарел -- кадр виден");
+        assert_eq!(ring.read_message(&mut out).unwrap(), LEN);
+        assert_eq!(out, [2u8; LEN]);
+        assert_eq!(
+            ring.read_message(&mut out).err(),
+            Some(ShmError::QueueEmpty)
+        );
     }
 
     /// Вторая половина протокола: снимок читателя «пусто» снят ДО

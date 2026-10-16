@@ -5,8 +5,9 @@
 //!
 //! Тест -- два потока, 10⁶ сообщений по 16 байт, читатель ждёт ТОЛЬКО
 //! событие `DATA` (`poll_*(None)`, без таймаутов-страховок), писатель --
-//! только место (`wait_for_space(None)`). Общий дедлайн 60 с держит главный
-//! поток: зависание -- провал теста, а не вечный прогон.
+//! только место (`wait_for_space(None)`). Общий на ОБА направления дедлайн
+//! 60 с держит главный поток (один `#[test]`, направления по очереди):
+//! зависание -- провал теста, а не вечный прогон.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
@@ -100,7 +101,7 @@ fn read_all(
 }
 
 #[expect(clippy::unwrap_used, reason = "тест: паника -- провал теста")]
-fn run(direction: Direction) {
+fn run(direction: Direction, deadline: Instant) {
     let name = unique_name(match direction {
         Direction::ServerToClient => "S2C",
         Direction::ClientToServer => "C2S",
@@ -158,7 +159,6 @@ fn run(direction: Direction) {
         }
     });
 
-    let deadline = Instant::now() + DEADLINE;
     for _ in 0..2 {
         let left = deadline.saturating_duration_since(Instant::now());
         match done_rx.recv_timeout(left) {
@@ -166,7 +166,7 @@ fn run(direction: Direction) {
                 assert!(result.is_ok(), "{direction:?}: {side} -> {result:?}");
             }
             Err(_) => panic!(
-                "{direction:?}: зависание -- прочитано {} из {TOTAL} за {DEADLINE:?} \
+                "{direction:?}: зависание -- прочитано {} из {TOTAL}, общий дедлайн {DEADLINE:?} \
                  (потерянное пробуждение)",
                 // Relaxed: диагностика.
                 progress.load(Ordering::Relaxed)
@@ -178,12 +178,11 @@ fn run(direction: Direction) {
     drop(server_thread.join().unwrap());
 }
 
+/// Оба направления под одним дедлайном `DEADLINE` (бриф: «общий дедлайн
+/// 60 с»): второе направление получает остаток после первого.
 #[test]
-fn data_wakeup_is_never_lost_server_to_client() {
-    run(Direction::ServerToClient);
-}
-
-#[test]
-fn data_wakeup_is_never_lost_client_to_server() {
-    run(Direction::ClientToServer);
+fn data_wakeup_is_never_lost_both_directions() {
+    let deadline = Instant::now() + DEADLINE;
+    run(Direction::ServerToClient, deadline);
+    run(Direction::ClientToServer, deadline);
 }
