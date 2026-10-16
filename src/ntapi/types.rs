@@ -254,8 +254,6 @@ pub const OBJ_OPENIF: ULONG = 0x0000_0080;
 pub const STATUS_OBJECT_NAME_EXISTS: NTSTATUS = 0x4000_0000;
 /// `NtOpenProcess`: процесса с таким идентификатором нет.
 pub const STATUS_INVALID_CID: NTSTATUS = 0xC000_000B_u32.cast_signed();
-/// Неверный параметр (`NtOpenProcess` на несуществующий PID в части сборок).
-pub const STATUS_INVALID_PARAMETER: NTSTATUS = 0xC000_000D_u32.cast_signed();
 /// Имя занято объектом другого типа (например, мьютекс лобби -- событием).
 pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024_u32.cast_signed();
 

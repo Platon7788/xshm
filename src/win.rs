@@ -67,7 +67,6 @@ use crate::ntapi::{
     SECTION_BASIC_INFORMATION,
     STATUS_ABANDONED_WAIT_0,
     STATUS_INVALID_CID,
-    STATUS_INVALID_PARAMETER,
     STATUS_OBJECT_NAME_EXISTS,
     STATUS_OBJECT_TYPE_MISMATCH,
     // Constants
@@ -983,7 +982,7 @@ impl ProcessWatch {
     }
 
     /// `open` с кодом отказа `NtOpenProcess`: отличает «процесса с таким PID
-    /// нет» (`STATUS_INVALID_CID`/`STATUS_INVALID_PARAMETER`) от «нет прав».
+    /// нет» (`STATUS_INVALID_CID`) от «нет прав».
     fn open_status(pid: u32) -> core::result::Result<Self, NTSTATUS> {
         let mut client_id = CLIENT_ID {
             // PID -- не адрес: собираем «указателеподобное» значение без провенанса
@@ -1093,8 +1092,9 @@ pub fn is_process_alive(pid: u32, start_time: u64) -> bool {
 /// Процесс `pid`, созданный в `start_time`, подтверждённо не существует
 /// (обратная консервативность к [`is_process_alive`]): `true` ТОЛЬКО если
 /// процесса с таким PID нет вовсе (`NtOpenProcess` ->
-/// `STATUS_INVALID_CID`/`STATUS_INVALID_PARAMETER`), он завершился, или
-/// процесс с этим PID создан в другое время (`start_time != 0`, своё время
+/// `STATUS_INVALID_CID`; любой другой отказ -- двусмысленность), он
+/// завершился, или процесс с этим PID создан в другое время
+/// (`start_time != 0`, своё время
 /// известно и не совпало -- PID переиспользован). Любая двусмысленность (нет
 /// прав, время не узнать, PID 0) -- `false`. Для решений «погасить чужой
 /// сигнал за упавший процесс» (маяк): ошибочное «умер» здесь дороже
@@ -1109,7 +1109,7 @@ pub fn is_process_gone(pid: u32, start_time: u64) -> bool {
             watch.has_exited()
                 || (start_time != 0 && watch.start_time().is_some_and(|t| t != start_time))
         }
-        Err(status) => status == STATUS_INVALID_CID || status == STATUS_INVALID_PARAMETER,
+        Err(status) => status == STATUS_INVALID_CID,
     }
 }
 

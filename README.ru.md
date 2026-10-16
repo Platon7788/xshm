@@ -579,21 +579,23 @@ use xshm::{Beacon, DispatchClient};
 // Клиент: спать, пока не появится сервер или не попросят остановиться.
 let lobby = Beacon::open("MyService")?;
 let stop = Beacon::unnamed()?; // взводит наш же путь остановки
+let mut retry_now = false;
 loop {
-    match Beacon::wait_any(&[&stop, &lobby], None)? {
-        Some(1) => {}
-        _ => break, // остановка
+    if !retry_now && Beacon::wait_any(&[&stop, &lobby], None)? != Some(1) {
+        break; // остановка
     }
+    retry_now = false;
     match DispatchClient::connect("MyService", registration(), handler(), Default::default()) {
         Ok(client) => { /* работа, пока канал жив */ }
         Err(_) if !DispatchClient::lobby_exists("MyService") => {
-            // Сервер упал со взведённым маяком: сбросить маяк за него и
-            // перепроверить — сервер, поднявшийся тем временем, взвёл маяк
-            // уже после создания лобби: либо лобби видно сейчас, либо
-            // разбудит новый взвод.
-            lobby.lower()?;
-            if DispatchClient::lobby_exists("MyService") {
-                lobby.raise()?;
+            // Маяк взведён, лобби нет: сервер, возможно, упал. Клиент НИКОГДА
+            // не вызывает `lower()` — `clear_if_stale` сбрасывает маяк, только
+            // если процесс взводившего сервера завершился, и возвращает его,
+            // если тем временем маяк взвёл новый сервер (поколение маяка, 0.10).
+            if lobby.clear_if_stale()? {
+                retry_now = DispatchClient::lobby_exists("MyService");
+            } else {
+                /* процесс сервера жив: отступ (прерываемый `stop`) */
             }
         }
         Err(_) => { /* временная ошибка: отступ (прерываемый `stop`) */ }
@@ -602,7 +604,9 @@ loop {
 ```
 
 Порядок сервера: сначала лобби (`DispatchServer::start` синхронный), потом
-`raise()`; при остановке — сначала `lower()`, потом остановка.
+`raise()`; при остановке — сначала `lower()`, потом остановка. Клиенты
+`raise`/`lower` именованного маяка не вызывают: `raise` записывает
+вызывающего как сервер в `<имя>_beacon_state`.
 `ProcessExit::open(pid)` вместе с `xshm::wait_any` позволяет клиенту, которому
 сервер отказал, спать до завершения процесса этого сервера — тоже без опроса.
 

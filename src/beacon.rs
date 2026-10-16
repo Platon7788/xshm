@@ -35,7 +35,7 @@
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::time::Duration;
 
-use crate::error::Result;
+use crate::error::{Result, ShmError};
 use crate::naming::has_explicit_namespace;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 
@@ -88,9 +88,62 @@ const STATE_SERVER_START_HI_OFFSET: usize = 16;
 #[derive(Debug)]
 pub struct Beacon {
     event: EventHandle,
-    /// Секция `<имя>_beacon_state` (0.10): поколение и личность сервера,
-    /// взводившего маяк последним. `None` -- безымянный маяк.
-    state: Option<Mapping>,
+    /// Состояние маяка (0.10): секция `<имя>_beacon_state` или причина,
+    /// по которой её нет.
+    state: BeaconState,
+}
+
+/// Состояние маяка.
+#[derive(Debug)]
+enum BeaconState {
+    /// Безымянный маяк: сервера нет, сбрасывать «за упавшего» нечего.
+    Unnamed,
+    /// Именованный маяк без секции состояния: её не дали создать или
+    /// открыть права (`STATUS_PRIVILEGE_NOT_HELD`/`STATUS_ACCESS_DENIED`,
+    /// например `Global\` из сессии != 0 без `SeCreateGlobalPrivilege`).
+    /// Поведение до 0.10: `clear_if_stale` сбрасывает без проверки сервера.
+    Legacy,
+    /// Секция `<имя>_beacon_state`: поколение и личность сервера,
+    /// взводившего маяк последним.
+    Shared(Mapping),
+}
+
+/// `NTSTATUS` `STATUS_PRIVILEGE_NOT_HELD`.
+const STATUS_PRIVILEGE_NOT_HELD: u32 = 0xC000_0061;
+/// `NTSTATUS` `STATUS_ACCESS_DENIED`.
+const STATUS_ACCESS_DENIED: u32 = 0xC000_0022;
+/// `NTSTATUS` `STATUS_OBJECT_NAME_NOT_FOUND`.
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+
+/// Ошибка открытия/создания секции состояния, при которой маяк деградирует
+/// до режима без состояния (`BeaconState::Legacy`), а не отказывает: только
+/// нехватка привилегии или прав. Подмена объекта (другой тип, `SEC_RESERVE`,
+/// маленькая секция) -- по-прежнему ошибка `open`.
+const fn state_fallback(error: &ShmError) -> bool {
+    matches!(
+        error,
+        ShmError::WindowsError { code, .. }
+            if *code == STATUS_PRIVILEGE_NOT_HELD || *code == STATUS_ACCESS_DENIED
+    )
+}
+
+/// Открыть секцию состояния: сначала существующую (открытие не требует
+/// `SeCreateGlobalPrivilege`), и только если её нет -- создать.
+fn open_state(name: &str) -> Result<BeaconState> {
+    let state_name = beacon_state_name(name);
+    let attempt = match Mapping::open(&state_name) {
+        Ok(mapping) if mapping.size() >= STATE_SIZE => Ok(mapping),
+        Ok(_) => Err(ShmError::Corrupted),
+        Err(ShmError::WindowsError { code, .. }) if code == STATUS_OBJECT_NAME_NOT_FOUND => {
+            Mapping::open_or_create(&state_name, STATE_SIZE)
+        }
+        Err(other) => Err(other),
+    };
+    match attempt {
+        Ok(mapping) => Ok(BeaconState::Shared(mapping)),
+        Err(error) if state_fallback(&error) => Ok(BeaconState::Legacy),
+        Err(error) => Err(error),
+    }
 }
 
 impl sealed::Sealed for Beacon {}
@@ -130,16 +183,24 @@ impl Beacon {
     /// `STATUS_ACCESS_DENIED`): подменённый маяк не открывается.
     ///
     /// 0.10: рядом с событием -- секция состояния `<имя>_beacon_state`
-    /// (create-or-open, `SEC_COMMIT`, 4096 байт). Секция, занятая заранее
+    /// (`SEC_COMMIT`, 4096 байт): сначала открывается существующая, и только
+    /// если её нет -- создаётся (`OBJ_OPENIF`). Секция, занятая заранее
     /// объектом другого типа, `SEC_RESERVE`/файлом/образом или меньше
     /// страницы, -- ошибка (`Corrupted` или код ОС), как и подменённое
     /// событие.
+    ///
+    /// **Без состояния**: если секцию не дают создать или открыть права
+    /// (`STATUS_PRIVILEGE_NOT_HELD` -- например, `Global\` из сессии != 0 без
+    /// `SeCreateGlobalPrivilege`, пока сервер-служба её не создал;
+    /// `STATUS_ACCESS_DENIED`), маяк открывается без неё и работает как до
+    /// 0.10: `raise` только взводит событие, [`Beacon::clear_if_stale`]
+    /// сбрасывает его без проверки сервера и поколения -- гонка нескольких
+    /// клиентов с новым сервером (находка 11) в этом режиме остаётся.
     pub fn open(name: &str) -> Result<Self> {
         let event = EventHandle::open_or_create_notification(&beacon_name(name))?;
-        let state = Mapping::open_or_create(&beacon_state_name(name), STATE_SIZE)?;
         let beacon = Self {
             event,
-            state: Some(state),
+            state: open_state(name)?,
         };
         // Новая секция -- нули: `magic` ставит первый открывший (CAS 0 ->
         // MAGIC). Не ноль и не MAGIC -- порча: CAS не проходит, состоянию не
@@ -162,7 +223,7 @@ impl Beacon {
     pub fn unnamed() -> Result<Self> {
         Ok(Self {
             event: EventHandle::create_unnamed(true)?,
-            state: None,
+            state: BeaconState::Unnamed,
         })
     }
 
@@ -188,10 +249,28 @@ impl Beacon {
     /// [`Beacon::clear_if_stale`] — прямой `lower` клиента может погасить
     /// маяк нового сервера, поднявшегося за мгновение до сброса.
     ///
+    /// 0.10: до `NtResetEvent` обнуляет личность сервера в состоянии маяка
+    /// (`server_pid`, затем половины времени). Иначе клиент, вернувший маяк
+    /// по сменившемуся поколению уже после этого `lower`, оставил бы маяк
+    /// взведённым без лобби, а следующие клиенты видели бы «сервер жив» до
+    /// выхода его процесса и крутились бы в опросе; с PID `0` следующий
+    /// [`Beacon::clear_if_stale`] маяк сбрасывает.
+    ///
     /// # Errors
     ///
     /// Ошибка ОС.
     pub fn lower(&self) -> Result<()> {
+        if let (Some(pid_word), Some(lo), Some(hi)) = (
+            self.trusted_word(STATE_SERVER_PID_OFFSET),
+            self.trusted_word(STATE_SERVER_START_LO_OFFSET),
+            self.trusted_word(STATE_SERVER_START_HI_OFFSET),
+        ) {
+            // PID первым: клиент читает его раньше времени, и PID 0 сразу
+            // уводит его на путь «сервера нет» (время не используется).
+            pid_word.store(0, Ordering::Release);
+            lo.store(0, Ordering::Release);
+            hi.store(0, Ordering::Release);
+        }
         self.event.reset()
     }
 
@@ -207,24 +286,39 @@ impl Beacon {
     /// обработан; клиент перепроверяет лобби и снова ждёт маяк.
     ///
     /// PID `0` (сервер не публиковал состояние: секция создана заново после
-    /// ухода всех держателей или пир её не пишет) — проверить нечего,
-    /// поведение прежнее: сброс с перепроверкой поколения. Состояние с
-    /// неверным `magic` и безымянный маяк — `Ok(false)` без сброса.
+    /// ухода всех держателей, сервер штатно ушёл через [`Beacon::lower`] или
+    /// пир её не пишет) — проверить нечего, поведение прежнее: сброс с
+    /// перепроверкой поколения. Состояние с неверным `magic` и безымянный
+    /// маяк — `Ok(false)` без сброса. Маяк без секции состояния (см.
+    /// [`Beacon::open`]) — сброс без проверок, `Ok(true)`.
+    ///
+    /// Мусор в личности сервера при верном `magic` (PID несуществующего
+    /// процесса, чужое время создания) допускает сброс: любой процесс и так
+    /// может сбросить маяк с NULL DACL напрямую.
     ///
     /// # Errors
     ///
     /// Ошибка ОС.
     pub fn clear_if_stale(&self) -> Result<bool> {
-        match self.snapshot() {
-            Some(snapshot) => self.clear_after(snapshot),
-            None => Ok(false),
+        match &self.state {
+            BeaconState::Unnamed => Ok(false),
+            BeaconState::Legacy => {
+                self.event.reset()?;
+                Ok(true)
+            }
+            BeaconState::Shared(_) => match self.snapshot() {
+                Some(snapshot) => self.clear_after(snapshot),
+                None => Ok(false),
+            },
         }
     }
 
     /// Слово состояния по смещению; `None` -- безымянный маяк или смещение
     /// вне отображения (не бывает: view не меньше `STATE_SIZE`).
     fn state_word(&self, offset: usize) -> Option<&AtomicU32> {
-        let state = self.state.as_ref()?;
+        let BeaconState::Shared(state) = &self.state else {
+            return None;
+        };
         if !offset.is_multiple_of(4) || offset.checked_add(4)? > state.size() {
             return None;
         }
@@ -511,6 +605,124 @@ mod tests {
         server.lower().unwrap();
         server.raise().unwrap();
         assert!(client.is_raised().unwrap());
+    }
+
+    /// Ревью T6 (важное 2): клиент A снял снимок при мёртвом S1; новый S2
+    /// взвёл маяк и штатно ушёл (`lower`), но его процесс жив; A сбросил
+    /// маяк и по сменившемуся поколению вернул его -- маяк взведён, лобби
+    /// нет. Следующий `clear_if_stale` обязан его сбросить (`lower` обнулил
+    /// личность сервера -> путь PID 0), а не отвечать «сервер жив» до выхода
+    /// процесса S2 (клиенты крутились бы в опросе).
+    #[test]
+    fn lowered_server_does_not_pin_beacon_raised() {
+        let name = unique("lowered");
+        let (dead_pid, dead_start) = dead_process();
+        let client_a = Beacon::open(&name).unwrap();
+        let old_server = Beacon::open(&name).unwrap();
+        old_server.publish(dead_pid, dead_start);
+        old_server.event.set().unwrap();
+        drop(old_server);
+
+        let snapshot = client_a.snapshot().expect("состояние маяка");
+        let new_server = Beacon::open(&name).unwrap();
+        new_server.raise().unwrap();
+        new_server.lower().unwrap(); // процесс S2 (этот тест) жив
+
+        assert!(client_a.clear_after(snapshot).unwrap());
+        assert!(client_a.is_raised().unwrap(), "A вернул маяк по поколению");
+
+        let client_b = Beacon::open(&name).unwrap();
+        assert!(
+            client_b.clear_if_stale().unwrap(),
+            "сервер ушёл штатно -- маяк без сервера сбрасывается"
+        );
+        assert!(!client_b.is_raised().unwrap());
+        drop(new_server);
+    }
+
+    /// Ревью T6 (мелкое 8): верный `magic`, мусор в личности сервера --
+    /// без паники; документировано, что такой мусор допускает сброс (любой
+    /// процесс и так может сбросить маяк с NULL DACL).
+    #[test]
+    fn garbage_identity_with_valid_magic_allows_reset_without_panic() {
+        let name = unique("garbage");
+        let server = Beacon::open(&name).unwrap();
+        let client = Beacon::open(&name).unwrap();
+        // Свой (живой) PID, но чужое время создания -- «PID переиспользован».
+        let real = current_process_start_time();
+        server.publish(std::process::id(), real ^ 0x5A5A_5A5A);
+        server.event.set().unwrap();
+        assert!(client.clear_if_stale().unwrap());
+        assert!(!client.is_raised().unwrap());
+        // Произвольный мусор: результат любой, но без паники и без ошибки.
+        server.publish(0xFFFF_FFF0, u64::MAX);
+        server.event.set().unwrap();
+        assert!(client.clear_if_stale().is_ok());
+    }
+
+    /// Ревью T6 (мелкое 8): `<имя>_beacon_state` занят событием (объект
+    /// другого типа) -- `open` отвергает маяк (`STATUS_OBJECT_TYPE_MISMATCH`
+    /// не входит в деградацию до режима без состояния).
+    #[test]
+    fn open_rejects_state_squatted_by_other_object_type() {
+        let name = unique("state-squat");
+        let _squatter = EventHandle::create(&beacon_state_name(&name)).unwrap();
+        match Beacon::open(&name) {
+            Err(ShmError::WindowsError { code, .. }) => {
+                assert_eq!(code, 0xC000_0024, "STATUS_OBJECT_TYPE_MISMATCH");
+            }
+            other => panic!("ожидался отказ по типу объекта, получено {other:?}"),
+        }
+    }
+
+    /// Ревью T6 (важное 3): деградация до режима без состояния -- только
+    /// на нехватку привилегии/прав (несоздаваемый `Global\` из сессии != 0),
+    /// всё остальное -- ошибка `open`.
+    #[test]
+    fn state_fallback_only_on_privilege_or_access_denied() {
+        let err = |code: u32| ShmError::WindowsError {
+            code,
+            context: "test",
+        };
+        assert!(
+            state_fallback(&err(0xC000_0061)),
+            "STATUS_PRIVILEGE_NOT_HELD"
+        );
+        assert!(state_fallback(&err(0xC000_0022)), "STATUS_ACCESS_DENIED");
+        assert!(
+            !state_fallback(&err(0xC000_0024)),
+            "STATUS_OBJECT_TYPE_MISMATCH"
+        );
+        assert!(
+            !state_fallback(&err(0xC000_0034)),
+            "STATUS_OBJECT_NAME_NOT_FOUND"
+        );
+        assert!(!state_fallback(&ShmError::Corrupted));
+    }
+
+    /// Маяк без состояния (деградация) ведёт себя как до 0.10: `raise`
+    /// взводит, `clear_if_stale` сбрасывает без проверки сервера.
+    #[test]
+    fn stateless_named_beacon_uses_legacy_clear() {
+        let name = unique("legacy");
+        let server = Beacon::open(&name).unwrap();
+        let client = Beacon {
+            event: EventHandle::open_or_create_notification(&beacon_name(&name)).unwrap(),
+            state: BeaconState::Legacy,
+        };
+        server.raise().unwrap();
+        assert!(
+            client.clear_if_stale().unwrap(),
+            "legacy: сброс без проверки"
+        );
+        assert!(!server.is_raised().unwrap());
+        client.raise().unwrap();
+        assert!(server.is_raised().unwrap());
+        // Безымянный маяк сервера не имеет -- сбрасывать нечего.
+        let unnamed = Beacon::unnamed().unwrap();
+        unnamed.raise().unwrap();
+        assert!(!unnamed.clear_if_stale().unwrap());
+        assert!(unnamed.is_raised().unwrap());
     }
 
     #[test]
