@@ -512,7 +512,7 @@ impl Endpoint {
             builder = builder.name(thread_name());
         }
         #[cfg(not(debug_assertions))]
-        let _ = thread_name;
+        drop(thread_name);
         let join = crate::thread_hook::spawn(builder, move || body(&worker))
             .map_err(|err| map_spawn_error(err, "spawn auto worker"))?;
         *endpoint.join.lock_clean() = Some(join);
