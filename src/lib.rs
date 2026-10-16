@@ -35,6 +35,9 @@ pub(crate) mod ntapi;
 #[cfg(test)]
 mod peer_tests;
 
+#[cfg(test)]
+mod handshake_model;
+
 pub use auto::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind, Delivery,
 };
