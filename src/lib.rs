@@ -7,6 +7,14 @@ pub mod events;
 mod layout;
 mod namespace;
 mod naming;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
+    )
+)]
+mod reactor;
 mod ring;
 mod security;
 mod server;

@@ -426,6 +426,9 @@
   `multiple_unsafe_ops_per_block`, `cast_sign_loss`, `cast_possible_wrap`,
   `borrow_as_ptr`, `allow_attributes(_without_reason)`, `unwrap_used`,
   `expect_used` (тестам `unwrap`/`expect` разрешены в `clippy.toml`).
+- Внутренний реактор `reactor` (IOCP + Wait Completion Packets, один поток
+  `xsr` на процесс, ключи — индекс слота + поколение): основа async API и
+  Multi на реакторе. Публичный API и протокол не меняются.
 
 ## [0.9.0] — не выпущено (ветка `feat/beacon`)
 

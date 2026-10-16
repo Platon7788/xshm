@@ -99,6 +99,17 @@ const INVALID_HANDLE_VALUE: isize = -1;
 pub struct Handle(HANDLE);
 
 impl Handle {
+    /// Взять во владение дескриптор, который вернул успешный NT-вызов
+    /// создания/открытия (для модулей вне `win`, 0.10: реактор).
+    ///
+    /// # Safety
+    ///
+    /// `handle` -- открытый дескриптор, которым больше никто не владеет:
+    /// `Drop` закроет его ровно один раз.
+    pub(crate) const unsafe fn from_raw(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+
     pub const fn raw(&self) -> HANDLE {
         self.0
     }

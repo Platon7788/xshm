@@ -338,7 +338,10 @@ pub const SEC_FILE: ULONG = 0x0080_0000;
 /// (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3).
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+    expect(
+        dead_code,
+        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
+    )
 )]
 pub const IO_COMPLETION_ALL_ACCESS: ACCESS_MASK = 0x001F_0003;
 /// Общее право «всё» (маска ACE политики безопасности; так же создают
@@ -381,7 +384,10 @@ impl Default for KERNEL_USER_TIMES {
 #[repr(C)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+    expect(
+        dead_code,
+        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
+    )
 )]
 pub struct IO_STATUS_BLOCK {
     pub Status: NTSTATUS,
@@ -392,7 +398,10 @@ pub struct IO_STATUS_BLOCK {
 #[repr(C)]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
+    expect(
+        dead_code,
+        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
+    )
 )]
 pub struct FILE_IO_COMPLETION_INFORMATION {
     pub KeyContext: PVOID,
@@ -441,3 +450,7 @@ pub const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: ACCESS_MASK = 0x1;
 pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32.cast_signed();
 /// Нет прав на объект (DACL не выдаёт запрошенный доступ).
 pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32.cast_signed();
+
+/// Операция отменена; `NtCancelWaitCompletionPacket` -- «снимать нечего»:
+/// пакет уже извлечён из порта или не привязывался.
+pub const STATUS_CANCELLED: NTSTATUS = 0xC000_0120_u32.cast_signed();
