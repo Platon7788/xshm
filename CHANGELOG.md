@@ -3,6 +3,86 @@
 Журнал изменений (до 0.9.0 вёлся в неотслеживаемом `Docs/CHANGELOG.md`;
 теперь канонический — этот файл).
 
+## [0.10.0] — не выпущено (ветка `feat/layout-v2`)
+
+Аудит качества 16.10.2026 (ядро, Auto/Dispatch, Multi/Beacon/тесты) и
+настраиваемая раскладка канала. **Разрыв совместимости**: новый формат
+разделяемой памяти `0x00020000` — пиры 0.9 и нативные пиры по старому
+контракту отвергаются по версии (`ShmError::VersionMismatch`). Нормативно —
+[`INTEROP.md`](INTEROP.md) §c и «Изменения 0.10».
+
+### Добавлено
+
+- **Раскладка канала по направлениям**: `RingConfig { capacity,
+  max_messages, max_message_size }` и `ChannelLayout { server_to_client,
+  client_to_server }`. Ёмкость — степень двойки от 4 КиБ до 1 ГиБ, сообщение
+  — до `capacity − 8` (больше прежних 64 КиБ). Выбирает сервер, клиент читает
+  её из сегмента сам.
+  - `SharedServer::start_with_layout`, `start_anonymous_with_layout`,
+    `SharedServer::layout`, `SharedClient::layout`;
+  - `AutoOptions::layout` (сервер), `AutoServer::layout`, `AutoClient::layout`;
+  - `MultiOptions::layout` (каждый слот), `MultiClient::layout`;
+  - `DispatchOptions::{channel_layout, lobby_layout, max_send_queue,
+    max_clients}`; лобби по умолчанию — 2 × 16 КиБ (`DEFAULT_LOBBY_LAYOUT`)
+    вместо 2 × 2 МиБ.
+- `DispatchHandler::admit(&ClientRegistration) -> Admission`
+  (`Accept`/`AcceptWithLayout`/`Reject`): допуск и раскладка канала для
+  клиента до создания канала.
+- `FreeSpace::max_message_size`, `frame_size()`, `max_payload_for()`,
+  константы `DEFAULT_*`, `MIN/MAX_RING_CAPACITY`, `FRAME_HEADER_SIZE`,
+  `FRAME_ALIGN`, `SHARED_VERSION`.
+- `ShmError::VersionMismatch { found, expected }`; `ShmError` —
+  `#[non_exhaustive]`.
+
+### Изменено (несовместимо)
+
+- Формат памяти `0x00020000`: `LayoutBlock` (смещение 64) с дескрипторами
+  колец; поля `ControlBlock` именованы (`slot_claim`, `slot_owner_pid`,
+  `server_pid`, `client_pid` — те же смещения, что `reserved[0..3]`); кадр
+  `u32 len + u32 flags`, выровнен на 8; `MIN_MESSAGE_SIZE` = 1.
+- `AutoServer::stop`/`AutoClient::stop`/`MultiClient::stop` — синхронные: после
+  возврата колбэков нет (из своего колбэка — без ожидания себя).
+- `AutoHandler::on_overflow`/`MultiClientHandler::on_overflow` — раз на
+  пачку вытесненных сообщений, а не на каждое.
+- `send` в Auto/Multi-клиенте проверяет длину синхронно (против лимита
+  кольца, когда он известен).
+- `RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE` — устаревшие псевдонимы
+  значений по умолчанию; `MESSAGE_HEADER_SIZE` удалён (кадр изменился —
+  `frame_size`).
+
+### Исправлено (аудит 16.10.2026)
+
+- **High** `MultiServer`/`DispatchServer`, отпущенные без `stop()`, жили
+  вечно: поток держал сильную ссылку на сервер. Теперь ручка
+  (`Arc<MultiServer>`/`Arc<DispatchServer>`) отделена от ядра, которое держат
+  потоки; `Drop` последней ручки останавливает сервер.
+- **High** Dispatch: регистрации без ограничения (секция + потоки на каждую)
+  — исчерпание памяти любым локальным процессом. Лимит `max_clients`
+  (64) и `admit` до создания канала.
+- **Medium** Гонка инициализации: `magic` писался в начале и не атомарно —
+  клиент Multi мог захватить слот, а `reset` стирал его claim. Теперь сегмент
+  публикуется `magic`-ом последним (release).
+- **Medium** Читатель доверял `message_count` и не сверял кадр с
+  `write_pos`: враждебный пир зацикливал чтение мусором. Теперь границы,
+  выравнивание и длина проверяются, ошибка — `Corrupted`; счётчик не уходит
+  ниже нуля; запись с перезаписью не зацикливается.
+- **Medium** Dispatch: `on_client_disconnect_reason` мог прийти после
+  `stop()` (поток закрытия канала не отслеживался); `disconnect_client` из
+  колбэков двух клиентов друг на друга — взаимная блокировка; `expect` при
+  создании потоков — паника в библиотеке.
+- **Medium** Auto: очередь `send` росла без предела, пока worker занят
+  колбэком (лимит применялся только в worker-е). Теперь лимит соблюдает
+  отправитель.
+- **Medium** Multi: очередь клиента росла без предела без подключения;
+  `Corrupted` от клиента оставлял слот «подключённым» навсегда (теперь
+  разрыв с причиной `Error`); после `stop()` из колбэка доставлялся остаток
+  пачки.
+- **Low** События канала открываются с проверкой типа (подменённое событие
+  с ручным сбросом гоняло worker на 100% CPU). `SPACE` больше не голодает при
+  непрерывном `DATA`. Копирование из кольца — без `&[u8]` на разделяемую
+  память. Перебор слотов Multi отображает только заголовок сегмента.
+  `compile_error!` на не-Windows.
+
 ## [0.9.0] — не выпущено (ветка `feat/beacon`)
 
 ### Зависимости (2026-10-06)
