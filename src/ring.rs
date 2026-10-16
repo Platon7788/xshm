@@ -201,7 +201,13 @@ impl RingBuffer {
 
     /// Слово заголовка кадра по индексу `index` (кратен 4, внутри кольца).
     fn header_word(&self, index: usize) -> &AtomicU32 {
-        debug_assert!(index.is_multiple_of(4) && index + 4 <= self.capacity as usize);
+        // Инвариант вызывающих (позиции проверены `frame_at`/`writer_used`);
+        // нарушение -- ошибка в самом крейте, проверка дешёвая и остаётся в
+        // release: запись за пределы кольца хуже паники.
+        assert!(
+            index.is_multiple_of(4) && index + 4 <= self.capacity as usize,
+            "ring frame header index out of bounds"
+        );
         // SAFETY: index кратен 4 и index + 4 <= capacity (позиции кадров
         // кратны FRAME_ALIGN, ёмкость кратна FRAME_ALIGN); storage выровнен
         // на 64 (идёт сразу за RingHeader). Слово читается/пишется атомарно,
@@ -312,6 +318,23 @@ impl RingBuffer {
             .unwrap_or(0)
     }
 
+    /// Занятость кольца для писателя с проверкой позиций из разделяемой
+    /// памяти. Читатель-пир может испортить и `read_pos`, и (через тот же
+    /// заголовок) `write_pos`: невыровненная позиция записи дала бы индекс
+    /// заголовка кадра у самого конца кольца, и `commit` писал бы ЗА его
+    /// пределы. Позиции обязаны быть кратны `FRAME_ALIGN`, занятость -- не
+    /// больше ёмкости; иначе `Corrupted` и ни одного байта в кольцо.
+    const fn writer_used(&self, write: u32, read: u32) -> Result<u32> {
+        let used = write.wrapping_sub(read);
+        if used > self.capacity
+            || !(write as usize).is_multiple_of(FRAME_ALIGN)
+            || !(read as usize).is_multiple_of(FRAME_ALIGN)
+        {
+            return Err(ShmError::Corrupted);
+        }
+        Ok(used)
+    }
+
     /// Запись с политикой «перезаписать старейшее»: при нехватке места
     /// (байт или слотов `max_messages`) вытесняет самые старые непрочитанные
     /// сообщения, число вытесненных -- в `WriteOutcome::overwritten`.
@@ -328,10 +351,7 @@ impl RingBuffer {
         loop {
             let write = header.write_pos.load(Ordering::Acquire);
             let read = header.read_pos.load(Ordering::Acquire);
-            let used = write.wrapping_sub(read);
-            if used > self.capacity {
-                return Err(ShmError::Corrupted);
-            }
+            let used = self.writer_used(write, read)?;
             let count = header.message_count.load(Ordering::Acquire);
             if self.capacity - used >= total && count < self.max_messages {
                 let was_empty = self.commit(write, payload, total);
@@ -383,10 +403,7 @@ impl RingBuffer {
         let write = header.write_pos.load(Ordering::Acquire);
         let read = header.read_pos.load(Ordering::Acquire);
         let count = header.message_count.load(Ordering::Acquire);
-        let used = write.wrapping_sub(read);
-        if used > self.capacity {
-            return Err(ShmError::Corrupted);
-        }
+        let used = self.writer_used(write, read)?;
         if self.capacity - used < total || count >= self.max_messages {
             return Err(ShmError::QueueFull);
         }
@@ -1034,6 +1051,25 @@ mod try_write_tests {
         header.write_pos.store(64, O::Relaxed);
         header.read_pos.store(3, O::Relaxed);
         assert_eq!(ring.read_message(&mut out), Err(ShmError::Corrupted));
+    }
+
+    /// Регрессия (security review 2026-10-16): читатель-пир ставит
+    /// невыровненную позицию записи у конца кольца -- раньше `commit`
+    /// писал второе слово заголовка кадра за пределы кольца.
+    #[test]
+    fn hostile_writer_position_cannot_write_out_of_bounds() {
+        let (ring, _mem) = make_ring();
+        let header = ring.header();
+        let edge = RING_CAPACITY as u32 - 4;
+        header.write_pos.store(edge, O::Relaxed);
+        header.read_pos.store(edge, O::Relaxed);
+        assert_eq!(ring.try_write_message(b"xx"), Err(ShmError::Corrupted));
+        assert_eq!(ring.write_message(b"xx"), Err(ShmError::Corrupted));
+        // Выровненная позиция записи при невыровненной позиции чтения.
+        header.write_pos.store(64, O::Relaxed);
+        header.read_pos.store(60, O::Relaxed);
+        assert_eq!(ring.try_write_message(b"xx"), Err(ShmError::Corrupted));
+        assert_eq!(ring.write_message(b"xx"), Err(ShmError::Corrupted));
     }
 
     /// Испорченный счётчик сообщений: пустое кольцо со «счётчиком» на
