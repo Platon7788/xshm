@@ -87,6 +87,11 @@
   непрерывном `DATA`. Копирование из кольца — без `&[u8]` на разделяемую
   память. Перебор слотов Multi отображает только заголовок сегмента.
   `compile_error!` на не-Windows.
+- **Low** Чужая секция под именем канала проверяется на тип
+  (`NtQuerySection`): `SEC_RESERVE` (страницы не выделены — access violation
+  при первом обращении), `SEC_IMAGE`, `SEC_FILE` и всё без `SEC_COMMIT`
+  отвергаются `Corrupted` до отображения — в `Mapping::open` и в
+  `Mapping::open_header` (перебор слотов Multi).
 
 ### Сборка
 

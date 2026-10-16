@@ -224,7 +224,6 @@ unsafe extern "system" {
     // ========================================================================
 
     /// Сведения о секции (SectionBasicInformation: реальный размер, атрибуты)
-    #[expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")]
     pub fn NtQuerySection(
         SectionHandle: HANDLE,
         SectionInformationClass: ULONG,

@@ -116,7 +116,7 @@ UTF-16. `OBJECT_ATTRIBUTES.Attributes` всегда содержит `OBJ_CASE_I
 
 | Объект | Имя | Тип | Нач. состояние | Создаёт (флаги, доступ) | Открывает | Кто сигналит | Кто ждёт |
 |---|---|---|---|---|---|---|---|
-| Секция канала | `Local\B` / `B` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, размер `LayoutBlock.segment_size` (0.10; по умолчанию `4 194 560`) | нули | сервер: `NtCreateSection(SECTION_ALL_ACCESS=0x000F001F)`, **без** `OBJ_OPENIF` — существующее имя = ошибка (`STATUS_OBJECT_NAME_COLLISION`) (`Mapping::create`) | клиент: `NtOpenSection(SECTION_ALL_ACCESS)` + отображение целиком + проверки §c.5 (`magic`/`version`/`LayoutBlock` против размера view; `SharedView::attach`) | — | — |
+| Секция канала | `Local\B` / `B` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, размер `LayoutBlock.segment_size` (0.10; по умолчанию `4 194 560`) | нули | сервер: `NtCreateSection(SECTION_ALL_ACCESS=0x000F001F)`, **без** `OBJ_OPENIF` — существующее имя = ошибка (`STATUS_OBJECT_NAME_COLLISION`) (`Mapping::create`) | клиент: `NtOpenSection(SECTION_ALL_ACCESS)` + проверка типа `NtQuerySection` = `SEC_COMMIT` (0.10) + отображение целиком + проверки §c.5 (`magic`/`version`/`LayoutBlock` против размера view; `SharedView::attach`) | — | — |
 | `P S2C_DATA` | | SynchronizationEvent (автосброс, `1`) | FALSE | сервер: `NtCreateEvent(EVENT_ALL_ACCESS=0x001F0003)`, без `OBJ_OPENIF` (`src/win.rs:135-161`) | клиент: `NtOpenEvent(EVENT_ALL_ACCESS)` + проверка типа `NtQueryEvent` = SynchronizationEvent (0.10, `EventHandle::open_auto_reset`) | писатель-сервер | читатель-клиент |
 | `P C2S_DATA` | | SynchronizationEvent | FALSE | сервер | клиент | писатель-клиент | читатель-сервер |
 | `P S2C_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-клиент** | писатель-сервер |
@@ -306,7 +306,12 @@ B+64   кольцо C2S           ┘ ёмкость c2s.capacity
 
 **Клиент (открытие):**
 
-1. `NtOpenSection` + отображение секции целиком (`ViewSize = 0`).
+1. `NtOpenSection` + `NtQuerySection(SectionBasicInformation)`: клиент
+   ОБЯЗАН отвергать секции не `SEC_COMMIT` — отказ, если в
+   `AllocationAttributes` есть `SEC_RESERVE` (`0x04000000`), `SEC_IMAGE`
+   (`0x01000000`) или `SEC_FILE` (`0x00800000`), либо нет `SEC_COMMIT`
+   (`0x08000000`) (0.10, `Mapping::open_view`); затем отображение секции
+   целиком (`ViewSize = 0`).
 2. Отображение меньше 128 байт → отказ.
 3. `magic` (acquire): `0` → «не готово» (повторить позже), иное ≠
    `SHARED_MAGIC` → отказ; `version ≠ 0x00020000` → отказ.

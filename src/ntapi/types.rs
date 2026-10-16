@@ -298,10 +298,6 @@ pub type POBJECT_BOUNDARY_DESCRIPTOR = PVOID;
     non_upper_case_globals,
     reason = "имя значения перечисления NT API воспроизводится дословно"
 )]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")
-)]
 pub const SectionBasicInformation: ULONG = 0;
 
 /// `PROCESSINFOCLASS::ProcessTimes` -- `KERNEL_USER_TIMES` процесса.
@@ -324,22 +320,10 @@ pub const ProcessTimes: ULONG = 4;
 pub const TokenUser: ULONG = 1;
 
 /// Секция с резервированием страниц без фиксации (`NtCreateSection`).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
-)]
 pub const SEC_RESERVE: ULONG = 0x0400_0000;
 /// Секция-образ исполняемого файла.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
-)]
 pub const SEC_IMAGE: ULONG = 0x0100_0000;
 /// Секция, отображающая файл (а не файл подкачки).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- проверка атрибутов секции (T3)")
-)]
 pub const SEC_FILE: ULONG = 0x0080_0000;
 
 /// Полный доступ к порту завершения ввода-вывода
@@ -358,10 +342,6 @@ pub const GENERIC_ALL: ACCESS_MASK = 0x1000_0000;
 
 /// Ответ `NtQuerySection(SectionBasicInformation)`.
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- проверка размера секции (T3)")
-)]
 pub struct SECTION_BASIC_INFORMATION {
     pub BaseAddress: PVOID,
     pub AllocationAttributes: ULONG,

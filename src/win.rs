@@ -40,6 +40,7 @@ use crate::ntapi::{
     NtOpenProcess,
     NtOpenSection,
     NtQueryEvent,
+    NtQuerySection,
     NtReleaseMutant,
     NtResetEvent,
     NtSetEvent,
@@ -55,7 +56,11 @@ use crate::ntapi::{
     PROCESS_SYNCHRONIZE,
     PVOID,
     SEC_COMMIT,
+    SEC_FILE,
+    SEC_IMAGE,
+    SEC_RESERVE,
     SECTION_ALL_ACCESS,
+    SECTION_BASIC_INFORMATION,
     STATUS_ABANDONED_WAIT_0,
     STATUS_OBJECT_NAME_EXISTS,
     STATUS_OBJECT_TYPE_MISMATCH,
@@ -64,6 +69,7 @@ use crate::ntapi::{
     STATUS_TIMEOUT,
     STATUS_WAIT_0,
     SYNCHRONIZATION_EVENT,
+    SectionBasicInformation,
     UNICODE_STRING,
     VIEW_UNMAP,
     WAIT_ANY,
@@ -646,6 +652,15 @@ impl Mapping {
 
         let handle = Handle(section_handle);
 
+        // Тип секции -- до отображения: под именем канала враждебный процесс
+        // может держать `SEC_RESERVE` (страницы не выделены -- первое
+        // обращение к ним даёт access violation) или секцию файла/образа.
+        // Сегмент канала всегда `SEC_COMMIT` из файла подкачки.
+        let attributes = Self::section_attributes(&handle)?;
+        if attributes & (SEC_RESERVE | SEC_IMAGE | SEC_FILE) != 0 || attributes & SEC_COMMIT == 0 {
+            return Err(ShmError::Corrupted);
+        }
+
         // Map view
         let mut base_address: PVOID = null_mut();
         let mut view_size: usize = view_size;
@@ -676,6 +691,31 @@ impl Mapping {
             view: base_address.cast::<u8>(),
             size: view_size,
         })
+    }
+
+    /// `AllocationAttributes` секции (`NtQuerySection(SectionBasicInformation)`).
+    fn section_attributes(handle: &Handle) -> Result<u32> {
+        let mut info = core::mem::MaybeUninit::<SECTION_BASIC_INFORMATION>::zeroed();
+        let mut returned: usize = 0;
+        // SAFETY: дескриптор секции валиден (держит `handle`); буфер -- локальная
+        // структура ровно того размера, что передаётся в `SectionInformationLength`;
+        // `returned` -- out-параметр на стеке.
+        let status = unsafe {
+            NtQuerySection(
+                handle.raw(),
+                SectionBasicInformation,
+                info.as_mut_ptr().cast::<c_void>(),
+                size_of::<SECTION_BASIC_INFORMATION>(),
+                &mut returned,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status_to_error(status, "NtQuerySection"));
+        }
+        // SAFETY: структура обнулена до вызова (все её поля -- целые и
+        // указатель, нулевой битовый шаблон допустим) и заполнена ядром.
+        let info = unsafe { info.assume_init() };
+        Ok(info.AllocationAttributes)
     }
 
     /// Размер отображённого view в байтах.
@@ -935,6 +975,58 @@ mod tests {
             Err(ShmError::Corrupted) => {}
             other => panic!("секция 4 КБ должна отвергаться, получено: {other:?}"),
         }
+    }
+
+    /// Создать именованную секцию 64 КиБ с заданными атрибутами (для тестов
+    /// на подмену секции чужим процессом).
+    fn create_test_section(name: &str, attributes: u32) -> Handle {
+        let mut nt_name = NtName::new(name).expect("nt name");
+        let mut sd = NullDaclSecurityDescriptor::new();
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
+        let mut handle: HANDLE = null_mut();
+        let mut max_size = LARGE_INTEGER {
+            QuadPart: 64 * 1024,
+        };
+        // SAFETY: все указатели валидны и живут до конца вызова.
+        let status = unsafe {
+            NtCreateSection(
+                &mut handle,
+                SECTION_ALL_ACCESS,
+                &mut obj_attr,
+                &mut max_size,
+                PAGE_READWRITE,
+                attributes,
+                null_mut(),
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS, "не удалось создать тестовую секцию");
+        Handle(handle)
+    }
+
+    /// Находка 14 (аудит 0.10): чужая секция `SEC_RESERVE` под именем канала
+    /// отображается, но её страницы не выделены -- первое обращение даёт
+    /// access violation. `Mapping::open` обязан отвергать всё, что не
+    /// `SEC_COMMIT`; честная секция `SEC_COMMIT` открывается.
+    #[test]
+    fn open_rejects_reserved_or_image_section() {
+        let reserved = format!("Local\\XSHM_TEST_SEC_RESERVE_{}", std::process::id());
+        let _reserved_owner = create_test_section(&reserved, SEC_RESERVE);
+        match Mapping::open(&reserved) {
+            Err(ShmError::Corrupted) => {}
+            Ok(_) => panic!("секция SEC_RESERVE принята"),
+            Err(other) => panic!("ожидался Corrupted, получено {other:?}"),
+        }
+        match Mapping::open_header(&reserved) {
+            Err(ShmError::Corrupted) => {}
+            Ok(_) => panic!("секция SEC_RESERVE принята (open_header)"),
+            Err(other) => panic!("ожидался Corrupted, получено {other:?}"),
+        }
+
+        let commit = format!("Local\\XSHM_TEST_SEC_COMMIT_{}", std::process::id());
+        let _commit_owner = create_test_section(&commit, SEC_COMMIT);
+        assert!(Mapping::open(&commit).is_ok());
+        assert!(Mapping::open_header(&commit).is_ok());
     }
 
     /// Подменённое событие канала (ручной сброс под именем автосбросного)
