@@ -13,10 +13,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{
-    AutoClient, AutoHandler, AutoOptions, AutoServer, ClientRegistration, DisconnectReason,
-    DispatchClient, DispatchClientHandler, DispatchClientOptions, DispatchHandler, DispatchOptions,
-    DispatchServer, MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler,
-    MultiOptions, MultiServer, SharedClient, SharedServer, ShmError, SpinPolicy,
+    Admission, AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ClientRegistration,
+    DisconnectReason, DispatchClient, DispatchClientHandler, DispatchClientOptions,
+    DispatchHandler, DispatchOptions, DispatchServer, MultiClient, MultiClientHandler,
+    MultiClientOptions, MultiHandler, MultiOptions, MultiServer, SharedClient, SharedServer,
+    ShmError, SpinPolicy,
 };
 
 const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
@@ -58,6 +59,27 @@ impl MultiClientHandler for Noop {
     fn on_connect(&self, _slot: u32) {}
     fn on_disconnect(&self) {}
     fn on_message(&self, _data: &[u8]) {}
+}
+
+/// Маяк «клиент лобби ждёт ответа» (`dispatch_lobby_stall`).
+fn admit_marker(name: &str) -> String {
+    format!("{name}_ADMIT")
+}
+
+/// Обработчик лобби, который не отвечает никогда: `admit` висит.
+struct StallingLobby {
+    marker: Beacon,
+}
+
+impl DispatchHandler for StallingLobby {
+    fn admit(&self, _info: &ClientRegistration) -> Admission {
+        let _ = self.marker.raise();
+        linger(Duration::from_secs(60));
+        Admission::Accept
+    }
+    fn on_client_connect(&self, _id: u32, _info: &ClientRegistration) {}
+    fn on_client_disconnect(&self, _id: u32) {}
+    fn on_message(&self, _id: u32, _data: &[u8]) {}
 }
 
 /// Держит процесс живым, пока его не убьют (с потолком на случай, если
@@ -135,6 +157,20 @@ fn child_entry() {
         }
         "multi_server" => {
             let server = MultiServer::start(name, Arc::new(Noop), MultiOptions::default()).unwrap();
+            linger(forever);
+            server.stop();
+        }
+        "dispatch_lobby_stall" => {
+            // Лобби, которое никогда не отвечает: `admit` взводит маяк
+            // `<имя>_ADMIT` (родитель узнаёт, что клиент уже ждёт ответа) и
+            // висит, пока процесс не убьют.
+            let marker = Beacon::open(&admit_marker(name)).unwrap();
+            let server = DispatchServer::start(
+                name,
+                Arc::new(StallingLobby { marker }),
+                DispatchOptions::default(),
+            )
+            .unwrap();
             linger(forever);
             server.stop();
         }
@@ -510,6 +546,41 @@ fn dispatch_client_sees_server_death() {
     assert_eq!(client.is_peer_alive(), Some(false));
     assert!(!client.is_connected());
     assert_eq!(client.try_send(b"after death"), Err(ShmError::NotReady));
+}
+
+/// Task 18: клиент ЛОББИ (регистрация ещё не получила ответа) видит
+/// смерть процесса сервера -- `DispatchClient::connect` возвращает
+/// `PeerDied` сразу (ожидание `[S2C_DATA, S2C_DISCONNECT, процесс сервера]`,
+/// INTEROP §d.2 шаг 7), а не через `response_timeout` (здесь 30 с).
+#[test]
+fn dispatch_lobby_client_sees_server_death() {
+    let name = unique_name("DS_LOBBY");
+    let marker = Beacon::open(&admit_marker(&name)).unwrap();
+    let mut peer = Peer::spawn("dispatch_lobby_stall", &name);
+    wait_until("child lobby", Duration::from_secs(20), || {
+        DispatchClient::lobby_exists(&name)
+    });
+    let client = thread::spawn(move || {
+        let result = DispatchClient::connect(
+            &name,
+            ClientRegistration::new(std::process::id(), 1, "lobby-orphan"),
+            Arc::new(Noop),
+            DispatchClientOptions {
+                response_timeout: Duration::from_secs(30),
+                ..DispatchClientOptions::default()
+            },
+        );
+        (result.map(drop), Instant::now())
+    });
+    // Сервер принял регистрацию и завис в `admit`: клиент ждёт ответа.
+    assert!(
+        marker.wait(Some(Duration::from_secs(20))).unwrap(),
+        "admit не начат"
+    );
+    let t0 = peer.kill();
+    let (result, woke) = client.join().unwrap();
+    assert_eq!(result, Err(ShmError::PeerDied));
+    report("dispatch lobby client connect", woke - t0);
 }
 
 #[test]

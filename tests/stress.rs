@@ -1,10 +1,28 @@
+//! Стресс-тесты single-client канала: поток сообщений в одну и в обе
+//! стороны с перезаписью при переполнении.
+//!
+//! Task 18: устойчивость под нагрузкой хоста. Никаких фиксированных `sleep`
+//! как условия (клиент подключается по сигналу «сервер поднят», а не через
+//! 50 мс) и никаких жёстких 5–10-секундных дедлайнов: сторож прогресса
+//! (`Watchdog`) валит тест, только если ни одного нового сообщения нет
+//! `STALL` (10 с -- это зависание, а не медленный хост), плюс общий дедлайн
+//! с большим запасом (`OVERALL`, 120 с).
+
 use std::convert::TryInto;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{SharedClient, SharedServer, ShmError};
 
 const MIN_SLEEP: Duration = Duration::from_micros(50);
+/// Нет прогресса столько времени -- зависание.
+const STALL: Duration = Duration::from_secs(10);
+/// Общий дедлайн теста (с запасом на перегруженный хост).
+const OVERALL: Duration = Duration::from_secs(120);
+/// Ожидание рукопожатия: подключение только по сигналу «сервер поднят»,
+/// граница -- от зависания, а не от медленного старта.
+const CONNECT: Duration = Duration::from_secs(30);
 
 #[expect(
     clippy::unwrap_used,
@@ -24,74 +42,119 @@ fn unique_name(tag: &str) -> String {
     )
 }
 
+/// Сторож прогресса: провал -- нет прогресса `STALL` или вышел `OVERALL`.
+struct Watchdog {
+    what: &'static str,
+    started: Instant,
+    last: Instant,
+}
+
+impl Watchdog {
+    fn new(what: &'static str) -> Self {
+        let now = Instant::now();
+        Self {
+            what,
+            started: now,
+            last: now,
+        }
+    }
+
+    /// Новое сообщение (отправлено или принято).
+    fn progress(&mut self) {
+        self.last = Instant::now();
+    }
+
+    fn check(&self) {
+        let idle = self.last.elapsed();
+        assert!(idle < STALL, "{}: нет прогресса {idle:?}", self.what);
+        let total = self.started.elapsed();
+        assert!(total < OVERALL, "{}: общий дедлайн {total:?}", self.what);
+    }
+}
+
+/// Поднять сервер в отдельном потоке: `ready` -- сигнал «секция создана»
+/// (клиенту можно подключаться), затем ожидание клиента и `body`.
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+fn spawn_server<T: Send + 'static>(
+    name: &str,
+    body: impl FnOnce(SharedServer) -> xshm::Result<T> + Send + 'static,
+) -> thread::JoinHandle<xshm::Result<T>> {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let name = name.to_owned();
+    let handle = thread::spawn(move || {
+        let mut server = SharedServer::start(&name)?;
+        ready_tx.send(()).unwrap();
+        server.wait_for_client(Some(CONNECT))?;
+        body(server)
+    });
+    // Сервер не поднялся (ошибка старта) -- канал закрыт; ошибку отдаст join.
+    let _ = ready_rx.recv();
+    handle
+}
+
 #[test]
 fn stress_server_to_client() {
     const TOTAL: usize = 4000;
     let name = unique_name("S2C");
 
-    let server_thread = thread::spawn({
-        let name = name.clone();
-        move || -> xshm::Result<(usize, usize)> {
-            let mut server = SharedServer::start(&name)?;
-            server.wait_for_client(Some(Duration::from_secs(5)))?;
-
-            let mut overwritten_total = 0usize;
-            for i in 0..TOTAL {
-                let mut msg = [0u8; 8];
-                msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
-                loop {
-                    match server.send_to_client(&msg) {
-                        Ok(outcome) => {
-                            overwritten_total += outcome.overwritten as usize;
-                            break;
-                        }
-                        Err(ShmError::QueueFull) => {
-                            thread::sleep(MIN_SLEEP);
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
-                thread::yield_now();
-            }
-
-            server.send_to_client(b"END")?;
-
-            let mut recv_buf = Vec::new();
-            let start = Instant::now();
+    let server_thread = spawn_server(&name, |server| -> xshm::Result<(usize, usize)> {
+        let mut dog = Watchdog::new("server S2C");
+        let mut overwritten_total = 0usize;
+        for i in 0..TOTAL {
+            let mut msg = [0u8; 8];
+            msg[..4].copy_from_slice(&(i as u32).to_le_bytes());
             loop {
-                if start.elapsed() > Duration::from_secs(5) {
-                    return Err(ShmError::Timeout);
-                }
-                if server.poll_client(Some(Duration::from_millis(10)))? {
-                    let len = server.receive_from_client(&mut recv_buf)?;
-                    if &recv_buf[..len] == b"ACK" {
+                match server.send_to_client(&msg) {
+                    Ok(outcome) => {
+                        overwritten_total += outcome.overwritten as usize;
+                        dog.progress();
                         break;
                     }
+                    Err(ShmError::QueueFull) => {
+                        dog.check();
+                        thread::sleep(MIN_SLEEP);
+                    }
+                    Err(err) => return Err(err),
                 }
             }
-
-            Ok((TOTAL, overwritten_total))
+            thread::yield_now();
         }
+
+        server.send_to_client(b"END")?;
+
+        let mut recv_buf = Vec::new();
+        let dog = Watchdog::new("server ждёт ACK");
+        loop {
+            dog.check();
+            if server.poll_client(Some(Duration::from_millis(10)))? {
+                let len = server.receive_from_client(&mut recv_buf)?;
+                if &recv_buf[..len] == b"ACK" {
+                    break;
+                }
+            }
+        }
+
+        Ok((TOTAL, overwritten_total))
     });
 
-    thread::sleep(Duration::from_millis(50));
-
     let client_result = (|| -> xshm::Result<usize> {
-        let client = SharedClient::connect(&name, Duration::from_secs(5))?;
+        let client = SharedClient::connect(&name, CONNECT)?;
         let mut recv_buf = Vec::new();
         let mut expected = 0u32;
-        let start = Instant::now();
+        let mut dog = Watchdog::new("client S2C");
         let mut done = false;
 
         while !done {
-            if start.elapsed() > Duration::from_secs(5) {
-                return Err(ShmError::Timeout);
-            }
+            dog.check();
             if client.poll_server(Some(Duration::from_millis(10)))? {
                 // Drain all available messages after a successful poll
                 loop {
                     match client.receive_from_server(&mut recv_buf) {
                         Ok(len) => {
+                            dog.progress();
                             if &recv_buf[..len] == b"END" {
                                 done = true;
                                 break;
@@ -118,6 +181,7 @@ fn stress_server_to_client() {
             }
         }
 
+        // Последнее сообщение до END не вытесняется (за ним в кольце только END).
         assert_eq!(expected as usize, TOTAL);
         client.send_to_server(b"ACK")?;
         Ok(expected as usize)
@@ -144,59 +208,52 @@ fn stress_client_to_server() {
     const TOTAL: usize = 4000;
     let name = unique_name("C2S");
 
-    let server_thread = thread::spawn({
-        let name = name.clone();
-        move || -> xshm::Result<usize> {
-            let mut server = SharedServer::start(&name)?;
-            server.wait_for_client(Some(Duration::from_secs(5)))?;
-            let mut recv_buf = Vec::new();
-            let mut expected = 0u32;
-            let start = Instant::now();
-            let mut done = false;
+    let server_thread = spawn_server(&name, |server| -> xshm::Result<usize> {
+        let mut recv_buf = Vec::new();
+        let mut expected = 0u32;
+        let mut dog = Watchdog::new("server C2S");
+        let mut done = false;
 
-            while !done {
-                if start.elapsed() > Duration::from_secs(5) {
-                    return Err(ShmError::Timeout);
-                }
-                if server.poll_client(Some(Duration::from_millis(10)))? {
-                    // Drain all available messages after a successful poll
-                    loop {
-                        match server.receive_from_client(&mut recv_buf) {
-                            Ok(len) => {
-                                if &recv_buf[..len] == b"END" {
-                                    done = true;
-                                    break;
-                                }
-                                assert!(len >= 4);
-                                let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
-                                // См. пояснение в stress_server_to_client: overwrite-on-full
-                                // допускает forward-гэп (value может обгонять expected), но
-                                // убывание/повтор value — реальный баг (reorder/дубль).
-                                assert!(
-                                    value >= expected,
-                                    "reorder/duplicate: got {value}, expected >= {expected}"
-                                );
-                                expected = value + 1;
+        while !done {
+            dog.check();
+            if server.poll_client(Some(Duration::from_millis(10)))? {
+                // Drain all available messages after a successful poll
+                loop {
+                    match server.receive_from_client(&mut recv_buf) {
+                        Ok(len) => {
+                            dog.progress();
+                            if &recv_buf[..len] == b"END" {
+                                done = true;
+                                break;
                             }
-                            Err(ShmError::QueueEmpty) => break,
-                            Err(err) => return Err(err),
+                            assert!(len >= 4);
+                            let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
+                            // См. пояснение в stress_server_to_client: overwrite-on-full
+                            // допускает forward-гэп (value может обгонять expected), но
+                            // убывание/повтор value — реальный баг (reorder/дубль).
+                            assert!(
+                                value >= expected,
+                                "reorder/duplicate: got {value}, expected >= {expected}"
+                            );
+                            expected = value + 1;
                         }
+                        Err(ShmError::QueueEmpty) => break,
+                        Err(err) => return Err(err),
                     }
-                } else {
-                    thread::sleep(MIN_SLEEP);
                 }
+            } else {
+                thread::sleep(MIN_SLEEP);
             }
-
-            assert_eq!(expected as usize, TOTAL);
-            server.send_to_client(b"ACK")?;
-            Ok(expected as usize)
         }
+
+        assert_eq!(expected as usize, TOTAL);
+        server.send_to_client(b"ACK")?;
+        Ok(expected as usize)
     });
 
-    thread::sleep(Duration::from_millis(50));
-
     let client_result = (|| -> xshm::Result<(usize, usize)> {
-        let client = SharedClient::connect(&name, Duration::from_secs(5))?;
+        let client = SharedClient::connect(&name, CONNECT)?;
+        let mut dog = Watchdog::new("client C2S");
         let mut overwritten_total = 0usize;
         for i in 0..TOTAL {
             let mut msg = [0u8; 8];
@@ -205,9 +262,11 @@ fn stress_client_to_server() {
                 match client.send_to_server(&msg) {
                     Ok(outcome) => {
                         overwritten_total += outcome.overwritten as usize;
+                        dog.progress();
                         break;
                     }
                     Err(ShmError::QueueFull) => {
+                        dog.check();
                         thread::sleep(MIN_SLEEP);
                     }
                     Err(err) => return Err(err),
@@ -219,11 +278,9 @@ fn stress_client_to_server() {
         client.send_to_server(b"END")?;
 
         let mut recv_buf = Vec::new();
-        let start = Instant::now();
+        let dog = Watchdog::new("client ждёт ACK");
         loop {
-            if start.elapsed() > Duration::from_secs(5) {
-                return Err(ShmError::Timeout);
-            }
+            dog.check();
             if client.poll_server(Some(Duration::from_millis(10)))? {
                 match client.receive_from_server(&mut recv_buf) {
                     Ok(len) => {
@@ -263,68 +320,63 @@ fn stress_bidirectional() {
     const TOTAL: usize = 2000;
     let name = unique_name("BI");
 
-    let server_thread = thread::spawn({
-        let name = name.clone();
-        move || -> xshm::Result<()> {
-            let mut server = SharedServer::start(&name)?;
-            server.wait_for_client(Some(Duration::from_secs(5)))?;
-
-            let mut recv_buf = Vec::new();
-            let mut received = 0u32;
-            let mut sent = 0u32;
-            let start = Instant::now();
-
-            while sent < TOTAL as u32 || received < TOTAL as u32 {
-                if sent < TOTAL as u32 {
-                    let mut msg = [0u8; 8];
-                    msg[..4].copy_from_slice(&sent.to_le_bytes());
-                    loop {
-                        match server.send_to_client(&msg) {
-                            Ok(_) => break,
-                            Err(ShmError::QueueFull) => thread::sleep(MIN_SLEEP),
-                            Err(err) => return Err(err),
-                        }
-                    }
-                    sent += 1;
-                }
-
-                if server.poll_client(Some(Duration::from_millis(1)))? {
-                    match server.receive_from_client(&mut recv_buf) {
-                        Ok(len) => {
-                            assert!(len >= 4);
-                            let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
-                            // overwrite-on-full допускает forward-гэп; убывание/повтор — баг.
-                            assert!(
-                                value >= received,
-                                "server reorder/duplicate: got {value}, expected >= {received}"
-                            );
-                            received = value + 1;
-                        }
-                        Err(ShmError::QueueEmpty) => {}
-                        Err(err) => return Err(err),
-                    }
-                } else {
-                    thread::sleep(MIN_SLEEP);
-                }
-
-                if start.elapsed() > Duration::from_secs(10) {
-                    return Err(ShmError::Timeout);
-                }
-            }
-
-            server.send_to_client(b"DONE")?;
-            Ok(())
-        }
-    });
-
-    thread::sleep(Duration::from_millis(50));
-
-    let client_result = (|| -> xshm::Result<()> {
-        let client = SharedClient::connect(&name, Duration::from_secs(5))?;
+    let server_thread = spawn_server(&name, |server| -> xshm::Result<()> {
         let mut recv_buf = Vec::new();
         let mut received = 0u32;
         let mut sent = 0u32;
-        let start = Instant::now();
+        let mut dog = Watchdog::new("server BI");
+
+        while sent < TOTAL as u32 || received < TOTAL as u32 {
+            if sent < TOTAL as u32 {
+                let mut msg = [0u8; 8];
+                msg[..4].copy_from_slice(&sent.to_le_bytes());
+                loop {
+                    match server.send_to_client(&msg) {
+                        Ok(_) => break,
+                        Err(ShmError::QueueFull) => {
+                            dog.check();
+                            thread::sleep(MIN_SLEEP);
+                        }
+                        Err(err) => return Err(err),
+                    }
+                }
+                sent += 1;
+                dog.progress();
+            }
+
+            if server.poll_client(Some(Duration::from_millis(1)))? {
+                match server.receive_from_client(&mut recv_buf) {
+                    Ok(len) => {
+                        assert!(len >= 4);
+                        let value = u32::from_le_bytes(recv_buf[..4].try_into().unwrap());
+                        // overwrite-on-full допускает forward-гэп; убывание/повтор — баг.
+                        assert!(
+                            value >= received,
+                            "server reorder/duplicate: got {value}, expected >= {received}"
+                        );
+                        received = value + 1;
+                        dog.progress();
+                    }
+                    Err(ShmError::QueueEmpty) => {}
+                    Err(err) => return Err(err),
+                }
+            } else {
+                thread::sleep(MIN_SLEEP);
+            }
+
+            dog.check();
+        }
+
+        server.send_to_client(b"DONE")?;
+        Ok(())
+    });
+
+    let client_result = (|| -> xshm::Result<()> {
+        let client = SharedClient::connect(&name, CONNECT)?;
+        let mut recv_buf = Vec::new();
+        let mut received = 0u32;
+        let mut sent = 0u32;
+        let mut dog = Watchdog::new("client BI");
 
         while sent < TOTAL as u32 || received < TOTAL as u32 {
             if sent < TOTAL as u32 {
@@ -333,16 +385,21 @@ fn stress_bidirectional() {
                 loop {
                     match client.send_to_server(&msg) {
                         Ok(_) => break,
-                        Err(ShmError::QueueFull) => thread::sleep(MIN_SLEEP),
+                        Err(ShmError::QueueFull) => {
+                            dog.check();
+                            thread::sleep(MIN_SLEEP);
+                        }
                         Err(err) => return Err(err),
                     }
                 }
                 sent += 1;
+                dog.progress();
             }
 
             if client.poll_server(Some(Duration::from_millis(1)))? {
                 match client.receive_from_server(&mut recv_buf) {
                     Ok(len) => {
+                        dog.progress();
                         if &recv_buf[..len] == b"DONE" {
                             break;
                         }
@@ -362,9 +419,7 @@ fn stress_bidirectional() {
                 thread::sleep(MIN_SLEEP);
             }
 
-            if start.elapsed() > Duration::from_secs(10) {
-                return Err(ShmError::Timeout);
-            }
+            dog.check();
         }
 
         Ok(())

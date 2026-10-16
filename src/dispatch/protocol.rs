@@ -398,4 +398,64 @@ mod tests {
         assert_eq!(decoded.client_id, 0);
         assert_eq!(decoded.channel_name, "");
     }
+
+    /// xorshift32 (Марсалья): детерминированный генератор без зависимостей.
+    fn xorshift(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    /// Task 18: 100 000 случайных буферов длиной 0..200 в оба декодера --
+    /// ни одной паники. Половина буферов начинается с настоящего заголовка
+    /// (magic, версия, тип), иначе почти все отсекались бы на magic и до
+    /// разбора имени дело не доходило бы. Строгий декодер: успех возможен
+    /// только для буфера, который кодировщик воспроизводит байт в байт.
+    #[test]
+    fn random_bytes_never_panic() {
+        const SEED: u32 = 0x1F2E_3D4C;
+        let mut state = SEED;
+        let mut decoded = [0u32; 2];
+        for i in 0..100_000u32 {
+            let len = (xorshift(&mut state) % 200) as usize;
+            let mut data: Vec<u8> = (0..len).map(|_| xorshift(&mut state) as u8).collect();
+            let response = i % 2 == 1;
+            if i % 4 >= 2 {
+                // Настоящий заголовок поверх случайных байтов (сколько влезет).
+                let msg_type = if response {
+                    MSG_TYPE_RESPONSE
+                } else {
+                    MSG_TYPE_REQUEST
+                };
+                let mut header = DISPATCH_MAGIC.to_le_bytes().to_vec();
+                header.extend_from_slice(&[DISPATCH_VERSION, msg_type]);
+                // Длина имени -- обычно правдоподобная (0..=70).
+                let name_at = if response { 11 } else { 12 };
+                for (dst, src) in data.iter_mut().zip(&header) {
+                    *dst = *src;
+                }
+                if let Some(name_len) = data.get_mut(name_at) {
+                    *name_len = (xorshift(&mut state) % 71) as u8;
+                }
+            }
+            if response {
+                if let Ok(resp) = decode_response(&data) {
+                    decoded[1] += 1;
+                    assert_eq!(encode_response(&resp), data, "seed {SEED:#x}, итерация {i}");
+                }
+            } else if let Ok(req) = decode_request(&data) {
+                decoded[0] += 1;
+                assert_eq!(encode_request(&req), data, "seed {SEED:#x}, итерация {i}");
+            }
+        }
+        // Генератор доходит и до успешного разбора (не только отказы на
+        // заголовке): имя из случайных байтов бывает валидным UTF-8.
+        assert!(
+            decoded.iter().all(|&n| n > 0),
+            "успешных разборов: {decoded:?}"
+        );
+    }
 }

@@ -1441,6 +1441,12 @@ impl MultiHandler for SlotJournal {
 /// другой слот всё это время обслуживается. До исправления `drain_slot`
 /// читал, пока пачки выбирались целиком, -- писатель, успевающий за
 /// читателем, держал единственный поток-диспетчер вечно.
+///
+/// Task 18 (Task 17): поток идёт через `try_send_to_server` -- запись без
+/// перезаписи `read_pos` не трогает, поэтому дочитывание всегда доходит
+/// до снимка и причина -- строго `Graceful` (с перезаписью писатель мог
+/// сдвинуть `read_pos` посреди дочитывания, и тест принимал досрочный
+/// `Corrupted`/`Error`, не проверяя границу).
 #[test]
 fn hostile_disconnect_flood_does_not_stall_dispatcher() {
     let name = unique("HOSTILE_DRAIN");
@@ -1487,14 +1493,16 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
         thread::spawn(move || {
             let client = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
             for _ in 0..BEFORE {
-                client.send_to_server(b"before").unwrap();
+                client.try_send_to_server(b"before").unwrap();
             }
             go_rx.recv().unwrap();
             client.events().disconnect.set().unwrap();
             ready_tx.send(Instant::now()).unwrap();
             let mut written = 0u64;
             while flooding.load(Ordering::Acquire) {
-                if client.send_to_server(b"flood-flood-flood").is_ok() {
+                // Без перезаписи: `QueueFull`, пока читатель не освободит
+                // место, -- `read_pos` двигает только он.
+                if client.try_send_to_server(b"flood-flood-flood").is_ok() {
                     written += 1;
                 }
             }
@@ -1527,12 +1535,13 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
         || journal.disconnect_of(1).is_some(),
     );
     let (reason, at) = journal.disconnect_of(1).unwrap();
-    // `Graceful` -- дочитано до снимка; `Error` -- писатель с перезаписью
-    // сдвинул `read_pos` во время дочитывания (своя позиция чтения это
-    // замечает: `Corrupted`, fix round 2).
+    // Дочитано до снимка: писатель без перезаписи `read_pos` не трогает,
+    // досрочного `Corrupted` (`Error`) быть не может.
+    assert_eq!(reason, DisconnectReason::Graceful);
     assert!(
-        matches!(reason, DisconnectReason::Graceful | DisconnectReason::Error),
-        "{reason:?}"
+        journal.errors.lock().unwrap().is_empty(),
+        "ошибки: {:?}",
+        journal.errors.lock().unwrap()
     );
     assert!(
         at.saturating_duration_since(signalled_at) < Duration::from_secs(2),

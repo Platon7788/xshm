@@ -128,6 +128,30 @@ pub(crate) trait Endpoint {
     fn mark_gone(&mut self);
 }
 
+/// Тестовый хук перепроверки: аргумент -- регистрация события операции
+/// уже стоит.
+#[cfg(test)]
+pub(crate) type RecheckHook = Box<dyn FnOnce(bool)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Тесты (Task 18): одноразовый хук в точке между регистрациями
+    /// набора и финальной перепроверкой (`is_empty` приёма, `fits`
+    /// отправки). Хук играет роль пира, успевшего опубликовать кадр
+    /// (освободить место) ровно в этом окне.
+    pub(crate) static BEFORE_RECHECK: std::cell::RefCell<Option<RecheckHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Вызвать тестовый хук `BEFORE_RECHECK` (если задан) -- в release его нет.
+#[cfg(test)]
+fn before_recheck(waits: &WaitSet) {
+    let hook = BEFORE_RECHECK.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook(waits.regs[OP].is_some());
+    }
+}
+
 /// Числовой handle для реактора.
 fn raw(handle: BorrowedHandle<'_>) -> isize {
     handle.as_raw_handle().addr().cast_signed()
@@ -317,6 +341,8 @@ impl<'a, E: Endpoint> RecvFuture<'a, E> {
             if let Err(err) = ensure_session(&*self.endpoint, &mut self.waits, waker) {
                 return Poll::Ready(Err(err));
             }
+            #[cfg(test)]
+            before_recheck(&self.waits);
             if self.endpoint.rx().is_empty() {
                 return Poll::Pending;
             }
@@ -413,6 +439,8 @@ impl<'a, E: Endpoint> SendFuture<'a, E> {
             if let Err(err) = ensure_session(&*self.endpoint, &mut self.waits, waker) {
                 return Poll::Ready(Err(err));
             }
+            #[cfg(test)]
+            before_recheck(&self.waits);
             if !self.endpoint.tx().free_space().fits(len) {
                 return Poll::Pending;
             }
@@ -450,5 +478,90 @@ impl<E: Endpoint> Future for SendFuture<'_, E> {
 impl<E: Endpoint> Drop for SendFuture<'_, E> {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Task 18 (Task 16, #2): порядок «регистрация -> финальная
+    //! перепроверка» защищён мутационно. Хук `BEFORE_RECHECK` публикует
+    //! кадр (освобождает место) ровно между регистрацией и перепроверкой:
+    //! future обязан завершиться на ЭТОМ ЖЕ опросе, без пробуждения извне.
+    //! Перепроверку убрали -- `Pending`; поставили регистрацию после неё --
+    //! хук видит набор без регистрации операции.
+    use super::*;
+    use crate::client::SharedClient;
+    use crate::layout::{ChannelLayout, RingConfig};
+    use crate::server::{ChannelConfig, SharedServer};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    /// Подключённая пара с маленькими кольцами (4 КиБ).
+    fn pair(tag: &str) -> (SharedServer, SharedClient) {
+        let name = format!("XSHM_ASYNC_RECHECK_{tag}_{}", std::process::id());
+        let config = ChannelConfig::new(ChannelLayout::symmetric(RingConfig::new(4096)));
+        let mut server = SharedServer::start_with(&name, &config).unwrap();
+        let waiter = std::thread::spawn(move || {
+            server
+                .wait_for_client(Some(Duration::from_secs(10)))
+                .unwrap();
+            server
+        });
+        let client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
+        (waiter.join().unwrap(), client)
+    }
+
+    fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
+        future.poll(&mut Context::from_waker(Waker::noop()))
+    }
+
+    #[test]
+    fn recv_rechecks_after_registration() {
+        let (server, mut client) = pair("RECV");
+        let server = Rc::new(RefCell::new(server));
+        let registered = Rc::new(std::cell::Cell::new(None));
+        BEFORE_RECHECK.with(|hook| {
+            let (server, registered) = (Rc::clone(&server), Rc::clone(&registered));
+            *hook.borrow_mut() = Some(Box::new(move |reg| {
+                registered.set(Some(reg));
+                server.borrow().try_send_to_client(b"window").unwrap();
+            }));
+        });
+        let mut buf = Vec::new();
+        let result = {
+            let mut future = std::pin::pin!(client.recv_async(&mut buf));
+            poll_once(future.as_mut())
+        };
+        assert_eq!(registered.get(), Some(true), "регистрация -- до хука");
+        assert!(
+            matches!(result, Poll::Ready(Ok(6))),
+            "кадр из окна не прочитан на том же опросе: {result:?}"
+        );
+        assert_eq!(buf, b"window");
+    }
+
+    #[test]
+    fn send_rechecks_after_registration() {
+        let (server, mut client) = pair("SEND");
+        let data = [5u8; 64];
+        while client.try_send_to_server(&data).is_ok() {}
+        let server = Rc::new(RefCell::new(server));
+        let registered = Rc::new(std::cell::Cell::new(None));
+        BEFORE_RECHECK.with(|hook| {
+            let (server, registered) = (Rc::clone(&server), Rc::clone(&registered));
+            *hook.borrow_mut() = Some(Box::new(move |reg| {
+                registered.set(Some(reg));
+                let mut out = Vec::new();
+                server.borrow().receive_from_client(&mut out).unwrap();
+            }));
+        });
+        let mut future = std::pin::pin!(client.send_async(&data));
+        let result = poll_once(future.as_mut());
+        assert_eq!(registered.get(), Some(true), "регистрация -- до хука");
+        assert!(
+            matches!(result, Poll::Ready(Ok(()))),
+            "место из окна не замечено на том же опросе: {result:?}"
+        );
     }
 }
