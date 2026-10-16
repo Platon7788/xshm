@@ -585,7 +585,9 @@ impl RingBuffer {
     /// кольцо пустым -- а пустое кольцо кадр принимает всегда (вместе с
     /// наихудшим PAD, `RingConfig::validate`). PAD-кадры вытесняются как
     /// обычные, но в `overwritten`/`drop_count` не попадают. `Corrupted` --
-    /// только по позициям и заголовкам кадров, не по счётчику.
+    /// только по позициям и заголовкам кадров, не по счётчику. Лимит
+    /// сообщений вытесняет только при полном кольце ПО КАДРАМ: счётчик на
+    /// пределе пересчитывается (`admits`, Task 18).
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
         let total = self.frame_len(payload.len())?;
         let header = self.header();
@@ -596,7 +598,7 @@ impl RingBuffer {
             let read = header.read_pos.load(Ordering::Acquire);
             let used = self.writer_used(write, read)?;
             let count = header.message_count.load(Ordering::Acquire);
-            if self.admits(write, used, total, count) {
+            if self.admits(read, write, used, total, count) {
                 let place = self.place(write, payload.len(), total);
                 // SAFETY: `place` вернул индекс payload, за которым до конца
                 // кольца не меньше `payload.len()` байт; диапазон свободен
@@ -731,7 +733,7 @@ impl RingBuffer {
         let read = header.read_pos.load(Ordering::Acquire);
         let count = header.message_count.load(Ordering::Acquire);
         let used = self.writer_used(write, read)?;
-        if !self.admits(write, used, total, count) {
+        if !self.admits(read, write, used, total, count) {
             return Err(ShmError::QueueFull);
         }
         Ok((write, self.place(write, payload_len, total)))
@@ -746,9 +748,10 @@ impl RingBuffer {
         if total <= tail { total } else { tail + total }
     }
 
-    /// Принять ли кадр `total` байт с позиции `write` при занятости `used`
-    /// (позиции уже проверены `writer_used`) и значении `message_count ==
-    /// count`. Место -- PAD (если нужен) + кадр (`frame_need`).
+    /// Принять ли кадр `total` байт с позиции `write` при снимке `read`,
+    /// занятости `used` (позиции уже проверены `writer_used`) и значении
+    /// `message_count == count`. Место -- PAD (если нужен) + кадр
+    /// (`frame_need`).
     ///
     /// `message_count` -- подсказка, а не истина: его пишет и пир
     /// (недоверенный), и законно отстаёт на 1 -- читатель уменьшает его
@@ -758,11 +761,48 @@ impl RingBuffer {
     /// при `used > 0`; пустое кольцо принимает любой кадр, помещающийся по
     /// байтам (а помещается любой допустимый вместе с PAD: `max_message_size
     /// <= capacity / 2 - FRAME_HEADER_SIZE`). PAD-кадры в лимит не входят.
-    /// Счётчик здесь не правим -- его сводит насыщающий `decrement_count`
-    /// читателя.
-    const fn admits(&self, write: u32, used: u32, total: u32, count: u32) -> bool {
+    ///
+    /// Task 18: счётчик на пределе (`count >= max_messages`) в непустом
+    /// кольце -- повод пересчитать сообщения по кадрам (`messages_between`),
+    /// а не приговор: отставший на 1 счётчик иначе вытеснял сообщение на
+    /// кадр раньше (`write_message`) или давал ложный `QueueFull`. Пересчёт
+    /// идёт только на пределе счётчика, поэтому обычная запись его не
+    /// платит. Счётчик здесь не правим -- его сводит насыщающий
+    /// `decrement_count` читателя.
+    fn admits(&self, read: u32, write: u32, used: u32, total: u32, count: u32) -> bool {
         self.capacity - used >= self.frame_need(write, total)
-            && (used == 0 || count < self.max_messages)
+            && (used == 0
+                || count < self.max_messages
+                || self.messages_between(read, write) < self.max_messages)
+    }
+
+    /// Сколько кадров сообщений (без PAD) лежит между снимком `read` и
+    /// опубликованным `write` -- по заголовкам кадров, а не по счётчику;
+    /// счёт останавливается на `max_messages` (больше знать не нужно).
+    ///
+    /// Вызывает только писатель: кадры в `[read, write)` опубликовал он сам,
+    /// честный читатель их заголовки не меняет, а уже забранные им (снимок
+    /// `read` мог устареть) писатель ещё не перезаписал -- такие кадры лишь
+    /// завышают ответ (консервативно: в худшем случае -- вытеснение, как без
+    /// пересчёта). Кадры, которые не сходятся (порча пиром), -- ответ
+    /// `max_messages`: решение остаётся за прежним правилом, а `Corrupted`
+    /// сообщит вытеснение (`frame_at`). Цикл конечен: каждый шаг сдвигает
+    /// позицию к `write` минимум на `FRAME_ALIGN` байт, не перескакивая его
+    /// (`frame_at` отвергает кадр длиннее опубликованного), -- не больше
+    /// `capacity / 8` шагов.
+    fn messages_between(&self, read: u32, write: u32) -> u32 {
+        let mut pos = read;
+        let mut messages = 0u32;
+        while pos != write && messages < self.max_messages {
+            let Ok(Some(frame)) = self.frame_at(pos, write) else {
+                return self.max_messages;
+            };
+            if !frame.pad {
+                messages += 1;
+            }
+            pos = pos.wrapping_add(frame.total);
+        }
+        messages
     }
 
     /// Записать заголовки кадра длины `len` (`total` байт) в позицию
@@ -1782,17 +1822,22 @@ mod try_write_tests {
         assert_eq!(ring.read_message(&mut out), Ok(2));
         assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
 
-        // Непустое кольцо при «исчерпанном» счётчике: try_write отказывает,
-        // write вытесняет до пустого кольца и пишет -- цикл конечен.
+        // Непустое кольцо при «исчерпанном» счётчике (Task 18): лимит
+        // пересчитывается по кадрам -- в кольце 2 сообщения из 500, обе
+        // записи проходят без вытеснения (раньше try_write отказывал, а
+        // write вытеснял оба кадра из-за одного испорченного слова).
         ring.try_write_message(b"a1").unwrap();
         ring.try_write_message(b"a2").unwrap();
         header.message_count.store(u32::MAX, O::Relaxed);
-        assert_eq!(ring.try_write_message(b"zz"), Err(ShmError::QueueFull));
+        ring.try_write_message(b"yy").unwrap();
+        header.message_count.store(u32::MAX, O::Relaxed);
         let outcome = ring.write_message(b"zz").unwrap();
-        assert_eq!(outcome.overwritten, 2);
-        assert!(outcome.was_empty, "вытеснение опустошило кольцо");
-        assert_eq!(ring.read_message(&mut out), Ok(2));
-        assert_eq!(out, b"zz");
+        assert_eq!(outcome.overwritten, 0);
+        assert!(!outcome.was_empty);
+        for expected in [b"a1", b"a2", b"yy", b"zz"] {
+            assert_eq!(ring.read_message(&mut out), Ok(2));
+            assert_eq!(out, expected);
+        }
         assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
 
         header.message_count.store(0, O::Relaxed);
@@ -2016,11 +2061,14 @@ mod try_write_tests {
         }
     }
 
-    /// Ветка вытеснения `write_message` (лимит сообщений), пока читатель
-    /// «замер» между CAS `read_pos` и `decrement_count`: писатель вытесняет
-    /// следующий за забранным кадр, кольцо НЕ пусто -- сигнал не нужен
-    /// (`was_empty == false`), а устаревший снимок читателя перепроверкой
-    /// не подтверждается; читатель дочитывает всё, новый кадр -- последним.
+    /// Ветка лимита сообщений `write_message`, пока читатель «замер» между
+    /// CAS `read_pos` и `decrement_count`. Task 18: счётчик на пределе
+    /// пересчитывается по кадрам (`messages_between`) -- в кольце
+    /// `MAX_MESSAGES - 1` сообщений, вытеснения нет (до Task 18 здесь
+    /// вытеснялся кадр 1 -- на кадр раньше). Кольцо НЕ пусто -- сигнал не
+    /// нужен (`was_empty == false`), а устаревший снимок читателя
+    /// перепроверкой не подтверждается. Затем кольцо полно по-настоящему:
+    /// вытеснение ровно одного кадра, тоже без сигнала.
     #[test]
     fn data_signal_on_eviction_by_count_with_reader_mid_step() {
         let (ring, _mem) = make_ring();
@@ -2039,21 +2087,31 @@ mod try_write_tests {
             .unwrap();
 
         let outcome = ring.write_message(&u32::MAX.to_le_bytes()).unwrap();
-        assert_eq!(outcome.overwritten, 1, "лимит сообщений -- вытеснение");
+        assert_eq!(outcome.overwritten, 0, "счётчик отстал -- места хватает");
         assert!(
             !outcome.was_empty,
             "читатель не выбрал всё до кадра -- он не уснёт, сигнал не нужен"
         );
         assert!(!ring.confirm_empty(write0), "снимок устарел -- кадр виден");
         ring.decrement_count();
+        assert_eq!(header.message_count.load(O::Acquire), MAX_MESSAGES);
 
-        // Кадр 1 вытеснен; читатель получает 2..MAX_MESSAGES и новый кадр.
+        // Полно по кадрам: вытесняется кадр 1, сигнал не нужен.
+        let write1 = header.write_pos.load(O::Acquire);
+        let outcome = ring.write_message(&(u32::MAX - 1).to_le_bytes()).unwrap();
+        assert_eq!(outcome.overwritten, 1, "лимит сообщений -- вытеснение");
+        assert!(!outcome.was_empty);
+        assert!(!ring.confirm_empty(write1));
+
+        // Читатель получает 2..MAX_MESSAGES и оба новых кадра.
         for i in 2..MAX_MESSAGES {
             assert_eq!(ring.read_message(&mut out).unwrap(), 4);
             assert_eq!(out, i.to_le_bytes());
         }
-        assert_eq!(ring.read_message(&mut out).unwrap(), 4);
-        assert_eq!(out, u32::MAX.to_le_bytes());
+        for last in [u32::MAX, u32::MAX - 1] {
+            assert_eq!(ring.read_message(&mut out).unwrap(), 4);
+            assert_eq!(out, last.to_le_bytes());
+        }
         assert_eq!(
             ring.read_message(&mut out).err(),
             Some(ShmError::QueueEmpty)
@@ -3119,5 +3177,92 @@ mod drain_tests {
             ring.drain_message(&mut out, &mut bound),
             Err(ShmError::Corrupted)
         );
+    }
+}
+
+#[cfg(test)]
+mod lagging_count_tests {
+    //! Task 18 (наблюдение Task 21): законно отстающий `message_count`
+    //! (читатель уже сдвинул `read_pos` CAS-ом, но ещё не уменьшил счётчик)
+    //! не даёт ни раннего вытеснения, ни ложного `QueueFull`.
+    use super::overflow_race_tests::make_ring_with;
+    use super::try_write_tests::drop_count;
+    use super::*;
+
+    const LIMIT: u32 = 4;
+    const LEN: usize = 8;
+
+    /// Кольцо с `LIMIT` сообщениями; читатель «застыл» между CAS `read_pos`
+    /// за первое сообщение и декрементом счётчика.
+    fn ring_with_reader_in_window() -> (RingBuffer, overflow_race_tests::RingMem) {
+        let (ring, mem) = make_ring_with(&RingConfig::new(4096).max_messages(LIMIT));
+        for seq in 0..LIMIT {
+            ring.try_write_message(&[seq as u8; LEN]).unwrap();
+        }
+        let header = ring.header();
+        let read = header.read_pos.load(Ordering::Acquire);
+        header
+            .read_pos
+            .store(read + frame_size(LEN) as u32, Ordering::Release);
+        assert_eq!(header.message_count.load(Ordering::Acquire), LIMIT);
+        (ring, mem)
+    }
+
+    /// Прочитать всё оставшееся (первые байты payload).
+    fn drain(ring: &RingBuffer) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut seen = Vec::new();
+        while ring.read_message(&mut out).is_ok() {
+            seen.push(out[0]);
+        }
+        seen
+    }
+
+    /// Запись с перезаписью в окне отставания: в кольце `LIMIT - 1`
+    /// сообщений -- место по лимиту есть, вытеснять нечего.
+    #[test]
+    fn overwrite_does_not_evict_early() {
+        let (ring, _mem) = ring_with_reader_in_window();
+        let outcome = ring.write_message(&[9u8; LEN]).unwrap();
+        assert_eq!(outcome.overwritten, 0, "вытеснение на кадр раньше");
+        assert_eq!(drop_count(&ring), 0);
+        // Читатель завершает чтение (декремент) -- счётчик сходится с кадрами.
+        ring.decrement_count();
+        assert_eq!(ring.header().message_count.load(Ordering::Acquire), LIMIT);
+        // Теперь кольцо полно по-настоящему: вытесняется ровно один кадр.
+        assert_eq!(
+            ring.try_write_message(&[10u8; LEN]),
+            Err(ShmError::QueueFull)
+        );
+        let outcome = ring.write_message(&[10u8; LEN]).unwrap();
+        assert_eq!(outcome.overwritten, 1);
+        assert_eq!(drop_count(&ring), 1);
+        assert_eq!(drain(&ring), [2, 3, 9, 10]);
+    }
+
+    /// То же для записи без перезаписи: ложного `QueueFull` нет.
+    #[test]
+    fn try_write_is_not_refused() {
+        let (ring, _mem) = ring_with_reader_in_window();
+        ring.try_write_message(&[9u8; LEN]).unwrap();
+        ring.decrement_count();
+        assert_eq!(drain(&ring), [1, 2, 3, 9]);
+    }
+
+    /// Пересчёт не верит и порче: «счётчик на пределе» при `LIMIT - 1`
+    /// настоящих сообщениях -- запись без вытеснения; при `LIMIT` настоящих
+    /// -- ровно одно вытеснение (лимит по кадрам соблюдён).
+    #[test]
+    fn recount_bounds_the_limit_by_frames() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096).max_messages(LIMIT));
+        let header = ring.header();
+        for seq in 0..LIMIT - 1 {
+            ring.try_write_message(&[seq as u8; LEN]).unwrap();
+        }
+        header.message_count.store(u32::MAX - 1, Ordering::Release);
+        assert_eq!(ring.write_message(&[7u8; LEN]).unwrap().overwritten, 0);
+        header.message_count.store(LIMIT, Ordering::Release);
+        assert_eq!(ring.write_message(&[8u8; LEN]).unwrap().overwritten, 1);
+        assert_eq!(drain(&ring), [1, 2, 7, 8]);
     }
 }
