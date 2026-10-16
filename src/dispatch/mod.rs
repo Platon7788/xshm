@@ -56,14 +56,27 @@ pub struct ClientRegistration {
     pub pid: u32,
     pub revision: u16,
     pub name: String,
-    /// PID процесса, проведшего рукопожатие с лобби (0.10): взят сервером из
-    /// сегмента лобби и сверен по времени создания процесса
-    /// (`ProcessWatch::open_peer`), в отличие от заявленного `pid`. `None` --
-    /// пир PID не сообщил (старая версия), процесс не открылся (нет прав) или
-    /// время создания не совпало. Тот же PID обязан провести рукопожатие
-    /// выделенного канала, иначе канал закрывается до `on_client_connect`
-    /// (`on_error(Some(id), HandshakeFailed)`). `DispatchClient::connect`
-    /// поле игнорирует -- в запрос оно не попадает.
+    /// PID из рукопожатия лобби (0.10), заполняет сервер.
+    ///
+    /// PID и время создания процесса **сообщает сам пир** (пишет в сегмент
+    /// лобби); сервер лишь сверяет их с существующим процессом с этим PID
+    /// (`ProcessWatch::open_peer`). `Some` -- пир сообщил PID и ненулевое
+    /// время создания, и они согласуются с живым процессом; `None` -- PID или
+    /// время не сообщены (старая версия), процесс не открылся (нет прав) или
+    /// время не совпало.
+    ///
+    /// Это сверка согласованности самоописания, **не доказательство
+    /// личности**: локальный процесс может заявить чужие PID и время
+    /// создания (время читается с `PROCESS_QUERY_LIMITED_INFORMATION`), а
+    /// секция лобби с NULL DACL читаема -- имя канала не секрет.
+    /// Аутентификацию дают политика безопасности объектов (ObjectSecurity) и
+    /// приватное пространство имён. Внутри одной учётной записи границы нет.
+    ///
+    /// Если `Some`, рукопожатие выделенного канала обязан провести пир с тем
+    /// же PID и ненулевым согласованным временем создания, иначе канал
+    /// закрывается до `on_client_connect` (`on_error(Some(id),
+    /// HandshakeFailed)`). `DispatchClient::connect` поле игнорирует -- в
+    /// запрос оно не попадает.
     pub handshake_pid: Option<u32>,
 }
 
@@ -897,9 +910,10 @@ impl DispatchCore {
             pid: request.pid,
             revision: request.revision,
             name: request.name,
-            // PID из рукопожатия лобби (сверен по времени создания процесса),
-            // а не заявленный в запросе.
-            handshake_pid: lobby.peer_pid(),
+            // PID из рукопожатия лобби, а не заявленный в запросе: самоописание
+            // пира, согласованное с живым процессом по ненулевому времени
+            // создания (без времени -- `None`). Не аутентификация.
+            handshake_pid: lobby.verified_peer_pid(),
         };
 
         // Лимит и допуск -- ДО создания канала: отказ ничего не стоит.
@@ -1084,6 +1098,21 @@ fn retire(
     client_id: u32,
     client: DispatchedClient,
 ) {
+    if let Some(client) = retire_in_background(background, clients, handler, client_id, client) {
+        client.close(&**handler, client_id);
+    }
+}
+
+/// `retire` без закрытия на месте: поток закрытия не создался -- канал
+/// возвращается вызывающему, чтобы тот закрыл его (и позвал колбэки) уже
+/// без лога карты клиентов.
+fn retire_in_background(
+    background: &Background,
+    clients: &ClientMap,
+    handler: &Arc<dyn DispatchHandler>,
+    client_id: u32,
+    client: DispatchedClient,
+) -> Option<DispatchedClient> {
     // Канал в `Option`: при ошибке создания потока замыкание (вместе с
     // каналом) возвращается не всегда, поэтому достаём его сами.
     let slot = Arc::new(Mutex::new(Some(client)));
@@ -1098,23 +1127,24 @@ fn retire(
         }
     });
     match spawned {
-        Ok(handle) => background.lock_clean().push(handle),
-        Err(_) => {
-            let taken = slot.lock_clean().take();
-            if let Some(client) = taken {
-                client.close(&**handler, client_id);
-            }
+        Ok(handle) => {
+            background.lock_clean().push(handle);
+            None
         }
+        Err(_) => slot.lock_clean().take(),
     }
 }
 
 // ─── AutoProxyHandler — bridges AutoServer events to DispatchHandler ─────────
 
-/// Провёл ли рукопожатие канала тот же процесс, что и рукопожатие лобби
-/// (0.10). PID лобби неизвестен (пир старой версии, нет прав, время
-/// создания не сошлось) -- сверять не с чем, канал принимается, как до 0.10.
-/// Известен -- канал обязан провести процесс с тем же PID (тоже сверенным по
-/// времени создания); канал без PID при известном PID лобби -- чужой.
+/// Согласовано ли самоописание пира канала с самоописанием пира лобби
+/// (0.10; аргументы -- сверенные PID с ненулевым временем создания,
+/// `verified_peer_pid`). PID лобби не сверен (пир старой версии, без
+/// времени, нет прав, время не сошлось) -- сверять не с чем, канал
+/// принимается, как до 0.10. Сверен -- канал обязан провести пир с тем же
+/// сверенным PID; канал без PID или без времени создания при сверенном PID
+/// лобби отвергается (закрыто по умолчанию). Это проверка согласованности,
+/// не аутентификация (см. `ClientRegistration::handshake_pid`).
 fn channel_peer_matches(lobby: Option<u32>, channel: Option<u32>) -> bool {
     lobby.is_none_or(|pid| channel == Some(pid))
 }
@@ -1167,16 +1197,18 @@ impl AutoHandler for AutoProxyHandler {
             let Some(server) = self.slot.lock_clean().take() else {
                 return;
             };
-            // 0.10: канал обязан подключить тот же процесс, что прошёл
-            // лобби. Имя канала секретно, но любой, кто его узнал (или
-            // занял канал раньше клиента), иначе получил бы чужую
-            // регистрацию. Чужой канал закрывается ДО `on_client_connect`;
-            // закрытие -- через поток закрытия под логом карты (как в
-            // `on_disconnect_reason`: `stop()` его дождётся), колбэк -- уже
-            // без лога.
-            if !channel_peer_matches(self.info.handshake_pid, server.peer_pid()) {
+            // 0.10: сверка согласованности самоописания пира -- канал
+            // обязан подключить процесс с тем же сверенным PID (и ненулевым
+            // временем создания), что прошёл лобби. Это НЕ аутентификация:
+            // PID и время пир пишет в память сам, а время чужого процесса
+            // читаемо; защиту дают политика безопасности объектов и
+            // приватное пространство имён. Несогласованный канал
+            // закрывается ДО `on_client_connect`; закрытие -- через поток
+            // закрытия под логом карты (как в `on_disconnect_reason`:
+            // `stop()` его дождётся), колбэки -- только без лога.
+            if !channel_peer_matches(self.info.handshake_pid, server.verified_peer_pid()) {
                 self.disconnected.store(true, Ordering::Release);
-                retire(
+                let fallback = retire_in_background(
                     &self.background,
                     &self.clients,
                     &self.handler,
@@ -1189,6 +1221,11 @@ impl AutoHandler for AutoProxyHandler {
                     },
                 );
                 drop(clients);
+                // Поток закрытия не создался: закрываем на месте, но уже без
+                // лога (из своего worker-а join себя пропускается).
+                if let Some(client) = fallback {
+                    client.close(&*self.handler, self.client_id);
+                }
                 // Поток ожидания больше не нужен: слот пуст.
                 let _ = self.registered_event.set();
                 self.handler
@@ -3050,8 +3087,10 @@ mod tests {
         handler.release.store(true, Ordering::Release);
         stopper.join().unwrap();
         let (result, elapsed) = client_thread.join().unwrap();
+        // Путь `DISCONNECT` при ушедшей сессии лобби -- именно `NotConnected`
+        // (не `Timeout` и не `HandshakeFailed`).
         assert!(
-            result.is_err(),
+            matches!(result, Err(ShmError::NotConnected)),
             "регистрация у остановленного сервера: {result:?}"
         );
         assert!(
@@ -3064,6 +3103,8 @@ mod tests {
     #[derive(Default)]
     struct PidProbe {
         admitted: Mutex<Vec<Option<u32>>>,
+        /// `handshake_pid` объявленных клиентов.
+        connected: Mutex<Vec<Option<u32>>>,
         connects: AtomicU32,
         handshake_failures: AtomicU32,
     }
@@ -3074,7 +3115,7 @@ mod tests {
             Admission::Accept
         }
         fn on_client_connect(&self, _client_id: u32, info: &ClientRegistration) {
-            assert_eq!(info.handshake_pid, Some(std::process::id()));
+            self.connected.lock().unwrap().push(info.handshake_pid);
             self.connects.fetch_add(1, Ordering::AcqRel);
         }
         fn on_client_disconnect(&self, _client_id: u32) {}
@@ -3128,8 +3169,76 @@ mod tests {
             handler.connects.load(Ordering::Acquire) == 1
         });
         assert_eq!(*handler.admitted.lock().unwrap(), [Some(me), Some(me)]);
+        assert_eq!(*handler.connected.lock().unwrap(), [Some(me)]);
         assert_eq!(handler.handshake_failures.load(Ordering::Acquire), 1);
         client.stop();
+        server.stop();
+    }
+
+    /// Регистрация лобби с подменённым временем создания (тест: на этом
+    /// потоке); `None` -- время не подменять.
+    fn register_with_start(name: &str, start: Option<u64>) -> String {
+        crate::client::FORGED_START_TIME.with(|cell| cell.set(start));
+        let mut buf = Vec::new();
+        let result = lobby_register(
+            name,
+            &ClientRegistration::new(std::process::id(), 1, "probe"),
+            &DispatchClientOptions::default(),
+            &mut buf,
+        );
+        crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
+        result.unwrap().1
+    }
+
+    /// Подключение к каналу с подменённым временем создания (PID сообщается).
+    fn connect_channel_with_start(channel: &str, start: Option<u64>) -> SharedClient {
+        crate::client::FORGED_START_TIME.with(|cell| cell.set(start));
+        let client = SharedClient::connect_impl(channel, Duration::from_secs(5), true, None);
+        crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
+        client.unwrap()
+    }
+
+    /// Раунд 1 (закрыто по умолчанию): пир лобби без времени создания
+    /// (`0`) -- PID не сверен, `handshake_pid == None`, сверки канала нет.
+    #[test]
+    fn lobby_peer_without_start_time_is_unverified() {
+        let name = format!("TEST_DISPATCH_NOSTART_LOBBY_{}", std::process::id());
+        let handler = Arc::new(PidProbe::default());
+        let server =
+            DispatchServer::start(&name, handler.clone(), DispatchOptions::default()).unwrap();
+        let channel = register_with_start(&name, Some(0));
+        let peer = connect_channel_with_start(&channel, None);
+        wait_for("подключение", Duration::from_secs(5), || {
+            handler.connects.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(*handler.admitted.lock().unwrap(), [None]);
+        assert_eq!(*handler.connected.lock().unwrap(), [None]);
+        assert_eq!(handler.handshake_failures.load(Ordering::Acquire), 0);
+        drop(peer);
+        server.stop();
+    }
+
+    /// Раунд 1 (закрыто по умолчанию): PID лобби сверен, а пир канала с тем
+    /// же PID время создания не сообщил (`0`) -- канал отвергается, как при
+    /// несовпадении PID.
+    #[test]
+    fn channel_peer_without_start_time_is_rejected() {
+        let name = format!("TEST_DISPATCH_NOSTART_CHAN_{}", std::process::id());
+        let handler = Arc::new(PidProbe::default());
+        let server =
+            DispatchServer::start(&name, handler.clone(), DispatchOptions::default()).unwrap();
+        let channel = register_with_start(&name, None);
+        let peer = connect_channel_with_start(&channel, Some(0));
+        wait_for("отказ каналу", Duration::from_secs(5), || {
+            handler.handshake_failures.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(
+            *handler.admitted.lock().unwrap(),
+            [Some(std::process::id())]
+        );
+        assert_eq!(handler.connects.load(Ordering::Acquire), 0);
+        assert_eq!(server.client_count(), 0);
+        drop(peer);
         server.stop();
     }
 

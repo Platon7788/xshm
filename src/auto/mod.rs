@@ -236,6 +236,9 @@ struct ChannelState {
     ring_free_msgs: AtomicU32,
     peer_pid: AtomicU32,
     peer_status: AtomicU8,
+    /// Сервер: PID клиента, сверенный по ненулевому времени создания
+    /// (`0` -- не сверен); только для сверки PID канала Dispatch.
+    peer_verified_pid: AtomicU32,
     tx_max_message: AtomicUsize,
     layout: Mutex<Option<ChannelLayout>>,
 }
@@ -292,6 +295,7 @@ impl ChannelState {
     /// Worker: соединение разорвано. После смерти пира PID сохраняется
     /// (для диагностики), статус -- `PEER_DEAD` до следующего подключения.
     fn peer_disconnected(&self, reason: DisconnectReason) {
+        self.peer_verified_pid.store(0, Ordering::Release);
         if reason == DisconnectReason::PeerDied {
             self.peer_status.store(PEER_DEAD, Ordering::Release);
         } else {
@@ -757,6 +761,19 @@ impl AutoServer {
         self.endpoint.gauge.peer_pid()
     }
 
+    /// PID текущего клиента, сверенный по ненулевому времени создания
+    /// процесса (`SharedServer::verified_peer_pid`); публикуется worker-ом
+    /// до `on_connect`. Сверка самоописания, не аутентификация.
+    pub(crate) fn verified_peer_pid(&self) -> Option<u32> {
+        Some(
+            self.endpoint
+                .gauge
+                .peer_verified_pid
+                .load(Ordering::Acquire),
+        )
+        .filter(|&p| p != 0)
+    }
+
     /// Остановить сервер синхронно: очередь дописывается в кольцо (сколько
     /// влезет), клиент получает `DISCONNECT`, worker-поток джойнится -- после
     /// возврата колбэков нет. Повторный вызов и `Drop` после него -- no-op.
@@ -810,6 +827,9 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
                 Ok(true) => {
                     connected = true;
                     gauge.peer_connected(server.peer_pid());
+                    gauge
+                        .peer_verified_pid
+                        .store(server.verified_peer_pid().unwrap_or(0), Ordering::Release);
                     worker.handler.on_connect();
                 }
                 Ok(false) => continue,

@@ -42,6 +42,10 @@ pub struct SharedServer {
     /// Удерживаемый handle процесса клиента (если клиент 0.8+ передал PID и
     /// процесс удалось открыть) -- для детекции его смерти.
     peer: Option<ProcessWatch>,
+    /// Время создания процесса клиента, сообщённое им в рукопожатии и
+    /// сверенное при открытии `peer` (`0` -- клиент время не сообщил, сверки
+    /// не было; см. `verified_peer_pid`).
+    peer_start: u64,
     _mapping: Mapping,
 }
 
@@ -124,6 +128,7 @@ impl SharedServer {
             ring_rx,
             connected: false,
             peer: None,
+            peer_start: 0,
             _mapping: mapping,
         })
     }
@@ -330,6 +335,7 @@ impl SharedServer {
             return Err(ShmError::HandshakeFailed);
         }
         self.peer = ProcessWatch::open_peer(client_pid, client_start);
+        self.peer_start = if self.peer.is_some() { client_start } else { 0 };
 
         // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
         // опросом `server_state`.
@@ -381,6 +387,7 @@ impl SharedServer {
         self.connected = false;
         // Закрываем handle процесса бывшего клиента (RAII).
         self.peer = None;
+        self.peer_start = 0;
 
         // Сбрасываем состояние в shared memory для возможности reconnect
         let control = self.view.control_block();
@@ -544,6 +551,20 @@ impl SharedServer {
         self.peer.as_ref().map(ProcessWatch::pid)
     }
 
+    /// PID клиента, только если он сообщил и время создания процесса
+    /// (ненулевое), и оно совпало с процессом, открытым по этому PID
+    /// (`ProcessWatch::open_peer`). Это **сверка самоописания** пира с
+    /// существующим процессом, а не доказательство личности: PID и время
+    /// пир пишет в разделяемую память сам, а время чужого процесса читается
+    /// с `PROCESS_QUERY_LIMITED_INFORMATION`. Клиент без времени (`0`) --
+    /// `None`, «не сверен» (0.10, Dispatch: сверка PID канала).
+    pub(crate) fn verified_peer_pid(&self) -> Option<u32> {
+        self.peer
+            .as_ref()
+            .filter(|_| self.peer_start != 0)
+            .map(ProcessWatch::pid)
+    }
+
     /// Жив ли процесс клиента: `Some(true/false)` -- клиент наблюдается через
     /// удерживаемый handle процесса; `None` -- не подключён или наблюдения
     /// нет (клиент старой версии, не передал PID, или handle не открылся --
@@ -565,6 +586,7 @@ impl SharedServer {
     /// быть в наборе ожидания worker-а, который ещё спит, -- закрывать
     /// ожидаемый handle нельзя, worker закроет его сам после пробуждения).
     pub(crate) const fn take_peer(&mut self) -> Option<ProcessWatch> {
+        self.peer_start = 0;
         self.peer.take()
     }
 }
