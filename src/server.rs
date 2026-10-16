@@ -1,3 +1,5 @@
+use std::cell::Cell;
+use std::marker::PhantomData;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -95,6 +97,22 @@ impl ChannelConfig {
     }
 }
 
+/// Сервер single-client канала.
+///
+/// Одна сторона SPSC-канала: тип `Send`, но НЕ `Sync` -- им пользуется один
+/// поток за раз (компилятор не даст поделить `&SharedServer` между
+/// потоками). Для работы из нескольких потоков -- `AutoServer`/
+/// `MultiServer`/`DispatchServer` (свой worker и очередь отправки) или
+/// обёртка в `Mutex<SharedServer>`.
+///
+/// ```compile_fail,E0277
+/// fn share(server: &xshm::SharedServer) {
+///     std::thread::scope(|s| {
+///         s.spawn(|| server.try_send_to_client(b"a"));
+///         s.spawn(|| server.try_send_to_client(b"b"));
+///     });
+/// }
+/// ```
 #[derive(Debug)]
 pub struct SharedServer {
     // Порядок полей важен для Drop: кольца и view ссылаются на память
@@ -116,6 +134,12 @@ pub struct SharedServer {
     /// -- с последним handle пространство исчезает, и клиент не нашёл бы
     /// канал. Последним: закрывается после секции и событий.
     _namespace: Option<Arc<PrivateNamespace>>,
+    /// Делает тип `!Sync` (0.10, нулевой размер): кольцо -- SPSC, и
+    /// `&self`-методы (`try_send_*`, `send_*`, `receive_*`) из двух потоков
+    /// одновременно были бы гонкой данных на одной стороне канала. `Send`
+    /// сохраняется (см. `unsafe impl Send` ниже): владение можно передать
+    /// другому потоку, делить -- нельзя.
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 // SAFETY: все поля либо владеющие (`Mapping`), либо синхронизируются через
@@ -239,6 +263,7 @@ impl SharedServer {
             peer_start: 0,
             _namespace: None,
             _mapping: mapping,
+            _not_sync: PhantomData,
         })
     }
 

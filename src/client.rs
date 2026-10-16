@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -144,6 +145,20 @@ fn wait_ack(
     }
 }
 
+/// Клиент single-client канала.
+///
+/// Одна сторона SPSC-канала: тип `Send`, но НЕ `Sync` -- им пользуется один
+/// поток за раз. Для работы из нескольких потоков -- `AutoClient`/
+/// `MultiClient`/`DispatchClient` или обёртка в `Mutex<SharedClient>`.
+///
+/// ```compile_fail,E0277
+/// fn share(client: &xshm::SharedClient) {
+///     std::thread::scope(|s| {
+///         s.spawn(|| client.try_send_to_server(b"a"));
+///         s.spawn(|| client.try_send_to_server(b"b"));
+///     });
+/// }
+/// ```
 #[derive(Debug)]
 pub struct SharedClient {
     view: SharedView,
@@ -159,6 +174,12 @@ pub struct SharedClient {
     generation: u32,
     /// Последним: view и кольца указывают в эту память.
     _mapping: Mapping,
+    /// Делает тип `!Sync` (0.10, нулевой размер): кольцо -- SPSC, и
+    /// `&self`-методы (`try_send_*`, `send_*`, `receive_*`) из двух потоков
+    /// одновременно были бы гонкой данных на одной стороне канала. `Send`
+    /// сохраняется (см. `unsafe impl Send` ниже): владение можно передать
+    /// другому потоку, делить -- нельзя.
+    _not_sync: PhantomData<std::cell::Cell<()>>,
 }
 
 // SAFETY: см. `SharedServer` -- владеющий `Mapping` плюс атомарные операции в
@@ -312,6 +333,7 @@ impl SharedClient {
             peer,
             generation,
             _mapping: mapping,
+            _not_sync: PhantomData,
         })
     }
 
@@ -396,10 +418,14 @@ impl SharedClient {
     /// ```
     pub fn send_with(&mut self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
         self.ensure_connected()?;
-        // SAFETY: `&mut self` -- этот клиент (единственный писатель кольца
-        // Client -> Server по рукопожатию: сервер подключает одного клиента)
-        // на время `f` не используется больше никем: ни вложенной записи из
-        // `f`, ни другого потока.
+        // SAFETY: контракт `write_with` -- единственный писатель В ПРЕДЕЛАХ
+        // этой конечной точки: `&mut self` исключает вложенную запись из `f`
+        // и запись из другого потока через этот же клиент (тип ещё и
+        // `!Sync`). Второй, устаревший `SharedClient` того же сегмента в
+        // этом процессе -- уже не эта точка, а пир, нарушающий протокол
+        // (одна сторона на направление); это случай враждебного пира,
+        // принятый для неопубликованной области (Ruling 17): страдает только
+        // сообщение, которое получит сервер.
         let result = unsafe { self.ring_tx.write_with(len, f) }?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();

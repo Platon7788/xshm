@@ -330,17 +330,14 @@ fn shared_server_sees_client_death() {
 
     let big = vec![1u8; 60_000];
     while server.try_send_to_client(&big).is_ok() {}
-    let server = Arc::new(server);
-    let waiter = {
-        let server = server.clone();
-        thread::spawn(move || {
-            let r = server.wait_for_space(big.len(), Some(Duration::from_secs(20)));
-            (r, Instant::now())
-        })
-    };
+    // `SharedServer` -- `!Sync` (0.10): ждёт в своём потоке и возвращается.
+    let waiter = thread::spawn(move || {
+        let r = server.wait_for_space(big.len(), Some(Duration::from_secs(20)));
+        (r, Instant::now(), server)
+    });
     thread::sleep(Duration::from_millis(100)); // писатель уже спит в ожидании
     let t0 = peer.kill();
-    let (result, woke) = waiter.join().unwrap();
+    let (result, woke, server) = waiter.join().unwrap();
     assert_eq!(result, Err(ShmError::PeerDied));
     report("shared server wait_for_space", woke - t0);
     assert_eq!(server.is_peer_alive(), Some(false));
@@ -362,18 +359,16 @@ fn shared_client_sees_server_death() {
         client = SharedClient::connect(&name, Duration::from_millis(500)).ok();
         client.is_some()
     });
-    let client = Arc::new(client.unwrap());
+    let client = client.unwrap();
     assert_eq!(client.peer_pid(), Some(peer.pid()));
-    let poller = {
-        let client = client.clone();
-        thread::spawn(move || {
-            let r = client.poll_server(Some(Duration::from_secs(20)));
-            (r, Instant::now())
-        })
-    };
+    // `SharedClient` -- `!Sync` (0.10): ждёт в своём потоке и возвращается.
+    let poller = thread::spawn(move || {
+        let r = client.poll_server(Some(Duration::from_secs(20)));
+        (r, Instant::now(), client)
+    });
     thread::sleep(Duration::from_millis(100));
     let t0 = peer.kill();
-    let (result, woke) = poller.join().unwrap();
+    let (result, woke, client) = poller.join().unwrap();
     assert_eq!(result, Err(ShmError::PeerDied));
     report("shared client poll_server", woke - t0);
     assert_eq!(client.is_peer_alive(), Some(false));
