@@ -562,6 +562,28 @@ impl SharedServer {
         Ok(result)
     }
 
+    /// Отправка клиенту без перезаписи с заполнением на месте (zero-copy,
+    /// 0.10): `f` получает срез из `len` байт payload прямо в кольце
+    /// Server -> Client и заполняет его целиком; после возврата `f` кадр
+    /// публикуется (сигнал `DATA` -- как у `try_send_to_client`). Место и
+    /// ошибки -- как у `try_send_to_client` (`QueueFull` -- `f` не
+    /// вызывается); ждать места -- `wait_for_space(len, ..)`.
+    ///
+    /// Начальное содержимое среза не определено (остатки прежних кадров).
+    /// Срез -- неопубликованная часть разделяемой памяти: недоверенный
+    /// клиент, нарушая протокол, может менять эти байты во время `f` --
+    /// пострадает только сообщение, которое получит он сам.
+    pub fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
+        self.ensure_connected()?;
+        let result = self.ring_tx.write_with(len, f)?;
+        if let Some(ref events) = self.events
+            && result.was_empty
+        {
+            let _ = events.s2c.data.set();
+        }
+        Ok(result)
+    }
+
     /// Свободное место в кольце Server -> Client.
     ///
     /// Из потока, который пишет в это кольцо, -- нижняя граница: если
@@ -626,9 +648,10 @@ impl SharedServer {
         )
     }
 
-    /// Для auto-режима: заявка/снятие ожидания места в исходящем кольце.
-    pub(crate) fn arm_space_waiter(&self, frame: u32) {
-        self.ring_tx.arm_space_waiter(frame);
+    /// Для auto-режима: заявка (под payload длины `payload_len`, с PAD в
+    /// текущей позиции записи) и снятие ожидания места в исходящем кольце.
+    pub(crate) fn arm_space_waiter(&self, payload_len: usize) {
+        self.ring_tx.arm_space_waiter_for(payload_len);
     }
 
     pub(crate) fn disarm_space_waiter(&self) {
@@ -638,15 +661,44 @@ impl SharedServer {
     pub fn receive_from_client(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.ensure_connected()?;
         let len = self.ring_rx.read_message(buffer)?;
-        // Сигнализируем только если events доступны. SPACE -- когда кольцо
-        // опустело (как раньше) ИЛИ когда писатель оставил заявку и места
-        // ему теперь хватает (`try_send`/`wait_for_space` на той стороне).
+        self.signal_space_after_read();
+        Ok(len)
+    }
+
+    /// Zero-copy приём от клиента (0.10): `f` получает payload сообщения
+    /// срезом прямо из кольца Client -> Server, после возврата `f` сообщение
+    /// забирается (сигнал `SPACE` -- как у `receive_from_client`).
+    /// `Err(QueueEmpty)`/`Err(Corrupted)` -- `f` не вызывается;
+    /// `Err(Overrun)` -- клиент перезаписал кадр во время `f` (только запись
+    /// с перезаписью), результат `f` отброшен. Подробно --
+    /// `RingBuffer::read_with`.
+    ///
+    /// # Safety
+    /// Пока выполняется `f`, никто не изменяет байты этого сообщения в
+    /// разделяемой памяти (иначе -- гонка данных и TOCTOU в `f`). Выполнено,
+    /// когда клиент -- доверенный честный пир xshm, пишущий это направление
+    /// без перезаписи (`try_send_to_server`, `send_with`, `wait_for_space`;
+    /// не `send_to_server`). Для недоверенного клиента --
+    /// `receive_from_client` (копия с проверкой после копирования).
+    pub unsafe fn receive_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        self.ensure_connected()?;
+        // SAFETY: контракт `read_with` -- контракт этой функции (`# Safety`).
+        let result = unsafe { self.ring_rx.read_with(f) };
+        if result.is_ok() {
+            self.signal_space_after_read();
+        }
+        result
+    }
+
+    /// Сигнализируем только если events доступны. SPACE -- когда кольцо
+    /// опустело (как раньше) ИЛИ когда писатель оставил заявку и места ему
+    /// теперь хватает (`try_send`/`wait_for_space` на той стороне).
+    fn signal_space_after_read(&self) {
         if let Some(ref events) = self.events
             && (self.ring_rx.take_space_waiter() || self.ring_rx.is_empty())
         {
             let _ = events.c2s.space.set();
         }
-        Ok(len)
     }
 
     /// Ждать данных от клиента. `Ok(true)` -- в кольце есть сообщение,

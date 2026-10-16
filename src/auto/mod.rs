@@ -6,7 +6,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::client::{Interrupt, SharedClient};
-use crate::constants::{MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
+use crate::constants::{FRAME_ALIGN, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
@@ -133,6 +133,66 @@ pub struct AutoOptions {
     /// бюджет в итерациях -- разное время на разных машинах. По умолчанию
     /// -- `SpinPolicy::NONE` (без спина). Пиру не виден.
     pub spin: SpinPolicy,
+    /// Способ доставки входящих сообщений в `on_message` (0.10). По
+    /// умолчанию -- копия в буфер worker-а (`Delivery::COPY`); срез прямо
+    /// из кольца -- только через `unsafe` (`AutoOptions::zero_copy_delivery`).
+    pub delivery: Delivery,
+}
+
+/// Способ доставки входящих сообщений в `on_message` Auto (0.10).
+///
+/// [`Delivery::COPY`] (по умолчанию): worker копирует сообщение в свой
+/// буфер (с проверкой «перезаписано во время копии» -- ADR 11) и отдаёт
+/// срез буфера -- безопасно при любом пире. Zero-copy ([`Delivery::zero_copy`])
+/// отдаёт срез прямо из кольца разделяемой памяти, без копии; создать его
+/// можно только `unsafe` -- выбор «пир доверенный и пишет без перезаписи»
+/// подтверждает вызывающий.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Delivery {
+    zero_copy: bool,
+}
+
+impl Delivery {
+    /// Копия в буфер worker-а (по умолчанию).
+    pub const COPY: Self = Self { zero_copy: false };
+
+    /// Доставка срезом прямо из кольца.
+    ///
+    /// # Safety
+    /// Пока выполняется `on_message`, никто не изменяет байты сообщения в
+    /// разделяемой памяти (иначе -- гонка данных и TOCTOU в обработчике,
+    /// см. `SharedServer::receive_with`). Выполнено, когда пир -- доверенный
+    /// честный xshm, пишущий в эту сторону без перезаписи (`try_send`,
+    /// не `send`). Перезапись, всё же замеченная после `on_message`, даёт
+    /// `on_error(Overrun)` -- это защита в глубину, а не разрешение.
+    /// `on_message` держит кадр в кольце: долгий обработчик задерживает
+    /// освобождение места для писателя.
+    #[must_use]
+    pub const unsafe fn zero_copy() -> Self {
+        Self { zero_copy: true }
+    }
+
+    /// Доставка срезом из кольца включена.
+    #[must_use]
+    pub const fn is_zero_copy(self) -> bool {
+        self.zero_copy
+    }
+}
+
+impl AutoOptions {
+    /// Включить доставку `on_message` срезом прямо из кольца (zero-copy,
+    /// 0.10), без промежуточного буфера worker-а.
+    ///
+    /// # Safety
+    /// Контракт [`Delivery::zero_copy`]: пока выполняется `on_message`, пир
+    /// не изменяет байты сообщения (доверенный честный пир xshm, пишущий
+    /// без перезаписи).
+    #[must_use]
+    pub const unsafe fn zero_copy_delivery(mut self) -> Self {
+        // SAFETY: контракт `Delivery::zero_copy` -- контракт этой функции.
+        self.delivery = unsafe { Delivery::zero_copy() };
+        self
+    }
 }
 
 impl Default for AutoOptions {
@@ -147,6 +207,7 @@ impl Default for AutoOptions {
             security: ObjectSecurity::default(),
             namespace: None,
             spin: SpinPolicy::NONE,
+            delivery: Delivery::COPY,
         }
     }
 }
@@ -262,6 +323,8 @@ struct ChannelState {
     pending_msgs: AtomicUsize,
     pending_bytes: AtomicUsize,
     ring_free_bytes: AtomicUsize,
+    /// `FreeSpace::max_frame` того же снимка (0.10, с учётом PAD).
+    ring_max_frame: AtomicUsize,
     ring_free_msgs: AtomicU32,
     peer_pid: AtomicU32,
     peer_status: AtomicU8,
@@ -375,17 +438,31 @@ impl ChannelState {
     /// Опубликовать снимок свободного места кольца (только worker).
     fn publish_ring(&self, space: FreeSpace) {
         self.ring_free_bytes.store(space.bytes, Ordering::Release);
+        self.ring_max_frame
+            .store(space.max_frame, Ordering::Release);
         self.ring_free_msgs.store(space.messages, Ordering::Release);
     }
 
     /// Консервативная оценка места для НОВОГО сообщения: кольцо минус всё,
     /// что уже принято, но ещё не записано; слоты ограничены и кольцом, и
     /// свободным местом очереди `max_send_queue`.
+    ///
+    /// `max_frame` (0.10, PAD): без ожидающих сообщений -- из снимка кольца
+    /// (там позиция записи известна). С ожидающими позиция, с которой ляжет
+    /// новое сообщение, неизвестна, поэтому оценка -- наихудший PAD. Ожидающие
+    /// и новое пишутся подряд и занимают не больше свободного места
+    /// (`<= capacity`), значит пересекают конец кольца не больше одного раза
+    /// -- PAD на всю серию один и меньше вызвавшего его кадра: `<= max(F,
+    /// M) - 8`, где `F` -- новый кадр, `M` -- кадр максимального сообщения
+    /// направления (оценка сверху для любого ожидающего). Новый кадр `F`
+    /// помещается, если `pending + F + max(F, M) - 8 <= ring_bytes`; так как
+    /// `F <= M`, это `F <= bytes + 8 - M` (`pending_max_frame`).
     fn estimate(&self, max_send_queue: usize) -> FreeSpace {
         let pending_msgs = self.pending_msgs.load(Ordering::Acquire);
         let pending_bytes = self.pending_bytes.load(Ordering::Acquire);
         let ring_msgs = self.ring_free_msgs.load(Ordering::Acquire) as usize;
         let ring_bytes = self.ring_free_bytes.load(Ordering::Acquire);
+        let ring_max_frame = self.ring_max_frame.load(Ordering::Acquire);
         let queue_room = max_send_queue.saturating_sub(pending_msgs);
         let ring_room = ring_msgs.saturating_sub(pending_msgs);
         let bytes = ring_bytes.saturating_sub(pending_bytes);
@@ -393,12 +470,28 @@ impl ChannelState {
         if bytes == 0 || messages == 0 {
             return FreeSpace::ZERO;
         }
+        let max_message_size = self.tx_max_message.load(Ordering::Acquire);
+        let max_frame = if pending_msgs == 0 {
+            ring_max_frame.min(bytes)
+        } else {
+            pending_max_frame(bytes, frame_size(max_message_size))
+        };
         FreeSpace {
             bytes,
+            max_frame,
             messages,
-            max_message_size: self.tx_max_message.load(Ordering::Acquire),
+            max_message_size,
         }
     }
+}
+
+/// Наибольший новый кадр, гарантированно помещающийся после ожидающих
+/// сообщений при любой позиции записи: `bytes` -- свободное место кольца
+/// за вычетом ожидающих, `max_frame` -- кадр максимального сообщения
+/// направления (наихудший PAD серии -- `max_frame - 8`, см.
+/// `ChannelState::estimate`).
+const fn pending_max_frame(bytes: usize, max_frame: usize) -> usize {
+    (bytes + FRAME_ALIGN).saturating_sub(max_frame) & !(FRAME_ALIGN - 1)
 }
 
 /// Постановка сообщения в очередь (общая для `AutoServer`/`AutoClient`);
@@ -621,6 +714,7 @@ impl Worker {
             buffer,
             self.options.recv_batch,
             self.tx.reverse(),
+            self.options.delivery,
         )
     }
 
@@ -1279,7 +1373,7 @@ where
                 }
             }
             Err(ShmError::QueueFull) if msg.lossless && !armed => {
-                endpoint.arm_space_waiter(msg.frame() as u32);
+                endpoint.arm_space_waiter(msg.data.len());
                 armed = true;
                 outbox.push_front(msg);
             }
@@ -1315,6 +1409,9 @@ struct ReceiveOutcome {
 }
 
 /// Обрабатывает до `batch` сообщений за вызов.
+///
+/// `delivery` -- копия в `buffer` (по умолчанию) или срез прямо из кольца
+/// (`Delivery::zero_copy`, контракт подтверждён вызывающим `unsafe`).
 fn process_receive_queue<R>(
     endpoint: &R,
     handler: &Arc<dyn AutoHandler>,
@@ -1322,16 +1419,34 @@ fn process_receive_queue<R>(
     buffer: &mut Vec<u8>,
     batch: usize,
     direction: ChannelKind,
+    delivery: Delivery,
 ) -> ReceiveOutcome
 where
     R: ReceiveEndpoint,
 {
+    let deliver = |data: &[u8]| {
+        // Relaxed: статистика.
+        stats.received_messages.fetch_add(1, Ordering::Relaxed);
+        handler.on_message(direction, data);
+    };
     for _ in 0..batch.max(1) {
-        match endpoint.read(buffer) {
-            Ok(len) => {
-                // Relaxed: статистика.
-                stats.received_messages.fetch_add(1, Ordering::Relaxed);
-                handler.on_message(direction, &buffer[..len]);
+        let received = if delivery.zero_copy {
+            // SAFETY: `Delivery::zero_copy` создаётся только через `unsafe`
+            // (`AutoOptions::zero_copy_delivery`/`Delivery::zero_copy`), и его
+            // контракт -- ровно контракт `receive_with`: пир не меняет кадр,
+            // пока идёт `on_message`.
+            unsafe { endpoint.read_with(deliver) }
+        } else {
+            endpoint.read(buffer).map(|len| deliver(&buffer[..len]))
+        };
+        match received {
+            Ok(()) => {}
+            Err(err @ ShmError::Overrun) => {
+                // Писатель с перезаписью вытеснил кадр во время
+                // `on_message` (нарушение контракта zero-copy): сообщение
+                // потеряно, кольцо читается дальше -- спать с данными в
+                // кольце нельзя (новый `DATA` писатель может не дать).
+                handler.on_error(err);
             }
             Err(
                 ShmError::QueueEmpty
@@ -1370,12 +1485,19 @@ trait SendEndpoint {
     fn write(&self, data: &[u8]) -> Result<WriteOutcome>;
     fn try_write(&self, data: &[u8]) -> Result<WriteOutcome>;
     fn free_space(&self) -> FreeSpace;
-    fn arm_space_waiter(&self, frame: u32);
+    /// Заявка на место под payload длины `payload_len` (PAD учитывает
+    /// кольцо по своей позиции записи).
+    fn arm_space_waiter(&self, payload_len: usize);
     fn disarm_space_waiter(&self);
 }
 
 trait ReceiveEndpoint {
     fn read(&self, buffer: &mut Vec<u8>) -> Result<usize>;
+    /// Zero-copy чтение (`receive_with`).
+    ///
+    /// # Safety
+    /// Контракт `RingBuffer::read_with`: пир не меняет кадр, пока идёт `f`.
+    unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T>;
 }
 
 impl SendEndpoint for SharedServer {
@@ -1388,8 +1510,8 @@ impl SendEndpoint for SharedServer {
     fn free_space(&self) -> FreeSpace {
         SharedServer::free_space(self)
     }
-    fn arm_space_waiter(&self, frame: u32) {
-        SharedServer::arm_space_waiter(self, frame);
+    fn arm_space_waiter(&self, payload_len: usize) {
+        SharedServer::arm_space_waiter(self, payload_len);
     }
     fn disarm_space_waiter(&self) {
         SharedServer::disarm_space_waiter(self);
@@ -1399,6 +1521,10 @@ impl SendEndpoint for SharedServer {
 impl ReceiveEndpoint for SharedServer {
     fn read(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.receive_from_client(buffer)
+    }
+    unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        // SAFETY: контракт `receive_with` -- контракт этой функции.
+        unsafe { self.receive_with(f) }
     }
 }
 
@@ -1412,8 +1538,8 @@ impl SendEndpoint for SharedClient {
     fn free_space(&self) -> FreeSpace {
         SharedClient::free_space(self)
     }
-    fn arm_space_waiter(&self, frame: u32) {
-        SharedClient::arm_space_waiter(self, frame);
+    fn arm_space_waiter(&self, payload_len: usize) {
+        SharedClient::arm_space_waiter(self, payload_len);
     }
     fn disarm_space_waiter(&self) {
         SharedClient::disarm_space_waiter(self);
@@ -1423,6 +1549,10 @@ impl SendEndpoint for SharedClient {
 impl ReceiveEndpoint for SharedClient {
     fn read(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.receive_from_server(buffer)
+    }
+    unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
+        // SAFETY: контракт `receive_with` -- контракт этой функции.
+        unsafe { self.receive_with(f) }
     }
 }
 
@@ -1577,12 +1707,13 @@ mod lossless_tests {
         fn free_space(&self) -> FreeSpace {
             FreeSpace {
                 bytes: self.room.get() * 1000,
+                max_frame: self.room.get() * 1000,
                 messages: self.room.get() as u32,
                 max_message_size: MOCK_MAX,
             }
         }
-        fn arm_space_waiter(&self, frame: u32) {
-            self.armed.set(frame);
+        fn arm_space_waiter(&self, payload_len: usize) {
+            self.armed.set(frame_size(payload_len) as u32);
             self.arms.set(self.arms.get() + 1);
         }
         fn disarm_space_waiter(&self) {
@@ -1754,7 +1885,9 @@ mod lossless_tests {
     }
 
     /// Оценка места консервативна: вычитает ещё не записанное и ограничена
-    /// свободным местом очереди.
+    /// свободным местом очереди; `max_frame` без ожидающих -- из снимка
+    /// кольца, с ожидающими -- с наихудшим PAD (кадр максимального
+    /// сообщения минус 8).
     #[test]
     fn gauge_estimate_is_conservative() {
         let gauge = ChannelState::default();
@@ -1762,6 +1895,7 @@ mod lossless_tests {
         gauge.set_layout(ChannelLayout::DEFAULT, ChannelKind::ServerToClient);
         gauge.publish_ring(FreeSpace {
             bytes: 10_000,
+            max_frame: 6_000,
             messages: 100,
             max_message_size: 0,
         });
@@ -1769,6 +1903,7 @@ mod lossless_tests {
             gauge.estimate(8),
             FreeSpace {
                 bytes: 10_000,
+                max_frame: 6_000,
                 messages: 8,
                 max_message_size: crate::constants::DEFAULT_MAX_MESSAGE_SIZE,
             }
@@ -1778,9 +1913,32 @@ mod lossless_tests {
         let est = gauge.estimate(8);
         assert_eq!(est.bytes, 8_000);
         assert_eq!(est.messages, 6);
+        // Наихудший PAD серии -- кадр 65 535 байт минус 8: больше 8 000.
+        assert_eq!(est.max_frame, 0);
+        assert!(!est.fits(16));
         assert!(!gauge.try_acquire(10, 2), "очередь 2/2");
         gauge.release(1000);
         assert!(gauge.try_acquire(10, 2));
+
+        // Маленький лимит сообщения: место после ожидающих -- bytes + 8 - M.
+        let gauge = ChannelState::default();
+        let ring = crate::layout::RingConfig::new(64 << 10).max_message_size(1000);
+        gauge.set_layout(ChannelLayout::symmetric(ring), ChannelKind::ServerToClient);
+        gauge.publish_ring(FreeSpace {
+            bytes: 4_000,
+            max_frame: 3_000,
+            messages: 100,
+            max_message_size: 1000,
+        });
+        assert_eq!(gauge.estimate(8).max_frame, 3_000, "снимок кольца");
+        gauge.acquire(frame_size(1000));
+        let est = gauge.estimate(8);
+        assert_eq!(est.bytes, 4_000 - 1008);
+        assert_eq!(est.max_frame, 4_000 - 1008 + 8 - 1008);
+        assert!(est.fits(1000));
+        // Проверка оценки: ожидающий кадр 1008 + наихудший PAD 1000 + новый
+        // кадр 1008 = 3024 <= 4000.
+        assert!(1008 + 1000 + frame_size(1000) <= 4_000);
     }
 
     #[derive(Default)]

@@ -51,9 +51,10 @@ pub struct RingConfig {
     /// (`>= 1`). Политика писателя: при `send` с перезаписью лишние
     /// вытесняют старейшие, `try_send` получает `QueueFull`.
     pub max_messages: u32,
-    /// Максимальный размер payload одного сообщения (`>= 1`); кадр
-    /// (`FRAME_HEADER_SIZE` + payload, выровненный на `FRAME_ALIGN`) обязан
-    /// помещаться в пустое кольцо.
+    /// Максимальный размер payload одного сообщения: `1 ..= capacity / 2 -
+    /// FRAME_HEADER_SIZE` (0.10, [`max_payload_for`]) -- кадр вместе с
+    /// наихудшим PAD-кадром помещается в пустое кольцо при любой позиции
+    /// записи.
     pub max_message_size: usize,
 }
 
@@ -66,8 +67,8 @@ impl RingConfig {
     };
 
     /// Кольцо ёмкостью `capacity` без лимита числа сообщений (его ограничивает
-    /// только объём) и с максимальным сообщением, какое влезает в пустое
-    /// кольцо.
+    /// только объём) и с максимальным допустимым сообщением
+    /// ([`max_payload_for`]: половина кольца минус заголовок кадра).
     #[must_use]
     pub const fn new(capacity: usize) -> Self {
         Self {
@@ -113,7 +114,7 @@ impl RingConfig {
         }
         if self.max_message_size > max_payload_for(self.capacity) {
             return Err(ShmError::InvalidConfig(
-                "max_message_size does not fit into an empty ring (capacity - FRAME_HEADER_SIZE)",
+                "max_message_size must be <= capacity / 2 - FRAME_HEADER_SIZE (frame + worst-case PAD fit into an empty ring)",
             ));
         }
         Ok(())
@@ -126,11 +127,24 @@ impl Default for RingConfig {
     }
 }
 
-/// Наибольший payload, кадр которого помещается в пустое кольцо ёмкости
-/// `capacity` (кратной `FRAME_ALIGN`).
+/// Наибольший payload, кадр которого гарантированно помещается в пустое
+/// кольцо ёмкости `capacity` (степень двойки) при ЛЮБОЙ позиции записи:
+/// `capacity / 2 - FRAME_HEADER_SIZE` (0.10).
+///
+/// Вывод. Кадр `F = frame_size(len)` кратен 8; остаток кольца от позиции
+/// записи до конца `t` тоже кратен 8 и `>= 8`. При `F <= t` кадр ложится
+/// непрерывно и занимает `F`; иначе перед ним PAD-кадр на весь остаток, и
+/// запись занимает `t + F`. Наихудший остаток, при котором PAD ещё нужен, --
+/// `t = F - 8`, то есть запись занимает до `2F - 8` байт. Пустое кольцо
+/// примет кадр при любой позиции, только если `2F - 8 <= capacity`, т. е.
+/// `F <= capacity / 2 + 4`, а с кратностью 8 (`capacity / 2` кратна 8) --
+/// `F <= capacity / 2`. `frame_size(len) <= capacity / 2` равносильно
+/// `8 + len <= capacity / 2`. Граница точная: при `F > capacity / 2` позиция
+/// с остатком `F - 8` достижима, и там пустое кольцо кадр не примет --
+/// сообщение стало бы невставляемым навсегда.
 #[must_use]
 pub const fn max_payload_for(capacity: usize) -> usize {
-    capacity.saturating_sub(FRAME_HEADER_SIZE)
+    (capacity / 2).saturating_sub(FRAME_HEADER_SIZE)
 }
 
 /// Конфигурация обоих направлений канала.
@@ -543,9 +557,16 @@ mod tests {
         // Нулевые лимиты.
         assert!(RingConfig::DEFAULT.max_messages(0).validate().is_err());
         assert!(RingConfig::DEFAULT.max_message_size(0).validate().is_err());
-        // Сообщение, не помещающееся в пустое кольцо.
+        // Сообщение, которое вместе с наихудшим PAD не помещается в пустое
+        // кольцо (0.10): предел -- capacity / 2 - 8.
         let ring = RingConfig::new(4096);
-        assert_eq!(ring.max_message_size, 4096 - FRAME_HEADER_SIZE);
+        assert_eq!(ring.max_message_size, 4096 / 2 - FRAME_HEADER_SIZE);
+        assert!(ring.validate().is_ok());
+        assert!(ring.max_message_size(2041).validate().is_err());
+        assert!(ring.max_message_size(4096 - 8).validate().is_err());
         assert!(ring.max_message_size(4096 - 7).validate().is_err());
+        assert_eq!(max_payload_for(MAX_RING_CAPACITY), (512 << 20) - 8);
+        // Значения по умолчанию и лобби Dispatch -- в пределах.
+        assert!(DEFAULT_MAX_MESSAGE_SIZE <= max_payload_for(DEFAULT_RING_CAPACITY));
     }
 }

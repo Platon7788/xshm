@@ -4,15 +4,33 @@
 //! На этих архитектурах stores видны в порядке программы, что упрощает
 //! синхронизацию. НЕ портировать на ARM/RISC-V без доработки!
 //!
-//! Кадр (формат `0x0002_0000`): `u32 len LE` + `u32 flags` (0) + payload,
+//! Кадр (формат `0x0002_0000`): `u32 len LE` + `u32 flags` + payload,
 //! дополненный до кратного `FRAME_ALIGN` (8). Позиции кадров кратны 8, поэтому
-//! заголовок кадра не разрывается границей кольца; payload может.
+//! заголовок кадра не разрывается границей кольца.
+//!
+//! Непрерывные кадры (0.10): кадр целиком (заголовок + payload) лежит
+//! внутри кольца одним куском. Если до конца кольца кадр не помещается,
+//! писатель занимает остаток PAD-кадром (`flags = FRAME_PAD`, `len` =
+//! остаток − 8) и кладёт кадр с начала кольца; PAD и кадр публикуются ОДНОЙ
+//! записью `write_pos`. Поэтому payload можно отдать срезом прямо из кольца
+//! (`read_with`) и заполнить на месте (`write_with`). Цена -- предел
+//! `max_message_size <= capacity / 2 - 8` (`layout::max_payload_for`).
+//!
+//! Автомат чтения кадра в позиции `read` (`frame_at`):
+//! - `write - read == 0` -- пусто;
+//! - занятость больше ёмкости или `read` не кратна 8 -- `Corrupted`;
+//! - `flags` с битами кроме `FRAME_PAD` -- `Corrupted`;
+//! - PAD: обязан кончаться ровно на границе кольца (`index + 8 + len ==
+//!   capacity`) и лежать в опубликованных данных, иначе `Corrupted`;
+//!   читатель сдвигает `read_pos` за него (CAS) без доставки и без учёта;
+//! - сообщение: `len` в `MIN_MESSAGE_SIZE..=max_message_size`, кадр в
+//!   опубликованных данных и НЕ пересекает конец кольца, иначе `Corrupted`.
 //!
 //! Граница доверия: содержимое кольца и `RingHeader` пишет другой процесс.
 //! Читатель сверяет каждый кадр с `write_pos` (кадр не выходит за
-//! опубликованные данные), с лимитом размера сообщения кольца и с
-//! выравниванием -- мусор пира даёт `Corrupted`, а не зависание, панику или
-//! выход за пределы кольца.
+//! опубликованные данные), с лимитом размера сообщения кольца, с
+//! выравниванием и с границей кольца -- мусор пира даёт `Corrupted`, а не
+//! зависание, панику или выход за пределы кольца.
 
 use std::marker::PhantomData;
 use std::os::windows::io::AsHandle;
@@ -177,7 +195,7 @@ pub struct WriteOutcome {
     /// Сигналить `DATA`: после публикации кадра и полного барьера писатель
     /// увидел `read_pos ==` прежнему `write_pos` -- читатель уже выбрал всё,
     /// что было до этого кадра, и мог уснуть (протокол «публикация ->
-    /// перепроверка», см. `RingBuffer::commit`). Не «счётчик был 0»:
+    /// перепроверка», см. `RingBuffer::publish`). Не «счётчик был 0»:
     /// `message_count` читатель уменьшает ПОСЛЕ сдвига `read_pos`, и решение по
     /// нему теряло пробуждение. Лишний `true` безвреден, ложного `false` при
     /// спящем читателе нет.
@@ -203,8 +221,14 @@ pub const fn frame_size(payload_len: usize) -> usize {
 /// писатель мог уже занять часть места.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FreeSpace {
-    /// Свободные байты кольца. Сообщение занимает `frame_size(len)` байт.
+    /// Свободные байты кольца (всего, включая остаток до конца кольца,
+    /// который может уйти под PAD-кадр).
     pub bytes: usize,
+    /// Наибольший кадр (`frame_size(len)`, байты), который можно записать
+    /// прямо сейчас с учётом PAD-кадра (0.10): кадр ложится непрерывно до
+    /// конца кольца, либо после PAD -- с начала кольца. Не больше `bytes`.
+    /// Решение «влезет ли сообщение» принимается по нему, а не по `bytes`.
+    pub max_frame: usize,
     /// Сколько ещё сообщений можно положить до лимита `max_messages` кольца.
     pub messages: u32,
     /// Лимит размера payload этого кольца (`RingConfig::max_message_size`).
@@ -215,6 +239,7 @@ impl FreeSpace {
     /// Нулевое место: канал не подключён или кольцо заполнено.
     pub const ZERO: Self = Self {
         bytes: 0,
+        max_frame: 0,
         messages: 0,
         max_message_size: 0,
     };
@@ -222,24 +247,33 @@ impl FreeSpace {
     /// Поместится ли сейчас payload длины `payload_len` без перезаписи.
     /// Для недопустимых длин (`< MIN_MESSAGE_SIZE` или больше лимита кольца)
     /// -- всегда `false`: такие сообщения не принимаются никогда.
+    ///
+    /// Множество помещающихся длин -- всегда префикс `1..=max_payload()`:
+    /// кадр не длиннее `max_frame` помещается (см. `max_frame_for`).
     #[must_use]
     pub const fn fits(&self, payload_len: usize) -> bool {
         payload_len >= MIN_MESSAGE_SIZE
             && payload_len <= self.max_message_size
             && self.messages > 0
             && self.bytes >= frame_size(payload_len)
+            && self.max_frame >= frame_size(payload_len)
     }
 
     /// Максимальная длина payload, которая поместится прямо сейчас
     /// (`0` -- не поместится ни одно сообщение).
     #[must_use]
     pub const fn max_payload(&self) -> usize {
-        if self.messages == 0 || self.bytes < frame_size(MIN_MESSAGE_SIZE) {
+        let frame = if self.max_frame < self.bytes {
+            self.max_frame
+        } else {
+            self.bytes
+        };
+        if self.messages == 0 || frame < frame_size(MIN_MESSAGE_SIZE) {
             return 0;
         }
-        // Наибольший len с frame_size(len) <= bytes: выравнивание поглощает
+        // Наибольший len с frame_size(len) <= frame: выравнивание поглощает
         // до FRAME_ALIGN - 1 байт хвоста.
-        let room = (self.bytes & !(FRAME_ALIGN - 1)) - FRAME_HEADER_SIZE;
+        let room = (frame & !(FRAME_ALIGN - 1)) - FRAME_HEADER_SIZE;
         if room > self.max_message_size {
             self.max_message_size
         } else {
@@ -248,11 +282,42 @@ impl FreeSpace {
     }
 }
 
+/// Наибольший кадр, который помещается в `free` свободных байт, когда до
+/// конца кольца от позиции записи `tail` байт (оба кратны 8, `tail >= 8`).
+///
+/// Кадр `F` помещается, если `F <= min(free, tail)` (непрерывно до конца)
+/// или `tail + F <= free` (PAD на остаток + кадр с начала кольца). Первое
+/// множество -- префикс до `min(free, tail)`, второе -- `(tail, free -
+/// tail]`; вместе -- префикс до `max(min(free, tail), free - tail)`: если
+/// `free - tail <= tail`, второе множество пусто или внутри первого.
+pub(crate) const fn max_frame_for(free: usize, tail: usize) -> usize {
+    let contiguous = if free < tail { free } else { tail };
+    let after_pad = free.saturating_sub(tail);
+    if contiguous > after_pad {
+        contiguous
+    } else {
+        after_pad
+    }
+}
+
 /// Кадр, найденный читателем по позиции `read`.
 #[derive(Debug, Clone, Copy)]
 struct Frame {
+    /// Длина payload (у PAD -- длина заполнителя, без смысла для чтения).
     len: usize,
+    /// Сколько байт кадр занимает в кольце (сдвиг `read_pos` за него).
     total: u32,
+    /// PAD-кадр (`FRAME_PAD`): пропускается без доставки и без учёта.
+    pad: bool,
+}
+
+/// Место под кадр, найденное писателем (`RingBuffer::place`).
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    /// Индекс payload в данных кольца.
+    payload: usize,
+    /// Сдвиг `write_pos`: PAD (если есть) + кадр.
+    advance: u32,
 }
 
 #[derive(Debug)]
@@ -343,8 +408,9 @@ impl RingBuffer {
         if payload_len > self.max_message_size as usize {
             return Err(ShmError::MessageTooLarge);
         }
-        // max_message_size <= capacity - FRAME_HEADER_SIZE (RingConfig::validate),
-        // поэтому кадр всегда помещается в пустое кольцо и в u32.
+        // max_message_size <= capacity / 2 - FRAME_HEADER_SIZE
+        // (RingConfig::validate), поэтому кадр вместе с наихудшим PAD
+        // помещается в пустое кольцо при любой позиции записи и в u32.
         Ok(frame_size(payload_len) as u32)
     }
 
@@ -368,54 +434,21 @@ impl RingBuffer {
         unsafe { AtomicU32::from_ptr(word.cast()) }
     }
 
-    /// Скопировать `src` в кольцо с позиции `start` с переносом через
-    /// границу.
-    ///
-    /// # Safety
-    /// `start < capacity`, `src.len() <= capacity`.
-    unsafe fn copy_in(&self, start: usize, src: &[u8]) {
-        let capacity = self.capacity as usize;
-        let first = (capacity - start).min(src.len());
-        let (head, tail) = src.split_at(first);
-        // SAFETY: start < capacity (контракт функции) -- адрес внутри кольца.
-        let dst = unsafe { self.data_ptr().add(start) };
-        // SAFETY: [start, start+first) лежит внутри кольца (first <=
-        // capacity - start); источник -- локальный срез, не пересекается с
-        // разделяемой памятью.
-        unsafe { std::ptr::copy_nonoverlapping(head.as_ptr(), dst, head.len()) };
-        // SAFETY: [0, src.len()-first) лежит внутри кольца (src.len() <=
-        // capacity); источник -- локальный срез.
-        unsafe { std::ptr::copy_nonoverlapping(tail.as_ptr(), self.data_ptr(), tail.len()) };
+    /// Адрес байта `index` данных кольца. Само вычисление безопасно
+    /// (`wrapping_add`); разыменовывать адрес можно только при `index <
+    /// capacity` -- это обеспечивают вызывающие (`frame_at`, `place`).
+    const fn data_at(&self, index: usize) -> *mut u8 {
+        self.data_ptr().wrapping_add(index)
     }
 
-    /// Скопировать `len` байт из кольца с позиции `start` в `dst`.
+    /// Кадр в позиции `read` при опубликованном `write` (автомат -- в
+    /// документации модуля).
     ///
-    /// Копирование идёт сырыми указателями без промежуточного `&[u8]` на
-    /// разделяемую память: при перезаписи писатель может менять эти байты
-    /// одновременно (seqlock-валидация в `read_message` отбросит копию).
-    ///
-    /// # Safety
-    /// `start < capacity`, `len <= capacity`, `dst` -- `len` байт записи.
-    unsafe fn copy_out(&self, start: usize, dst: *mut u8, len: usize) {
-        let capacity = self.capacity as usize;
-        let first = (capacity - start).min(len);
-        // SAFETY: start < capacity (контракт функции) -- адрес внутри кольца.
-        let src = unsafe { self.data_ptr().add(start) };
-        // SAFETY: [start, start+first) внутри кольца, `dst` -- `len >= first`
-        // байт записи (контракт функции).
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, first) };
-        // SAFETY: first <= len -- адрес внутри буфера `dst`.
-        let dst_tail = unsafe { dst.add(first) };
-        // SAFETY: [0, len-first) внутри кольца (len <= capacity), `dst_tail`
-        // -- оставшиеся `len - first` байт записи.
-        unsafe { std::ptr::copy_nonoverlapping(self.data_ptr(), dst_tail, len - first) };
-    }
-
-    /// Кадр в позиции `read` при опубликованном `write`.
-    ///
-    /// `Ok(None)` -- кольцо пусто; `Err(Corrupted)` -- позиции или заголовок
-    /// кадра не согласуются (порча пиром или гонка с перезаписью -- решает
-    /// вызывающий, перечитав `read_pos`).
+    /// `Ok(None)` -- кольцо пусто; `Err(Corrupted)` -- позиции, заголовок
+    /// кадра или флаги не согласуются (порча пиром или гонка с перезаписью
+    /// -- решает вызывающий, перечитав `read_pos`). Найденный кадр всегда
+    /// лежит внутри данных кольца одним куском и внутри опубликованных
+    /// данных: на этом держится безопасность срезов `read_with`.
     fn frame_at(&self, read: u32, write: u32) -> Result<Option<Frame>> {
         let used = write.wrapping_sub(read);
         if used == 0 {
@@ -424,29 +457,47 @@ impl RingBuffer {
         if used > self.capacity || !(read as usize).is_multiple_of(FRAME_ALIGN) {
             return Err(ShmError::Corrupted);
         }
+        let index = self.mask_index(read);
+        // До конца кольца: кратно 8 и >= 8 (index кратен 8 и < capacity).
+        let tail = self.capacity as usize - index;
         // Relaxed: видимость байтов кадра дало Acquire-чтение write_pos.
-        let len = self
-            .header_word(self.mask_index(read))
-            .load(Ordering::Relaxed) as usize;
-        if !(MIN_MESSAGE_SIZE..=self.max_message_size as usize).contains(&len) {
-            return Err(ShmError::Corrupted);
-        }
-        let total = frame_size(len) as u32;
+        let len = self.header_word(index).load(Ordering::Relaxed) as usize;
+        let flags = self.header_word(index + 4).load(Ordering::Relaxed);
+        let (total, pad) = match flags {
+            0 => {
+                if !(MIN_MESSAGE_SIZE..=self.max_message_size as usize).contains(&len) {
+                    return Err(ShmError::Corrupted);
+                }
+                let total = frame_size(len);
+                // Payload больше не разрывается границей кольца (0.10).
+                if total > tail {
+                    return Err(ShmError::Corrupted);
+                }
+                (total, false)
+            }
+            // PAD обязан занимать ровно остаток кольца до границы; `len == 0`
+            // допустим (остаток -- один заголовок).
+            FRAME_PAD if len == tail - FRAME_HEADER_SIZE => (tail, true),
+            // PAD не до границы и любые неизвестные биты флагов.
+            _ => return Err(ShmError::Corrupted),
+        };
+        // total <= tail <= capacity -- помещается в u32.
+        let total = total as u32;
         if total > used {
             return Err(ShmError::Corrupted);
         }
-        Ok(Some(Frame { len, total }))
+        Ok(Some(Frame { len, total, pad }))
     }
 
-    /// Вытеснить старейшее сообщение (запись с перезаписью). `Ok(true)` --
-    /// вытеснено, `Ok(false)` -- читатель успел сдвинуть `read_pos`
-    /// (перепроверить место).
+    /// Вытеснить старейший кадр (запись с перезаписью). `Ok(true)` --
+    /// вытеснено сообщение, `Ok(false)` -- вытеснен PAD-кадр (не считается)
+    /// или читатель успел сдвинуть `read_pos` (перепроверить место).
     fn discard_oldest(&self, read: u32, write: u32) -> Result<bool> {
         let header = self.header();
         let Some(frame) = self.frame_at(read, write)? else {
             return Ok(false);
         };
-        // CAS: читатель может параллельно забрать это же сообщение.
+        // CAS: читатель может параллельно забрать этот же кадр.
         if header
             .read_pos
             .compare_exchange(
@@ -457,6 +508,10 @@ impl RingBuffer {
             )
             .is_err()
         {
+            return Ok(false);
+        }
+        if frame.pad {
+            // PAD -- не сообщение: ни message_count, ни drop_count.
             return Ok(false);
         }
         self.decrement_count();
@@ -478,7 +533,7 @@ impl RingBuffer {
     /// Занятость кольца для писателя с проверкой позиций из разделяемой
     /// памяти. Читатель-пир может испортить и `read_pos`, и (через тот же
     /// заголовок) `write_pos`: невыровненная позиция записи дала бы индекс
-    /// заголовка кадра у самого конца кольца, и `commit` писал бы ЗА его
+    /// заголовка кадра у самого конца кольца, и запись кадра писала бы ЗА его
     /// пределы. Позиции обязаны быть кратны `FRAME_ALIGN`, занятость -- не
     /// больше ёмкости; иначе `Corrupted` и ни одного байта в кольцо.
     const fn writer_used(&self, write: u32, read: u32) -> Result<u32> {
@@ -499,8 +554,10 @@ impl RingBuffer {
     /// Число итераций ограничено: вытеснение идёт только при `used > 0`
     /// (см. `admits`), каждая итерация либо сдвигает `read_pos` к
     /// `write_pos` (наше вытеснение или чтение читателя), либо застаёт
-    /// кольцо пустым -- а пустое кольцо кадр принимает всегда. `Corrupted`
-    /// -- только по позициям и заголовкам кадров, не по счётчику.
+    /// кольцо пустым -- а пустое кольцо кадр принимает всегда (вместе с
+    /// наихудшим PAD, `RingConfig::validate`). PAD-кадры вытесняются как
+    /// обычные, но в `overwritten`/`drop_count` не попадают. `Corrupted` --
+    /// только по позициям и заголовкам кадров, не по счётчику.
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
         let total = self.frame_len(payload.len())?;
         let header = self.header();
@@ -511,8 +568,21 @@ impl RingBuffer {
             let read = header.read_pos.load(Ordering::Acquire);
             let used = self.writer_used(write, read)?;
             let count = header.message_count.load(Ordering::Acquire);
-            if self.admits(used, total, count) {
-                let was_empty = self.commit(write, payload, total);
+            if self.admits(write, used, total, count) {
+                let place = self.place(write, payload.len(), total);
+                // SAFETY: `place` вернул индекс payload, за которым до конца
+                // кольца не меньше `payload.len()` байт; диапазон свободен
+                // (`admits`) и не опубликован -- читатель его не трогает;
+                // источник -- локальный срез, с разделяемой памятью не
+                // пересекается.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        payload.as_ptr(),
+                        self.data_at(place.payload),
+                        payload.len(),
+                    );
+                }
+                let was_empty = self.publish(write, place.advance);
                 return Ok(WriteOutcome {
                     overwritten,
                     was_empty,
@@ -540,7 +610,8 @@ impl RingBuffer {
     /// - атомарность сообщения та же, что у `write_message`: данные
     ///   копируются до публикации `write_pos`, читатель видит сообщение
     ///   целиком или не видит вовсе;
-    /// - `QueueFull` -- не хватает байт (`frame_size(len)`) или занято
+    /// - `QueueFull` -- не хватает байт (`frame_size(len)`, а если кадр не
+    ///   помещается до конца кольца -- PAD на остаток + кадр) или занято
     ///   `max_messages` слотов; проверка консервативна (см. `free_space`),
     ///   ложных успехов нет, ложный `QueueFull` возможен только если читатель
     ///   освободил место в тот же момент -- повтор увидит его;
@@ -554,29 +625,90 @@ impl RingBuffer {
     /// что писатель затем пишет в освобождённый диапазон, happens-after
     /// чтения этого диапазона читателем.
     pub fn try_write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
-        let total = self.frame_len(payload.len())?;
-        let header = self.header();
-
-        // write_pos меняет только этот (единственный) писатель; read_pos и
-        // message_count читатель может лишь уменьшать «занятость», поэтому
-        // значения ниже -- консервативная оценка свободного места.
-        let write = header.write_pos.load(Ordering::Acquire);
-        let read = header.read_pos.load(Ordering::Acquire);
-        let count = header.message_count.load(Ordering::Acquire);
-        let used = self.writer_used(write, read)?;
-        if !self.admits(used, total, count) {
-            return Err(ShmError::QueueFull);
+        let (write, place) = self.reserve(payload.len())?;
+        // SAFETY: `reserve` вернул индекс payload, за которым до конца кольца
+        // не меньше `payload.len()` байт; диапазон свободен и не опубликован
+        // -- читатель его не трогает; источник -- локальный срез, с
+        // разделяемой памятью не пересекается.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.as_ptr(),
+                self.data_at(place.payload),
+                payload.len(),
+            );
         }
-
-        let was_empty = self.commit(write, payload, total);
+        let was_empty = self.publish(write, place.advance);
         Ok(WriteOutcome {
             overwritten: 0,
             was_empty,
         })
     }
 
-    /// Принять ли кадр `total` байт при занятости `used` (позиции уже
-    /// проверены `writer_used`) и значении `message_count == count`.
+    /// Запись без перезаписи с заполнением на месте (zero-copy, 0.10):
+    /// `f` получает срез ровно из `len` байт payload прямо в кольце и
+    /// заполняет его; после возврата `f` кадр публикуется. Семантика места и
+    /// ошибок -- как у `try_write_message` (`QueueFull` -- `f` не
+    /// вызывается, кольцо не меняется).
+    ///
+    /// Срез -- ещё не опубликованная часть кольца: читатель-пир по
+    /// протоколу его не читает и не пишет, содержимое принадлежит писателю.
+    /// Начальное содержимое не определено (остатки прежних кадров): `f`
+    /// обязан записать все `len` байт, иначе уйдут старые байты. Паника в
+    /// `f` -- кадр не публикуется (кольцо как до вызова, кроме байтов
+    /// неопубликованной области).
+    ///
+    /// Граница доверия: враждебный пир, нарушая протокол, может писать в
+    /// эту область параллельно с `f` -- страдает только сообщение, которое
+    /// получит он сам (его же кольцо приёма); памяти писателя это не
+    /// касается.
+    pub fn write_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
+        let (write, place) = self.reserve(len)?;
+        // SAFETY: `reserve` вернул индекс payload, за которым до конца кольца
+        // не меньше `len` байт (кадр не пересекает границу); диапазон
+        // свободен и не опубликован, у честного пира к нему нет доступа до
+        // `publish` ниже, писатель кольца один (SPSC) -- `&mut` уникален на
+        // время `f`. Срез живёт только внутри `f`.
+        let buf = unsafe { std::slice::from_raw_parts_mut(self.data_at(place.payload), len) };
+        f(buf);
+        let was_empty = self.publish(write, place.advance);
+        Ok(WriteOutcome {
+            overwritten: 0,
+            was_empty,
+        })
+    }
+
+    /// Общая часть записи без перезаписи: проверка длины, позиций и места
+    /// (PAD + кадр), запись заголовков PAD/кадра. Возвращает прежний
+    /// `write_pos` и место payload; публикует вызывающий (`publish`).
+    ///
+    /// write_pos меняет только этот (единственный) писатель; read_pos и
+    /// message_count читатель может лишь уменьшать «занятость», поэтому
+    /// снимок ниже -- консервативная оценка свободного места.
+    fn reserve(&self, payload_len: usize) -> Result<(u32, Placement)> {
+        let total = self.frame_len(payload_len)?;
+        let header = self.header();
+        let write = header.write_pos.load(Ordering::Acquire);
+        let read = header.read_pos.load(Ordering::Acquire);
+        let count = header.message_count.load(Ordering::Acquire);
+        let used = self.writer_used(write, read)?;
+        if !self.admits(write, used, total, count) {
+            return Err(ShmError::QueueFull);
+        }
+        Ok((write, self.place(write, payload_len, total)))
+    }
+
+    /// Сколько байт займёт кадр `total` байт, записанный с позиции `write`:
+    /// сам кадр, если он помещается до конца кольца, иначе PAD на остаток +
+    /// кадр с начала кольца (`<= 2 * total - 8 <= capacity`, см.
+    /// `layout::max_payload_for`).
+    pub(crate) const fn frame_need(&self, write: u32, total: u32) -> u32 {
+        let tail = self.capacity - (write & self.mask);
+        if total <= tail { total } else { tail + total }
+    }
+
+    /// Принять ли кадр `total` байт с позиции `write` при занятости `used`
+    /// (позиции уже проверены `writer_used`) и значении `message_count ==
+    /// count`. Место -- PAD (если нужен) + кадр (`frame_need`).
     ///
     /// `message_count` -- подсказка, а не истина: его пишет и пир
     /// (недоверенный), и законно отстаёт на 1 -- читатель уменьшает его
@@ -584,14 +716,45 @@ impl RingBuffer {
     /// может показывать `count == max_messages` (при `max_messages = 1` --
     /// обычная гонка). Поэтому лимит сообщений вытесняет/отказывает только
     /// при `used > 0`; пустое кольцо принимает любой кадр, помещающийся по
-    /// байтам (а помещается любой допустимый: `max_message_size <=
-    /// capacity - FRAME_HEADER_SIZE`). Счётчик здесь не правим -- его
-    /// сводит насыщающий `decrement_count` читателя.
-    const fn admits(&self, used: u32, total: u32, count: u32) -> bool {
-        self.capacity - used >= total && (used == 0 || count < self.max_messages)
+    /// байтам (а помещается любой допустимый вместе с PAD: `max_message_size
+    /// <= capacity / 2 - FRAME_HEADER_SIZE`). PAD-кадры в лимит не входят.
+    /// Счётчик здесь не правим -- его сводит насыщающий `decrement_count`
+    /// читателя.
+    const fn admits(&self, write: u32, used: u32, total: u32, count: u32) -> bool {
+        self.capacity - used >= self.frame_need(write, total)
+            && (used == 0 || count < self.max_messages)
     }
 
-    /// Копирует кадр в позицию `write` и публикует его.
+    /// Записать заголовки кадра длины `len` (`total` байт) в позицию
+    /// `write`: при нужде сначала PAD-кадр на остаток кольца, затем
+    /// заголовок кадра (с начала кольца). Ничего не публикует.
+    ///
+    /// Вызывающий обязан предварительно убедиться (`admits`), что
+    /// `frame_need(write, total)` байт начиная с `write` свободны.
+    fn place(&self, write: u32, len: usize, total: u32) -> Placement {
+        let index = self.mask_index(write);
+        let tail = self.capacity as usize - index;
+        // Relaxed: заголовки публикует Release-запись write_pos в `publish`.
+        let (frame, pad) = if total as usize <= tail {
+            (index, 0)
+        } else {
+            // PAD до границы: len = остаток - заголовок (может быть 0).
+            self.header_word(index)
+                .store((tail - FRAME_HEADER_SIZE) as u32, Ordering::Relaxed);
+            self.header_word(index + 4)
+                .store(FRAME_PAD, Ordering::Relaxed);
+            (0, tail as u32)
+        };
+        self.header_word(frame).store(len as u32, Ordering::Relaxed);
+        self.header_word(frame + 4).store(0, Ordering::Relaxed);
+        Placement {
+            payload: frame + FRAME_HEADER_SIZE,
+            advance: pad + total,
+        }
+    }
+
+    /// Публикует записанные с позиции `write` PAD (если был) и кадр ОДНОЙ
+    /// записью `write_pos += advance` и решает, нужен ли сигнал `DATA`.
     /// Возвращает `true`, если читатель мог уснуть, не увидев кадр, --
     /// вызывающий сигналит `DATA` (`WriteOutcome::was_empty`).
     ///
@@ -605,31 +768,22 @@ impl RingBuffer {
     /// запись другой: либо читатель при перепроверке увидит новый
     /// `write_pos` и прочитает кадр, либо писатель увидит `read_pos ==
     /// write` (всё до кадра выбрано) и просигналит событие -- потерянного
-    /// пробуждения нет. `message_count` и `sequence` -- лимит и статистика,
-    /// на решение о сигнале не влияют.
-    ///
-    /// Вызывающий обязан предварительно убедиться, что `total` байт начиная
-    /// с `write` свободны и `message_count < max_messages`.
-    fn commit(&self, write: u32, payload: &[u8], total: u32) -> bool {
+    /// пробуждения нет. PAD и кадр видны читателю одновременно, поэтому
+    /// сравнение -- с `write` ДО PAD, правило §e.2 п. 1 применяется один раз.
+    /// `message_count` и `sequence` -- лимит и статистика, на решение о
+    /// сигнале не влияют.
+    fn publish(&self, write: u32, advance: u32) -> bool {
         let header = self.header();
-        let idx = self.mask_index(write);
-        // Relaxed: заголовок кадра публикует Release-запись write_pos ниже.
-        self.header_word(idx)
-            .store(payload.len() as u32, Ordering::Relaxed);
-        self.header_word(idx + 4).store(0, Ordering::Relaxed);
-        // SAFETY: idx + FRAME_HEADER_SIZE < capacity по модулю mask; payload
-        // не длиннее max_message_size <= capacity (frame_len).
-        unsafe {
-            self.copy_in((idx + FRAME_HEADER_SIZE) & self.mask as usize, payload);
-        }
-
+        // Заголовки и байты payload (копия или `write_with`) записаны выше по
+        // программе: Release-запись write_pos публикует их читателю.
         // ВАЖНО: сначала увеличиваем message_count, потом обновляем write_pos:
-        // писатель, проверяющий лимит, не увидит «лишнего» места. Прежнее
-        // значение счётчика на сигнал НЕ влияет (см. протокол выше).
+        // писатель, проверяющий лимит, не увидит «лишнего» места. PAD
+        // сообщением не считается. Прежнее значение счётчика на сигнал НЕ
+        // влияет (см. протокол выше).
         header.message_count.fetch_add(1, Ordering::AcqRel);
         header
             .write_pos
-            .store(write.wrapping_add(total), Ordering::Release);
+            .store(write.wrapping_add(advance), Ordering::Release);
 
         // Публикация write_pos упорядочена перед чтением read_pos -- первая
         // половина Dekker-пары с `confirm_empty` (на x86 -- mfence: TSO сам
@@ -653,9 +807,9 @@ impl RingBuffer {
     /// снимка `write_seen` (при котором `read_pos == write_seen`). `true` --
     /// пусто и спать безопасно: писатель, публикующий кадр позже, увидит
     /// `read_pos == write_seen` и просигналит `DATA` (Dekker-пара с
-    /// `commit`, см. там). `false` -- кадр появился, читать снова.
+    /// `publish`, см. там). `false` -- кадр появился, читать снова.
     fn confirm_empty(&self, write_seen: u32) -> bool {
-        // Парный фенс к `commit`: сдвиг read_pos этим читателем (CAS в
+        // Парный фенс к `publish`: сдвиг read_pos этим читателем (CAS в
         // `read_message`) упорядочен перед повторным чтением write_pos.
         fence(Ordering::SeqCst);
         self.header().write_pos.load(Ordering::Acquire) == write_seen
@@ -673,10 +827,14 @@ impl RingBuffer {
         let count = header.message_count.load(Ordering::Acquire);
         let used = write.wrapping_sub(read);
         let messages = self.max_messages.saturating_sub(count);
+        // Занятость больше ёмкости -- только на испорченном заголовке:
+        // трактуем как «места нет».
+        let bytes = self.capacity.saturating_sub(used) as usize;
+        // Остаток до конца кольца от позиции записи (под возможный PAD).
+        let tail = (self.capacity - (write & self.mask)) as usize;
         FreeSpace {
-            // Занятость больше ёмкости -- только на испорченном заголовке:
-            // трактуем как «места нет».
-            bytes: self.capacity.saturating_sub(used) as usize,
+            bytes,
+            max_frame: max_frame_for(bytes, tail),
             // Пустое кольцо принимает кадр при любом (отстающем) счётчике --
             // то же правило, что у записи (`admits`).
             messages: if used == 0 { messages.max(1) } else { messages },
@@ -684,7 +842,20 @@ impl RingBuffer {
         }
     }
 
-    /// Писатель: заявить, что ждём места под кадр `frame` байт.
+    /// Писатель: заявка на место под payload длины `payload_len` в текущей
+    /// позиции записи (`arm_space_waiter` с `frame_need`: PAD + кадр, если
+    /// кадр не помещается до конца кольца). Позицию записи меняет только
+    /// этот писатель, поэтому заявка остаётся верной, пока он ждёт.
+    pub(crate) fn arm_space_waiter_for(&self, payload_len: usize) {
+        // Длина проверена вызывающим (`frame_len`); `min` -- только чтобы
+        // испорченная длина не дала заявку больше кольца.
+        let total = frame_size(payload_len.min(self.max_message_size as usize)) as u32;
+        let write = self.header().write_pos.load(Ordering::Acquire);
+        self.arm_space_waiter(self.frame_need(write, total));
+    }
+
+    /// Писатель: заявить, что ждём `need` свободных байт (кадр с
+    /// выравниванием и, если нужен, PAD перед ним -- `frame_need`).
     ///
     /// Протокол «заявка -> перепроверка -> сон» (Dekker): писатель пишет
     /// заявку, ставит `fence(SeqCst)` и ЗАТЕМ перепроверяет место; читатель
@@ -693,9 +864,9 @@ impl RingBuffer {
     /// сторона увидит запись другой: либо писатель при перепроверке увидит
     /// освобождённое место, либо читатель увидит заявку и просигналит
     /// событие -- потерянного пробуждения нет.
-    pub(crate) fn arm_space_waiter(&self, frame: u32) {
+    pub(crate) fn arm_space_waiter(&self, need: u32) {
         // Relaxed: упорядочивание с последующей перепроверкой даёт fence ниже.
-        self.header().space_waiter.store(frame, Ordering::Relaxed);
+        self.header().space_waiter.store(need, Ordering::Relaxed);
         fence(Ordering::SeqCst);
     }
 
@@ -714,7 +885,9 @@ impl RingBuffer {
         // Парный фенс к `arm_space_waiter` (см. там): сдвиг read_pos в
         // read_message упорядочен перед чтением заявки.
         fence(Ordering::SeqCst);
-        // Relaxed: упорядочивание с read_pos обеспечил фенс выше.
+        // Relaxed: упорядочивание с read_pos обеспечил фенс выше. Заявка --
+        // байты под PAD + кадр в позиции записи писателя (`frame_need`),
+        // поэтому сравнивается со всеми свободными байтами.
         let frame = header.space_waiter.load(Ordering::Relaxed);
         if frame == 0 {
             return false;
@@ -737,48 +910,25 @@ impl RingBuffer {
     /// Возвращает длину payload; `Err(QueueEmpty)` -- сообщений нет,
     /// `Err(Corrupted)` -- пир испортил кольцо (позиции/заголовок кадра).
     pub fn read_message(&self, out: &mut Vec<u8>) -> Result<usize> {
-        let header = self.header();
-
         loop {
-            let read = header.read_pos.load(Ordering::Acquire);
-            // Acquire: всё, что писатель записал до публикации write_pos
-            // (заголовок и payload кадра), видно ниже.
-            let write = header.write_pos.load(Ordering::Acquire);
-            let frame = match self.frame_at(read, write) {
-                Ok(Some(frame)) => frame,
-                // Пусто по снимку -- перепроверка после полного барьера
-                // (вторая половина Dekker-пары с `commit`): кадр, опубликованный
-                // после снимка, читаем сейчас, а не ждём `DATA`, которого
-                // писатель тогда может не дать.
-                Ok(None) if self.confirm_empty(write) => return Err(ShmError::QueueEmpty),
-                Ok(None) => continue,
-                Err(err) => {
-                    // Заголовок мог быть «порван» перезаписью писателя: если
-                    // read_pos уже сдвинулся -- это гонка, повторяем.
-                    if header.read_pos.load(Ordering::Acquire) != read {
-                        continue;
-                    }
-                    return Err(err);
-                }
-            };
+            let (read, frame) = self.next_message()?;
 
-            // ОПТИМИСТИЧНОЕ копирование ДО фиксации read_pos (seqlock-паттерн).
-            // Если producer перезапишет слот во время копирования, CAS ниже
-            // провалится, и мы отбросим эту (потенциально битую) копию.
+            // ОПТИМИСТИЧНОЕ копирование ДО фиксации read_pos (seqlock-паттерн,
+            // ADR 11). Если producer перезапишет слот во время копирования,
+            // CAS ниже провалится, и мы отбросим эту (потенциально битую)
+            // копию. Копирование -- сырыми указателями, без `&[u8]` на
+            // разделяемую память: при перезаписи эти байты меняются
+            // одновременно.
             out.clear();
             out.reserve(frame.len);
-            // SAFETY: в `out` зарезервировано не меньше frame.len байт;
-            // frame.len <= max_message_size <= capacity, старт -- внутри
-            // кольца по маске.
+            // SAFETY: payload кадра лежит внутри кольца одним куском
+            // (`frame_at`: кадр не пересекает границу), в `out` зарезервировано
+            // не меньше frame.len байт, области не пересекаются.
             unsafe {
-                self.copy_out(
-                    self.mask_index(read.wrapping_add(FRAME_HEADER_SIZE as u32)),
-                    out.as_mut_ptr(),
-                    frame.len,
-                );
+                std::ptr::copy_nonoverlapping(self.payload_ptr(read), out.as_mut_ptr(), frame.len);
             }
             // SAFETY: первые frame.len байт только что инициализированы
-            // (`copy_out` выше), ёмкость зарезервирована.
+            // (копия выше), ёмкость зарезервирована.
             unsafe { out.set_len(frame.len) };
 
             // Барьер компилятора: копирование не должно «переехать» НИЖЕ CAS,
@@ -788,26 +938,120 @@ impl RingBuffer {
 
             // Фиксация: атомарно забираем кадр. Провал => producer сдвинул
             // read_pos (перезапись) => скопированные байты невалидны.
-            if header
-                .read_pos
-                .compare_exchange(
-                    read,
-                    read.wrapping_add(frame.total),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
+            if self.commit_read(read, frame) {
+                return Ok(frame.len);
             }
-
-            if self.decrement_count() <= 1 {
-                // Relaxed: счётчик статистики переходов non-empty -> empty.
-                header.sequence.fetch_add(1, Ordering::Relaxed);
-            }
-
-            return Ok(frame.len);
         }
+    }
+
+    /// Zero-copy чтение (0.10): `f` получает payload старейшего сообщения
+    /// срезом прямо из кольца (кадр непрерывен -- PAD-кадры пропускаются),
+    /// после возврата `f` кадр забирается (`read_pos` сдвигается).
+    ///
+    /// `Err(QueueEmpty)` -- сообщений нет, `Err(Corrupted)` -- пир испортил
+    /// кольцо (в обоих случаях `f` не вызывается); `Err(Overrun)` -- писатель
+    /// с перезаписью вытеснил кадр, пока шёл `f` (CAS `read_pos` не прошёл):
+    /// результат `f` отброшен, сообщение потеряно, следующее читается
+    /// следующим вызовом. Паника в `f` -- кадр остаётся непрочитанным.
+    ///
+    /// # Safety
+    /// Пока выполняется `f`, никто не изменяет байты этого кадра. Срез
+    /// указывает в разделяемую память: если её меняют во время `f`, это
+    /// гонка данных (UB), а проверка «после проверки» в `f` может читать уже
+    /// другие байты (TOCTOU: компилятор вправе перечитать «неизменяемую»
+    /// память). На практике контракт выполняется, когда писатель этого
+    /// направления -- честный пир xshm, пишущий БЕЗ перезаписи (`try_send*`,
+    /// `write_with`, `wait_for_space`; не `send` с overwrite-oldest), и пир
+    /// доверенный. Для недоверенных пиров -- копирующий `read_message`.
+    /// `Overrun` -- лишь защита в глубину: о перезаписи он сообщает уже
+    /// после `f`.
+    pub unsafe fn read_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        let (read, frame) = self.next_message()?;
+        // SAFETY: payload кадра -- `frame.len` байт внутри кольца одним
+        // куском и внутри опубликованных данных (`frame_at`), выровнен на 8,
+        // отображение живо всё время `&self`. Неизменность байтов на время
+        // `f` -- контракт вызывающего (`# Safety`).
+        let data = unsafe { std::slice::from_raw_parts(self.payload_ptr(read), frame.len) };
+        let result = f(data);
+        // Барьер компилятора: чтения из среза внутри `f` не должны
+        // «переехать» ниже CAS (см. `read_message`).
+        compiler_fence(Ordering::Release);
+        if self.commit_read(read, frame) {
+            Ok(result)
+        } else {
+            Err(ShmError::Overrun)
+        }
+    }
+
+    /// Адрес payload кадра в позиции `read`.
+    /// Для кадра, найденного `frame_at`, индекс кадра + заголовок + `len` <=
+    /// capacity: кадр лежит внутри кольца целиком.
+    const fn payload_ptr(&self, read: u32) -> *const u8 {
+        self.data_at(self.mask_index(read) + FRAME_HEADER_SIZE)
+            .cast_const()
+    }
+
+    /// Найти старейшее сообщение: пропустить PAD-кадры (CAS `read_pos` за
+    /// каждый, без учёта), перепроверить пустоту по Dekker-протоколу.
+    /// Возвращает позицию и кадр сообщения (ещё не забранного).
+    fn next_message(&self) -> Result<(u32, Frame)> {
+        let header = self.header();
+        loop {
+            let read = header.read_pos.load(Ordering::Acquire);
+            // Acquire: всё, что писатель записал до публикации write_pos
+            // (заголовки PAD/кадра и payload), видно ниже.
+            let write = header.write_pos.load(Ordering::Acquire);
+            match self.frame_at(read, write) {
+                Ok(Some(frame)) if frame.pad => {
+                    // PAD -- не сообщение: сдвинуть read_pos за него и искать
+                    // дальше. Провал CAS -- писатель вытеснил его сам.
+                    let _ = header.read_pos.compare_exchange(
+                        read,
+                        read.wrapping_add(frame.total),
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+                Ok(Some(frame)) => return Ok((read, frame)),
+                // Пусто по снимку -- перепроверка после полного барьера
+                // (вторая половина Dekker-пары с `publish`): кадр,
+                // опубликованный после снимка, читаем сейчас, а не ждём
+                // `DATA`, которого писатель тогда может не дать.
+                Ok(None) if self.confirm_empty(write) => return Err(ShmError::QueueEmpty),
+                Ok(None) => {}
+                Err(err) => {
+                    // Заголовок мог быть «порван» перезаписью писателя: если
+                    // read_pos уже сдвинулся -- это гонка, повторяем.
+                    if header.read_pos.load(Ordering::Acquire) != read {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    /// Забрать сообщение `frame` в позиции `read`: CAS `read_pos`. `false` --
+    /// писатель с перезаписью уже вытеснил кадр (прочитанное невалидно).
+    fn commit_read(&self, read: u32, frame: Frame) -> bool {
+        let header = self.header();
+        if header
+            .read_pos
+            .compare_exchange(
+                read,
+                read.wrapping_add(frame.total),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        if self.decrement_count() <= 1 {
+            // Relaxed: счётчик статистики переходов non-empty -> empty.
+            header.sequence.fetch_add(1, Ordering::Relaxed);
+        }
+        true
     }
 
     /// Писатель: дождаться, пока в кольце появится место под payload длины
@@ -838,7 +1082,7 @@ impl RingBuffer {
         timeout: Option<Duration>,
         spin: SpinPolicy,
     ) -> Result<bool> {
-        let frame = self.frame_len(payload_len)?;
+        self.frame_len(payload_len)?;
         let deadline = deadline_of(timeout);
         if timeout != Some(Duration::ZERO)
             && spin_until(spin, deadline, || self.free_space().fits(payload_len))
@@ -849,7 +1093,9 @@ impl RingBuffer {
             if self.free_space().fits(payload_len) {
                 return Ok(true);
             }
-            self.arm_space_waiter(frame);
+            // Заявка -- PAD + кадр в текущей позиции записи (её меняет только
+            // этот писатель, пока он ждёт, -- никто).
+            self.arm_space_waiter_for(payload_len);
             // Перепроверка ПОСЛЕ заявки -- вторая половина Dekker-протокола.
             if self.free_space().fits(payload_len) {
                 self.disarm_space_waiter();
@@ -965,7 +1211,7 @@ impl RingBuffer {
     /// до `QueueEmpty`), `Ok(false)` -- истёк `timeout`, `Err(PeerDied)` --
     /// процесс писателя завершился и всё, что он записал, прочитано.
     ///
-    /// Порядок: `is_empty` (с барьером, Dekker-пара с `commit`), затем
+    /// Порядок: `is_empty` (с барьером, Dekker-пара с `publish`), затем
     /// `spin` -- один бюджет на вызов с проверкой по позициям, затем ОДНО
     /// ожидание в ядре по `[DATA, процесс писателя]` (индекс 0 -- данные:
     /// при одновременном сигнале последние данные мёртвого пира не
@@ -1178,7 +1424,7 @@ mod try_write_tests {
 
     /// Детерминированный xorshift64* -- без внешних зависимостей (proptest
     /// в крейт не тянем: правило «никаких зависимостей без крайней нужды»).
-    struct Rng(u64);
+    pub(super) struct Rng(pub(super) u64);
     impl Rng {
         fn next(&mut self) -> u64 {
             let mut x = self.0;
@@ -1188,18 +1434,18 @@ mod try_write_tests {
             self.0 = x;
             x.wrapping_mul(0x2545_F491_4F6C_DD1D)
         }
-        fn below(&mut self, n: u64) -> u64 {
+        pub(super) fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
     }
 
-    fn drop_count(ring: &RingBuffer) -> u32 {
+    pub(super) fn drop_count(ring: &RingBuffer) -> u32 {
         ring.header().drop_count.load(O::Acquire)
     }
 
     /// Payload с seq в начале/середине/конце и детерминированным телом --
     /// по нему видно и потерю/перестановку, и порванное сообщение.
-    fn make_payload(seq: u32, len: usize) -> Vec<u8> {
+    pub(super) fn make_payload(seq: u32, len: usize) -> Vec<u8> {
         let mut v: Vec<u8> = (0..len)
             .map(|i| (i as u32).wrapping_mul(31).wrapping_add(seq) as u8)
             .collect();
@@ -1227,6 +1473,7 @@ mod try_write_tests {
     fn free_space_helpers_edge_cases() {
         let fs = |bytes, messages| FreeSpace {
             bytes,
+            max_frame: bytes,
             messages,
             max_message_size: MAX_MESSAGE_SIZE,
         };
@@ -1444,72 +1691,126 @@ mod try_write_tests {
         assert_eq!(drop_count(&ring), 0);
     }
 
-    /// Рандомизированная проверка кадрирования против модели (VecDeque):
-    /// случайные длины (с упором на границы 2/65535 и перенос через конец
-    /// кольца), случайное чередование записи и чтения, многократный wrap
-    /// позиций. Однопоточно предсказание QueueFull точное, поэтому модель
-    /// сверяет и сам факт отказа, и содержимое каждого прочитанного сообщения.
-    #[test]
-    fn randomized_framing_matches_model() {
-        let (ring, _mem) = make_ring();
-        let steps = if cfg!(miri) { 300 } else { 60_000 };
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
-        let mut model: VecDeque<Vec<u8>> = VecDeque::new();
+    /// Итог прогона модели кадрирования.
+    pub(super) struct ModelRun {
+        /// Сколько раз запись вставила PAD-кадр.
+        pub(super) pads: u32,
+        /// Сколько раз запись упёрлась в полное кольцо.
+        pub(super) fulls: u32,
+        /// Сколько раз позиция записи обошла кольцо.
+        pub(super) wraps: usize,
+    }
+
+    /// Рандомизированная модель кадрирования (VecDeque + позиция записи):
+    /// случайные длины (с упором на границы `1`/`max_message_size`),
+    /// случайное чередование записи (`try_write_message` или `write_with`)
+    /// и чтения (`read`), многократный wrap позиций. Модель знает правило
+    /// PAD (0.10): кадр, не помещающийся непрерывно до конца кольца,
+    /// предваряется PAD-кадром до границы, и место под запись -- PAD + кадр.
+    /// Однопоточно предсказание `QueueFull` точное, поэтому модель сверяет
+    /// и сам факт отказа, и `free_space`, и содержимое каждого сообщения.
+    pub(super) fn run_framing_model(
+        config: &RingConfig,
+        steps: usize,
+        seed: u64,
+        read: impl Fn(&RingBuffer) -> Result<Vec<u8>>,
+    ) -> ModelRun {
+        let (ring, _mem) = make_ring_with(config);
+        let cap = config.capacity;
+        let max_len = config.max_message_size;
+        let mut rng = Rng(seed);
+        // Сообщение и PAD перед ним (0 -- без PAD).
+        let mut model: VecDeque<(Vec<u8>, usize)> = VecDeque::new();
         let mut used = 0usize;
-        let mut out = Vec::new();
+        let mut write_index = 0usize;
         let mut seq = 0u32;
-        let mut fulls = 0u32;
-        for _ in 0..steps {
+        let (mut pads, mut fulls) = (0u32, 0u32);
+        for step in 0..steps {
             if rng.below(100) < 55 {
                 let len = match rng.below(10) {
                     0 => MIN_MESSAGE_SIZE,
-                    1 => MAX_MESSAGE_SIZE,
-                    2..=5 => 2 + rng.below(64) as usize,
-                    _ => 2 + rng.below((MAX_MESSAGE_SIZE - 1) as u64) as usize,
+                    1 => max_len,
+                    2..=5 => 1 + rng.below(64) as usize,
+                    _ => 1 + rng.below(max_len as u64) as usize,
                 };
                 let payload = make_payload(seq, len);
-                let fits_model =
-                    used + frame_size(len) <= RING_CAPACITY && (model.len() as u32) < MAX_MESSAGES;
-                assert_eq!(ring.free_space().fits(len), fits_model);
-                match ring.try_write_message(&payload) {
+                let frame = frame_size(len);
+                let tail = cap - write_index;
+                let pad = if frame <= tail { 0 } else { tail };
+                let fits_model = used + pad + frame <= cap
+                    && (model.is_empty() || (model.len() as u64) < u64::from(config.max_messages));
+                assert_eq!(ring.free_space().fits(len), fits_model, "шаг {step}");
+                let result = if rng.below(2) == 0 {
+                    ring.try_write_message(&payload)
+                } else {
+                    ring.write_with(len, |buf| buf.copy_from_slice(&payload))
+                };
+                match result {
                     Ok(o) => {
-                        assert!(fits_model, "try_write прошёл, хотя места нет по модели");
+                        assert!(fits_model, "запись прошла, хотя места нет по модели");
                         assert_eq!(o.overwritten, 0);
                         assert_eq!(o.was_empty, model.is_empty());
-                        used += frame_size(len);
-                        model.push_back(payload);
+                        used += pad + frame;
+                        write_index = (write_index + pad + frame) % cap;
+                        if pad > 0 {
+                            pads += 1;
+                        }
+                        model.push_back((payload, pad));
                         seq += 1;
                     }
                     Err(ShmError::QueueFull) => {
-                        assert!(!fits_model, "ложный QueueFull");
+                        assert!(!fits_model, "ложный QueueFull на шаге {step}");
                         fulls += 1;
                     }
                     Err(err) => panic!("unexpected {err:?}"),
                 }
             } else {
-                match ring.read_message(&mut out) {
-                    Ok(n) => {
-                        let expect = model.pop_front().expect("кольцо отдало лишнее");
-                        assert_eq!(n, expect.len());
-                        assert_eq!(out, expect);
-                        used -= frame_size(n);
+                match read(&ring) {
+                    Ok(got) => {
+                        let (expect, pad) = model.pop_front().expect("кольцо отдало лишнее");
+                        assert_eq!(got.len(), expect.len());
+                        assert_eq!(got, expect, "шаг {step}");
+                        used -= pad + frame_size(got.len());
                     }
                     Err(ShmError::QueueEmpty) => assert!(model.is_empty()),
                     Err(err) => panic!("unexpected {err:?}"),
                 }
             }
             let free = ring.free_space();
-            assert_eq!(free.bytes, RING_CAPACITY - used);
-            assert_eq!(free.messages, MAX_MESSAGES - model.len() as u32);
+            assert_eq!(free.bytes, cap - used, "шаг {step}");
+            assert_eq!(
+                free.messages,
+                config.max_messages.saturating_sub(model.len() as u32)
+            );
+            assert_eq!(
+                ring.header().message_count.load(O::Acquire),
+                model.len() as u32,
+                "PAD не считается сообщением"
+            );
         }
         assert_eq!(drop_count(&ring), 0);
+        ModelRun {
+            pads,
+            fulls,
+            wraps: ring.header().write_pos.load(O::Acquire) as usize / cap,
+        }
+    }
+
+    /// Модель кадрирования на кольце по умолчанию с копирующим чтением.
+    #[test]
+    fn randomized_framing_matches_model() {
+        let steps = if cfg!(miri) { 300 } else { 60_000 };
+        let run = run_framing_model(&RingConfig::DEFAULT, steps, 0x9E37_79B9_7F4A_7C15, |ring| {
+            let mut out = Vec::new();
+            ring.read_message(&mut out).map(|_| out)
+        });
         if !cfg!(miri) {
-            assert!(fulls > 0, "тест ни разу не упёрся в полное кольцо");
-            let total_written = ring.header().write_pos.load(O::Acquire) as usize;
+            assert!(run.fulls > 0, "тест ни разу не упёрся в полное кольцо");
+            assert!(run.pads > 0, "тест ни разу не вставил PAD");
             assert!(
-                total_written / RING_CAPACITY >= 10,
+                run.wraps >= 10,
                 "позиции обернулись всего {} раз",
-                total_written / RING_CAPACITY
+                run.wraps
             );
         }
     }
@@ -1624,21 +1925,33 @@ mod try_write_tests {
     /// всё до своего кадра (`read_pos ==` прежнему `write_pos`) -- решение
     /// «сигналить» верно (читатель с прежним снимком «пусто» иначе уснул
     /// бы), снимок до записи перепроверкой не подтверждается.
+    ///
+    /// 0.10 (PAD): кадр больше половины кольца недопустим, поэтому «не
+    /// входит» здесь из-за PAD -- пустое кольцо стоит на смещении 2048, кадр
+    /// 4096 байт ложится в [2048, 6144), второй такой же до конца кольца не
+    /// помещается (хвост 2048), нужно PAD 2048 + кадр = 6144 при свободных
+    /// 4096 -- первый кадр вытесняется, кольцо пустеет, пишутся PAD + кадр.
     #[test]
     fn data_signal_on_eviction_by_bytes_that_empties_ring() {
-        let config = RingConfig::new(4096);
+        let config = RingConfig::new(8192);
         let (ring, _mem) = make_ring_with(&config);
         let header = ring.header();
         let mut out = Vec::new();
-        const LEN: usize = 3000;
+        const LEN: usize = 4088;
+        assert_eq!(config.max_message_size, LEN);
+        header.write_pos.store(2048, O::Relaxed);
+        header.read_pos.store(2048, O::Relaxed);
         ring.write_message(&[1u8; LEN]).unwrap();
         let write0 = header.write_pos.load(O::Acquire);
+        assert_eq!(write0, 6144);
 
         let outcome = ring.write_message(&[2u8; LEN]).unwrap();
         assert_eq!(
             outcome.overwritten, 1,
-            "два кадра по 3000 в 4 КиБ не входят"
+            "PAD + второй кадр в остаток кольца не входят"
         );
+        assert_eq!(header.write_pos.load(O::Acquire), write0 + 2048 + 4096);
+        assert_eq!(drop_count(&ring), 1, "PAD не считается вытесненным");
         assert!(
             outcome.was_empty,
             "вытеснение выбрало всё до кадра -- read_pos == прежний write_pos"
@@ -2145,8 +2458,10 @@ mod try_write_tests {
 
 #[cfg(test)]
 mod tests {
-    //! Спин перед ожиданием в ядре (0.10, `SpinPolicy`).
-    use super::overflow_race_tests::make_ring;
+    //! Спин перед ожиданием в ядре (0.10, `SpinPolicy`); непрерывные кадры,
+    //! PAD и zero-copy (0.10, `read_with`/`write_with`).
+    use super::overflow_race_tests::{make_ring, make_ring_with};
+    use super::try_write_tests::{drop_count, run_framing_model};
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::Ordering as O;
@@ -2349,5 +2664,276 @@ mod tests {
         assert_eq!(space_waits() - before, 0, "спин ушёл в ядро");
         assert_eq!(ring.header().space_waiter.load(O::Acquire), 0);
         ring.try_write_message(&[1u8; LEN]).unwrap();
+    }
+
+    /// Слово заголовка кадра в позиции `pos`.
+    fn word(ring: &RingBuffer, pos: u32) -> u32 {
+        ring.header_word(ring.mask_index(pos)).load(O::Relaxed)
+    }
+
+    fn set_word(ring: &RingBuffer, pos: u32, value: u32) {
+        ring.header_word(ring.mask_index(pos))
+            .store(value, O::Relaxed);
+    }
+
+    /// Чтение через `read_with`: срез обязан лежать внутри данных кольца
+    /// одним куском (payload не разрывается границей).
+    fn read_contiguous(ring: &RingBuffer) -> Result<Vec<u8>> {
+        let base = ring.data_ptr().addr();
+        let end = base + ring.capacity as usize;
+        // SAFETY: однопоточный тест -- пока выполняется `f`, кадр никто не
+        // меняет (писатель -- этот же поток, он стоит).
+        unsafe {
+            ring.read_with(|data| {
+                let start = data.as_ptr().addr();
+                assert!(
+                    start >= base && start + data.len() <= end,
+                    "срез payload вне кольца"
+                );
+                data.to_vec()
+            })
+        }
+    }
+
+    /// 0.10: каждый `read_with` получает непрерывный срез, содержимое
+    /// совпадает с моделью (PAD-кадры вставлены и пропущены) -- на маленьком
+    /// кольце без лимита сообщений (частые PAD и обёртки) и на кольце по
+    /// умолчанию.
+    #[test]
+    fn payload_never_wraps() {
+        let steps = if cfg!(miri) { 300 } else { 40_000 };
+        let run = run_framing_model(
+            &RingConfig::new(64 << 10),
+            steps,
+            0x2545_F491_4F6C_DD1D,
+            read_contiguous,
+        );
+        if !cfg!(miri) {
+            assert!(run.pads > 0, "ни одного PAD");
+            assert!(run.fulls > 0, "ни разу не упёрлись в полное кольцо");
+            assert!(
+                run.wraps >= 10,
+                "позиции обернулись всего {} раз",
+                run.wraps
+            );
+        }
+        let run = run_framing_model(&RingConfig::DEFAULT, steps, 7, read_contiguous);
+        if !cfg!(miri) {
+            assert!(run.pads > 0, "ни одного PAD на кольце по умолчанию");
+        }
+    }
+
+    /// PAD-кадр: вставляется, когда кадр не помещается непрерывно до конца
+    /// кольца; занимает место (`free_space` учитывает PAD + кадр), но не
+    /// считается сообщением и не доставляется.
+    #[test]
+    fn pad_frame_is_skipped_and_accounted() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096));
+        let header = ring.header();
+        let mut out = Vec::new();
+        assert_eq!(ring.max_message_size(), 4096 / 2 - FRAME_HEADER_SIZE);
+        // A [0, 2008), B [2008, 4016); A прочитан: read_pos = 2008, хвост до
+        // конца кольца -- 80 байт.
+        ring.try_write_message(&[1u8; 2000]).unwrap();
+        ring.try_write_message(&[2u8; 2000]).unwrap();
+        assert_eq!(ring.read_message(&mut out), Ok(2000));
+        let free = ring.free_space();
+        assert_eq!(free.bytes, 4096 - 2008);
+        // Байт хватает на кадр 2048, но непрерывно -- нет: PAD 80 + 2048 > 2088.
+        assert!(free.bytes >= frame_size(2040));
+        assert!(!free.fits(2040), "свободное место учитывает PAD");
+        assert!(!free.fits(2001));
+        assert!(free.fits(2000), "PAD 80 + кадр 2008 == 2088");
+        assert_eq!(free.max_payload(), 2000);
+        assert_eq!(
+            ring.try_write_message(&[3u8; 2040]),
+            Err(ShmError::QueueFull)
+        );
+        assert_eq!(
+            ring.write_with(2040, |_| unreachable!("места нет")),
+            Err(ShmError::QueueFull)
+        );
+        assert_eq!(
+            header.write_pos.load(O::Acquire),
+            4016,
+            "отказ ничего не пишет"
+        );
+
+        let outcome = ring.try_write_message(&[4u8; 1992]).unwrap();
+        assert!(!outcome.was_empty, "B ещё не прочитан");
+        // PAD + кадр опубликованы одной записью write_pos.
+        assert_eq!(header.write_pos.load(O::Acquire), 4016 + 80 + 2000);
+        // PAD: len = 80 - 8, flags = FRAME_PAD; кадр -- с начала кольца.
+        assert_eq!(word(&ring, 4016), 72);
+        assert_eq!(word(&ring, 4020), FRAME_PAD);
+        assert_eq!(word(&ring, 0), 1992);
+        assert_eq!(word(&ring, 4), 0);
+        assert_eq!(
+            header.message_count.load(O::Acquire),
+            2,
+            "PAD -- не сообщение"
+        );
+        assert_eq!(ring.free_space().bytes, 4096 - (6096 - 2008));
+
+        // B, затем PAD пропускается без доставки -- сразу новое сообщение.
+        assert_eq!(ring.read_message(&mut out), Ok(2000));
+        assert_eq!(out, [2u8; 2000]);
+        assert_eq!(ring.read_message(&mut out), Ok(1992));
+        assert_eq!(out, [4u8; 1992]);
+        assert_eq!(header.read_pos.load(O::Acquire), 6096);
+        assert_eq!(header.message_count.load(O::Acquire), 0);
+        assert_eq!(drop_count(&ring), 0);
+        assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
+        assert_eq!(ring.free_space().bytes, 4096);
+    }
+
+    /// Писатель вытеснил кадр, пока `f` работал с ним: CAS `read_pos`
+    /// проваливается, результат `f` отбрасывается -- `Overrun`.
+    #[test]
+    fn read_with_reports_overrun() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096).max_messages(1));
+        let header = ring.header();
+        ring.write_message(b"first").unwrap();
+        let mut ran = false;
+        // SAFETY: вытеснение во время `f` -- по лимиту сообщений: писатель
+        // сдвигает только `read_pos` и пишет новый кадр ПОСЛЕ заимствованного
+        // ([16, 32) против [0, 16)) -- байты среза не меняются.
+        let result = unsafe {
+            ring.read_with(|data| {
+                assert_eq!(data, b"first");
+                let outcome = ring.write_message(b"second").unwrap();
+                assert_eq!(outcome.overwritten, 1);
+                ran = true;
+                data.len()
+            })
+        };
+        assert!(ran);
+        assert_eq!(result, Err(ShmError::Overrun), "результат f отброшен");
+        assert_eq!(drop_count(&ring), 1);
+        assert_eq!(header.message_count.load(O::Acquire), 1);
+        // SAFETY: однопоточно -- кадр никто не меняет.
+        let second = unsafe { ring.read_with(<[u8]>::to_vec) };
+        assert_eq!(second, Ok(b"second".to_vec()));
+        // SAFETY: см. выше.
+        let empty = unsafe { ring.read_with(|_| ()) };
+        assert_eq!(empty, Err(ShmError::QueueEmpty));
+    }
+
+    /// Позиции -- `u32` по модулю 2³² (Review Focus 5): PAD у самой границы
+    /// обёртки, чтение через неё и вытеснение старейшего PAD-кадра.
+    #[test]
+    fn pad_at_u32_wrap_boundary() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096));
+        let header = ring.header();
+        let mut out = Vec::new();
+        // Пустое кольцо за 24 байта до обёртки u32: индекс 4072, хвост 24.
+        let start = 0u32.wrapping_sub(24);
+        assert_eq!(ring.mask_index(start), 4072);
+        let reset = || {
+            header.write_pos.store(start, O::Relaxed);
+            header.read_pos.store(start, O::Relaxed);
+        };
+
+        // Чтение через границу: PAD [2^32-24, 2^32), кадр с начала кольца,
+        // write_pos оборачивается в 112.
+        reset();
+        let outcome = ring.write_message(&[1u8; 100]).unwrap();
+        assert!(outcome.was_empty);
+        assert_eq!(header.write_pos.load(O::Acquire), 112);
+        assert_eq!(word(&ring, start), 16);
+        assert_eq!(word(&ring, start.wrapping_add(4)), FRAME_PAD);
+        assert_eq!(ring.free_space().bytes, 4096 - 136);
+        assert_eq!(read_contiguous(&ring), Ok(vec![1u8; 100]));
+        assert_eq!(header.read_pos.load(O::Acquire), 112);
+        assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
+
+        // Вытеснение старейшего PAD у границы: M1 = PAD 24 + 112, M2 [112,
+        // 2120); M3 (кадр 2008) до конца не помещается (хвост 1976) -- нужно
+        // 3984 при свободных 1952: вытесняются PAD (не считается), M1 и M2.
+        reset();
+        ring.write_message(&[1u8; 100]).unwrap();
+        ring.write_message(&[2u8; 2000]).unwrap();
+        assert_eq!(header.write_pos.load(O::Acquire), 2120);
+        let outcome = ring.write_message(&[3u8; 2000]).unwrap();
+        assert_eq!(outcome.overwritten, 2, "PAD вытеснен, но не посчитан");
+        assert!(outcome.was_empty, "вытеснение выбрало всё до кадра");
+        assert_eq!(drop_count(&ring), 2);
+        assert_eq!(header.read_pos.load(O::Acquire), 2120);
+        assert_eq!(header.write_pos.load(O::Acquire), 2120 + 1976 + 2008);
+        assert_eq!(header.message_count.load(O::Acquire), 1);
+        assert_eq!(ring.read_message(&mut out), Ok(2000));
+        assert_eq!(out, [3u8; 2000]);
+        assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
+        assert_eq!(header.message_count.load(O::Acquire), 0);
+    }
+
+    /// Порча PAD-кадров и флагов пиром (Review Focus 1): читатель и
+    /// вытесняющий писатель отвечают `Corrupted` -- без доставки мусора,
+    /// выхода за кольцо и зацикливания.
+    #[test]
+    fn hostile_pad_frames_are_corrupted() {
+        // max_messages = 1: `write_message` при непустом кольце обязан
+        // вытеснять -- проверяем и путь писателя.
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096).max_messages(1));
+        let header = ring.header();
+        let expect_corrupted = |what: &str| {
+            let mut out = Vec::new();
+            assert_eq!(
+                ring.read_message(&mut out),
+                Err(ShmError::Corrupted),
+                "{what}"
+            );
+            // SAFETY: однопоточно; `f` не вызывается вовсе (порча).
+            let zero_copy = unsafe {
+                ring.read_with(|_| unreachable!("{what}: доставлен мусор"))
+            };
+            assert_eq!(zero_copy, Err(ShmError::Corrupted), "{what}");
+            assert_eq!(ring.write_message(b"x"), Err(ShmError::Corrupted), "{what}");
+        };
+        let at = |pos: u32| {
+            header.write_pos.store(pos, O::Relaxed);
+            header.read_pos.store(pos, O::Relaxed);
+            header.message_count.store(0, O::Relaxed);
+        };
+
+        // PAD с len за пределом кольца.
+        at(0);
+        ring.try_write_message(b"payload").unwrap();
+        set_word(&ring, 0, u32::MAX - 7);
+        set_word(&ring, 4, FRAME_PAD);
+        expect_corrupted("PAD len за пределом кольца");
+
+        // PAD посреди кольца (не до границы).
+        set_word(&ring, 0, 8);
+        expect_corrupted("PAD не до границы кольца");
+
+        // Неизвестный бит флагов обычного кадра.
+        set_word(&ring, 0, 7);
+        set_word(&ring, 4, 2);
+        expect_corrupted("неизвестный бит флагов");
+
+        // Настоящий PAD у границы с лишним битом флагов.
+        at(4072);
+        ring.try_write_message(&[5u8; 100]).unwrap();
+        assert_eq!(word(&ring, 4072), 16);
+        set_word(&ring, 4076, FRAME_PAD | 2);
+        expect_corrupted("PAD с неизвестным битом");
+
+        // PAD за пределом опубликованных данных (write_pos внутри PAD).
+        set_word(&ring, 4076, FRAME_PAD);
+        header.write_pos.store(4072 + 16, O::Relaxed);
+        expect_corrupted("PAD за write_pos");
+
+        // PAD, выходящий за конец кольца на 8 байт.
+        header.write_pos.store(4072 + 136, O::Relaxed);
+        set_word(&ring, 4072, 24);
+        expect_corrupted("PAD за концом кольца");
+
+        // Обычный кадр, payload которого пересекает конец кольца.
+        at(4072);
+        ring.try_write_message(&[6u8; 8]).unwrap();
+        set_word(&ring, 4072, 20);
+        header.write_pos.store(4072 + 32, O::Relaxed);
+        expect_corrupted("payload через границу");
     }
 }

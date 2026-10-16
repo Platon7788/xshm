@@ -379,6 +379,18 @@ impl SharedClient {
         Ok(result)
     }
 
+    /// Отправка серверу без перезаписи с заполнением на месте (zero-copy,
+    /// 0.10; семантика -- `SharedServer::send_with`): `f` заполняет `len`
+    /// байт payload прямо в кольце Client -> Server.
+    pub fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
+        self.ensure_connected()?;
+        let result = self.ring_tx.write_with(len, f)?;
+        if result.was_empty {
+            let _ = self.events.c2s.data.set();
+        }
+        Ok(result)
+    }
+
     /// Свободное место в кольце Client -> Server (нижняя граница из потока
     /// писателя, см. `SharedServer::free_space`). Вне подключения --
     /// `FreeSpace::ZERO`.
@@ -426,9 +438,10 @@ impl SharedClient {
         )
     }
 
-    /// Для auto-режима: заявка/снятие ожидания места в исходящем кольце.
-    pub(crate) fn arm_space_waiter(&self, frame: u32) {
-        self.ring_tx.arm_space_waiter(frame);
+    /// Для auto-режима: заявка (под payload длины `payload_len`, с PAD в
+    /// текущей позиции записи) и снятие ожидания места в исходящем кольце.
+    pub(crate) fn arm_space_waiter(&self, payload_len: usize) {
+        self.ring_tx.arm_space_waiter_for(payload_len);
     }
 
     pub(crate) fn disarm_space_waiter(&self) {
@@ -438,12 +451,36 @@ impl SharedClient {
     pub fn receive_from_server(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.ensure_connected()?;
         let len = self.ring_rx.read_message(buffer)?;
-        // SPACE -- когда кольцо опустело ИЛИ писатель-сервер ждёт места и
-        // его теперь хватает (см. `SharedServer::receive_from_client`).
+        self.signal_space_after_read();
+        Ok(len)
+    }
+
+    /// Zero-copy приём от сервера (0.10; семантика и ошибки --
+    /// `SharedServer::receive_with`): `f` получает payload срезом прямо из
+    /// кольца Server -> Client.
+    ///
+    /// # Safety
+    /// Пока выполняется `f`, никто не изменяет байты этого сообщения в
+    /// разделяемой памяти. Выполнено, когда сервер -- доверенный честный пир
+    /// xshm, пишущий это направление без перезаписи (`try_send_to_client`,
+    /// `send_with`, `wait_for_space`; не `send_to_client`). Для
+    /// недоверенного сервера -- `receive_from_server`.
+    pub unsafe fn receive_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        self.ensure_connected()?;
+        // SAFETY: контракт `read_with` -- контракт этой функции (`# Safety`).
+        let result = unsafe { self.ring_rx.read_with(f) };
+        if result.is_ok() {
+            self.signal_space_after_read();
+        }
+        result
+    }
+
+    /// SPACE -- когда кольцо опустело ИЛИ писатель-сервер ждёт места и его
+    /// теперь хватает (см. `SharedServer::receive_from_client`).
+    fn signal_space_after_read(&self) {
         if self.ring_rx.take_space_waiter() || self.ring_rx.is_empty() {
             let _ = self.events.s2c.space.set();
         }
-        Ok(len)
     }
 
     /// Ждать данных от сервера (семантика -- `SharedServer::poll_client`).

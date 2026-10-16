@@ -32,6 +32,11 @@ pub enum ShmError {
     /// Формат данных в буфере повреждён или некорректен.
     #[error("shared ring buffer is corrupted")]
     Corrupted,
+    /// Zero-copy чтение (`receive_with`, 0.10): писатель вытеснил кадр
+    /// (запись с перезаписью), пока замыкание работало с его срезом.
+    /// Результат замыкания отброшен, сообщение потеряно -- как вытесненное.
+    #[error("message was overwritten by the writer while it was being read")]
+    Overrun,
     /// Не удалось выполнить handshake между участниками.
     #[error("handshake failed")]
     HandshakeFailed,

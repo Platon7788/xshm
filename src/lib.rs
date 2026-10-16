@@ -26,7 +26,9 @@ pub(crate) mod ntapi;
 #[cfg(test)]
 mod peer_tests;
 
-pub use auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind};
+pub use auto::{
+    AutoClient, AutoHandler, AutoOptions, AutoServer, AutoStatsSnapshot, ChannelKind, Delivery,
+};
 pub use beacon::{Beacon, ProcessExit, Waitable, wait_any};
 pub use client::SharedClient;
 /// Лимиты и значения по умолчанию раскладки -- нужны потребителям, которые
@@ -34,7 +36,8 @@ pub use client::SharedClient;
 /// число слотов). Фактические параметры канала -- `ChannelLayout`.
 pub use constants::{
     DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_MAX_MESSAGES, DEFAULT_RING_CAPACITY, FRAME_ALIGN,
-    FRAME_HEADER_SIZE, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE, MIN_RING_CAPACITY, SHARED_VERSION,
+    FRAME_HEADER_SIZE, FRAME_PAD, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE, MIN_RING_CAPACITY,
+    SHARED_VERSION,
 };
 pub use dispatch::{
     Admission, ClientRegistration, DEFAULT_LOBBY_LAYOUT, DispatchClient, DispatchClientHandler,

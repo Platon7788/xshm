@@ -241,12 +241,13 @@ fn multi_slots_use_configured_layout() {
     });
     assert_eq!(client.layout(), Some(layout));
 
-    // Сообщение больше 64 КиБ не помещается в кольцо 64 КиБ -- синхронный отказ.
+    // Сообщение больше `capacity / 2 - 8` (0.10, PAD) в кольцо 64 КиБ не
+    // принимается -- синхронный отказ; максимальное доходит.
     assert_eq!(
-        client.send(&[0u8; 64 << 10]),
+        client.send(&[0u8; (32 << 10) - 7]),
         Err(ShmError::MessageTooLarge)
     );
-    let msg = payload((64 << 10) - 8, 1);
+    let msg = payload((32 << 10) - 8, 1);
     client.send(&msg).unwrap();
     let id = client.slot_id();
     server.send_to(id, b"hello").unwrap();

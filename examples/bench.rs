@@ -5,9 +5,10 @@
 //! cargo run --release --example bench -- throughput 16 5
 //! cargo run --release --example bench -- latency 4096 5 --ring 1048576 --max-messages 64
 //! cargo run --release --example bench -- latency 16 5 --spin 2000
+//! cargo run --release --example bench -- throughput 65536 5 --zero-copy
 //! ```
 //!
-//! `bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>]`
+//! `bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>] [--zero-copy]`
 //!
 //! Каждый прогон печатает строку `mode size msgs/s MiB/s p50_us p99_us layout`:
 //! - `throughput` -- `SharedServer` -> `SharedClient`, два потока одного
@@ -38,6 +39,12 @@
 //! `--spin <iterations>` (0.10) -- спин перед ожиданием в ядре на обеих
 //! сторонах (`poll_*_spin`, `wait_for_space_spin`); по умолчанию 0 -- без
 //! спина. Значение печатается в колонке `layout` (`spin=N`).
+//!
+//! `--zero-copy` (0.10, только `throughput`) -- читатель принимает
+//! сообщение `receive_with` срезом прямо из кольца, без копии в свой буфер
+//! (писатель не меняется: `try_send_to_client` копирует payload в кольцо).
+//! Проверка порядка -- та же, по срезу. Печатается в колонке `layout`
+//! (`zc=1`).
 //!
 //! Проверка данных: при `size >= 8` первые 8 байт payload -- сквозной номер
 //! сообщения `u64` (LE), получатель сверяет порядок (потеря, повтор,
@@ -88,6 +95,7 @@ struct Args {
     ring: Option<usize>,
     max_messages: Option<u32>,
     spin: SpinPolicy,
+    zero_copy: bool,
 }
 
 /// Результат одного прогона.
@@ -102,7 +110,12 @@ struct Sample {
 fn main() -> BenchResult<()> {
     let args = parse_args()?;
     let ring = resolve_ring(&args)?;
-    let layout_desc = format!("{},spin={}", describe(&ring), args.spin.iterations);
+    let layout_desc = format!(
+        "{},spin={},zc={}",
+        describe(&ring),
+        args.spin.iterations,
+        u8::from(args.zero_copy)
+    );
     let config = ChannelConfig::new(ChannelLayout::symmetric(ring));
     let name = format!("XSHM_BENCH_{}_{}", std::process::id(), args.size);
     let spin = args.spin;
@@ -113,7 +126,15 @@ fn main() -> BenchResult<()> {
                 (THROUGHPUT_BYTES / args.size).clamp(THROUGHPUT_MIN_MSGS, THROUGHPUT_MAX_MSGS);
             // Один полный круг по кольцу (+1 кадр), но не меньше минимума.
             let warmup = (ring.capacity / frame_size(args.size)).max(THROUGHPUT_WARMUP_MIN) + 1;
-            run_throughput(&name, &config, args.size, total, warmup, args.runs, spin)?
+            let plan = Plan {
+                size: args.size,
+                total,
+                warmup,
+                runs: args.runs,
+                spin,
+                zero_copy: args.zero_copy,
+            };
+            run_throughput(&name, &config, &plan)?
         }
         Mode::Latency => run_latency(&name, &config, args.size, args.runs, spin)?,
     };
@@ -163,7 +184,7 @@ fn main() -> BenchResult<()> {
 }
 
 fn usage() -> BenchError {
-    "использование: bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>]"
+    "использование: bench [throughput|latency] <size> [runs] [--ring <bytes>] [--max-messages <n>] [--spin <iterations>] [--zero-copy]"
         .into()
 }
 
@@ -172,6 +193,7 @@ fn parse_args() -> BenchResult<Args> {
     let mut ring = None;
     let mut max_messages = None;
     let mut spin = SpinPolicy::NONE;
+    let mut zero_copy = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -187,6 +209,7 @@ fn parse_args() -> BenchResult<Args> {
                 let v = it.next().ok_or_else(usage)?;
                 spin = SpinPolicy::new(v.parse::<u32>().map_err(|_| usage())?);
             }
+            "--zero-copy" => zero_copy = true,
             _ => positional.push(arg),
         }
     }
@@ -213,6 +236,9 @@ fn parse_args() -> BenchResult<Args> {
     if runs == 0 {
         return Err("runs должен быть >= 1".into());
     }
+    if zero_copy && mode != Mode::Throughput {
+        return Err("--zero-copy -- только для throughput".into());
+    }
     Ok(Args {
         mode,
         size,
@@ -220,6 +246,7 @@ fn parse_args() -> BenchResult<Args> {
         ring,
         max_messages,
         spin,
+        zero_copy,
     })
 }
 
@@ -391,6 +418,41 @@ fn recv_c2s(server: &SharedServer, buf: &mut Vec<u8>, spin: SpinPolicy) -> Bench
     }
 }
 
+/// `--zero-copy`: принять одно сообщение от сервера срезом прямо из кольца
+/// и сверить его (длина и номер -- как у `check`), ожидая его в ядре.
+fn recv_s2c_zero_copy(
+    client: &SharedClient,
+    size: usize,
+    expected: u64,
+    spin: SpinPolicy,
+) -> BenchResult<()> {
+    loop {
+        // SAFETY: писатель кольца S2C -- поток этого же процесса (честный
+        // xshm, доверенный) и пишет только `try_send_to_client` без
+        // перезаписи: пока выполняется замыкание, кадр никто не меняет.
+        let got = unsafe {
+            client.receive_with(|data| {
+                check(data, data.len(), size, expected, "клиент")?;
+                black_box(data);
+                Ok(())
+            })
+        };
+        match got {
+            Ok(checked) => return checked,
+            Err(ShmError::QueueEmpty) => {
+                if !client.poll_server_spin(Some(STEP_TIMEOUT), spin)? {
+                    let mut buf = Vec::new();
+                    return Err(timeout_error(
+                        "клиент",
+                        client.receive_from_server(&mut buf),
+                    ));
+                }
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+}
+
 /// Ошибка таймаута `poll_*`. `again` -- повторное чтение после таймаута:
 /// если сообщение всё же лежит в кольце, писатель записал его, не взведя
 /// `DATA` (потерянное пробуждение), -- это дефект протокола, а не медленный
@@ -439,34 +501,51 @@ fn join<T>(handle: thread::JoinHandle<BenchResult<T>>) -> BenchResult<T> {
 /// канал std (с таймаутом на стороне сервера -- без риска взаимной
 /// блокировки), и только после этого сервер запускает часы. Время прогона --
 /// от первой отправки до приёма последнего сообщения.
-fn run_throughput(
-    name: &str,
-    config: &ChannelConfig,
+/// Параметры замера пропускной способности.
+#[derive(Clone, Copy)]
+struct Plan {
     size: usize,
     total: usize,
     warmup: usize,
     runs: usize,
     spin: SpinPolicy,
-) -> BenchResult<Vec<Sample>> {
+    zero_copy: bool,
+}
+
+fn run_throughput(name: &str, config: &ChannelConfig, plan: &Plan) -> BenchResult<Vec<Sample>> {
+    let Plan {
+        size,
+        total,
+        warmup,
+        runs,
+        spin,
+        zero_copy,
+    } = *plan;
     let (warmed_tx, warmed_rx) = mpsc::channel::<()>();
     let (server, client) =
         connect_pair(name, config, move |client| -> BenchResult<Vec<Instant>> {
             let mut buf = Vec::with_capacity(size);
             let mut expected = 0u64;
             let mut ends = Vec::with_capacity(runs);
+            let mut receive = |expected: u64| -> BenchResult<()> {
+                if zero_copy {
+                    return recv_s2c_zero_copy(&client, size, expected, spin);
+                }
+                let len = recv_s2c(&client, &mut buf, spin)?;
+                check(&buf, len, size, expected, "клиент")?;
+                black_box(&buf);
+                Ok(())
+            };
             for _ in 0..runs {
                 for _ in 0..warmup {
-                    let len = recv_s2c(&client, &mut buf, spin)?;
-                    check(&buf, len, size, expected, "клиент")?;
+                    receive(expected)?;
                     expected += 1;
                 }
                 // Сервер мог уже упасть -- тогда его ошибку вернёт join.
                 let _ = warmed_tx.send(());
                 for _ in 0..total {
-                    let len = recv_s2c(&client, &mut buf, spin)?;
-                    check(&buf, len, size, expected, "клиент")?;
+                    receive(expected)?;
                     expected += 1;
-                    black_box(&buf);
                 }
                 ends.push(Instant::now());
             }
