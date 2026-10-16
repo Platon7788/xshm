@@ -6,7 +6,8 @@ use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
-use crate::naming::mapping_name;
+use crate::namespace::PrivateNamespace;
+use crate::naming::ObjectPath;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
 use crate::server::poll_with_peer;
 use crate::shared::SharedView;
@@ -172,7 +173,19 @@ impl SharedClient {
     /// `VersionMismatch` -- сервер другого формата памяти, `Corrupted` --
     /// под именем чужой объект или повреждённая раскладка.
     pub fn connect(name: &str, timeout: Duration) -> Result<Self> {
-        Self::connect_impl(name, timeout, true, None)
+        Self::connect_impl(None, name, timeout, true, None)
+    }
+
+    /// Подключиться к каналу `name` в частном пространстве имён `ns` (0.10;
+    /// сервер -- `ChannelConfig::namespace` с той же границей). Имя
+    /// относительное: без `Local\`/`Global\` и без `\` (иначе
+    /// `InvalidConfig`). Пространство нужно только на время подключения:
+    /// дальше клиент держит открытые объекты канала.
+    ///
+    /// Ошибки -- как у [`SharedClient::connect`]; канала в пространстве нет
+    /// -- `WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`.
+    pub fn connect_in(ns: &PrivateNamespace, name: &str, timeout: Duration) -> Result<Self> {
+        Self::connect_impl(Some(ns), name, timeout, true, None)
     }
 
     /// Раскладка канала, выбранная сервером.
@@ -184,11 +197,12 @@ impl SharedClient {
     /// Подключение, ожидание которого прерывает `interrupt` (worker-ы
     /// Auto/Dispatch/Multi: `stop`/Drop не ждут `connect_timeout`).
     pub(crate) fn connect_interruptible(
+        namespace: Option<&PrivateNamespace>,
         name: &str,
         timeout: Duration,
         interrupt: Interrupt<'_>,
     ) -> Result<Self> {
-        Self::connect_impl(name, timeout, true, Some(interrupt))
+        Self::connect_impl(namespace, name, timeout, true, Some(interrupt))
     }
 
     /// `announce_pid = false` -- поведение клиента 0.7/0.8.0 без обмена PID
@@ -202,20 +216,20 @@ impl SharedClient {
     /// тогда `DISCONNECT` взведён, и worker дочитает кольцо (прощальное
     /// сообщение), а не потеряет его в откате.
     pub(crate) fn connect_impl(
+        namespace: Option<&PrivateNamespace>,
         name: &str,
         timeout: Duration,
         announce_pid: bool,
         mut interrupt: Option<Interrupt<'_>>,
     ) -> Result<Self> {
-        let map_name = mapping_name(name);
-        let mapping = Mapping::open(&map_name)?;
+        let mapping = Mapping::open(ObjectPath::mapping(namespace, name))?;
         // SAFETY: отображение длиной `mapping.size()` живёт, пока жив
         // `mapping`, а он переезжает в возвращаемую структуру вместе с view;
         // адрес view выровнен на гранулу выделения.
         let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }?;
         let control = view.control_block();
 
-        let events = SharedEvents::open(name)?;
+        let events = SharedEvents::open_in(namespace, name)?;
 
         // Ревизия 2: `generation` ДО заявки -- по его смене узнаём, что
         // сервер принял именно нас (новый generation он публикует в

@@ -297,8 +297,14 @@ pub const WAIT_ANY: ULONG = 1;
 pub type PSID = PVOID;
 /// Непрозрачный дескриптор границы частного пространства имён
 /// (`RtlCreateBoundaryDescriptor`).
-#[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
 pub type POBJECT_BOUNDARY_DESCRIPTOR = PVOID;
+/// Полный доступ к каталогу объектов (частное пространство имён --
+/// каталог): `STANDARD_RIGHTS_REQUIRED | 0xF`.
+pub const DIRECTORY_ALL_ACCESS: ACCESS_MASK = 0x000F_000F;
+/// Объект (пространство имён с тем же дескриптором границы) уже есть.
+pub const STATUS_OBJECT_NAME_COLLISION: NTSTATUS = 0xC000_0035_u32.cast_signed();
+/// Объекта с таким именем нет.
+pub const STATUS_OBJECT_NAME_NOT_FOUND: NTSTATUS = 0xC000_0034_u32.cast_signed();
 
 /// `SECTION_INFORMATION_CLASS::SectionBasicInformation` для `NtQuerySection`.
 #[expect(

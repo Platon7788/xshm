@@ -5,6 +5,7 @@ mod constants;
 mod error;
 pub mod events;
 mod layout;
+mod namespace;
 mod naming;
 mod ring;
 mod security;
@@ -64,6 +65,7 @@ pub const MAX_MESSAGE_SIZE: usize = DEFAULT_MAX_MESSAGE_SIZE;
 pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
+pub use namespace::PrivateNamespace;
 pub use ring::{FreeSpace, WriteOutcome, frame_size};
 pub use security::ObjectSecurity;
 pub use server::{ChannelConfig, SharedServer};

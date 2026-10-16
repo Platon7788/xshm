@@ -3,7 +3,8 @@ use crate::constants::{
     EVENT_SPACE_SUFFIX,
 };
 use crate::error::Result;
-use crate::naming::{Direction, event_name};
+use crate::namespace::PrivateNamespace;
+use crate::naming::{Direction, ObjectPath};
 use crate::security::SecurityAttributes;
 use crate::win::EventHandle;
 
@@ -38,41 +39,32 @@ pub struct EventHandles {
 }
 
 impl SharedEvents {
-    /// Создать 7 событий канала `base` с дескриптором `security` (0.10).
-    pub(crate) fn create(base: &str, security: &SecurityAttributes) -> Result<Self> {
+    /// Создать 7 событий канала `base` с дескриптором `security` (0.10) --
+    /// в частном пространстве `namespace` (относительные имена) или, если
+    /// `None`, в namespace имени канала.
+    pub(crate) fn create(
+        namespace: Option<&PrivateNamespace>,
+        base: &str,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let create = |direction, suffix| {
+            EventHandle::create(
+                ObjectPath::event(namespace, base, direction, suffix),
+                security,
+            )
+        };
         Ok(Self {
             s2c: ChannelEvents {
-                data: EventHandle::create(
-                    &event_name(base, Direction::ServerToClient, EVENT_DATA_SUFFIX),
-                    security,
-                )?,
-                space: EventHandle::create(
-                    &event_name(base, Direction::ServerToClient, EVENT_SPACE_SUFFIX),
-                    security,
-                )?,
+                data: create(Direction::ServerToClient, EVENT_DATA_SUFFIX)?,
+                space: create(Direction::ServerToClient, EVENT_SPACE_SUFFIX)?,
             },
             c2s: ChannelEvents {
-                data: EventHandle::create(
-                    &event_name(base, Direction::ClientToServer, EVENT_DATA_SUFFIX),
-                    security,
-                )?,
-                space: EventHandle::create(
-                    &event_name(base, Direction::ClientToServer, EVENT_SPACE_SUFFIX),
-                    security,
-                )?,
+                data: create(Direction::ClientToServer, EVENT_DATA_SUFFIX)?,
+                space: create(Direction::ClientToServer, EVENT_SPACE_SUFFIX)?,
             },
-            connect_ack: EventHandle::create(
-                &event_name(base, Direction::ServerToClient, EVENT_CONNECT_SUFFIX),
-                security,
-            )?,
-            connect_req: EventHandle::create(
-                &event_name(base, Direction::ClientToServer, EVENT_CONNECT_REQ_SUFFIX),
-                security,
-            )?,
-            disconnect: EventHandle::create(
-                &event_name(base, Direction::ServerToClient, EVENT_DISCONNECT_SUFFIX),
-                security,
-            )?,
+            connect_ack: create(Direction::ServerToClient, EVENT_CONNECT_SUFFIX)?,
+            connect_req: create(Direction::ClientToServer, EVENT_CONNECT_REQ_SUFFIX)?,
+            disconnect: create(Direction::ServerToClient, EVENT_DISCONNECT_SUFFIX)?,
         })
     }
 
@@ -91,47 +83,30 @@ impl SharedEvents {
         }
     }
 
+    /// Открыть 7 событий канала `base` (в namespace имени канала).
     pub fn open(base: &str) -> Result<Self> {
+        Self::open_in(None, base)
+    }
+
+    /// Открыть 7 событий канала `base` в частном пространстве `namespace`
+    /// (`None` -- как [`SharedEvents::open`]). Все -- автосбросные
+    /// (`open_auto_reset`).
+    pub(crate) fn open_in(namespace: Option<&PrivateNamespace>, base: &str) -> Result<Self> {
+        let open = |direction, suffix| {
+            EventHandle::open_auto_reset(ObjectPath::event(namespace, base, direction, suffix))
+        };
         Ok(Self {
             s2c: ChannelEvents {
-                data: EventHandle::open_auto_reset(&event_name(
-                    base,
-                    Direction::ServerToClient,
-                    EVENT_DATA_SUFFIX,
-                ))?,
-                space: EventHandle::open_auto_reset(&event_name(
-                    base,
-                    Direction::ServerToClient,
-                    EVENT_SPACE_SUFFIX,
-                ))?,
+                data: open(Direction::ServerToClient, EVENT_DATA_SUFFIX)?,
+                space: open(Direction::ServerToClient, EVENT_SPACE_SUFFIX)?,
             },
             c2s: ChannelEvents {
-                data: EventHandle::open_auto_reset(&event_name(
-                    base,
-                    Direction::ClientToServer,
-                    EVENT_DATA_SUFFIX,
-                ))?,
-                space: EventHandle::open_auto_reset(&event_name(
-                    base,
-                    Direction::ClientToServer,
-                    EVENT_SPACE_SUFFIX,
-                ))?,
+                data: open(Direction::ClientToServer, EVENT_DATA_SUFFIX)?,
+                space: open(Direction::ClientToServer, EVENT_SPACE_SUFFIX)?,
             },
-            connect_ack: EventHandle::open_auto_reset(&event_name(
-                base,
-                Direction::ServerToClient,
-                EVENT_CONNECT_SUFFIX,
-            ))?,
-            connect_req: EventHandle::open_auto_reset(&event_name(
-                base,
-                Direction::ClientToServer,
-                EVENT_CONNECT_REQ_SUFFIX,
-            ))?,
-            disconnect: EventHandle::open_auto_reset(&event_name(
-                base,
-                Direction::ServerToClient,
-                EVENT_DISCONNECT_SUFFIX,
-            ))?,
+            connect_ack: open(Direction::ServerToClient, EVENT_CONNECT_SUFFIX)?,
+            connect_req: open(Direction::ClientToServer, EVENT_CONNECT_REQ_SUFFIX)?,
+            disconnect: open(Direction::ServerToClient, EVENT_DISCONNECT_SUFFIX)?,
         })
     }
 }

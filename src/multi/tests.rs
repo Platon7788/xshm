@@ -457,13 +457,13 @@ fn stale_claim_is_released_at_deadline_not_by_ticking() {
     thread::sleep(Duration::from_millis(100));
 
     // «Упавший» клиент: захватил слот и не подключился.
-    assert!(try_claim_slot(&slot_name, 0xC1A1_0001).unwrap());
+    assert!(try_claim_slot(None, &slot_name, 0xC1A1_0001).unwrap());
     thread::sleep(Duration::from_millis(100));
     let w0 = server.wakeups();
     assert_eq!(w0, 0, "захват сам по себе сервер не будит");
 
     let t0 = Instant::now();
-    nudge_stale_claims(&name);
+    nudge_stale_claims(None, &name);
     let claim_of_slot0 = || {
         let slots = server.slots.read().unwrap();
         slots[0].lock().unwrap().claim()
@@ -511,7 +511,7 @@ fn client_waiting_for_slot_gets_it_after_stale_claim_deadline() {
         Duration::from_millis(300),
     )
     .expect("start");
-    assert!(try_claim_slot(&format!("{name}_0"), 0xC1A1_0002).unwrap());
+    assert!(try_claim_slot(None, &format!("{name}_0"), 0xC1A1_0002).unwrap());
 
     let client = MultiClient::connect(
         &name,
@@ -524,6 +524,54 @@ fn client_waiting_for_slot_gets_it_after_stale_claim_deadline() {
     .unwrap();
     wait_for(
         "подключение после дедлайна",
+        Duration::from_secs(5),
+        || client.is_connected(),
+    );
+    drop(client);
+    server.stop();
+}
+
+/// Захватчик, создавший заранее `B_N` за последним слотом с запрещающим
+/// DACL, превращает итог перебора в `AccessDenied` -- но толчок протухших
+/// захватов от этого не отключается (иначе сервер спал бы, а захват
+/// упавшего клиента держал бы слот вечно).
+#[test]
+fn denied_squatter_slot_does_not_disable_nudge() {
+    let name = unique("STALE_DENIED");
+    let server = MultiServer::start_with(
+        &name,
+        Arc::new(TestHandler::new()),
+        single_slot(1),
+        Duration::from_millis(300),
+    )
+    .expect("start");
+    // Пустой DACL: открыть секцию не может никто, включая этого пользователя.
+    let mut deny_all = vec![1u8, 0, 0x04, 0x80];
+    deny_all.extend_from_slice(&[0; 12]);
+    deny_all.extend_from_slice(&20u32.to_le_bytes());
+    deny_all.extend_from_slice(&[2, 0, 8, 0, 0, 0, 0, 0]);
+    let attributes = ObjectSecurity::Descriptor(deny_all).attributes().unwrap();
+    let _squatter = Mapping::create(format!("{name}_1"), 4096, &attributes).unwrap();
+    // Worker успел пройти первый обход и уснуть: захват он увидит только
+    // после толчка.
+    thread::sleep(Duration::from_millis(100));
+    assert!(try_claim_slot(None, &format!("{name}_0"), 0xC1A1_0003).unwrap());
+    assert_eq!(
+        claim_free_slot(None, &name).unwrap_err(),
+        ShmError::AccessDenied
+    );
+
+    let client = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions {
+            retry_delay: Duration::from_millis(100),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    wait_for(
+        "подключение после дедлайна при захватчике",
         Duration::from_secs(5),
         || client.is_connected(),
     );
@@ -761,10 +809,13 @@ fn corrupted_slot_count_is_ignored() {
             control.slot_count.store(u32::MAX, Ordering::Release);
         }
     }
-    assert_eq!(claim_free_slot(&name).unwrap_err(), ShmError::NoFreeSlot);
-    nudge_stale_claims(&name); // не паникует на испорченном числе
     assert_eq!(
-        claim_free_slot(&unique("NO_SERVER")).unwrap_err(),
+        claim_free_slot(None, &name).unwrap_err(),
+        ShmError::NoFreeSlot
+    );
+    nudge_stale_claims(None, &name); // не паникует на испорченном числе
+    assert_eq!(
+        claim_free_slot(None, &unique("NO_SERVER")).unwrap_err(),
         ShmError::NotConnected
     );
     server.stop();
@@ -820,7 +871,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
     let slot_name = format!("{name}_0");
     for round in 0..20 {
         assert!(
-            try_claim_slot(&slot_name, TOKEN_A).unwrap(),
+            try_claim_slot(None, &slot_name, TOKEN_A).unwrap(),
             "раунд {round}"
         );
         let mut a = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
@@ -831,7 +882,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
         server.disconnect_client(0).unwrap();
         // Гонка из дефекта: B пытается захватить слот сразу после отключения.
         assert!(
-            !try_claim_slot(&slot_name, TOKEN_B).unwrap(),
+            !try_claim_slot(None, &slot_name, TOKEN_B).unwrap(),
             "раунд {round}: слот освобождён раньше, чем A узнал об отключении"
         );
         assert!(
@@ -845,10 +896,10 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
         // DISCONNECT, затем снимает свой claim.
         a.mark_disconnected();
         drop(a);
-        release_claim(&slot_name, TOKEN_A);
+        release_claim(None, &slot_name, TOKEN_A);
 
         assert!(
-            try_claim_slot(&slot_name, TOKEN_B).unwrap(),
+            try_claim_slot(None, &slot_name, TOKEN_B).unwrap(),
             "раунд {round}"
         );
         let b = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
@@ -857,7 +908,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
         });
         assert!(b.is_session_current());
         drop(b); // штатный уход B: DISCONNECT -> сервер снимает claim CAS-ом
-        release_claim(&slot_name, TOKEN_B);
+        release_claim(None, &slot_name, TOKEN_B);
         wait_for("B отключён", Duration::from_secs(5), || {
             server.client_count() == 0
         });
@@ -876,7 +927,7 @@ fn claim_of_a_kicked_client_that_never_leaves_is_released_at_deadline() {
         MultiServer::start_with(&name, Arc::new(TestHandler::new()), single_slot(1), reserve)
             .expect("start");
     let slot_name = format!("{name}_0");
-    assert!(try_claim_slot(&slot_name, 0xDEAD_0001).unwrap());
+    assert!(try_claim_slot(None, &slot_name, 0xDEAD_0001).unwrap());
     let client = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
     wait_for("подключение", Duration::from_secs(5), || {
         server.client_count() == 1

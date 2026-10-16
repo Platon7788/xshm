@@ -1,4 +1,5 @@
 use std::os::windows::io::{AsHandle, BorrowedHandle};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -6,7 +7,8 @@ use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
-use crate::naming::mapping_name;
+use crate::namespace::PrivateNamespace;
+use crate::naming::ObjectPath;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
@@ -31,14 +33,14 @@ impl Deadline {
     }
 }
 
-/// Параметры канала для [`SharedServer::start_with`]: раскладка и политика
-/// безопасности объектов.
+/// Параметры канала для [`SharedServer::start_with`]: раскладка, политика
+/// безопасности объектов и частное пространство имён.
 ///
 /// `#[non_exhaustive]`: строится от `ChannelConfig::default()` (раскладка
-/// `ChannelLayout::DEFAULT`, политика `ObjectSecurity::CurrentUser`) и
-/// методами [`ChannelConfig::layout`]/[`ChannelConfig::security`]; новые
-/// параметры (например, частное пространство имён) добавляются без поломки
-/// вызывающих.
+/// `ChannelLayout::DEFAULT`, политика `ObjectSecurity::CurrentUser`, без
+/// пространства) и методами [`ChannelConfig::layout`]/
+/// [`ChannelConfig::security`]/[`ChannelConfig::namespace`]; новые
+/// параметры добавляются без поломки вызывающих.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct ChannelConfig {
@@ -46,6 +48,12 @@ pub struct ChannelConfig {
     pub layout: ChannelLayout,
     /// Кто получает доступ к секции и событиям канала.
     pub security: ObjectSecurity,
+    /// Частное пространство имён канала (0.10): `Some` -- секция и события
+    /// создаются в нём под относительными именами (имя канала -- без
+    /// `Local\`/`Global\`, иначе `InvalidConfig`), сервер держит ссылку на
+    /// пространство, пока жив. `None` (по умолчанию) -- общий
+    /// `\BaseNamedObjects`, как до 0.10.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 impl ChannelConfig {
@@ -55,6 +63,7 @@ impl ChannelConfig {
         Self {
             layout,
             security: ObjectSecurity::default(),
+            namespace: None,
         }
     }
 
@@ -69,6 +78,16 @@ impl ChannelConfig {
     #[must_use]
     pub fn security(mut self, security: ObjectSecurity) -> Self {
         self.security = security;
+        self
+    }
+
+    /// Создавать объекты канала в частном пространстве имён `namespace`
+    /// (0.10, см. [`PrivateNamespace`]). Клиент подключается через
+    /// [`SharedClient::connect_in`](crate::SharedClient::connect_in) с
+    /// пространством той же границы.
+    #[must_use]
+    pub fn namespace(mut self, namespace: Arc<PrivateNamespace>) -> Self {
+        self.namespace = Some(namespace);
         self
     }
 }
@@ -90,6 +109,10 @@ pub struct SharedServer {
     /// не было; см. `verified_peer_pid`).
     peer_start: u64,
     _mapping: Mapping,
+    /// Частное пространство имён канала (0.10): держим, пока живы объекты
+    /// -- с последним handle пространство исчезает, и клиент не нашёл бы
+    /// канал. Последним: закрывается после секции и событий.
+    _namespace: Option<Arc<PrivateNamespace>>,
 }
 
 // SAFETY: все поля либо владеющие (`Mapping`), либо синхронизируются через
@@ -121,7 +144,13 @@ impl SharedServer {
     /// # Ok::<(), xshm::ShmError>(())
     /// ```
     pub fn start_with(name: &str, config: &ChannelConfig) -> Result<Self> {
-        Self::start_slot(name, config.layout, 0, &config.security.attributes()?)
+        Self::start_slot(
+            config.namespace.as_ref(),
+            name,
+            config.layout,
+            0,
+            &config.security.attributes()?,
+        )
     }
 
     /// Сервер канала `name`, публикующий в `ControlBlock::slot_count` число
@@ -129,15 +158,22 @@ impl SharedServer {
     /// `security` -- общий для секции и всех событий канала (Multi строит его
     /// один раз на все слоты).
     pub(crate) fn start_slot(
+        namespace: Option<&Arc<PrivateNamespace>>,
         name: &str,
         layout: ChannelLayout,
         slot_count: u32,
         security: &SecurityAttributes,
     ) -> Result<Self> {
         layout.validate()?;
-        let mapping = Mapping::create(&mapping_name(name), layout.segment_size(), security)?;
+        let root = namespace.map(Arc::as_ref);
+        let mapping = Mapping::create(
+            ObjectPath::mapping(root, name),
+            layout.segment_size(),
+            security,
+        )?;
         let mut server = Self::from_mapping(mapping, layout, slot_count)?;
-        server.events = Some(SharedEvents::create(name, security)?);
+        server.events = Some(SharedEvents::create(root, name, security)?);
+        server._namespace = namespace.cloned();
         Ok(server)
     }
 
@@ -198,6 +234,7 @@ impl SharedServer {
             connected: false,
             peer: None,
             peer_start: 0,
+            _namespace: None,
             _mapping: mapping,
         })
     }

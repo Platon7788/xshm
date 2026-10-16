@@ -98,7 +98,7 @@ const SYSTEM_SID: [u32; 3] = [
 ];
 
 /// SID метки целостности Low `S-1-16-4096` (Mandatory Label Authority 16).
-const LOW_LABEL_SID: [u32; 3] = [
+pub(crate) const LOW_LABEL_SID: [u32; 3] = [
     u32::from_le_bytes([1, 1, 0, 0]),
     u32::from_le_bytes([0, 0, 0, 16]),
     0x1000,
@@ -154,7 +154,7 @@ fn byte_len(words: &[u32]) -> Result<ULONG> {
 
 /// SID пользователя токена процесса (`TokenUser`), слова `u32` ровно его
 /// длины.
-fn current_user_sid() -> Result<Vec<u32>> {
+pub(crate) fn current_user_sid() -> Result<Vec<u32>> {
     let mut raw: HANDLE = null_mut();
     // SAFETY: псевдо-handle текущего процесса не требует закрытия;
     // out-параметр -- локальная переменная.

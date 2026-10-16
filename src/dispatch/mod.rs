@@ -35,7 +35,8 @@ use crate::auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind,
 use crate::client::SharedClient;
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
-use crate::naming::mapping_name;
+use crate::namespace::PrivateNamespace;
+use crate::naming::ObjectPath;
 use crate::ring::FreeSpace;
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -218,6 +219,13 @@ pub struct DispatchOptions {
     /// клиентов наследуют её. По умолчанию -- `ObjectSecurity::CurrentUser`:
     /// клиенты другого пользователя получают `AccessDenied` уже на лобби.
     pub security: ObjectSecurity,
+    /// Частное пространство имён (0.10): лобби, мьютекс `<лобби>_lock` и
+    /// каналы клиентов создаются в нём под относительными именами (имя
+    /// лобби -- без `Local\`/`Global\`, имя канала -- 16 hex без префикса).
+    /// Клиенту нужно пространство той же границы
+    /// (`DispatchClientOptions::namespace`). `None` (по умолчанию) -- общий
+    /// `\BaseNamedObjects`.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 /// Раскладка лобби по умолчанию: регистрация -- одно короткое сообщение в
@@ -240,6 +248,7 @@ impl Default for DispatchOptions {
             channel_layout: ChannelLayout::DEFAULT,
             lobby_layout: DEFAULT_LOBBY_LAYOUT,
             security: ObjectSecurity::default(),
+            namespace: None,
         }
     }
 }
@@ -265,6 +274,10 @@ pub struct DispatchClientOptions {
     /// уже создал сервер с политикой лобби, и поле не применяется. По
     /// умолчанию -- `ObjectSecurity::CurrentUser`.
     pub security: ObjectSecurity,
+    /// Частное пространство имён лобби и выделенного канала (0.10; см.
+    /// `DispatchOptions::namespace`). `None` (по умолчанию) -- общий
+    /// `\BaseNamedObjects`.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 impl Default for DispatchClientOptions {
@@ -277,6 +290,7 @@ impl Default for DispatchClientOptions {
             recv_batch: 32,
             max_send_queue: 256,
             security: ObjectSecurity::default(),
+            namespace: None,
         }
     }
 }
@@ -303,14 +317,16 @@ fn channel_namespace_prefix(lobby: &str) -> &str {
     }
 }
 
-/// Имя мьютекса лобби (0.9): `<лобби>_lock` в пространстве имён лобби (те же
-/// правила, что у секции и маяка).
+/// Мьютекс лобби (0.9): `<лобби>_lock` в пространстве имён лобби (те же
+/// правила, что у секции и маяка; 0.10 -- и в частном пространстве лобби).
+fn lobby_lock_path<'a>(namespace: Option<&'a PrivateNamespace>, lobby: &str) -> ObjectPath<'a> {
+    ObjectPath::scoped(namespace, lobby, "_lock")
+}
+
+/// Имя мьютекса лобби вне частного пространства.
+#[cfg(test)]
 fn lobby_lock_name(lobby: &str) -> String {
-    if crate::naming::has_explicit_namespace(lobby) {
-        format!("{lobby}_lock")
-    } else {
-        format!("Local\\{lobby}_lock")
-    }
+    lobby_lock_path(None, lobby).name().to_owned()
 }
 
 thread_local! {
@@ -469,8 +485,17 @@ impl DispatchServer {
         }
         options.channel_layout.validate()?;
         let security = options.security.attributes()?;
-        let lobby = SharedServer::start_slot(name, options.lobby_layout, 0, &security)?;
-        let lobby_lock = NamedMutex::open_or_create(&lobby_lock_name(name), &security)?;
+        let lobby = SharedServer::start_slot(
+            options.namespace.as_ref(),
+            name,
+            options.lobby_layout,
+            0,
+            &security,
+        )?;
+        let lobby_lock = NamedMutex::open_or_create(
+            lobby_lock_path(options.namespace.as_deref(), name),
+            &security,
+        )?;
 
         let stop_event = Arc::new(EventHandle::create_unnamed(true)?);
         let running = Arc::new(AtomicBool::new(true));
@@ -786,7 +811,13 @@ impl DispatchCore {
             let mut lobby_server = match first.take() {
                 Some(lobby) => lobby,
                 None => match self.options.security.attributes().and_then(|security| {
-                    SharedServer::start_slot(base_name, self.options.lobby_layout, 0, &security)
+                    SharedServer::start_slot(
+                        self.options.namespace.as_ref(),
+                        base_name,
+                        self.options.lobby_layout,
+                        0,
+                        &security,
+                    )
                 }) {
                     Ok(s) => s,
                     Err(err) => {
@@ -1000,8 +1031,9 @@ impl DispatchCore {
             recv_batch: self.options.recv_batch,
             max_send_queue: self.options.max_send_queue,
             layout,
-            // Канал клиента наследует политику лобби.
+            // Канал клиента наследует политику и пространство имён лобби.
             security: self.options.security.clone(),
+            namespace: self.options.namespace.clone(),
             ..AutoOptions::default()
         };
 
@@ -1391,6 +1423,8 @@ impl DispatchClient {
             poll_timeout: options.poll_timeout,
             max_send_queue: options.max_send_queue,
             recv_batch: options.recv_batch,
+            // Канал -- в пространстве имён лобби (0.10).
+            namespace: options.namespace.clone(),
             ..AutoOptions::default()
         };
 
@@ -1500,7 +1534,14 @@ impl DispatchClient {
     /// мог бы погасить маяк нового сервера) от временной ошибки регистрации.
     #[must_use]
     pub fn lobby_exists(name: &str) -> bool {
-        Mapping::open(&mapping_name(name)).is_ok()
+        Mapping::open(ObjectPath::mapping(None, name)).is_ok()
+    }
+
+    /// [`DispatchClient::lobby_exists`] для лобби в частном пространстве
+    /// имён `ns` (0.10, `DispatchOptions::namespace`).
+    #[must_use]
+    pub fn lobby_exists_in(ns: &PrivateNamespace, name: &str) -> bool {
+        Mapping::open(ObjectPath::mapping(Some(ns), name)).is_ok()
     }
 
     /// Пробуждения worker-а канала (тесты: ноль в простое).
@@ -1591,14 +1632,18 @@ fn lobby_register(
 ) -> Result<(u32, String)> {
     // Обычно мьютекс уже создал сервер (с политикой лобби) и `security`
     // клиента не применяется; своя политика -- только если клиент первый.
-    let lock =
-        NamedMutex::open_or_create(&lobby_lock_name(base_name), &options.security.attributes()?)?;
+    let namespace = options.namespace.as_deref();
+    let lock = NamedMutex::open_or_create(
+        lobby_lock_path(namespace, base_name),
+        &options.security.attributes()?,
+    )?;
     // Порядок объявлений важен: `client` дропается раньше `_turn` --
     // мьютекс отпускается только после отключения от лобби.
     let Some(_turn) = lock.lock(Some(options.lobby_timeout))? else {
         return Err(ShmError::Timeout);
     };
-    let client = SharedClient::connect(base_name, options.lobby_timeout)?;
+    let client =
+        SharedClient::connect_impl(namespace, base_name, options.lobby_timeout, true, None)?;
 
     // Отправляем запрос на регистрацию
     let request = protocol::encode_request(&RegistrationRequest {
@@ -1770,13 +1815,13 @@ mod tests {
         .unwrap();
         let client_policy = ObjectSecurity::default().attributes().unwrap();
         assert_eq!(
-            NamedMutex::open_or_create(&lobby_lock_name(&name), &client_policy).err(),
+            NamedMutex::open_or_create(lobby_lock_name(&name), &client_policy).err(),
             Some(ShmError::AccessDenied)
         );
         server.stop();
         drop(server);
         // Сервера нет -- мьютекс закрыт, клиент создаёт свой.
-        assert!(NamedMutex::open_or_create(&lobby_lock_name(&name), &client_policy).is_ok());
+        assert!(NamedMutex::open_or_create(lobby_lock_name(&name), &client_policy).is_ok());
     }
 
     struct TestClientHandler {
@@ -3209,7 +3254,8 @@ mod tests {
         )
         .unwrap();
         let intruder =
-            SharedClient::connect_impl(&channel, Duration::from_secs(5), false, None).unwrap();
+            SharedClient::connect_impl(None, &channel, Duration::from_secs(5), false, None)
+                .unwrap();
         wait_for("отказ каналу", Duration::from_secs(5), || {
             handler.handshake_failures.load(Ordering::Acquire) == 1
         });
@@ -3253,7 +3299,7 @@ mod tests {
     /// Подключение к каналу с подменённым временем создания (PID сообщается).
     fn connect_channel_with_start(channel: &str, start: Option<u64>) -> SharedClient {
         crate::client::FORGED_START_TIME.with(|cell| cell.set(start));
-        let client = SharedClient::connect_impl(channel, Duration::from_secs(5), true, None);
+        let client = SharedClient::connect_impl(None, channel, Duration::from_secs(5), true, None);
         crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
         client.unwrap()
     }

@@ -17,6 +17,8 @@ use std::ptr::{null, null_mut};
 use std::time::Duration;
 
 use crate::error::{Result, ShmError};
+use crate::namespace::{PrivateNamespace, validate_relative};
+use crate::naming::ObjectPath;
 use crate::ntapi::{
     // Types
     CLIENT_ID,
@@ -76,12 +78,12 @@ use crate::ntapi::{
     SYNCHRONIZATION_EVENT,
     SectionBasicInformation,
     ULONG,
-    UNICODE_STRING,
     VIEW_UNMAP,
     WAIT_ANY,
     duration_to_nt_timeout,
 };
 use crate::security::SecurityAttributes;
+use core::marker::PhantomData;
 
 // ============================================================================
 // Constants
@@ -144,6 +146,43 @@ impl Drop for Handle {
 // Helper functions
 // ============================================================================
 
+/// Имя для `OBJECT_ATTRIBUTES` (0.10): NT-имя и каталог-корень.
+///
+/// Без пространства -- полный NT-путь (`to_nt_path`), корень NULL; в частном
+/// пространстве -- относительное имя (проверено: непустое, без `\`) и
+/// handle пространства. Заимствует пространство на `'a`: handle корня
+/// действителен, пока жив `ResolvedName`.
+struct ResolvedName<'a> {
+    nt: NtName,
+    root: HANDLE,
+    _namespace: PhantomData<&'a PrivateNamespace>,
+}
+
+impl<'a> ResolvedName<'a> {
+    fn new(path: &ObjectPath<'a>) -> Result<Self> {
+        let (nt, root) = match path.root() {
+            Some(namespace) => {
+                validate_relative(path.name())?;
+                (NtName::verbatim(path.name())?, namespace.root())
+            }
+            None => (NtName::new(path.name())?, null_mut()),
+        };
+        Ok(Self {
+            nt,
+            root,
+            _namespace: PhantomData,
+        })
+    }
+
+    /// `OBJECT_ATTRIBUTES` с этим именем и корнем; указывает внутрь `self`
+    /// -- годится, пока `self` жив и не перемещён.
+    const fn attributes(&mut self, flags: ULONG, security_descriptor: PVOID) -> OBJECT_ATTRIBUTES {
+        let mut attributes = OBJECT_ATTRIBUTES::new(self.nt.as_ptr(), flags, security_descriptor);
+        attributes.RootDirectory = self.root;
+        attributes
+    }
+}
+
 /// `NTSTATUS` отказа -- `ShmError`. `STATUS_ACCESS_DENIED` (DACL объекта не
 /// выдаёт запрошенный доступ, 0.10) -- отдельный вариант `AccessDenied`.
 pub(crate) const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
@@ -192,15 +231,19 @@ impl AsRawHandle for EventHandle {
 impl EventHandle {
     /// Создание события через NtCreateEvent с дескриптором `security`
     /// (политика создателя, 0.10).
-    pub(crate) fn create(name: &str, security: &SecurityAttributes) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr =
-            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, security.as_ptr());
+    pub(crate) fn create<'a>(
+        name: impl Into<ObjectPath<'a>>,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE, security.as_ptr());
 
         let mut handle: HANDLE = null_mut();
 
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
-        // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
+        // вызова и держит внутри `nt_name`/`security` (и корень из `path`),
+        // которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
                 &raw mut handle,
@@ -223,16 +266,13 @@ impl EventHandle {
     /// Событие-уведомление (ручной сброс): создаётся или, если уже есть,
     /// открывается (`OBJ_OPENIF`). Дескриптор `security` применяется только
     /// к новому событию; существующее открывается по своему DACL.
-    pub(crate) fn open_or_create_notification(
-        name: &str,
+    pub(crate) fn open_or_create_notification<'a>(
+        name: impl Into<ObjectPath<'a>>,
         security: &SecurityAttributes,
     ) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            security.as_ptr(),
-        );
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE | OBJ_OPENIF, security.as_ptr());
         let mut handle: HANDLE = null_mut();
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
         // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
@@ -333,10 +373,10 @@ impl EventHandle {
     }
 
     /// Открытие события через NtOpenEvent
-    pub fn open(name: &str) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr =
-            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
+    pub(crate) fn open<'a>(name: impl Into<ObjectPath<'a>>) -> Result<Self> {
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE, null_mut());
 
         let mut handle: HANDLE = null_mut();
 
@@ -358,7 +398,7 @@ impl EventHandle {
     /// заранее созданное под тем же именем чужим процессом (имя в общем
     /// namespace занимает любой, со своим DACL), не гасилось бы ожиданием и гоняло бы worker на
     /// 100% CPU -- `Corrupted` (аудит 2026-10-16).
-    pub fn open_auto_reset(name: &str) -> Result<Self> {
+    pub(crate) fn open_auto_reset<'a>(name: impl Into<ObjectPath<'a>>) -> Result<Self> {
         let event = Self::open(name)?;
         if event.event_type()? != SYNCHRONIZATION_EVENT {
             return Err(ShmError::Corrupted);
@@ -461,20 +501,20 @@ pub struct NamedMutexGuard<'a> {
     #[cfg_attr(not(test), expect(dead_code, reason = "читается только тестами"))]
     abandoned: bool,
     /// Не `Send`: освобождать обязан поток-владелец.
-    _not_send: std::marker::PhantomData<*const ()>,
+    _not_send: PhantomData<*const ()>,
 }
 
 impl NamedMutex {
     /// Создать мьютекс `name` или открыть существующий. Имя, занятое объектом
     /// другого типа, -- ошибка (`STATUS_OBJECT_TYPE_MISMATCH`). `security`
     /// применяется только к новому мьютексу.
-    pub fn open_or_create(name: &str, security: &SecurityAttributes) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            security.as_ptr(),
-        );
+    pub(crate) fn open_or_create<'a>(
+        name: impl Into<ObjectPath<'a>>,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE | OBJ_OPENIF, security.as_ptr());
         let mut handle: HANDLE = null_mut();
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
         // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
@@ -514,7 +554,7 @@ impl NamedMutex {
         Ok(Some(NamedMutexGuard {
             mutex: self,
             abandoned,
-            _not_send: std::marker::PhantomData,
+            _not_send: PhantomData,
         }))
     }
 }
@@ -567,12 +607,15 @@ impl Mapping {
 
     /// Внутренний метод создания секции (общая логика для named и anonymous)
     fn create_internal(
-        object_name: *mut UNICODE_STRING,
+        object_name: Option<&mut ResolvedName<'_>>,
         size: usize,
         security: &SecurityAttributes,
     ) -> Result<Self> {
-        let mut obj_attr =
-            OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, security.as_ptr());
+        let anonymous = object_name.is_none();
+        let mut obj_attr = match object_name {
+            Some(name) => name.attributes(OBJ_CASE_INSENSITIVE, security.as_ptr()),
+            None => OBJECT_ATTRIBUTES::new(null_mut(), OBJ_CASE_INSENSITIVE, security.as_ptr()),
+        };
 
         let mut section_handle: HANDLE = null_mut();
         // Размер секции -- `LARGE_INTEGER` (знаковый): больше `i64::MAX` не
@@ -583,9 +626,9 @@ impl Mapping {
         };
 
         // SAFETY: все переданные указатели -- на локальные переменные, живущие до
-        // конца вызова; `object_name` либо NULL (anonymous), либо указывает на
-        // `UNICODE_STRING`, который держит вызывающий (`Mapping::create`);
-        // дескриптор `security` заимствован на весь вызов.
+        // конца вызова; имя в `obj_attr` либо NULL (anonymous), либо указывает
+        // в `ResolvedName`, который держит вызывающий (`Mapping::create`) вместе
+        // с корнем-пространством; дескриптор `security` заимствован на весь вызов.
         let status = unsafe {
             NtCreateSection(
                 &raw mut section_handle,
@@ -599,7 +642,7 @@ impl Mapping {
         };
 
         if status != STATUS_SUCCESS {
-            let context = if object_name.is_null() {
+            let context = if anonymous {
                 "NtCreateSection (anonymous)"
             } else {
                 "NtCreateSection"
@@ -639,7 +682,7 @@ impl Mapping {
         };
 
         if status != STATUS_SUCCESS {
-            let context = if object_name.is_null() {
+            let context = if anonymous {
                 "NtMapViewOfSection (anonymous)"
             } else {
                 "NtMapViewOfSection"
@@ -659,9 +702,14 @@ impl Mapping {
 
     /// Создание секции размером `size` байт через NtCreateSection с
     /// дескриптором `security` (политика создателя, 0.10).
-    pub fn create(name: &str, size: usize, security: &SecurityAttributes) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        Self::create_internal(nt_name.as_ptr(), size, security)
+    pub(crate) fn create<'a>(
+        name: impl Into<ObjectPath<'a>>,
+        size: usize,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        Self::create_internal(Some(&mut nt_name), size, security)
     }
 
     /// Создание anonymous секции без имени (только через handle)
@@ -687,7 +735,7 @@ impl Mapping {
     /// права исходного handle без проверки DACL -- дескриптор задан для
     /// единообразия и на случай открытия объекта по указателю ядром.
     pub fn create_anonymous(size: usize, security: &SecurityAttributes) -> Result<Self> {
-        Self::create_internal(null_mut(), size, security)
+        Self::create_internal(None, size, security)
     }
 
     /// Открытие чужой секции целиком.
@@ -696,22 +744,21 @@ impl Mapping {
     /// доверия: имя в `\BaseNamedObjects` может занять кто угодно (namespace
     /// общий, DACL выбирает занявший), поэтому раскладку, прочитанную из сегмента,
     /// `SharedView::attach` сверяет именно с ним, прежде чем трогать кольца.
-    pub fn open(name: &str) -> Result<Self> {
-        Self::open_view(name, 0)
+    pub(crate) fn open<'a>(name: impl Into<ObjectPath<'a>>) -> Result<Self> {
+        Self::open_view(&name.into(), 0)
     }
 
     /// Открытие чужой секции с отображением только заголовка сегмента
     /// (первая страница): перебор слотов Multi не отображает кольца целиком
     /// ради чтения `ControlBlock`.
-    pub fn open_header(name: &str) -> Result<Self> {
-        Self::open_view(name, crate::constants::SEGMENT_HEADER_SIZE)
+    pub(crate) fn open_header<'a>(name: impl Into<ObjectPath<'a>>) -> Result<Self> {
+        Self::open_view(&name.into(), crate::constants::SEGMENT_HEADER_SIZE)
     }
 
     /// `view_size = 0` -- секция целиком.
-    fn open_view(name: &str, view_size: usize) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr =
-            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, null_mut());
+    fn open_view(path: &ObjectPath<'_>, view_size: usize) -> Result<Self> {
+        let mut nt_name = ResolvedName::new(path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE, null_mut());
 
         let mut section_handle: HANDLE = null_mut();
 
@@ -740,13 +787,14 @@ impl Mapping {
     /// Существующая секция проверяется как чужая: тип `SEC_COMMIT` и view не
     /// меньше `size`, иначе `Corrupted`. Для объектов, которые создаёт
     /// первая пришедшая сторона (состояние маяка).
-    pub fn open_or_create(name: &str, size: usize, security: &SecurityAttributes) -> Result<Self> {
-        let mut nt_name = NtName::new(name)?;
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(
-            nt_name.as_ptr(),
-            OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            security.as_ptr(),
-        );
+    pub(crate) fn open_or_create<'a>(
+        name: impl Into<ObjectPath<'a>>,
+        size: usize,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let path = name.into();
+        let mut nt_name = ResolvedName::new(&path)?;
+        let mut obj_attr = nt_name.attributes(OBJ_CASE_INSENSITIVE | OBJ_OPENIF, security.as_ptr());
         let mut section_handle: HANDLE = null_mut();
         let mut max_size = LARGE_INTEGER {
             QuadPart: i64::try_from(size)

@@ -53,7 +53,8 @@ use crate::constants::{
 };
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
-use crate::naming::{Direction, event_name, mapping_name};
+use crate::namespace::PrivateNamespace;
+use crate::naming::{Direction, ObjectPath};
 use crate::ring::FreeSpace;
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -183,6 +184,12 @@ pub struct MultiOptions {
     /// (0.10; до 0.10 -- NULL DACL). По умолчанию --
     /// `ObjectSecurity::CurrentUser`.
     pub security: ObjectSecurity,
+    /// Частное пространство имён слотов (0.10): секции и события
+    /// `base_name_N` создаются в нём под относительными именами (базовое имя
+    /// -- без `Local\`/`Global\`). Клиенту нужно пространство той же
+    /// границы (`MultiClientOptions::namespace`). `None` (по умолчанию) --
+    /// общий `\BaseNamedObjects`.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 impl Default for MultiOptions {
@@ -193,6 +200,7 @@ impl Default for MultiOptions {
             recv_batch: 32,
             layout: ChannelLayout::DEFAULT,
             security: ObjectSecurity::default(),
+            namespace: None,
         }
     }
 }
@@ -218,6 +226,10 @@ pub struct MultiClientOptions {
     /// самого старого (overwrite-семантика, как у `AutoOptions.max_send_queue`).
     /// Без этого предела очередь росла бы неограниченно, если пир завис/тормозит.
     pub max_send_queue: usize,
+    /// Частное пространство имён, в котором искать слоты (0.10; см.
+    /// `MultiOptions::namespace`). `None` (по умолчанию) -- общий
+    /// `\BaseNamedObjects`.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 impl Default for MultiClientOptions {
@@ -228,6 +240,7 @@ impl Default for MultiClientOptions {
             retry_delay: Duration::from_millis(250),
             recv_batch: 32,
             max_send_queue: 256,
+            namespace: None,
         }
     }
 }
@@ -431,6 +444,7 @@ impl MultiServer {
             // Каждый слот публикует число слотов -- подсказка для диагностики,
             // перебор клиента им не ограничивается.
             let server = SharedServer::start_slot(
+                options.namespace.as_ref(),
                 &format!("{base_name}_{slot_id}"),
                 options.layout,
                 options.max_clients,
@@ -1526,17 +1540,21 @@ fn client_worker(
     let wake = &*shared.wake;
     let outbox = &*shared.outbox;
     let effective_slot_timeout = clamp_slot_timeout(options.slot_timeout);
+    let namespace = options.namespace.as_deref();
 
     while running.load(Ordering::Acquire) {
         report_evicted(outbox, handler);
         // Шаг 1: атомарно захватываем свободный слот (без централизованного lobby).
-        let (slot_id, slot_name, token) = match claim_free_slot(base_name) {
+        let (slot_id, slot_name, token) = match claim_free_slot(namespace, base_name) {
             Ok(v) => v,
             Err(err) => {
-                if err == ShmError::NoFreeSlot {
-                    // Возможно, слот держит захват упавшего клиента: толкаем
-                    // сервер, чтобы он назначил дедлайн его освобождения.
-                    nudge_stale_claims(base_name);
+                // Возможно, слот держит захват упавшего клиента: толкаем
+                // сервер, чтобы он назначил дедлайн его освобождения. И при
+                // `AccessDenied`: слот, занятый захватчиком с запрещающим
+                // DACL (`B_N` создан заранее), не должен отключать толчок
+                // остальных слотов.
+                if matches!(err, ShmError::NoFreeSlot | ShmError::AccessDenied) {
+                    nudge_stale_claims(namespace, base_name);
                 }
                 handler.on_error(err);
                 if !wait_delay_or(running, wake, options.retry_delay) {
@@ -1551,6 +1569,7 @@ fn client_worker(
         // не ждут `slot_timeout` (`stop` гасит `running` сам).
         let mut should_stop = || !running.load(Ordering::Acquire);
         let connected = SharedClient::connect_interruptible(
+            namespace,
             &slot_name,
             effective_slot_timeout,
             Interrupt {
@@ -1561,13 +1580,13 @@ fn client_worker(
         let mut client = match connected {
             Ok(c) => c,
             Err(_) if !running.load(Ordering::Acquire) => {
-                release_claim(&slot_name, token);
+                release_claim(namespace, &slot_name, token);
                 break;
             }
             Err(err) => {
                 // Не подключились — освобождаем захваченный слот (best-effort;
                 // иначе сервер вернёт его в оборот по RESERVE_TIMEOUT).
-                release_claim(&slot_name, token);
+                release_claim(namespace, &slot_name, token);
                 handler.on_error(err);
                 if !wait_delay_or(running, wake, options.retry_delay) {
                     break;
@@ -1676,7 +1695,7 @@ fn client_worker(
         // Слот освободился у нас — снимаем claim (best-effort), чтобы он сразу
         // вернулся в оборот. CAS token->FREE сработает, только если claim ещё наш
         // (если сервер уже отнял слот по таймауту/force-disconnect — это no-op).
-        release_claim(&slot_name, token);
+        release_claim(namespace, &slot_name, token);
 
         if !wait_delay_or(running, wake, options.retry_delay) {
             break;
@@ -1715,11 +1734,18 @@ fn next_claim_token() -> u32 {
 
 /// Пытается атомарно захватить конкретный слот через `compare_exchange`.
 /// `Ok(true)` — захвачено нами; `Ok(false)` — слот занят/невалиден;
-/// `Err(_)` — слота с таким именем не существует (сегмент не открылся).
-fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
-    // Сервер создаёт секцию под именем mapping_name(slot_name) — открываем так же,
-    // но отображаем только заголовок: кольца для захвата не нужны.
-    let mapping = Mapping::open_header(&mapping_name(slot_name))?; // Err => слота нет
+/// `Err(AccessDenied)` (0.10) — слот есть, но DACL не даёт его этому
+/// пользователю (чужой сервер или захватчик имени); любая другая `Err(_)` —
+/// слота с таким именем нет (сегмент не открылся).
+fn try_claim_slot(
+    namespace: Option<&PrivateNamespace>,
+    slot_name: &str,
+    token: u32,
+) -> Result<bool> {
+    // Сервер создаёт секцию под именем `ObjectPath::mapping(slot_name)` —
+    // открываем так же (в том же пространстве), но отображаем только
+    // заголовок: кольца для захвата не нужны.
+    let mapping = Mapping::open_header(ObjectPath::mapping(namespace, slot_name))?;
     let Some(control) = SharedView::peek_control(&mapping) else {
         // Не опубликован (сервер ещё инициализирует), другой формат или
         // чужой объект -- пропускаем.
@@ -1747,8 +1773,8 @@ fn try_claim_slot(slot_name: &str, token: u32) -> Result<bool> {
 }
 
 /// Снять собственный claim со слота (CAS token -> FREE), если он всё ещё наш.
-fn release_claim(slot_name: &str, token: u32) {
-    if let Ok(mapping) = Mapping::open_header(&mapping_name(slot_name))
+fn release_claim(namespace: Option<&PrivateNamespace>, slot_name: &str, token: u32) {
+    if let Ok(mapping) = Mapping::open_header(ObjectPath::mapping(namespace, slot_name))
         && let Some(control) = SharedView::peek_control(&mapping)
     {
         let _ = control.slot_claim.compare_exchange(
@@ -1767,12 +1793,15 @@ fn release_claim(slot_name: &str, token: u32) {
 /// назначает дедлайн освобождения протухшего захвата. Так упавший между
 /// захватом и подключением клиент не держит слот, пока сервер спит, -- без
 /// какого-либо тика на сервере. Перебор -- как в `claim_free_slot`: до
-/// первого отсутствующего слота, `slot_count` не учитывается.
-fn nudge_stale_claims(base_name: &str) {
+/// первого отсутствующего слота, `slot_count` не учитывается; слот с отказом
+/// в доступе (0.10) пропускается, а не завершает перебор.
+fn nudge_stale_claims(namespace: Option<&PrivateNamespace>, base_name: &str) {
     for slot_id in 0..MAX_MULTI_CLIENTS {
         let slot_name = format!("{base_name}_{slot_id}");
-        let Ok(mapping) = Mapping::open_header(&mapping_name(&slot_name)) else {
-            break; // слотов больше нет
+        let mapping = match Mapping::open_header(ObjectPath::mapping(namespace, &slot_name)) {
+            Ok(mapping) => mapping,
+            Err(ShmError::AccessDenied) => continue, // слот есть, но чужой
+            Err(_) => break,                         // слотов больше нет
         };
         let Some(control) = SharedView::peek_control(&mapping) else {
             continue;
@@ -1781,7 +1810,8 @@ fn nudge_stale_claims(base_name: &str) {
         let accepted = control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
         if claimed
             && !accepted
-            && let Ok(event) = EventHandle::open(&event_name(
+            && let Ok(event) = EventHandle::open(ObjectPath::event(
+                namespace,
                 &slot_name,
                 Direction::ClientToServer,
                 EVENT_CONNECT_REQ_SUFFIX,
@@ -1808,13 +1838,16 @@ fn nudge_stale_claims(base_name: &str) {
 /// (слоты есть, все заняты) > `NotConnected` (ни одного слота -- сервер не
 /// запущен). Иначе клиент пользователя против службы SYSTEM с политикой по
 /// умолчанию видел бы вечный `NotConnected` -- неотличимо от «сервера нет».
-fn claim_free_slot(base_name: &str) -> Result<(u32, String, u32)> {
+fn claim_free_slot(
+    namespace: Option<&PrivateNamespace>,
+    base_name: &str,
+) -> Result<(u32, String, u32)> {
     let token = next_claim_token();
     let mut saw_slot = false;
     let mut denied = false;
     for slot_id in 0..MAX_MULTI_CLIENTS {
         let slot_name = format!("{base_name}_{slot_id}");
-        match try_claim_slot(&slot_name, token) {
+        match try_claim_slot(namespace, &slot_name, token) {
             Ok(true) => return Ok((slot_id, slot_name, token)),
             Ok(false) => saw_slot = true,
             Err(ShmError::AccessDenied) => denied = true,

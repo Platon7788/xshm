@@ -37,7 +37,7 @@ fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServ
     });
     thread::sleep(Duration::from_millis(30));
     let client =
-        SharedClient::connect_impl(name, Duration::from_secs(5), announce_pid, None).unwrap();
+        SharedClient::connect_impl(None, name, Duration::from_secs(5), announce_pid, None).unwrap();
     (server_thread.join().unwrap(), client)
 }
 
@@ -129,7 +129,8 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client = SharedClient::connect_impl(&name, Duration::from_secs(5), false, None).unwrap();
+    let client =
+        SharedClient::connect_impl(None, &name, Duration::from_secs(5), false, None).unwrap();
     let server = server_thread.join().unwrap();
     assert_eq!(server.peer_pid(), None);
     assert_eq!(server.is_peer_alive(), None);
@@ -182,7 +183,7 @@ fn client_with_forged_start_time_is_reported_dead() {
     thread::sleep(Duration::from_millis(30));
     let forged = crate::win::current_process_start_time().wrapping_add(1);
     crate::client::FORGED_START_TIME.with(|cell| cell.set(Some(forged)));
-    let client = SharedClient::connect_impl(&name, Duration::from_secs(5), true, None);
+    let client = SharedClient::connect_impl(None, &name, Duration::from_secs(5), true, None);
     crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
     let client = client.unwrap();
     let server = server_thread.join().unwrap();

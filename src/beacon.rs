@@ -36,8 +36,10 @@ use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::time::Duration;
 
 use crate::error::{Result, ShmError};
-use crate::naming::has_explicit_namespace;
+use crate::namespace::PrivateNamespace;
+use crate::naming::ObjectPath;
 use crate::security::{ObjectSecurity, SecurityAttributes};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 use crate::win::{EventHandle, Mapping, ProcessWatch, current_process_start_time, is_process_gone};
@@ -92,6 +94,10 @@ pub struct Beacon {
     /// Состояние маяка (0.10): секция `<имя>_beacon_state` или причина,
     /// по которой её нет.
     state: BeaconState,
+    /// Частное пространство имён маяка (0.10, [`Beacon::open_in`]): держим,
+    /// пока жив маяк, -- иначе с последним handle пространство исчезло бы,
+    /// и пир не нашёл бы маяк.
+    _namespace: Option<Arc<PrivateNamespace>>,
 }
 
 /// Состояние маяка.
@@ -135,13 +141,16 @@ const fn state_fallback(error: &ShmError) -> bool {
 /// Открыть секцию состояния: сначала существующую (открытие не требует
 /// `SeCreateGlobalPrivilege`), и только если её нет -- создать с
 /// дескриптором `security` (тот же, что у события маяка).
-fn open_state(name: &str, security: &SecurityAttributes) -> Result<BeaconState> {
-    let state_name = beacon_state_name(name);
-    let attempt = match Mapping::open(&state_name) {
+fn open_state(
+    namespace: Option<&PrivateNamespace>,
+    name: &str,
+    security: &SecurityAttributes,
+) -> Result<BeaconState> {
+    let attempt = match Mapping::open(beacon_state_path(namespace, name)) {
         Ok(mapping) if mapping.size() >= STATE_SIZE => Ok(mapping),
         Ok(_) => Err(ShmError::Corrupted),
         Err(ShmError::WindowsError { code, .. }) if code == STATUS_OBJECT_NAME_NOT_FOUND => {
-            Mapping::open_or_create(&state_name, STATE_SIZE, security)
+            Mapping::open_or_create(beacon_state_path(namespace, name), STATE_SIZE, security)
         }
         Err(other) => Err(other),
     };
@@ -162,18 +171,27 @@ impl AsHandle for Beacon {
     }
 }
 
-/// Имя события маяка для базового имени канала/лобби.
-fn beacon_name(base: &str) -> String {
-    if has_explicit_namespace(base) {
-        format!("{base}_beacon")
-    } else {
-        format!("Local\\{base}_beacon")
-    }
+/// Событие маяка `<base>_beacon` (namespace -- как у канала/лобби `base`;
+/// 0.10: или относительное имя в частном пространстве).
+fn beacon_path<'a>(namespace: Option<&'a PrivateNamespace>, base: &str) -> ObjectPath<'a> {
+    ObjectPath::scoped(namespace, base, "_beacon")
 }
 
-/// Имя секции состояния маяка (тот же namespace, что у события).
+/// Секция состояния маяка `<base>_beacon_state` (там же, где событие).
+fn beacon_state_path<'a>(namespace: Option<&'a PrivateNamespace>, base: &str) -> ObjectPath<'a> {
+    ObjectPath::scoped(namespace, base, "_beacon_state")
+}
+
+/// Имя события маяка вне частного пространства (тесты).
+#[cfg(test)]
+fn beacon_name(base: &str) -> String {
+    beacon_path(None, base).name().to_owned()
+}
+
+/// Имя секции состояния маяка вне частного пространства (тесты).
+#[cfg(test)]
 fn beacon_state_name(base: &str) -> String {
-    format!("{}_state", beacon_name(base))
+    beacon_state_path(None, base).name().to_owned()
 }
 
 impl Beacon {
@@ -224,11 +242,39 @@ impl Beacon {
     /// состояния с отказом в доступе -- не ошибка, а маяк без состояния);
     /// `InvalidConfig` -- некорректный `ObjectSecurity::Descriptor`.
     pub fn open_with(name: &str, security: &ObjectSecurity) -> Result<Self> {
+        Self::open_scoped(None, name, security)
+    }
+
+    /// [`Beacon::open_with`] в частном пространстве имён `ns` (0.10, см.
+    /// [`PrivateNamespace`]): событие `<имя>_beacon` и секция
+    /// `<имя>_beacon_state` -- относительные имена в пространстве, их не
+    /// видит и не может занять процесс вне границы. Имя -- без
+    /// `Local\`/`Global\` (иначе `InvalidConfig`). Маяк держит ссылку на
+    /// пространство, пока жив.
+    ///
+    /// # Errors
+    ///
+    /// Как у [`Beacon::open_with`].
+    pub fn open_in(
+        ns: &Arc<PrivateNamespace>,
+        name: &str,
+        security: &ObjectSecurity,
+    ) -> Result<Self> {
+        Self::open_scoped(Some(ns), name, security)
+    }
+
+    fn open_scoped(
+        namespace: Option<&Arc<PrivateNamespace>>,
+        name: &str,
+        security: &ObjectSecurity,
+    ) -> Result<Self> {
         let security = security.attributes()?;
-        let event = EventHandle::open_or_create_notification(&beacon_name(name), &security)?;
+        let root = namespace.map(Arc::as_ref);
+        let event = EventHandle::open_or_create_notification(beacon_path(root, name), &security)?;
         let beacon = Self {
             event,
-            state: open_state(name, &security)?,
+            state: open_state(root, name, &security)?,
+            _namespace: namespace.cloned(),
         };
         // Новая секция -- нули: `magic` ставит первый открывший (CAS 0 ->
         // MAGIC). Не ноль и не MAGIC -- порча: CAS не проходит, состоянию не
@@ -252,6 +298,7 @@ impl Beacon {
         Ok(Self {
             event: EventHandle::create_unnamed(true)?,
             state: BeaconState::Unnamed,
+            _namespace: None,
         })
     }
 
@@ -700,7 +747,7 @@ mod tests {
     #[test]
     fn open_rejects_state_squatted_by_other_object_type() {
         let name = unique("state-squat");
-        let _squatter = EventHandle::create(&beacon_state_name(&name), &sec()).unwrap();
+        let _squatter = EventHandle::create(beacon_state_name(&name), &sec()).unwrap();
         match Beacon::open(&name) {
             Err(ShmError::WindowsError { code, .. }) => {
                 assert_eq!(code, 0xC000_0024, "STATUS_OBJECT_TYPE_MISMATCH");
@@ -743,8 +790,9 @@ mod tests {
         let name = unique("legacy");
         let server = Beacon::open(&name).unwrap();
         let client = Beacon {
-            event: EventHandle::open_or_create_notification(&beacon_name(&name), &sec()).unwrap(),
+            event: EventHandle::open_or_create_notification(beacon_name(&name), &sec()).unwrap(),
             state: BeaconState::Legacy,
+            _namespace: None,
         };
         server.raise().unwrap();
         assert!(
@@ -772,7 +820,7 @@ mod tests {
     #[test]
     fn open_rejects_squatted_auto_reset_event() {
         let name = unique("squat");
-        let _squatter = EventHandle::create(&beacon_name(&name), &sec()).unwrap();
+        let _squatter = EventHandle::create(beacon_name(&name), &sec()).unwrap();
         assert!(
             Beacon::open(&name).is_err(),
             "маяк с автосбросом должен отвергаться"

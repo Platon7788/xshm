@@ -256,27 +256,33 @@ unsafe extern "system" {
     // ========================================================================
     // Private namespaces (0.10)
     // ========================================================================
+    //
+    // Сигнатуры сверены с phnt (ntrtl.h / ntobapi.h): все NTAPI (stdcall на
+    // x86), `PCUNICODE_STRING` -- указатель на неизменяемую строку.
 
     /// Создание дескриптора границы; NULL при нехватке памяти
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
     pub fn RtlCreateBoundaryDescriptor(
         Name: *const UNICODE_STRING,
         Flags: ULONG,
     ) -> POBJECT_BOUNDARY_DESCRIPTOR;
 
     /// Добавление SID в дескриптор границы (может перевыделить дескриптор)
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
     pub fn RtlAddSIDToBoundaryDescriptor(
         BoundaryDescriptor: *mut POBJECT_BOUNDARY_DESCRIPTOR,
         RequiredSid: PSID,
     ) -> NTSTATUS;
 
+    /// Добавление метки целостности в дескриптор границы (может
+    /// перевыделить дескриптор)
+    pub fn RtlAddIntegrityLabelToBoundaryDescriptor(
+        BoundaryDescriptor: *mut POBJECT_BOUNDARY_DESCRIPTOR,
+        IntegrityLabel: PSID,
+    ) -> NTSTATUS;
+
     /// Освобождение дескриптора границы
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
     pub fn RtlDeleteBoundaryDescriptor(BoundaryDescriptor: POBJECT_BOUNDARY_DESCRIPTOR);
 
     /// Создание частного пространства имён
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
     pub fn NtCreatePrivateNamespace(
         NamespaceHandle: *mut HANDLE,
         DesiredAccess: ACCESS_MASK,
@@ -285,7 +291,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Открытие существующего частного пространства имён
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
     pub fn NtOpenPrivateNamespace(
         NamespaceHandle: *mut HANDLE,
         DesiredAccess: ACCESS_MASK,
@@ -293,9 +298,8 @@ unsafe extern "system" {
         BoundaryDescriptor: POBJECT_BOUNDARY_DESCRIPTOR,
     ) -> NTSTATUS;
 
-    /// Пометка частного пространства имён на удаление
-    #[expect(dead_code, reason = "потребитель -- частные пространства имён (T10)")]
-    pub fn NtDeletePrivateNamespace(NamespaceHandle: HANDLE) -> NTSTATUS;
+    // `NtDeletePrivateNamespace` намеренно не объявлен: xshm пространство не
+    // удаляет (см. `namespace.rs` -- пиры остались бы в «висящем» каталоге).
 
     // ========================================================================
     // IO completion и пакеты ожидания завершения (0.10)

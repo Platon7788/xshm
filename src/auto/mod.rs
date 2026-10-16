@@ -9,6 +9,7 @@ use crate::client::{Interrupt, SharedClient};
 use crate::constants::{MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
+use crate::namespace::PrivateNamespace;
 use crate::ring::{FreeSpace, WriteOutcome, frame_size};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -112,6 +113,12 @@ pub struct AutoOptions {
     /// Использует только `AutoServer`: клиент объекты открывает, а не
     /// создаёт. По умолчанию -- `ObjectSecurity::CurrentUser`.
     pub security: ObjectSecurity,
+    /// Частное пространство имён канала (0.10): `AutoServer` создаёт объекты
+    /// в нём, `AutoClient` в нём же их ищет (при каждом переподключении).
+    /// Имя канала -- относительное (без `Local\`/`Global\`). `None` (по
+    /// умолчанию) -- общий `\BaseNamedObjects`. Worker держит ссылку, пока
+    /// жив: пространство не исчезает, пока его кто-то использует.
+    pub namespace: Option<Arc<PrivateNamespace>>,
 }
 
 impl Default for AutoOptions {
@@ -124,6 +131,7 @@ impl Default for AutoOptions {
             recv_batch: 32,
             layout: ChannelLayout::DEFAULT,
             security: ObjectSecurity::default(),
+            namespace: None,
         }
     }
 }
@@ -689,8 +697,13 @@ impl AutoServer {
     /// Поднять канал `name` (раскладка -- `options.layout`) и worker,
     /// который принимает клиентов и обслуживает их по событиям.
     pub fn start(name: &str, handler: Arc<dyn AutoHandler>, options: AutoOptions) -> Result<Self> {
-        let mut server =
-            SharedServer::start_slot(name, options.layout, 0, &options.security.attributes()?)?;
+        let mut server = SharedServer::start_slot(
+            options.namespace.as_ref(),
+            name,
+            options.layout,
+            0,
+            &options.security.attributes()?,
+        )?;
         let layout = *server.layout();
         let endpoint = Endpoint::spawn(
             handler,
@@ -1060,6 +1073,7 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
         // не ждут `connect_timeout`; `send` ожидание не прерывает.
         let mut should_stop = || !worker.running();
         let connected = SharedClient::connect_interruptible(
+            worker.options.namespace.as_deref(),
             name,
             worker.options.connect_timeout,
             Interrupt {

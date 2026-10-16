@@ -119,8 +119,15 @@ impl NtName {
     /// длинном буфере, т.е. рассинхронизацию Length/Buffer.
     /// `Err(WindowsError)` -- сессия процесса неизвестна (см. `to_nt_path`).
     pub fn new(name: &str) -> Result<Self> {
-        let nt_path = to_nt_path(name)?;
-        let wide = to_wide(&nt_path);
+        Self::verbatim(&to_nt_path(name)?)
+    }
+
+    /// Строка как есть, без преобразования в NT путь (0.10): имя объекта
+    /// относительно каталога `OBJECT_ATTRIBUTES.RootDirectory` (частное
+    /// пространство имён), имя дескриптора границы. Те же проверки длины,
+    /// что у [`NtName::new`].
+    pub fn verbatim(value: &str) -> Result<Self> {
+        let wide = to_wide(value);
         let units = wide.len() - 1; // без null-терминатора
 
         if units > MAX_NT_NAME_UNITS {

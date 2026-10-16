@@ -4,6 +4,11 @@
 //! префикса (`XSHM_SEG_`/`XSHM_` убраны в 0.6.0) — пространство имён полностью
 //! контролирует встраивающий код. Вызывающая сторона сама гарантирует, что
 //! базовое имя не конфликтует с другими объектами в том же namespace.
+//!
+//! 0.10: объект может жить в частном пространстве имён ([`ObjectPath`] с
+//! корнем) -- тогда имя относительное, без `Local\`/`Global\`.
+
+use crate::namespace::PrivateNamespace;
 
 #[derive(Clone, Copy)]
 pub enum Direction {
@@ -20,6 +25,77 @@ impl Direction {
     }
 }
 
+/// Имя объекта ядра вместе с каталогом, в котором его искать (0.10).
+///
+/// `root = None` -- Win32-имя (`Local\`/`Global\`/NT-путь, см.
+/// `ntapi::to_nt_path`); `Some(ns)` -- имя относительно частного
+/// пространства `ns` (`OBJECT_ATTRIBUTES.RootDirectory`), проверяется при
+/// разрешении: пустое или с `\` -- `InvalidConfig`.
+pub(crate) struct ObjectPath<'a> {
+    root: Option<&'a PrivateNamespace>,
+    name: String,
+}
+
+impl<'a> ObjectPath<'a> {
+    /// Объект `{base}{suffix}` канала/лобби/маяка `base`: в пространстве
+    /// `ns` -- относительное имя как есть, иначе -- в namespace по правилам
+    /// `scoped_name` (явный `Global\`/`Local\`/NT-путь как есть, иначе
+    /// неявный `Local\`).
+    pub(crate) fn scoped(ns: Option<&'a PrivateNamespace>, base: &str, suffix: &str) -> Self {
+        let name = match ns {
+            Some(_) => format!("{base}{suffix}"),
+            None => scoped_name(base, suffix),
+        };
+        Self { root: ns, name }
+    }
+
+    /// Секция канала `base`.
+    pub(crate) fn mapping(ns: Option<&'a PrivateNamespace>, base: &str) -> Self {
+        Self::scoped(ns, base, "")
+    }
+
+    /// Событие канала `base`.
+    pub(crate) fn event(
+        ns: Option<&'a PrivateNamespace>,
+        base: &str,
+        direction: Direction,
+        suffix: &str,
+    ) -> Self {
+        Self::scoped(ns, base, &event_suffix(direction, suffix))
+    }
+
+    /// Каталог (`None` -- общий `\BaseNamedObjects`).
+    pub(crate) const fn root(&self) -> Option<&'a PrivateNamespace> {
+        self.root
+    }
+
+    /// Имя (Win32 или относительное -- см. [`ObjectPath::root`]).
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl From<&str> for ObjectPath<'_> {
+    fn from(name: &str) -> Self {
+        Self {
+            root: None,
+            name: name.to_owned(),
+        }
+    }
+}
+
+impl From<&String> for ObjectPath<'_> {
+    fn from(name: &String) -> Self {
+        Self::from(name.as_str())
+    }
+}
+
+impl From<String> for ObjectPath<'_> {
+    fn from(name: String) -> Self {
+        Self { root: None, name }
+    }
+}
+
 /// Явно заданный вызывающим namespace, который нельзя переопределять.
 ///
 /// Без этой проверки имя `Global\Chan` превращалось в `Local\Global\Chan`, а
@@ -30,29 +106,36 @@ pub(crate) fn has_explicit_namespace(base: &str) -> bool {
     base.starts_with("Global\\") || base.starts_with("Local\\") || base.starts_with('\\')
 }
 
+/// `{base}{suffix}` в namespace `base`: как есть при явном namespace
+/// (`Global\...`, `Local\...`, NT-путь `\...`), иначе -- `Local\{base}{suffix}`.
+/// Все объекты канала (секция, события, маяк, мьютекс лобби) попадают в ОДИН
+/// namespace.
+fn scoped_name(base: &str, suffix: &str) -> String {
+    if has_explicit_namespace(base) {
+        format!("{base}{suffix}")
+    } else {
+        format!("Local\\{base}{suffix}")
+    }
+}
+
 /// Имя секции: `Local\{base}`, либо `base` как есть, если namespace задан явно
 /// (`Global\...`, `Local\...`, либо готовый NT-путь `\...`).
-pub fn mapping_name(base: &str) -> String {
-    if has_explicit_namespace(base) {
-        base.to_owned()
-    } else {
-        format!("Local\\{base}")
-    }
+#[cfg(test)]
+fn mapping_name(base: &str) -> String {
+    scoped_name(base, "")
 }
 
-/// Префикс имён событий канала. Namespace выбирается по тем же правилам, что
-/// и в `mapping_name`, иначе секция и события канала оказались бы в РАЗНЫХ
+/// Суффикс события: `_{S2C|C2S}_{suffix}`.
+fn event_suffix(direction: Direction, suffix: &str) -> String {
+    format!("_{}_{}", direction.as_str(), suffix)
+}
+
+/// Имя события канала. Namespace выбирается по тем же правилам, что и в
+/// `mapping_name`, иначе секция и события канала оказались бы в РАЗНЫХ
 /// namespace'ах.
-fn event_prefix(base: &str) -> String {
-    if has_explicit_namespace(base) {
-        format!("{base}_")
-    } else {
-        format!("Local\\{base}_")
-    }
-}
-
-pub fn event_name(base: &str, direction: Direction, suffix: &str) -> String {
-    format!("{}{}_{}", event_prefix(base), direction.as_str(), suffix)
+#[cfg(test)]
+fn event_name(base: &str, direction: Direction, suffix: &str) -> String {
+    scoped_name(base, &event_suffix(direction, suffix))
 }
 
 #[cfg(test)]
