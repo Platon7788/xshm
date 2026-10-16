@@ -322,7 +322,9 @@ fn main() -> Result<()> {
 
 ### Multi-client mode
 
-Fixed pool of slots (default 20, hard cap 256). Clients concurrently claim a
+Fixed pool of slots (default 20, hard cap 256; 256 slots × the default
+2 × 2 MiB layout ≈ 1 GiB of committed sections — set a small
+`MultiOptions::layout` for large `max_clients`). Clients concurrently claim a
 free slot via lock-free CAS — no central lobby, no negotiation round-trip:
 
 ```mermaid
@@ -619,7 +621,7 @@ The ring limits below are re-exported from the crate root
 | `MAX_MESSAGE_SIZE` | 65535 | Max message size (bytes) |
 | `MIN_MESSAGE_SIZE` | 2 | Min message size (bytes) |
 | `DEFAULT_MAX_CLIENTS` | 20 | Default slot count for `MultiServer` |
-| `MAX_MULTI_CLIENTS` | 256 | Hard cap for `MultiServer`, set by the slot-scan protocol (the server publishes `slot_count` in every slot, clients scan `0..min(slot_count, 256)`), not by the 64-handle wait limit — workers are split per 21 slots (256 slots = 13 threads) |
+| `MAX_MULTI_CLIENTS` | 256 | Hard cap for `MultiServer`, set by the slot-scan cost (clients scan slots `0..256` until the first missing one; the server also writes `slot_count` into every slot as a hint, clients never bound the scan by it), not by the 64-handle wait limit — workers are split per 21 slots (256 slots = 13 threads) |
 
 ## Event Handles for Kernel Drivers
 
