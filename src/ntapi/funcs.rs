@@ -183,7 +183,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Установка SACL (метка целостности) в Security Descriptor
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn RtlSetSaclSecurityDescriptor(
         SecurityDescriptor: *mut SECURITY_DESCRIPTOR,
         SaclPresent: BOOLEAN,
@@ -192,11 +191,9 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Инициализация пустого ACL в буфере длины `AclLength`
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn RtlCreateAcl(Acl: *mut ACL, AclLength: ULONG, AclRevision: ULONG) -> NTSTATUS;
 
     /// Добавление разрешающей записи ACE для SID
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn RtlAddAccessAllowedAce(
         Acl: *mut ACL,
         AceRevision: ULONG,
@@ -205,7 +202,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Добавление обязательной метки (SYSTEM_MANDATORY_LABEL_ACE) в SACL
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn RtlAddMandatoryAce(
         Acl: *mut ACL,
         AceRevision: ULONG,
@@ -216,8 +212,17 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Длина SID в байтах
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn RtlLengthSid(Sid: PSID) -> ULONG;
+
+    /// Проверка self-relative дескриптора безопасности длины
+    /// `SecurityDescriptorLength` (все смещения -- в пределах буфера);
+    /// `RequiredInformation` -- `SECURITY_INFORMATION`, обязательные части
+    /// (0 -- никаких). Ненулевой результат -- дескриптор корректен.
+    pub fn RtlValidRelativeSecurityDescriptor(
+        SecurityDescriptorInput: PVOID,
+        SecurityDescriptorLength: ULONG,
+        RequiredInformation: ULONG,
+    ) -> BOOLEAN;
 
     // ========================================================================
     // Section/Token queries (0.10)
@@ -233,7 +238,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Открытие токена процесса
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn NtOpenProcessToken(
         ProcessHandle: HANDLE,
         DesiredAccess: ACCESS_MASK,
@@ -241,7 +245,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Запрос сведений о токене (TokenUser -- SID пользователя)
-    #[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
     pub fn NtQueryInformationToken(
         TokenHandle: HANDLE,
         TokenInformationClass: ULONG,

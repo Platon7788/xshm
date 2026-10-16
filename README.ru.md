@@ -219,6 +219,39 @@ namespace выбирается по префиксу:
 
 События канала всегда попадают в тот же namespace, что и секция.
 
+## Безопасность объектов (0.10)
+
+**NULL DACL больше не по умолчанию.** Каждый именованный объект, который
+создаёт xshm (секция канала и её 7 событий, слоты Multi, лобби Dispatch, его
+мьютекс `<лобби>_lock` и каналы клиентов, маяк и `<имя>_beacon_state`),
+получает дескриптор безопасности, выбранный **создателем** (`ObjectSecurity`);
+открывающая сторона дескриптор не передаёт и проверяется по DACL создателя.
+Отказ при открытии — `ShmError::AccessDenied`.
+
+| Политика | DACL / SACL | Для чего |
+|----------|-------------|----------|
+| `ObjectSecurity::CurrentUser` (по умолчанию) | SID пользователя токена процесса + SYSTEM (`S-1-5-18`), `GENERIC_ALL` | пиры одного пользователя |
+| `ObjectSecurity::CurrentUserAllowLowIntegrity` | то же + метка Low `S:(ML;;NW;;;LW)` | песочницы (Low IL) того же пользователя |
+| `ObjectSecurity::Everyone` | NULL DACL (поведение ≤ 0.9) | служба SYSTEM ↔ пользователь через `Global\` без общей группы |
+| `ObjectSecurity::Descriptor(bytes)` | свой self-relative дескриптор (проверяется) | всё остальное (например, SYSTEM + `Users`, SID AppContainer) |
+
+```rust
+use xshm::{ChannelConfig, DispatchOptions, ObjectSecurity, SharedServer};
+
+// Служба в сессии 0 и процессы других пользователей на десктопе:
+let config = ChannelConfig::default().security(ObjectSecurity::Everyone);
+let server = SharedServer::start_with("Global\\MyService", &config)?;
+// Auto / Multi / Dispatch: поле `security` их опций (каналы Dispatch и
+// мьютекс лобби наследуют `DispatchOptions::security`);
+// маяк: `Beacon::open_with(name, &policy)`.
+let options = DispatchOptions { security: ObjectSecurity::Everyone, ..Default::default() };
+```
+
+**Миграция с 0.9**: `Global\`-канал служба SYSTEM ↔ процесс пользователя
+работал с NULL DACL; с политикой по умолчанию пользователь получает
+`AccessDenied`, если объекты создаёт служба. Создающей стороне нужна
+`ObjectSecurity::Everyone` (или свой `Descriptor`).
+
 ## Требования
 
 - Windows 10/11
@@ -652,7 +685,7 @@ if let Some(handles) = server.get_event_handles() {
 - **Anonymous-серверы**: event handles недоступны (только режим polling)
 - **Число слотов Multi-client**: жёсткий предел 256 одновременных клиентов (ограничивает перебор слотов клиентом; каждые 21 слот — ещё один worker-поток) — используйте Dispatch-режим, если нужно больше
 - **Таймеры переподключения**: `AutoClient` / `MultiClient` *без подключения* (сервера нет, нет свободного слота) повторяет попытку раз в `reconnect_delay` / `retry_delay`; подключённые каналы в простое не просыпаются. Для обнаружения сервера целиком по событиям — `Beacon`
-- **Без аутентификации**: именованные объекты создаются с NULL DACL — открыть их может любой локальный процесс (с `Global\` — из любого сеанса); не передавайте секреты
+- **Разграничение доступа, а не аутентификация**: по умолчанию именованные объекты открыты только пользователю-создателю и SYSTEM (`ObjectSecurity::CurrentUser`); любой процесс того же пользователя открыть их всё равно может, а `ObjectSecurity::Everyone` возвращает NULL DACL ≤ 0.9 — не передавайте секреты
 
 ## Структура проекта
 

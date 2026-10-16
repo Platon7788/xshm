@@ -55,6 +55,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::naming::{Direction, event_name, mapping_name};
 use crate::ring::FreeSpace;
+use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::shared::SharedView;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker};
@@ -178,6 +179,10 @@ pub struct MultiOptions {
     /// отдельная секция `layout.segment_size()` байт commit-а, поэтому
     /// для многих клиентов с короткими сообщениями выгодны маленькие кольца.
     pub layout: ChannelLayout,
+    /// Политика безопасности объектов каждого слота -- секции и 7 событий
+    /// (0.10; до 0.10 -- NULL DACL). По умолчанию --
+    /// `ObjectSecurity::CurrentUser`.
+    pub security: ObjectSecurity,
 }
 
 impl Default for MultiOptions {
@@ -187,6 +192,7 @@ impl Default for MultiOptions {
             poll_timeout: None,
             recv_batch: 32,
             layout: ChannelLayout::DEFAULT,
+            security: ObjectSecurity::default(),
         }
     }
 }
@@ -426,6 +432,7 @@ impl MultiServer {
                 &format!("{base_name}_{slot_id}"),
                 options.layout,
                 options.max_clients,
+                &options.security,
             )?;
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
@@ -1788,7 +1795,7 @@ fn nudge_stale_claims(base_name: &str) {
 ///
 /// Перебор -- до первого отсутствующего слота, не дальше
 /// `MAX_MULTI_CLIENTS`. `ControlBlock::slot_count` границей НЕ служит: его
-/// может переписать любой клиент (NULL DACL), и `slot_count = 1` в слоте 0
+/// может переписать любой клиент с доступом к слоту, и `slot_count = 1` в слоте 0
 /// закрыл бы остальные слоты для всех -- отказ в обслуживании.
 fn claim_free_slot(base_name: &str) -> Result<(u32, String, u32)> {
     let token = next_claim_token();

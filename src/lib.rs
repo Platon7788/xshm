@@ -7,6 +7,7 @@ pub mod events;
 mod layout;
 mod naming;
 mod ring;
+mod security;
 mod server;
 mod shared;
 mod sync_ext;
@@ -64,7 +65,8 @@ pub use multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
 pub use ring::{FreeSpace, WriteOutcome, frame_size};
-pub use server::SharedServer;
+pub use security::ObjectSecurity;
+pub use server::{ChannelConfig, SharedServer};
 pub use thread_hook::{set_thread_start_hook, thread_start_hook};
 
 use std::sync::atomic::{AtomicBool, Ordering};

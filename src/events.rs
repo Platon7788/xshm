@@ -4,6 +4,7 @@ use crate::constants::{
 };
 use crate::error::Result;
 use crate::naming::{Direction, event_name};
+use crate::security::SecurityAttributes;
 use crate::win::EventHandle;
 
 #[derive(Debug)]
@@ -37,47 +38,41 @@ pub struct EventHandles {
 }
 
 impl SharedEvents {
-    pub fn create(base: &str) -> Result<Self> {
+    /// Создать 7 событий канала `base` с дескриптором `security` (0.10).
+    pub(crate) fn create(base: &str, security: &SecurityAttributes) -> Result<Self> {
         Ok(Self {
             s2c: ChannelEvents {
-                data: EventHandle::create(&event_name(
-                    base,
-                    Direction::ServerToClient,
-                    EVENT_DATA_SUFFIX,
-                ))?,
-                space: EventHandle::create(&event_name(
-                    base,
-                    Direction::ServerToClient,
-                    EVENT_SPACE_SUFFIX,
-                ))?,
+                data: EventHandle::create(
+                    &event_name(base, Direction::ServerToClient, EVENT_DATA_SUFFIX),
+                    security,
+                )?,
+                space: EventHandle::create(
+                    &event_name(base, Direction::ServerToClient, EVENT_SPACE_SUFFIX),
+                    security,
+                )?,
             },
             c2s: ChannelEvents {
-                data: EventHandle::create(&event_name(
-                    base,
-                    Direction::ClientToServer,
-                    EVENT_DATA_SUFFIX,
-                ))?,
-                space: EventHandle::create(&event_name(
-                    base,
-                    Direction::ClientToServer,
-                    EVENT_SPACE_SUFFIX,
-                ))?,
+                data: EventHandle::create(
+                    &event_name(base, Direction::ClientToServer, EVENT_DATA_SUFFIX),
+                    security,
+                )?,
+                space: EventHandle::create(
+                    &event_name(base, Direction::ClientToServer, EVENT_SPACE_SUFFIX),
+                    security,
+                )?,
             },
-            connect_ack: EventHandle::create(&event_name(
-                base,
-                Direction::ServerToClient,
-                EVENT_CONNECT_SUFFIX,
-            ))?,
-            connect_req: EventHandle::create(&event_name(
-                base,
-                Direction::ClientToServer,
-                EVENT_CONNECT_REQ_SUFFIX,
-            ))?,
-            disconnect: EventHandle::create(&event_name(
-                base,
-                Direction::ServerToClient,
-                EVENT_DISCONNECT_SUFFIX,
-            ))?,
+            connect_ack: EventHandle::create(
+                &event_name(base, Direction::ServerToClient, EVENT_CONNECT_SUFFIX),
+                security,
+            )?,
+            connect_req: EventHandle::create(
+                &event_name(base, Direction::ClientToServer, EVENT_CONNECT_REQ_SUFFIX),
+                security,
+            )?,
+            disconnect: EventHandle::create(
+                &event_name(base, Direction::ServerToClient, EVENT_DISCONNECT_SUFFIX),
+                security,
+            )?,
         })
     }
 

@@ -37,6 +37,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
 use crate::naming::mapping_name;
 use crate::ring::FreeSpace;
+use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker};
 use crate::wait_delay_or;
@@ -68,7 +69,8 @@ pub struct ClientRegistration {
     /// Это сверка согласованности самоописания, **не доказательство
     /// личности**: локальный процесс может заявить чужие PID и время
     /// создания (время читается с `PROCESS_QUERY_LIMITED_INFORMATION`), а
-    /// секция лобби с NULL DACL читаема -- имя канала не секрет.
+    /// секция лобби читаема всяким, кому её DACL даёт доступ (по умолчанию --
+    /// тот же пользователь) -- имя канала не секрет.
     /// Аутентификацию дают политика безопасности объектов (ObjectSecurity) и
     /// приватное пространство имён. Внутри одной учётной записи границы нет.
     ///
@@ -211,6 +213,11 @@ pub struct DispatchOptions {
     /// Раскладка лобби: сообщения регистрации короче 100 байт, поэтому по
     /// умолчанию лобби -- два кольца по 16 КиБ, а не 2 × 2 МиБ.
     pub lobby_layout: ChannelLayout,
+    /// Политика безопасности объектов сервера (0.10; до 0.10 -- NULL DACL):
+    /// лобби (секция и события), мьютекс лобби `<лобби>_lock` и каналы
+    /// клиентов наследуют её. По умолчанию -- `ObjectSecurity::CurrentUser`:
+    /// клиенты другого пользователя получают `AccessDenied` уже на лобби.
+    pub security: ObjectSecurity,
 }
 
 /// Раскладка лобби по умолчанию: регистрация -- одно короткое сообщение в
@@ -232,6 +239,7 @@ impl Default for DispatchOptions {
             max_clients: 64,
             channel_layout: ChannelLayout::DEFAULT,
             lobby_layout: DEFAULT_LOBBY_LAYOUT,
+            security: ObjectSecurity::default(),
         }
     }
 }
@@ -252,6 +260,11 @@ pub struct DispatchClientOptions {
     pub recv_batch: usize,
     /// Максимум сообщений в очереди перед сбросом самого старого.
     pub max_send_queue: usize,
+    /// Политика безопасности мьютекса лобби `<лобби>_lock` (0.10) -- если
+    /// его создаёт этот клиент (сервер не запущен или 0.9). Обычно мьютекс
+    /// уже создал сервер с политикой лобби, и поле не применяется. По
+    /// умолчанию -- `ObjectSecurity::CurrentUser`.
+    pub security: ObjectSecurity,
 }
 
 impl Default for DispatchClientOptions {
@@ -263,6 +276,7 @@ impl Default for DispatchClientOptions {
             poll_timeout: None,
             recv_batch: 32,
             max_send_queue: 256,
+            security: ObjectSecurity::default(),
         }
     }
 }
@@ -390,7 +404,7 @@ type Background = Arc<Mutex<Vec<JoinHandle<()>>>>;
 
 mod core_type {
     use super::{Arc, AtomicBool, AtomicU32, Background, ClientMap, DispatchHandler};
-    use super::{DispatchOptions, EventHandle, JoinHandle, Mutex};
+    use super::{DispatchOptions, EventHandle, JoinHandle, Mutex, NamedMutex};
 
     /// Состояние сервера, общее для ручки `DispatchServer` и потока лобби.
     /// Вне крейта тип не именуем: его методы доступны через `Deref` ручки.
@@ -417,6 +431,11 @@ mod core_type {
         pub(in crate::dispatch) channel_prefix: String,
         /// Возвраты потока лобби из ожидания в ядре (тесты: ноль в простое).
         pub(in crate::dispatch) lobby_wakeups: std::sync::atomic::AtomicU64,
+        /// Мьютекс клиентов лобби `<лобби>_lock` (0.10): сервер создаёт его
+        /// в `start` с политикой лобби и держит открытым, чтобы дескриптор
+        /// мьютекса задавал он, а не первый пришедший клиент. Сервер его не
+        /// захватывает.
+        pub(in crate::dispatch) _lobby_lock: NamedMutex,
     }
 }
 use core_type::DispatchCore;
@@ -449,7 +468,9 @@ impl DispatchServer {
             return Err(ShmError::InvalidConfig("max_clients must be at least 1"));
         }
         options.channel_layout.validate()?;
-        let lobby = SharedServer::start_with_layout(name, options.lobby_layout)?;
+        let lobby = SharedServer::start_slot(name, options.lobby_layout, 0, &options.security)?;
+        let lobby_lock =
+            NamedMutex::open_or_create(&lobby_lock_name(name), &options.security.attributes()?)?;
         let stop_event = Arc::new(EventHandle::create_unnamed(true)?);
         let running = Arc::new(AtomicBool::new(true));
 
@@ -465,6 +486,7 @@ impl DispatchServer {
             options,
             channel_prefix,
             lobby_wakeups: std::sync::atomic::AtomicU64::new(0),
+            _lobby_lock: lobby_lock,
         });
 
         let lobby_core = Arc::clone(&core);
@@ -762,8 +784,12 @@ impl DispatchCore {
             // ошибки (с отступом, прерываемым остановкой).
             let mut lobby_server = match first.take() {
                 Some(lobby) => lobby,
-                None => match SharedServer::start_with_layout(base_name, self.options.lobby_layout)
-                {
+                None => match SharedServer::start_slot(
+                    base_name,
+                    self.options.lobby_layout,
+                    0,
+                    &self.options.security,
+                ) {
                     Ok(s) => s,
                     Err(err) => {
                         self.handler.on_error(None, err);
@@ -976,6 +1002,8 @@ impl DispatchCore {
             recv_batch: self.options.recv_batch,
             max_send_queue: self.options.max_send_queue,
             layout,
+            // Канал клиента наследует политику лобби.
+            security: self.options.security.clone(),
             ..AutoOptions::default()
         };
 
@@ -1563,7 +1591,10 @@ fn lobby_register(
     options: &DispatchClientOptions,
     buffer: &mut Vec<u8>,
 ) -> Result<(u32, String)> {
-    let lock = NamedMutex::open_or_create(&lobby_lock_name(base_name))?;
+    // Обычно мьютекс уже создал сервер (с политикой лобби) и `security`
+    // клиента не применяется; своя политика -- только если клиент первый.
+    let lock =
+        NamedMutex::open_or_create(&lobby_lock_name(base_name), &options.security.attributes()?)?;
     // Порядок объявлений важен: `client` дропается раньше `_turn` --
     // мьютекс отпускается только после отключения от лобби.
     let Some(_turn) = lock.lock(Some(options.lobby_timeout))? else {
@@ -1717,6 +1748,37 @@ mod tests {
         fn on_message(&self, _client_id: u32, _data: &[u8]) {
             self.messages.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// 0.10: мьютекс лобби создаёт сервер с политикой лобби -- клиент,
+    /// пришедший позже, открывает уже существующий объект с DACL сервера
+    /// (пустой DACL -- отказ), а не создаёт свой.
+    #[test]
+    fn lobby_lock_is_created_with_server_policy() {
+        // Self-relative дескриптор с пустым DACL (никому ничего).
+        let mut sd = vec![1u8, 0, 0x04, 0x80];
+        sd.extend_from_slice(&[0; 12]);
+        sd.extend_from_slice(&20u32.to_le_bytes());
+        sd.extend_from_slice(&[2, 0, 8, 0, 0, 0, 0, 0]);
+        let name = format!("TEST_DISPATCH_LOCK_POLICY_{}", std::process::id());
+        let server = DispatchServer::start(
+            &name,
+            Arc::new(TestServerHandler::new()),
+            DispatchOptions {
+                security: ObjectSecurity::Descriptor(sd),
+                ..DispatchOptions::default()
+            },
+        )
+        .unwrap();
+        let client_policy = ObjectSecurity::default().attributes().unwrap();
+        assert_eq!(
+            NamedMutex::open_or_create(&lobby_lock_name(&name), &client_policy).err(),
+            Some(ShmError::AccessDenied)
+        );
+        server.stop();
+        drop(server);
+        // Сервера нет -- мьютекс закрыт, клиент создаёт свой.
+        assert!(NamedMutex::open_or_create(&lobby_lock_name(&name), &client_policy).is_ok());
     }
 
     struct TestClientHandler {

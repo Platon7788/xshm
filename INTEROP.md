@@ -109,10 +109,35 @@ UTF-16. `OBJECT_ATTRIBUTES.Attributes` всегда содержит `OBJ_CASE_I
 
 ### b.2 Полный перечень объектов
 
-`P` = префикс событий (`Local\B_` или `B_`). Все созданные именованные объекты
-получают `SECURITY_DESCRIPTOR` с **NULL DACL** (`RtlCreateSecurityDescriptor` +
-`RtlSetDaclSecurityDescriptor(DaclPresent=TRUE, Dacl=NULL)`); открывающая
-сторона передаёт `SecurityDescriptor = NULL`.
+`P` = префикс событий (`Local\B_` или `B_`). **Дескриптор безопасности задаёт
+создатель** объекта (0.10, `ObjectSecurity`; до 0.10 — всегда NULL DACL):
+`OBJECT_ATTRIBUTES.SecurityDescriptor` при `NtCreate*` — дескриптор политики
+создателя; открывающая сторона передаёт `SecurityDescriptor = NULL` (**без
+изменений**) и получает доступ по DACL объекта, отказ — `STATUS_ACCESS_DENIED
+(0xC0000022)` (в Rust — `ShmError::AccessDenied`). Политики Rust:
+
+- `CurrentUser` (**по умолчанию**) — абсолютный дескриптор
+  (`RtlCreateSecurityDescriptor` + `RtlSetDaclSecurityDescriptor`), DACL
+  ревизии 2 (`RtlCreateAcl`) из двух `ACCESS_ALLOWED_ACE` с маской
+  `GENERIC_ALL (0x10000000)`, без флагов наследования: SID пользователя токена
+  процесса (`NtOpenProcessToken(TOKEN_QUERY)` +
+  `NtQueryInformationToken(TokenUser)`), затем LocalSystem `S-1-5-18`
+  (процесс от SYSTEM — одна запись). Владелец, группа, SACL — по умолчанию
+  токена;
+- `CurrentUserAllowLowIntegrity` — то же + SACL ревизии 2 с одной
+  `SYSTEM_MANDATORY_LABEL_ACE` (тип `0x11`, флаги 0) для `S-1-16-4096` (Low)
+  с политикой `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP (0x1)` — SDDL
+  `S:(ML;;NW;;;LW)`;
+- `Everyone` — NULL DACL (`RtlSetDaclSecurityDescriptor(DaclPresent=TRUE,
+  Dacl=NULL)`), как до 0.10;
+- `Descriptor` — self-relative дескриптор вызывающего (проверен
+  `RtlValidRelativeSecurityDescriptor`).
+
+Секция и все события одного канала (и всех слотов Multi, лобби Dispatch вместе с
+`B_lock` и каналами клиентов) создаются с **одной** политикой. Нативный пир,
+создающий объекты, выбирает дескриптор сам; чтобы с ним работал Rust 0.10 с
+политикой по умолчанию от другого пользователя, его DACL обязан выдавать этому
+пользователю `SECTION_ALL_ACCESS`/`EVENT_ALL_ACCESS`/`MUTANT_ALL_ACCESS`.
 
 | Объект | Имя | Тип | Нач. состояние | Создаёт (флаги, доступ) | Открывает | Кто сигналит | Кто ждёт |
 |---|---|---|---|---|---|---|---|
@@ -125,8 +150,8 @@ UTF-16. `OBJECT_ATTRIBUTES.Attributes` всегда содержит `OBJ_CASE_I
 | `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`) | сервер |
 | `P S2C_DISCONNECT` | | SynchronizationEvent | FALSE | сервер | клиент | **обе** стороны при штатном закрытии (одно событие на оба направления, несмотря на `S2C` в имени) | обе стороны |
 | **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`src/win.rs:164-193`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
-| **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, NULL DACL; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
-| **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, NULL DACL; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс не трогает |
+| **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, дескриптор — политика создателя маяка (та же, что у `_beacon`; 0.10, до 0.10 — NULL DACL); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они; второй — в том числе DACL чужой секции не включает этого пользователя) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
+| **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | 0.10: **сервер** в `start` (после секции лобби, держит до остановки, не захватывает; дескриптор — политика лобби) и **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, дескриптор — политика создателя (до 0.10 — NULL DACL, создавал только клиент); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс только держит открытым (0.10) |
 | Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`src/win.rs:195-223`) | не открывается по имени | свой процесс | свой процесс |
 | Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`src/win.rs:615-652`) | ядро (при завершении процесса) | сторона, открывшая handle |
 
@@ -223,7 +248,8 @@ timeout)`; `timeout = NULL` — без конца; иначе относител
 
   Мусор в личности сервера при верном `magic` (PID несуществующего процесса,
   чужое время создания) допускает сброс — не новая возможность: любой процесс
-  и так может сбросить маяк с NULL DACL напрямую. Неверный `magic` — маяк не
+  с доступом к маяку (NULL DACL до 0.10, тот же пользователь с 0.10) и так
+  может сбросить его напрямую. Неверный `magic` — маяк не
   трогается.
 - **Гонка остаётся (явно)** в двух случаях — там клиент защищён только
   перепроверкой лобби, как до 0.10, и при ≥ 2 клиентах один может погасить
@@ -819,7 +845,8 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    dispatch_disconnect_no_double_notify, stop_does_not_deadlock_after_client_disconnects,
    client_is_connected_false_after_server_disconnect, stop_synchronously_joins_worker}`.
 6. **Маяк**: NotificationEvent `<B>_beacon` с `OBJ_OPENIF` (+ принять
-   `STATUS_OBJECT_NAME_EXISTS`), NULL DACL, `InitialState = FALSE`;
+   `STATUS_OBJECT_NAME_EXISTS`), дескриптор — своя политика (§b.2; до 0.10
+   NULL DACL), `InitialState = FALSE`;
    `raise`/`lower`/`wait`/`wait_any`/`is_raised`; 0.10 — секция состояния
    `<B>_beacon_state`, публикация в `raise`, `clear_if_stale` клиента вместо
    `lower`; порядок сервера и алгоритм клиента §b.3; `lobby_exists`. Тесты:
@@ -928,8 +955,10 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    заявки (R15).
 4. **Первый создатель маяка определяет его тип** (§b.3): любой процесс может
    заранее создать `<B>_beacon` как SynchronizationEvent или с жёстким DACL
-   (тогда `EVENT_ALL_ACCESS` у остальных даст отказ). Модель безопасности —
-   NULL DACL, аутентификации нет.
+   (тогда `EVENT_ALL_ACCESS` у остальных даст отказ). Модель безопасности
+   до 0.10 — NULL DACL; с 0.10 DACL задаёт создатель (§b.2), по умолчанию —
+   пользователь + SYSTEM: занять маяк заранее может только процесс того же
+   пользователя (или с политикой `Everyone` — любой).
 5. **Лобби «существует»**, пока на секцию есть хоть один handle — в том числе
    у клиента, застрявшего в регистрации: `lobby_exists` может вернуть `true`
    сразу после падения сервера, а новый сервер — не стартовать на этом имени.
@@ -938,8 +967,9 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    разделяемую память **сам**; сервер лишь сверяет их с существующим
    процессом с этим PID. Локальный процесс может заявить чужие PID и время
    (время чужого процесса читается с `PROCESS_QUERY_LIMITED_INFORMATION`), а
-   секция лобби с NULL DACL читаема любым — имя канала из ответа **не
-   секрет**. Поэтому сверка (§d.2 шаг 9) ловит только несогласованное
+   секция лобби читаема любым процессом, которому её DACL даёт доступ
+   (0.10 по умолчанию — тем же пользователем; `Everyone` — любым), — имя
+   канала из ответа **не секрет**. Поэтому сверка (§d.2 шаг 9) ловит только несогласованное
    самоописание (другой PID, канал без PID или без времени), но не
    подмену личности. Аутентификацию дают политика безопасности объектов
    (ObjectSecurity) и приватное пространство имён. **Внутри одной учётной
@@ -981,7 +1011,7 @@ reserved[1] = PID` (Release, §c.1);
 Сервер ОБЯЗАН записать `slot_count = max_clients` (§c.1, смещение 60) в
 **каждый** слот до публикации `magic`. Это **подсказка** (диагностика):
 клиенты по ней перебор **НЕ** ограничивают и ОБЯЗАНЫ не ограничивать —
-поле доступно на запись любому клиенту (NULL DACL), и `slot_count = 1` в
+поле доступно на запись любому клиенту, которому DACL слота даёт доступ, и `slot_count = 1` в
 `B_0` иначе закрыл бы остальные слоты для всех (отказ в обслуживании).
 Любое значение поля, включая мусор, на перебор не влияет.
 
@@ -1205,6 +1235,7 @@ R1–R17), §g (фактический прогон).
 | 19 | Конец сессии лобби сервером | `mark_disconnected` без сигнала | после `IDLE` — `NtSetEvent(S2C_DISCONNECT)`, в том числе когда ответа не будет (таймаут чтения, ошибка, остановка) | §d.2 шаг 6 |
 | 20 | Ожидание ответа клиентом лобби | `S2C_DATA` до `response_timeout` | `[S2C_DATA, S2C_DISCONNECT, процесс сервера]`; кольцо читается первым; `DISCONNECT` при ушедшей сессии — `NotConnected`, смерть сервера — `PeerDied` | §d.2 шаг 7, §e.4 таблица ожиданий |
 | 21 | Согласованность самоописания клиента канала Dispatch (не аутентификация) | не проверялась | PID лобби сверен (PID + ненулевое `client_start_*` совпали с процессом) — пир канала ОБЯЗАН сообщить тот же PID и ненулевое совпадающее время, иначе (в т. ч. время `0`) канал закрывается до `on_client_connect`; не сверен — сверки нет; `ClientRegistration::handshake_pid`. Подмену личности не ловит: PID и время пир пишет сам (§h п. 6) | §d.2 шаг 9, §h |
+| 22 | Дескриптор безопасности создаваемых именованных объектов (секция и события канала, слоты Multi, лобби и `B_lock`, каналы Dispatch, маяк и `_beacon_state`) | NULL DACL у всех | задаёт создатель (`ObjectSecurity`), по умолчанию DACL = SID пользователя токена + `S-1-5-18`, `GENERIC_ALL` (`CurrentUserAllowLowIntegrity` — + SACL `S:(ML;;NW;;;LW)`, `Everyone` — NULL DACL, `Descriptor` — свой); открывающий по-прежнему передаёт `SecurityDescriptor = NULL`, отказ — `STATUS_ACCESS_DENIED`. Сервер Dispatch сам создаёт `B_lock` (`OBJ_OPENIF`, политика лобби) в `start` и держит его. Служба SYSTEM ↔ пользователь через `Global\` — `Everyone` или свой дескриптор у создающей стороны | §b.2, §h п. 4, 6 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации

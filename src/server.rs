@@ -8,6 +8,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::naming::mapping_name;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
+use crate::security::ObjectSecurity;
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
 
@@ -27,6 +28,48 @@ impl Deadline {
     fn remaining(&self) -> Option<Duration> {
         self.0
             .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+}
+
+/// Параметры канала для [`SharedServer::start_with`]: раскладка и политика
+/// безопасности объектов.
+///
+/// `#[non_exhaustive]`: строится от `ChannelConfig::default()` (раскладка
+/// `ChannelLayout::DEFAULT`, политика `ObjectSecurity::CurrentUser`) и
+/// методами [`ChannelConfig::layout`]/[`ChannelConfig::security`]; новые
+/// параметры (например, частное пространство имён) добавляются без поломки
+/// вызывающих.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ChannelConfig {
+    /// Раскладка канала (размеры колец, лимиты по направлениям).
+    pub layout: ChannelLayout,
+    /// Кто получает доступ к секции и событиям канала.
+    pub security: ObjectSecurity,
+}
+
+impl ChannelConfig {
+    /// Параметры с раскладкой `layout` и политикой по умолчанию.
+    #[must_use]
+    pub fn new(layout: ChannelLayout) -> Self {
+        Self {
+            layout,
+            security: ObjectSecurity::default(),
+        }
+    }
+
+    /// Заменить раскладку.
+    #[must_use]
+    pub const fn layout(mut self, layout: ChannelLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    /// Заменить политику безопасности.
+    #[must_use]
+    pub fn security(mut self, security: ObjectSecurity) -> Self {
+        self.security = security;
+        self
     }
 }
 
@@ -56,25 +99,45 @@ unsafe impl Send for SharedServer {}
 impl SharedServer {
     /// Сервер канала `name` с раскладкой по умолчанию (`ChannelLayout::DEFAULT`).
     pub fn start(name: &str) -> Result<Self> {
-        Self::start_with_layout(name, ChannelLayout::DEFAULT)
+        Self::start_with(name, &ChannelConfig::default())
     }
 
-    /// Сервер канала `name` с заданными параметрами каждого направления.
+    /// Сервер канала `name` с параметрами `config`: раскладка каждого
+    /// направления и политика безопасности объектов канала (секция и 7
+    /// событий).
     ///
     /// Клиент подстраивается сам: раскладка записана в сегменте
-    /// (`SharedClient::layout`). `Err(InvalidConfig)` -- `layout` не прошёл
-    /// `ChannelLayout::validate`.
-    pub fn start_with_layout(name: &str, layout: ChannelLayout) -> Result<Self> {
-        Self::start_slot(name, layout, 0)
+    /// (`SharedClient::layout`). `Err(InvalidConfig)` -- `config.layout` не
+    /// прошёл `ChannelLayout::validate` или `ObjectSecurity::Descriptor`
+    /// некорректен (оба -- до создания объектов).
+    ///
+    /// ```no_run
+    /// use xshm::{ChannelConfig, ChannelLayout, ObjectSecurity, RingConfig, SharedServer};
+    ///
+    /// let config = ChannelConfig::default()
+    ///     .layout(ChannelLayout::symmetric(RingConfig::new(64 << 10)))
+    ///     .security(ObjectSecurity::Everyone); // служба SYSTEM <-> пользователь
+    /// let server = SharedServer::start_with("Global\\MyService", &config)?;
+    /// # Ok::<(), xshm::ShmError>(())
+    /// ```
+    pub fn start_with(name: &str, config: &ChannelConfig) -> Result<Self> {
+        Self::start_slot(name, config.layout, 0, &config.security)
     }
 
     /// Сервер канала `name`, публикующий в `ControlBlock::slot_count` число
-    /// `slot_count` (Multi: `max_clients`; `0` -- не Multi).
-    pub(crate) fn start_slot(name: &str, layout: ChannelLayout, slot_count: u32) -> Result<Self> {
+    /// `slot_count` (Multi: `max_clients`; `0` -- не Multi). Дескриптор
+    /// строится один раз на секцию и все события канала.
+    pub(crate) fn start_slot(
+        name: &str,
+        layout: ChannelLayout,
+        slot_count: u32,
+        security: &ObjectSecurity,
+    ) -> Result<Self> {
         layout.validate()?;
-        let mapping = Mapping::create(&mapping_name(name), layout.segment_size())?;
+        let security = security.attributes()?;
+        let mapping = Mapping::create(&mapping_name(name), layout.segment_size(), &security)?;
         let mut server = Self::from_mapping(mapping, layout, slot_count)?;
-        server.events = Some(SharedEvents::create(name)?);
+        server.events = Some(SharedEvents::create(name, &security)?);
         Ok(server)
     }
 
@@ -96,9 +159,15 @@ impl SharedServer {
 
     /// Anonymous-сервер с заданной раскладкой (см. `start_anonymous`).
     /// Драйвер читает раскладку из `LayoutBlock` сегмента (INTEROP §c).
+    ///
+    /// 0.10: дескриптор секции -- политика по умолчанию
+    /// (`ObjectSecurity::CurrentUser`) вместо NULL DACL. По имени секцию не
+    /// открыть; дубликат handle получает права исходного handle без
+    /// проверки DACL, поэтому политика здесь не настраивается.
     pub fn start_anonymous_with_layout(layout: ChannelLayout) -> Result<Self> {
         layout.validate()?;
-        let mapping = Mapping::create_anonymous(layout.segment_size())?;
+        let security = ObjectSecurity::default().attributes()?;
+        let mapping = Mapping::create_anonymous(layout.segment_size(), &security)?;
         Self::from_mapping(mapping, layout, 0)
     }
 

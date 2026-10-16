@@ -125,8 +125,11 @@ impl SECURITY_DESCRIPTOR {
         }
     }
 
-    pub const fn as_ptr(&mut self) -> PVOID {
-        core::ptr::from_mut(self).cast()
+    /// Указатель для `OBJECT_ATTRIBUTES.SecurityDescriptor`: NT-вызовы
+    /// создания дескриптор только читают (ядро копирует его при захвате),
+    /// поэтому хватает разделяемой ссылки.
+    pub const fn as_ptr(&self) -> PVOID {
+        core::ptr::from_ref(self).cast_mut().cast()
     }
 }
 
@@ -170,7 +173,7 @@ impl NullDaclSecurityDescriptor {
         Self { sd }
     }
 
-    pub const fn as_ptr(&mut self) -> PVOID {
+    pub const fn as_ptr(&self) -> PVOID {
         self.sd.as_ptr()
     }
 }
@@ -316,7 +319,6 @@ pub const ProcessTimes: ULONG = 4;
     non_upper_case_globals,
     reason = "имя значения перечисления NT API воспроизводится дословно"
 )]
-#[expect(dead_code, reason = "потребитель -- политика безопасности (T9)")]
 pub const TokenUser: ULONG = 1;
 
 /// Секция с резервированием страниц без фиксации (`NtCreateSection`).
@@ -333,11 +335,8 @@ pub const SEC_FILE: ULONG = 0x0080_0000;
     expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
 )]
 pub const IO_COMPLETION_ALL_ACCESS: ACCESS_MASK = 0x001F_0003;
-/// Общее право «всё» (так создают пакеты ожидания завершения).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- реактор на IOCP (T15)")
-)]
+/// Общее право «всё» (маска ACE политики безопасности; так же создают
+/// пакеты ожидания завершения).
 pub const GENERIC_ALL: ACCESS_MASK = 0x1000_0000;
 
 /// Ответ `NtQuerySection(SectionBasicInformation)`.
@@ -397,10 +396,6 @@ pub struct FILE_IO_COMPLETION_INFORMATION {
 
 /// SID с атрибутами (часть `TOKEN_USER`).
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
-)]
 pub struct SID_AND_ATTRIBUTES {
     pub Sid: PSID,
     pub Attributes: ULONG,
@@ -409,20 +404,12 @@ pub struct SID_AND_ATTRIBUTES {
 /// Ответ `NtQueryInformationToken(TokenUser)`; за структурой в буфере
 /// следует сам SID, на который указывает `User.Sid`.
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
-)]
 pub struct TOKEN_USER {
     pub User: SID_AND_ATTRIBUTES,
 }
 
 /// Заголовок ACL; записи ACE следуют за ним в том же буфере.
 #[repr(C)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "потребитель -- политика безопасности (T9)")
-)]
 pub struct ACL {
     pub AclRevision: u8,
     pub Sbz1: u8,
@@ -430,3 +417,21 @@ pub struct ACL {
     pub AceCount: u16,
     pub Sbz2: u16,
 }
+
+// ============================================================================
+// Дескрипторы безопасности: токен, ACL, метка целостности (0.10, T9)
+// ============================================================================
+
+/// Право `TOKEN_QUERY` (`NtOpenProcessToken`): читать сведения о токене.
+pub const TOKEN_QUERY: ACCESS_MASK = 0x0008;
+/// `ACL_REVISION` -- ревизия ACL с ACE `ACCESS_ALLOWED`/метками.
+pub const ACL_REVISION: ULONG = 2;
+/// `SYSTEM_MANDATORY_LABEL_ACE_TYPE` -- обязательная метка целостности в SACL.
+pub const SYSTEM_MANDATORY_LABEL_ACE_TYPE: u8 = 0x11;
+/// `SYSTEM_MANDATORY_LABEL_NO_WRITE_UP` -- политика метки: процессы ниже
+/// уровня метки не получают права записи (SDDL `NW`).
+pub const SYSTEM_MANDATORY_LABEL_NO_WRITE_UP: ACCESS_MASK = 0x1;
+/// Буфер мал (`NtQueryInformationToken`), нужный размер -- в `ReturnLength`.
+pub const STATUS_BUFFER_TOO_SMALL: NTSTATUS = 0xC000_0023_u32.cast_signed();
+/// Нет прав на объект (DACL не выдаёт запрошенный доступ).
+pub const STATUS_ACCESS_DENIED: NTSTATUS = 0xC000_0022_u32.cast_signed();

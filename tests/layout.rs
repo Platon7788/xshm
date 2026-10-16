@@ -8,11 +8,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{
-    Admission, AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind, ChannelLayout,
-    ClientRegistration, DispatchClient, DispatchClientHandler, DispatchClientOptions,
-    DispatchHandler, DispatchOptions, DispatchServer, MultiClient, MultiClientHandler,
-    MultiClientOptions, MultiHandler, MultiOptions, MultiServer, RingConfig, SharedClient,
-    SharedServer, ShmError,
+    Admission, AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelConfig, ChannelKind,
+    ChannelLayout, ClientRegistration, DispatchClient, DispatchClientHandler,
+    DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer, MultiClient,
+    MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer, RingConfig,
+    SharedClient, SharedServer, ShmError,
 };
 
 fn unique_name(tag: &str) -> String {
@@ -52,7 +52,7 @@ fn payload(len: usize, seed: u8) -> Vec<u8> {
 fn shared_asymmetric_layout_roundtrip_with_large_messages() {
     let name = unique_name("SHARED");
     let layout = asymmetric();
-    let mut server = SharedServer::start_with_layout(&name, layout).unwrap();
+    let mut server = SharedServer::start_with(&name, &ChannelConfig::new(layout)).unwrap();
     assert_eq!(*server.layout(), layout);
 
     let client_thread = thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)));
@@ -104,7 +104,7 @@ fn invalid_layout_is_rejected_before_creating_objects() {
     let name = unique_name("INVALID");
     let bad = ChannelLayout::symmetric(RingConfig::new(3 * 4096));
     assert!(matches!(
-        SharedServer::start_with_layout(&name, bad),
+        SharedServer::start_with(&name, &ChannelConfig::new(bad)),
         Err(ShmError::InvalidConfig(_))
     ));
     // Имя не занято: отказ случился до создания секции.

@@ -52,6 +52,13 @@ pub enum ShmError {
         /// Контекст операции.
         context: &'static str,
     },
+    /// Нет прав на именованный объект (`STATUS_ACCESS_DENIED` при открытии
+    /// или создании, 0.10): DACL объекта не выдаёт доступ этому процессу --
+    /// например, канал создан другим пользователем с политикой по умолчанию
+    /// (`ObjectSecurity::CurrentUser`). Сценарию служба SYSTEM ↔ пользователь
+    /// нужна политика `ObjectSecurity::Everyone` или свой дескриптор.
+    #[error("access denied to a named object (security descriptor of its creator)")]
+    AccessDenied,
     /// Нет свободных слотов на мультиклиентном сервере.
     #[error("no free slots available on multi-client server")]
     NoFreeSlot,

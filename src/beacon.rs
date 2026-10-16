@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use crate::error::{Result, ShmError};
 use crate::naming::has_explicit_namespace;
+use crate::security::{ObjectSecurity, SecurityAttributes};
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 use crate::win::{EventHandle, Mapping, ProcessWatch, current_process_start_time, is_process_gone};
@@ -120,22 +121,27 @@ const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
 /// нехватка привилегии или прав. Подмена объекта (другой тип, `SEC_RESERVE`,
 /// маленькая секция) -- по-прежнему ошибка `open`.
 const fn state_fallback(error: &ShmError) -> bool {
-    matches!(
-        error,
-        ShmError::WindowsError { code, .. }
-            if *code == STATUS_PRIVILEGE_NOT_HELD || *code == STATUS_ACCESS_DENIED
-    )
+    match error {
+        // 0.10: `STATUS_ACCESS_DENIED` приходит как `AccessDenied`
+        // (`status_to_error`); код в `WindowsError` -- на всякий случай.
+        ShmError::AccessDenied => true,
+        ShmError::WindowsError { code, .. } => {
+            *code == STATUS_PRIVILEGE_NOT_HELD || *code == STATUS_ACCESS_DENIED
+        }
+        _ => false,
+    }
 }
 
 /// Открыть секцию состояния: сначала существующую (открытие не требует
-/// `SeCreateGlobalPrivilege`), и только если её нет -- создать.
-fn open_state(name: &str) -> Result<BeaconState> {
+/// `SeCreateGlobalPrivilege`), и только если её нет -- создать с
+/// дескриптором `security` (тот же, что у события маяка).
+fn open_state(name: &str, security: &SecurityAttributes) -> Result<BeaconState> {
     let state_name = beacon_state_name(name);
     let attempt = match Mapping::open(&state_name) {
         Ok(mapping) if mapping.size() >= STATE_SIZE => Ok(mapping),
         Ok(_) => Err(ShmError::Corrupted),
         Err(ShmError::WindowsError { code, .. }) if code == STATUS_OBJECT_NAME_NOT_FOUND => {
-            Mapping::open_or_create(&state_name, STATE_SIZE)
+            Mapping::open_or_create(&state_name, STATE_SIZE, security)
         }
         Err(other) => Err(other),
     };
@@ -179,8 +185,10 @@ impl Beacon {
     /// Ошибка ОС (имя недопустимо, нет прав на `Global\`). 0.9: имя уже
     /// занято событием другого типа (автосброс вместо уведомления --
     /// `WindowsError { code: STATUS_OBJECT_TYPE_MISMATCH }`) или объектом с
-    /// ограничивающим DACL (`EVENT_ALL_ACCESS` не выдан --
-    /// `STATUS_ACCESS_DENIED`): подменённый маяк не открывается.
+    /// ограничивающим DACL (`EVENT_ALL_ACCESS` не выдан -- 0.10:
+    /// [`ShmError::AccessDenied`]): подменённый маяк не открывается.
+    /// Политика создаваемых объектов -- по умолчанию (владелец + SYSTEM),
+    /// другая -- [`Beacon::open_with`].
     ///
     /// 0.10: рядом с событием -- секция состояния `<имя>_beacon_state`
     /// (`SEC_COMMIT`, 4096 байт): сначала открывается существующая, и только
@@ -197,10 +205,30 @@ impl Beacon {
     /// сбрасывает его без проверки сервера и поколения -- гонка нескольких
     /// клиентов с новым сервером (находка 11) в этом режиме остаётся.
     pub fn open(name: &str) -> Result<Self> {
-        let event = EventHandle::open_or_create_notification(&beacon_name(name))?;
+        Self::open_with(name, &ObjectSecurity::default())
+    }
+
+    /// [`Beacon::open`] с политикой безопасности `security` (0.10) для
+    /// объектов, которые создаёт этот вызов: события `<имя>_beacon` и секции
+    /// `<имя>_beacon_state`. Уже существующие объекты открываются по своему
+    /// DACL (политику задал их создатель). [`Beacon::open`] -- политика по
+    /// умолчанию ([`ObjectSecurity::CurrentUser`]): маяк службы SYSTEM на
+    /// `Global\` для процессов пользователя -- [`ObjectSecurity::Everyone`]
+    /// или свой дескриптор у той стороны, что создаёт маяк первой (обычно
+    /// у обеих одинаковый).
+    ///
+    /// # Errors
+    ///
+    /// Как у [`Beacon::open`]; `AccessDenied` -- маяк создан другим
+    /// пользователем, DACL которого этот процесс не включает (секция
+    /// состояния с отказом в доступе -- не ошибка, а маяк без состояния);
+    /// `InvalidConfig` -- некорректный `ObjectSecurity::Descriptor`.
+    pub fn open_with(name: &str, security: &ObjectSecurity) -> Result<Self> {
+        let security = security.attributes()?;
+        let event = EventHandle::open_or_create_notification(&beacon_name(name), &security)?;
         let beacon = Self {
             event,
-            state: open_state(name)?,
+            state: open_state(name, &security)?,
         };
         // Новая секция -- нули: `magic` ставит первый открывший (CAS 0 ->
         // MAGIC). Не ноль и не MAGIC -- порча: CAS не проходит, состоянию не
@@ -293,8 +321,9 @@ impl Beacon {
     /// [`Beacon::open`]) — сброс без проверок, `Ok(true)`.
     ///
     /// Мусор в личности сервера при верном `magic` (PID несуществующего
-    /// процесса, чужое время создания) допускает сброс: любой процесс и так
-    /// может сбросить маяк с NULL DACL напрямую.
+    /// процесса, чужое время создания) допускает сброс: любой процесс с
+    /// доступом к маяку (тот же пользователь при политике по умолчанию,
+    /// любой при `Everyone`) и так может сбросить его напрямую.
     ///
     /// # Errors
     ///
@@ -498,6 +527,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
 
+    /// Политика по умолчанию для объектов тестов.
+    fn sec() -> SecurityAttributes {
+        ObjectSecurity::default().attributes().unwrap()
+    }
+
     /// Уникальное имя в пределах прогона: PID + счётчик (раньше —
     /// `Instant::now().elapsed()`, то есть почти всегда 0: имена тестов
     /// совпадали и маяки делились между ними).
@@ -642,7 +676,7 @@ mod tests {
 
     /// Ревью T6 (мелкое 8): верный `magic`, мусор в личности сервера --
     /// без паники; документировано, что такой мусор допускает сброс (любой
-    /// процесс и так может сбросить маяк с NULL DACL).
+    /// процесс с доступом к маяку и так может сбросить его).
     #[test]
     fn garbage_identity_with_valid_magic_allows_reset_without_panic() {
         let name = unique("garbage");
@@ -666,7 +700,7 @@ mod tests {
     #[test]
     fn open_rejects_state_squatted_by_other_object_type() {
         let name = unique("state-squat");
-        let _squatter = EventHandle::create(&beacon_state_name(&name)).unwrap();
+        let _squatter = EventHandle::create(&beacon_state_name(&name), &sec()).unwrap();
         match Beacon::open(&name) {
             Err(ShmError::WindowsError { code, .. }) => {
                 assert_eq!(code, 0xC000_0024, "STATUS_OBJECT_TYPE_MISMATCH");
@@ -689,6 +723,8 @@ mod tests {
             "STATUS_PRIVILEGE_NOT_HELD"
         );
         assert!(state_fallback(&err(0xC000_0022)), "STATUS_ACCESS_DENIED");
+        // 0.10: отказ в доступе приходит отдельным вариантом.
+        assert!(state_fallback(&ShmError::AccessDenied), "AccessDenied");
         assert!(
             !state_fallback(&err(0xC000_0024)),
             "STATUS_OBJECT_TYPE_MISMATCH"
@@ -707,7 +743,7 @@ mod tests {
         let name = unique("legacy");
         let server = Beacon::open(&name).unwrap();
         let client = Beacon {
-            event: EventHandle::open_or_create_notification(&beacon_name(&name)).unwrap(),
+            event: EventHandle::open_or_create_notification(&beacon_name(&name), &sec()).unwrap(),
             state: BeaconState::Legacy,
         };
         server.raise().unwrap();
@@ -736,7 +772,7 @@ mod tests {
     #[test]
     fn open_rejects_squatted_auto_reset_event() {
         let name = unique("squat");
-        let _squatter = EventHandle::create(&beacon_name(&name)).unwrap();
+        let _squatter = EventHandle::create(&beacon_name(&name), &sec()).unwrap();
         assert!(
             Beacon::open(&name).is_err(),
             "маяк с автосбросом должен отвергаться"

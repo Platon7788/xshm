@@ -18,7 +18,10 @@
   client_to_server }`. Ёмкость — степень двойки от 4 КиБ до 1 ГиБ, сообщение
   — до `capacity − 8` (больше прежних 64 КиБ). Выбирает сервер, клиент читает
   её из сегмента сам.
-  - `SharedServer::start_with_layout`, `start_anonymous_with_layout`,
+  - `SharedServer::start_with(name, &ChannelConfig)` (раскладка + политика
+    безопасности; `ChannelConfig` — `#[non_exhaustive]`, строится от
+    `default()`/`new(layout)` методами `layout`/`security`),
+    `start_anonymous_with_layout`,
     `SharedServer::layout`, `SharedClient::layout`;
   - `AutoOptions::layout` (сервер), `AutoServer::layout`, `AutoClient::layout`;
   - `MultiOptions::layout` (каждый слот), `MultiClient::layout`;
@@ -33,9 +36,46 @@
   `FRAME_ALIGN`, `SHARED_VERSION`.
 - `ShmError::VersionMismatch { found, expected }`; `ShmError` —
   `#[non_exhaustive]`.
+- **Политика безопасности объектов** `ObjectSecurity` (`#[non_exhaustive]`):
+  `CurrentUser` (по умолчанию — DACL: SID пользователя токена процесса +
+  SYSTEM `S-1-5-18`, `GENERIC_ALL`), `CurrentUserAllowLowIntegrity` (+ SACL с
+  меткой Low `S:(ML;;NW;;;LW)`), `Everyone` (NULL DACL, как до 0.10),
+  `Descriptor(Vec<u8>)` (свой self-relative дескриптор; проверяется
+  `RtlValidRelativeSecurityDescriptor` с длиной, иначе `InvalidConfig` до
+  создания объектов). Задаётся создателем объектов: `ChannelConfig::security`,
+  поля `security` в `AutoOptions` (сервер), `MultiOptions` (каждый слот),
+  `DispatchOptions` (лобби, мьютекс лобби и каналы клиентов наследуют),
+  `DispatchClientOptions` (мьютекс лобби, если клиент создаёт его первым);
+  `Beacon::open_with(name, &ObjectSecurity)` — событие маяка и секция
+  `_beacon_state` (`Beacon::open` — политика по умолчанию). Дескриптор
+  строится на каждое создание и владеет своими буферами (SID/ACL) до конца
+  `NtCreate*`. Anonymous-секция — тоже политика по умолчанию вместо NULL DACL;
+  безымянные события — без атрибутов (DACL токена), как раньше.
+- `ShmError::AccessDenied` — `STATUS_ACCESS_DENIED` при открытии/создании
+  объекта (раньше `WindowsError { code: 0xC0000022 }`). Маяк по-прежнему
+  деградирует до режима без состояния, если в секции состояния отказано.
 
 ### Изменено (несовместимо)
 
+- **NULL DACL больше не по умолчанию** (несовместимо по поведению): все
+  именованные объекты создаются с `ObjectSecurity::CurrentUser` — открыть их
+  могут только процессы того же пользователя и SYSTEM; остальные получают
+  `ShmError::AccessDenied`. Сервер Dispatch теперь сам создаёт мьютекс лобби
+  `<лобби>_lock` в `start` (`OBJ_OPENIF`, политика лобби) и держит его, чтобы
+  DACL мьютекса задавал сервер, а не первый клиент; имя, занятое объектом
+  другого типа, — ошибка `DispatchServer::start`. INTEROP §b.2, «Изменения
+  0.10» п. 22.
+
+  **Миграция с 0.9**: `Global\`-канал служба SYSTEM (сессия 0) ↔ процесс
+  пользователя, работавший на NULL DACL, при создании объектов службой с
+  политикой по умолчанию даёт пользователю `AccessDenied` (DACL — только
+  SYSTEM). Создающей стороне (серверу, а для маяка — каждой стороне, которая
+  может создать его первой) нужна `ObjectSecurity::Everyone` или свой
+  `ObjectSecurity::Descriptor` (например, SYSTEM + группа `Users`). То же для
+  песочниц Low integrity — `CurrentUserAllowLowIntegrity`, для AppContainer —
+  `Descriptor` с SID пакета. `SharedServer::start_with_layout` (не выпущен)
+  заменён на `start_with(name, &ChannelConfig)`; `SharedEvents::create` —
+  внутренний.
 - Формат памяти `0x00020000`: `LayoutBlock` (смещение 64) с дескрипторами
   колец; поля `ControlBlock` именованы (`slot_claim`, `slot_owner_pid`,
   `server_pid`, `client_pid` — те же смещения, что `reserved[0..3]`); кадр

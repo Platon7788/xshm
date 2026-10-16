@@ -217,6 +217,38 @@ namespace is chosen by its prefix:
 
 Channel events always land in the same namespace as the section.
 
+## Object Security (0.10)
+
+**NULL DACL is no longer the default.** Every named object xshm creates (channel
+section and its 7 events, Multi slots, Dispatch lobby, its `<lobby>_lock` mutex
+and per-client channels, beacon and `<name>_beacon_state`) gets the security
+descriptor chosen by its **creator** (`ObjectSecurity`); openers pass none and are
+checked against the creator's DACL. A denied open is `ShmError::AccessDenied`.
+
+| Policy | DACL / SACL | Use for |
+|--------|-------------|---------|
+| `ObjectSecurity::CurrentUser` (default) | user SID of the process token + SYSTEM (`S-1-5-18`), `GENERIC_ALL` | peers of the same user |
+| `ObjectSecurity::CurrentUserAllowLowIntegrity` | same + Low mandatory label `S:(ML;;NW;;;LW)` | sandboxed Low-IL processes of the same user |
+| `ObjectSecurity::Everyone` | NULL DACL (behavior ≤ 0.9) | service SYSTEM ↔ user over `Global\` with no shared group |
+| `ObjectSecurity::Descriptor(bytes)` | your self-relative descriptor (validated) | anything else (e.g. SYSTEM + `Users`, AppContainer SIDs) |
+
+```rust
+use xshm::{ChannelConfig, DispatchOptions, ObjectSecurity, SharedServer};
+
+// Service in session 0 talking to desktop processes of other users:
+let config = ChannelConfig::default().security(ObjectSecurity::Everyone);
+let server = SharedServer::start_with("Global\\MyService", &config)?;
+// Auto / Multi / Dispatch: the `security` field of their options
+// (Dispatch channels and the lobby mutex inherit `DispatchOptions::security`);
+// beacon: `Beacon::open_with(name, &policy)`.
+let options = DispatchOptions { security: ObjectSecurity::Everyone, ..Default::default() };
+```
+
+**Migrating from 0.9**: a `Global\` channel between a SYSTEM service and a user
+process worked with NULL DACL; with the default policy the user gets
+`AccessDenied` when the service creates the objects. Use `ObjectSecurity::Everyone`
+(or a `Descriptor`) on the creating side.
+
 ## Requirements
 
 - Windows 10/11
@@ -649,7 +681,7 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **Anonymous servers**: No event handles available (polling mode only)
 - **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan; every 21 slots add a worker thread) — use Dispatch mode if you need more
 - **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* (no server, no free slot) retries every `reconnect_delay` / `retry_delay`; connected channels never wake while idle. Use `Beacon` for fully event-driven discovery
-- **No authentication**: named objects use a NULL DACL — any local process (any session with `Global\`) can open them; do not send secrets
+- **Access control, not authentication**: by default named objects are open only to the creating user and SYSTEM (`ObjectSecurity::CurrentUser`); any process of that same user can still open them, and `ObjectSecurity::Everyone` restores the ≤ 0.9 NULL DACL — do not send secrets
 
 ## Project Structure
 

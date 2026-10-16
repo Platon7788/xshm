@@ -50,7 +50,6 @@ use crate::ntapi::{
     NtUnmapViewOfSection,
     NtWaitForMultipleObjects,
     NtWaitForSingleObject,
-    NullDaclSecurityDescriptor,
     OBJ_CASE_INSENSITIVE,
     OBJ_OPENIF,
     OBJECT_ATTRIBUTES,
@@ -66,6 +65,7 @@ use crate::ntapi::{
     SECTION_ALL_ACCESS,
     SECTION_BASIC_INFORMATION,
     STATUS_ABANDONED_WAIT_0,
+    STATUS_ACCESS_DENIED,
     STATUS_INVALID_CID,
     STATUS_OBJECT_NAME_EXISTS,
     STATUS_OBJECT_TYPE_MISMATCH,
@@ -81,6 +81,7 @@ use crate::ntapi::{
     WAIT_ANY,
     duration_to_nt_timeout,
 };
+use crate::security::SecurityAttributes;
 
 // ============================================================================
 // Constants
@@ -143,7 +144,12 @@ impl Drop for Handle {
 // Helper functions
 // ============================================================================
 
-const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
+/// `NTSTATUS` отказа -- `ShmError`. `STATUS_ACCESS_DENIED` (DACL объекта не
+/// выдаёт запрошенный доступ, 0.10) -- отдельный вариант `AccessDenied`.
+pub(crate) const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
+    if status == STATUS_ACCESS_DENIED {
+        return ShmError::AccessDenied;
+    }
     ShmError::WindowsError {
         code: status.cast_unsigned(),
         context,
@@ -184,17 +190,17 @@ impl AsRawHandle for EventHandle {
 }
 
 impl EventHandle {
-    /// Создание события через NtCreateEvent с NULL DACL
-    pub fn create(name: &str) -> Result<Self> {
+    /// Создание события через NtCreateEvent с дескриптором `security`
+    /// (политика создателя, 0.10).
+    pub(crate) fn create(name: &str, security: &SecurityAttributes) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr =
-            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
+            OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, security.as_ptr());
 
         let mut handle: HANDLE = null_mut();
 
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
-        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
+        // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
                 &raw mut handle,
@@ -215,18 +221,21 @@ impl EventHandle {
     }
 
     /// Событие-уведомление (ручной сброс): создаётся или, если уже есть,
-    /// открывается (`OBJ_OPENIF`). NULL DACL — как у остальных объектов.
-    pub fn open_or_create_notification(name: &str) -> Result<Self> {
+    /// открывается (`OBJ_OPENIF`). Дескриптор `security` применяется только
+    /// к новому событию; существующее открывается по своему DACL.
+    pub(crate) fn open_or_create_notification(
+        name: &str,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr = OBJECT_ATTRIBUTES::new(
             nt_name.as_ptr(),
             OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            sd.as_ptr(),
+            security.as_ptr(),
         );
         let mut handle: HANDLE = null_mut();
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
-        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
+        // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
                 &raw mut handle,
@@ -346,8 +355,8 @@ impl EventHandle {
 
     /// Открытие чужого события канала с проверкой типа: все события канала
     /// -- автосбросные (`SYNCHRONIZATION_EVENT`). Событие с ручным сбросом,
-    /// заранее созданное под тем же именем чужим процессом (NULL DACL,
-    /// общий namespace), не гасилось бы ожиданием и гоняло бы worker на
+    /// заранее созданное под тем же именем чужим процессом (имя в общем
+    /// namespace занимает любой, со своим DACL), не гасилось бы ожиданием и гоняло бы worker на
     /// 100% CPU -- `Corrupted` (аудит 2026-10-16).
     pub fn open_auto_reset(name: &str) -> Result<Self> {
         let event = Self::open(name)?;
@@ -410,7 +419,8 @@ impl EventHandle {
 // NamedMutex - NT Mutant (сериализация клиентов лобби, 0.9)
 // ============================================================================
 
-/// Именованный мьютекс ядра (Mutant): create-or-open (`OBJ_OPENIF`), NULL DACL.
+/// Именованный мьютекс ядра (Mutant): create-or-open (`OBJ_OPENIF`),
+/// дескриптор нового -- политика создателя (0.10).
 ///
 /// Владение мьютексом у Windows -- по ПОТОКУ: освобождать обязан тот же поток,
 /// что захватил. Поэтому guard не `Send` (см. `NamedMutexGuard`). Если
@@ -456,18 +466,18 @@ pub struct NamedMutexGuard<'a> {
 
 impl NamedMutex {
     /// Создать мьютекс `name` или открыть существующий. Имя, занятое объектом
-    /// другого типа, -- ошибка (`STATUS_OBJECT_TYPE_MISMATCH`).
-    pub fn open_or_create(name: &str) -> Result<Self> {
+    /// другого типа, -- ошибка (`STATUS_OBJECT_TYPE_MISMATCH`). `security`
+    /// применяется только к новому мьютексу.
+    pub fn open_or_create(name: &str, security: &SecurityAttributes) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr = OBJECT_ATTRIBUTES::new(
             nt_name.as_ptr(),
             OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            sd.as_ptr(),
+            security.as_ptr(),
         );
         let mut handle: HANDLE = null_mut();
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` живёт до конца
-        // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
+        // вызова и держит внутри `nt_name`/`security`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateMutant(
                 &raw mut handle,
@@ -556,9 +566,13 @@ impl Mapping {
     }
 
     /// Внутренний метод создания секции (общая логика для named и anonymous)
-    fn create_internal(object_name: *mut UNICODE_STRING, size: usize) -> Result<Self> {
-        let mut sd = NullDaclSecurityDescriptor::new();
-        let mut obj_attr = OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, sd.as_ptr());
+    fn create_internal(
+        object_name: *mut UNICODE_STRING,
+        size: usize,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let mut obj_attr =
+            OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, security.as_ptr());
 
         let mut section_handle: HANDLE = null_mut();
         // Размер секции -- `LARGE_INTEGER` (знаковый): больше `i64::MAX` не
@@ -570,7 +584,8 @@ impl Mapping {
 
         // SAFETY: все переданные указатели -- на локальные переменные, живущие до
         // конца вызова; `object_name` либо NULL (anonymous), либо указывает на
-        // `UNICODE_STRING`, который держит вызывающий (`Mapping::create`).
+        // `UNICODE_STRING`, который держит вызывающий (`Mapping::create`);
+        // дескриптор `security` заимствован на весь вызов.
         let status = unsafe {
             NtCreateSection(
                 &raw mut section_handle,
@@ -642,10 +657,11 @@ impl Mapping {
         })
     }
 
-    /// Создание секции размером `size` байт через NtCreateSection с NULL DACL
-    pub fn create(name: &str, size: usize) -> Result<Self> {
+    /// Создание секции размером `size` байт через NtCreateSection с
+    /// дескриптором `security` (политика создателя, 0.10).
+    pub fn create(name: &str, size: usize, security: &SecurityAttributes) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        Self::create_internal(nt_name.as_ptr(), size)
+        Self::create_internal(nt_name.as_ptr(), size, security)
     }
 
     /// Создание anonymous секции без имени (только через handle)
@@ -665,15 +681,20 @@ impl Mapping {
     /// как anonymous (unnamed) объект. Пустой `UNICODE_STRING` (даже с `Length = 0`)
     /// все равно является указателем на структуру, а не NULL, поэтому создаст
     /// именованную секцию (которая, вероятно, завершится ошибкой из-за невалидного имени).
-    pub fn create_anonymous(size: usize) -> Result<Self> {
-        Self::create_internal(null_mut(), size)
+    ///
+    /// Дескриптор `security` (0.10; до 0.10 -- NULL DACL): по имени такую
+    /// секцию не открыть, а дубликат handle (`NtDuplicateObject`) получает
+    /// права исходного handle без проверки DACL -- дескриптор задан для
+    /// единообразия и на случай открытия объекта по указателю ядром.
+    pub fn create_anonymous(size: usize, security: &SecurityAttributes) -> Result<Self> {
+        Self::create_internal(null_mut(), size, security)
     }
 
     /// Открытие чужой секции целиком.
     ///
     /// Размер view (= размер секции, округлённый до страницы) -- граница
-    /// доверия: имя в `\BaseNamedObjects` может занять кто угодно (NULL DACL,
-    /// namespace общий), поэтому раскладку, прочитанную из сегмента,
+    /// доверия: имя в `\BaseNamedObjects` может занять кто угодно (namespace
+    /// общий, DACL выбирает занявший), поэтому раскладку, прочитанную из сегмента,
     /// `SharedView::attach` сверяет именно с ним, прежде чем трогать кольца.
     pub fn open(name: &str) -> Result<Self> {
         Self::open_view(name, 0)
@@ -713,18 +734,18 @@ impl Mapping {
         Self::map_section(handle, view_size)
     }
 
-    /// Секция `name` размером не меньше `size`: создаётся (NULL DACL,
-    /// `SEC_COMMIT`) или, если имя уже занято, открывается (`OBJ_OPENIF`).
+    /// Секция `name` размером не меньше `size`: создаётся (дескриптор
+    /// `security`, `SEC_COMMIT`) или, если имя уже занято, открывается
+    /// (`OBJ_OPENIF`; дескриптор существующей не меняется).
     /// Существующая секция проверяется как чужая: тип `SEC_COMMIT` и view не
     /// меньше `size`, иначе `Corrupted`. Для объектов, которые создаёт
     /// первая пришедшая сторона (состояние маяка).
-    pub fn open_or_create(name: &str, size: usize) -> Result<Self> {
+    pub fn open_or_create(name: &str, size: usize, security: &SecurityAttributes) -> Result<Self> {
         let mut nt_name = NtName::new(name)?;
-        let mut sd = NullDaclSecurityDescriptor::new();
         let mut obj_attr = OBJECT_ATTRIBUTES::new(
             nt_name.as_ptr(),
             OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
-            sd.as_ptr(),
+            security.as_ptr(),
         );
         let mut section_handle: HANDLE = null_mut();
         let mut max_size = LARGE_INTEGER {
@@ -732,7 +753,7 @@ impl Mapping {
                 .map_err(|_| ShmError::InvalidConfig("section size exceeds i64::MAX"))?,
         };
         // SAFETY: все переданные указатели -- на локальные переменные, живущие
-        // до конца вызова (`obj_attr` держит `nt_name`/`sd`, они тоже живы).
+        // до конца вызова (`obj_attr` держит `nt_name`/`security`, они тоже живы).
         let status = unsafe {
             NtCreateSection(
                 &raw mut section_handle,
@@ -1168,6 +1189,13 @@ fn query_start_time(process: HANDLE) -> Option<u64> {
 mod tests {
     use super::*;
 
+    /// Политика по умолчанию для объектов тестов.
+    fn sec() -> SecurityAttributes {
+        crate::security::ObjectSecurity::default()
+            .attributes()
+            .unwrap()
+    }
+
     #[test]
     fn own_process_is_alive() {
         assert!(is_process_alive(std::process::id(), 0));
@@ -1202,7 +1230,7 @@ mod tests {
         let name = format!("XSHM_TEST_SMALL_SECTION_{}", std::process::id());
 
         let mut nt_name = NtName::new(&name).expect("nt name");
-        let mut sd = NullDaclSecurityDescriptor::new();
+        let sd = crate::ntapi::NullDaclSecurityDescriptor::new();
         let mut obj_attr =
             OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
         let mut handle: HANDLE = null_mut();
@@ -1255,7 +1283,7 @@ mod tests {
     /// на подмену секции чужим процессом).
     fn create_test_section(name: &str, attributes: u32) -> Handle {
         let mut nt_name = NtName::new(name).expect("nt name");
-        let mut sd = NullDaclSecurityDescriptor::new();
+        let sd = crate::ntapi::NullDaclSecurityDescriptor::new();
         let mut obj_attr =
             OBJECT_ATTRIBUTES::new(nt_name.as_ptr(), OBJ_CASE_INSENSITIVE, sd.as_ptr());
         let mut handle: HANDLE = null_mut();
@@ -1309,8 +1337,8 @@ mod tests {
     #[test]
     fn open_or_create_shares_section_and_rejects_reserved_squatter() {
         let name = format!("Local\\XSHM_TEST_OPENIF_{}", std::process::id());
-        let first = Mapping::open_or_create(&name, 4096).unwrap();
-        let second = Mapping::open_or_create(&name, 4096).unwrap();
+        let first = Mapping::open_or_create(&name, 4096, &sec()).unwrap();
+        let second = Mapping::open_or_create(&name, 4096, &sec()).unwrap();
         assert!(first.size() >= 4096 && second.size() >= 4096);
         // SAFETY: view не меньше страницы, адрес выровнен на страницу и живёт
         // до конца теста.
@@ -1323,7 +1351,7 @@ mod tests {
         let reserved = format!("Local\\XSHM_TEST_OPENIF_RESERVE_{}", std::process::id());
         let _owner = create_test_section(&reserved, SEC_RESERVE);
         assert_eq!(
-            Mapping::open_or_create(&reserved, 4096).err(),
+            Mapping::open_or_create(&reserved, 4096, &sec()).err(),
             Some(ShmError::Corrupted)
         );
     }
@@ -1357,13 +1385,13 @@ mod tests {
     #[test]
     fn open_auto_reset_rejects_manual_reset_squatter() {
         let fake = format!("Local\\XSHM_TEST_SQUAT_{}", std::process::id());
-        let _squatter = EventHandle::open_or_create_notification(&fake).unwrap();
+        let _squatter = EventHandle::open_or_create_notification(&fake, &sec()).unwrap();
         assert_eq!(
             EventHandle::open_auto_reset(&fake).err(),
             Some(ShmError::Corrupted)
         );
         let real = format!("Local\\XSHM_TEST_AUTO_{}", std::process::id());
-        let _owner = EventHandle::create(&real).unwrap();
+        let _owner = EventHandle::create(&real, &sec()).unwrap();
         assert!(EventHandle::open_auto_reset(&real).is_ok());
     }
 
@@ -1372,13 +1400,13 @@ mod tests {
     #[test]
     fn named_mutex_serializes_and_survives_abandoned_owner() {
         let name = format!("Local\\XSHM_TEST_MUTEX_{}", std::process::id());
-        let mutex = NamedMutex::open_or_create(&name).unwrap();
+        let mutex = NamedMutex::open_or_create(&name, &sec()).unwrap();
         let guard = mutex.lock(Some(Duration::from_secs(1))).unwrap().unwrap();
         assert!(!guard.was_abandoned());
         {
             let name = name.clone();
             std::thread::spawn(move || {
-                let other = NamedMutex::open_or_create(&name).unwrap();
+                let other = NamedMutex::open_or_create(&name, &sec()).unwrap();
                 assert!(
                     other
                         .lock(Some(Duration::from_millis(50)))
@@ -1395,7 +1423,7 @@ mod tests {
         // Владелец-поток завершается, не освободив мьютекс.
         {
             std::thread::spawn(move || {
-                let owner = NamedMutex::open_or_create(&name).unwrap();
+                let owner = NamedMutex::open_or_create(&name, &sec()).unwrap();
                 let guard = owner.lock(Some(Duration::from_secs(1))).unwrap().unwrap();
                 std::mem::forget(guard);
             })
@@ -1412,8 +1440,8 @@ mod tests {
     #[test]
     fn named_mutex_rejects_other_object_type() {
         let name = format!("Local\\XSHM_TEST_MUTEX_TYPE_{}", std::process::id());
-        let _event = EventHandle::create(&name).unwrap();
-        match NamedMutex::open_or_create(&name) {
+        let _event = EventHandle::create(&name, &sec()).unwrap();
+        match NamedMutex::open_or_create(&name, &sec()) {
             Err(ShmError::WindowsError { code, .. }) => {
                 assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH.cast_unsigned());
             }
@@ -1426,8 +1454,8 @@ mod tests {
     #[test]
     fn notification_open_rejects_synchronization_event() {
         let name = format!("Local\\XSHM_TEST_BEACON_TYPE_{}", std::process::id());
-        let _squatter = EventHandle::create(&name).unwrap(); // SynchronizationEvent
-        match EventHandle::open_or_create_notification(&name) {
+        let _squatter = EventHandle::create(&name, &sec()).unwrap(); // SynchronizationEvent
+        match EventHandle::open_or_create_notification(&name, &sec()) {
             Err(ShmError::WindowsError { code, .. }) => {
                 assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH.cast_unsigned());
             }
@@ -1435,8 +1463,8 @@ mod tests {
         }
 
         let fair = format!("Local\\XSHM_TEST_BEACON_OK_{}", std::process::id());
-        let first = EventHandle::open_or_create_notification(&fair).unwrap();
-        let second = EventHandle::open_or_create_notification(&fair).unwrap();
+        let first = EventHandle::open_or_create_notification(&fair, &sec()).unwrap();
+        let second = EventHandle::open_or_create_notification(&fair, &sec()).unwrap();
         assert_eq!(second.event_type().unwrap(), NOTIFICATION_EVENT);
         drop(first);
     }
