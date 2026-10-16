@@ -10,7 +10,8 @@ use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
 use crate::ring::{
-    DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome, spin_until,
+    DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome, deadline_of,
+    spin_until,
 };
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
@@ -598,7 +599,8 @@ impl SharedServer {
     /// `wait_for_space` со спином перед ожиданием в ядре (0.10): до
     /// `spin.iterations` перепроверок места по позициям (заявка
     /// `space_waiter` на время спина не ставится), затем обычное ожидание.
-    /// При `timeout = Some(0)` спина нет. `SpinPolicy::NONE` -- то же, что
+    /// При `timeout = Some(0)` спина нет; дедлайн `timeout` спин сверяет раз
+    /// в 64 итерации (перебег -- не больше 64 итераций). `SpinPolicy::NONE` -- то же, что
     /// `wait_for_space`.
     pub fn wait_for_space_spin(
         &self,
@@ -659,7 +661,8 @@ impl SharedServer {
     /// `spin.iterations` проверок кольца по позициям, затем обычное
     /// ожидание `DATA`. Спин сокращает задержку, когда клиент отвечает
     /// быстрее пробуждения из ядра, ценой занятого ядра CPU на время спина;
-    /// при `timeout = Some(0)` спина нет. `SpinPolicy::NONE` -- то же, что
+    /// при `timeout = Some(0)` спина нет; дедлайн `timeout` спин сверяет раз
+    /// в 64 итерации (перебег -- не больше 64 итераций). `SpinPolicy::NONE` -- то же, что
     /// `poll_client`.
     pub fn poll_client_spin(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
         self.ensure_connected()?;
@@ -667,7 +670,7 @@ impl SharedServer {
         let Some(events) = self.events.as_ref() else {
             if !self.ring_rx.is_empty()
                 || (timeout != Some(Duration::ZERO)
-                    && spin_until(spin, || self.ring_rx.has_unread()))
+                    && spin_until(spin, deadline_of(timeout), || self.ring_rx.has_unread()))
             {
                 return Ok(true);
             }

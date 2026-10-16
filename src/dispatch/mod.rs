@@ -227,8 +227,11 @@ pub struct DispatchOptions {
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
     /// Спин worker-а каждого клиентского канала перед сном (0.10, см.
-    /// `AutoOptions::spin`). Лобби не спинит никогда. По умолчанию --
-    /// `SpinPolicy::NONE`.
+    /// `AutoOptions::spin`). Лобби не спинит никогда. Во время спина
+    /// `DISCONNECT`, `SPACE` и смерть клиента не наблюдаются -- замечаются не
+    /// позже конца бюджета. Цена -- занятое ядро CPU на каждый активный
+    /// канал; длительность итерации (`pause`) зависит от CPU. По умолчанию
+    /// -- `SpinPolicy::NONE`.
     pub spin: SpinPolicy,
 }
 
@@ -284,7 +287,10 @@ pub struct DispatchClientOptions {
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
     /// Спин worker-а выделенного канала перед сном (0.10, см.
-    /// `AutoOptions::spin`). Регистрация в лобби не спинит. По умолчанию --
+    /// `AutoOptions::spin`). Регистрация в лобби не спинит. Во время спина
+    /// `DISCONNECT`, `SPACE` и смерть сервера не наблюдаются -- замечаются не
+    /// позже конца бюджета. Цена -- занятое ядро CPU на время спина;
+    /// длительность итерации (`pause`) зависит от CPU. По умолчанию --
     /// `SpinPolicy::NONE`.
     pub spin: SpinPolicy,
 }

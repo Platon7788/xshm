@@ -91,14 +91,39 @@ impl SpinPolicy {
 /// `ready` обязан быть дешёвым (атомарные чтения без блокировок) и сам
 /// включать проверку остановки, если поток её ждёт: так задержка `stop()`
 /// ограничена одной итерацией, а не всем бюджетом.
-pub(crate) fn spin_until(spin: SpinPolicy, mut ready: impl FnMut() -> bool) -> bool {
-    for _ in 0..spin.iterations {
+///
+/// `deadline` -- дедлайн вызывающего (`poll_*_spin`, `wait_for_space_spin`):
+/// проверяется раз в `SPIN_DEADLINE_STRIDE` итераций (`Instant::now` -- не
+/// на каждой), наступил -- спин прекращается с `false`. Перебег таймаута
+/// поэтому не больше `SPIN_DEADLINE_STRIDE` итераций (единицы микросекунд),
+/// а не весь бюджет. Worker-ы без таймаута передают `None`.
+pub(crate) fn spin_until(
+    spin: SpinPolicy,
+    deadline: Option<Instant>,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    for i in 0..spin.iterations {
         if ready() {
             return true;
+        }
+        if let Some(deadline) = deadline
+            && i % SPIN_DEADLINE_STRIDE == SPIN_DEADLINE_STRIDE - 1
+            && Instant::now() >= deadline
+        {
+            return false;
         }
         std::hint::spin_loop();
     }
     false
+}
+
+/// Раз во сколько итераций спин сверяется с дедлайном вызывающего.
+const SPIN_DEADLINE_STRIDE: u32 = 64;
+
+/// Дедлайн из таймаута (`None` -- без таймаута или он непредставим как
+/// `Instant`: ждать «вечно» и так).
+pub(crate) fn deadline_of(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|t| Instant::now().checked_add(t))
 }
 
 /// Проба «есть непрочитанные данные» по позициям одного кольца -- для
@@ -802,7 +827,8 @@ impl RingBuffer {
     /// `spin` (0.10): до заявки -- один бюджет спина на вызов с
     /// перепроверкой места по позициям; заявка `space_waiter` во время спина
     /// НЕ ставится (читатель не тратит на нас сигнал). При нулевом таймауте
-    /// спина нет: вызов не блокирующий.
+    /// спина нет: вызов не блокирующий. Спин уважает дедлайн `timeout`:
+    /// перебег не больше `SPIN_DEADLINE_STRIDE` итераций (см. `spin_until`).
     pub(crate) fn wait_for_space(
         &self,
         payload_len: usize,
@@ -815,7 +841,7 @@ impl RingBuffer {
         let frame = self.frame_len(payload_len)?;
         let deadline = timeout.map(|t| Instant::now() + t);
         if timeout != Some(Duration::ZERO)
-            && spin_until(spin, || self.free_space().fits(payload_len))
+            && spin_until(spin, deadline, || self.free_space().fits(payload_len))
         {
             return Ok(true);
         }
@@ -946,7 +972,8 @@ impl RingBuffer {
     /// теряются). Спин, увидевший кадр, возвращает `Ok(true)` без ядра;
     /// `DATA`, который писатель мог при этом взвести, остаётся взведённым и
     /// даст позже одно лишнее пробуждение -- сбрасывать его нельзя (можно
-    /// потерять сигнал следующего кадра). При нулевом таймауте спина нет.
+    /// потерять сигнал следующего кадра). При нулевом таймауте спина нет;
+    /// дедлайн `timeout` спин сверяет раз в `SPIN_DEADLINE_STRIDE` итераций.
     pub(crate) fn wait_for_data(
         &self,
         data: &EventHandle,
@@ -957,7 +984,9 @@ impl RingBuffer {
         if !self.is_empty() {
             return Ok(true);
         }
-        if timeout != Some(Duration::ZERO) && spin_until(spin, || self.has_unread()) {
+        if timeout != Some(Duration::ZERO)
+            && spin_until(spin, deadline_of(timeout), || self.has_unread())
+        {
             return Ok(true);
         }
         #[cfg(test)]
@@ -2139,11 +2168,11 @@ mod tests {
         assert!(!SpinPolicy::NONE.is_enabled());
         assert!(SpinPolicy::new(1).is_enabled());
         assert!(
-            !spin_until(SpinPolicy::NONE, || true),
+            !spin_until(SpinPolicy::NONE, None, || true),
             "без бюджета -- ни одной проверки"
         );
         let mut calls = 0;
-        assert!(!spin_until(SpinPolicy::new(5), || {
+        assert!(!spin_until(SpinPolicy::new(5), None, || {
             calls += 1;
             false
         }));
@@ -2212,6 +2241,59 @@ mod tests {
             "нулевой таймаут спинил: {:?}",
             t0.elapsed()
         );
+    }
+
+    /// Спин уважает дедлайн вызывающего: бюджет `u32::MAX` (минуты) не
+    /// растягивает короткий таймаут ни ожидания данных, ни ожидания места.
+    #[test]
+    fn spin_respects_caller_deadline() {
+        let unbounded = SpinPolicy::new(u32::MAX);
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(Duration::from_millis(30)), unbounded),
+            Ok(false)
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "спин данных перебрал таймаут: {:?}",
+            t0.elapsed()
+        );
+
+        while ring.try_write_message(&[0u8; LEN]).is_ok() {}
+        let space = EventHandle::create_unnamed(false).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                None,
+                None,
+                Some(Duration::from_millis(30)),
+                unbounded
+            ),
+            Ok(false)
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "спин места перебрал таймаут: {:?}",
+            t0.elapsed()
+        );
+
+        // Дедлайн проверяется раз в `SPIN_DEADLINE_STRIDE` итераций, а не
+        // на каждой: уже наступивший дедлайн обрывает спин ровно на первой
+        // проверке, после `SPIN_DEADLINE_STRIDE` вызовов `ready`.
+        let mut calls = 0;
+        assert!(!spin_until(
+            SpinPolicy::new(SPIN_DEADLINE_STRIDE * 3),
+            Some(Instant::now()),
+            || {
+                calls += 1;
+                false
+            }
+        ));
+        assert_eq!(calls, SPIN_DEADLINE_STRIDE, "дедлайн сверяется на шаге");
     }
 
     /// Место, освобождённое читателем во время спина (без заявки и без

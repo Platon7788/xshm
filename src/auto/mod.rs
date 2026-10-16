@@ -123,8 +123,15 @@ pub struct AutoOptions {
     /// нечего делать, до `spin.iterations` раз проверяет входящее кольцо по
     /// позициям (и новые `send`/`try_send`, и остановку), прежде чем уснуть
     /// на наборе событий. Один бюджет на каждое засыпание: в простое worker
-    /// отспинивает его один раз и спит без таймаута. По умолчанию --
-    /// `SpinPolicy::NONE` (без спина). Пиру не виден.
+    /// отспинивает его один раз и спит без таймаута. После удачного спина
+    /// набор событий всё равно опрашивается (ожидание с нулевым таймаутом).
+    ///
+    /// Во время спина `DISCONNECT`, `SPACE` и смерть пира не наблюдаются:
+    /// они замечаются не позже конца бюджета (или раньше, если придут
+    /// данные). Цена -- занятое ядро CPU на время спина; длительность
+    /// итерации (`pause`) зависит от CPU (порядка 10..140 тактов), поэтому
+    /// бюджет в итерациях -- разное время на разных машинах. По умолчанию
+    /// -- `SpinPolicy::NONE` (без спина). Пиру не виден.
     pub spin: SpinPolicy,
 }
 
@@ -639,9 +646,13 @@ impl Worker {
         ok
     }
 
-    /// Спин перед сном (`AutoOptions::spin`). `true` -- во входящем кольце
-    /// появились данные, пришла новая отправка или остановка: в ядро не
-    /// уходить, а сделать ещё один проход цикла.
+    /// Спин перед сном (`AutoOptions::spin`) -- возвращает таймаут
+    /// следующего ожидания. Во входящем кольце появились данные, пришла
+    /// новая отправка или остановка -- `Some(0)`: ожидание НЕ пропускается,
+    /// а только не блокирует, так что `DISCONNECT`, `SPACE`, смерть пира и
+    /// `wake` проверяются после КАЖДОГО спина (непрерывный поток данных не
+    /// может держать worker вне `wait_any`). Иначе -- обычный
+    /// `poll_timeout`.
     ///
     /// Вызывается ровно один раз перед каждым ожиданием в ядре, только у
     /// подключённого worker-а, только когда проход ничего не оставил
@@ -652,16 +663,23 @@ impl Worker {
     /// Непустая очередь отправки на входе -- спина нет: её голова либо ждёт
     /// `SPACE` (тогда спин по `pending_msgs` закончился бы сразу и крутил
     /// цикл), либо поставлена колбэком этого прохода -- тогда `wake` уже
-    /// взведён и ожидание вернётся сразу. Данные, увиденные спином, оставляют
-    /// `DATA` взведённым (одно лишнее пробуждение потом); сбрасывать его
-    /// нельзя -- можно потерять сигнал следующего кадра.
-    fn spin_before_wait(&self, has_unread: impl Fn() -> bool) -> bool {
-        if !self.options.spin.is_enabled() || !self.outbox.lock().is_empty() {
-            return false;
+    /// взведён и ожидание вернётся сразу. `DATA`, взведённый писателем за
+    /// время спина, поглощает нулевое ожидание (или даёт одно лишнее
+    /// пробуждение потом); сбрасывать его вручную нельзя -- можно потерять
+    /// сигнал следующего кадра.
+    fn spin_before_wait(&self, has_unread: impl Fn() -> bool) -> Option<Duration> {
+        let spun = self.options.spin.is_enabled()
+            && self.outbox.lock().is_empty()
+            && spin_until(self.options.spin, None, || {
+                has_unread()
+                    || self.gauge.pending_msgs.load(Ordering::Acquire) > 0
+                    || !self.running()
+            });
+        if spun {
+            Some(Duration::ZERO)
+        } else {
+            self.options.poll_timeout
         }
-        spin_until(self.options.spin, || {
-            has_unread() || self.gauge.pending_msgs.load(Ordering::Acquire) > 0 || !self.running()
-        })
     }
 
     /// Обработать результат ожидания подключённого worker-а. `None` --
@@ -906,9 +924,7 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
                 break 'session None;
             }
             // Спин -- один бюджет на засыпание (см. `spin_before_wait`).
-            if worker.spin_before_wait(|| server.has_unread_from_client()) {
-                break 'session None;
-            }
+            let timeout = worker.spin_before_wait(|| server.has_unread_from_client());
             // Набор -- заимствование событий сервера на одно ожидание
             // (`wait_for_client_or`/`mark_disconnected` требуют `&mut`).
             let Some(events) = server.events() else {
@@ -925,7 +941,7 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
                 server.peer_wait_handle(),
                 worker.wake.as_handle(),
             );
-            let result = win::wait_any(set.handles(), worker.options.poll_timeout);
+            let result = win::wait_any(set.handles(), timeout);
             worker.stats.wake();
             worker.handle_wait(server, &set, space, result, &mut buffer)
         };
@@ -1176,15 +1192,13 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 continue;
             }
             // Спин -- один бюджет на засыпание (см. `spin_before_wait`).
-            if worker.spin_before_wait(|| client.has_unread_from_server()) {
-                continue;
-            }
+            let timeout = worker.spin_before_wait(|| client.has_unread_from_server());
             let set = WaitSet::new(
                 base_handles,
                 client.peer_wait_handle(),
                 worker.wake.as_handle(),
             );
-            let result = win::wait_any(set.handles(), worker.options.poll_timeout);
+            let result = win::wait_any(set.handles(), timeout);
             worker.stats.wake();
             if let Some(reason) = worker.handle_wait(&client, &set, space, result, &mut buffer) {
                 break Some(reason);
@@ -1838,9 +1852,21 @@ mod lossless_tests {
 
     /// 0.10: спин включён -- обмен работает (ping-pong через колбэк), а в
     /// простое worker отспинивает бюджет один раз и спит в ядре: ноль
-    /// пробуждений, как без спина. `stop()` во время спина не ждёт бюджета.
+    /// пробуждений, как без спина.
     #[test]
     fn idle_worker_with_spin_does_not_wake_up() {
+        spin_ping_pong_then_idle(SpinPolicy::new(20_000));
+    }
+
+    /// 0.10: бюджет `u32::MAX` (минуты спина) -- `stop()` прерывает спин по
+    /// флагу `running`, а не ждёт конца бюджета; в простое (воркеры ещё
+    /// спинят) пробуждений тоже нет.
+    #[test]
+    fn stop_interrupts_unbounded_spin() {
+        spin_ping_pong_then_idle(SpinPolicy::new(u32::MAX));
+    }
+
+    fn spin_ping_pong_then_idle(spin: SpinPolicy) {
         /// Сервер отвечает эхом из своего колбэка.
         struct Echo {
             server: Mutex<Option<Arc<AutoServer>>>,
@@ -1858,10 +1884,10 @@ mod lossless_tests {
             }
         }
         let options = || AutoOptions {
-            spin: SpinPolicy::new(20_000),
+            spin,
             ..AutoOptions::default()
         };
-        let name = format!("AUTO_IDLE_SPIN_{}", std::process::id());
+        let name = format!("AUTO_IDLE_SPIN_{}_{}", std::process::id(), spin.iterations);
         let server_h = Arc::new(Echo {
             server: Mutex::new(None),
             counting: Counting::default(),

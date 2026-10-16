@@ -193,8 +193,16 @@ pub struct MultiOptions {
     /// Спин worker-а группы перед сном в ядре (0.10): до `spin.iterations`
     /// проверок колец клиент -> сервер всех подключённых слотов группы по
     /// позициям (и остановки), прежде чем уснуть на наборе событий. Один
-    /// бюджет на каждое засыпание (в простое -- ноль пробуждений). По
-    /// умолчанию -- `SpinPolicy::NONE`. Пиру не виден.
+    /// бюджет на каждое засыпание (в простое -- ноль пробуждений). После
+    /// удачного спина данные читаются, а набор событий группы всё равно
+    /// опрашивается (нулевой таймаут) -- болтливый слот не заслоняет
+    /// `CONNECT_REQ`/`DISCONNECT`/смерть процесса остальных.
+    ///
+    /// Во время спина `CONNECT_REQ`, `DISCONNECT` и смерть клиентов не
+    /// наблюдаются: они замечаются не позже конца бюджета. Цена -- занятое
+    /// ядро CPU на время спина; длительность итерации (`pause`) зависит от
+    /// CPU (порядка 10..140 тактов). По умолчанию -- `SpinPolicy::NONE`.
+    /// Пиру не виден.
     pub spin: SpinPolicy,
 }
 
@@ -239,8 +247,14 @@ pub struct MultiClientOptions {
     pub namespace: Option<Arc<PrivateNamespace>>,
     /// Спин подключённого worker-а перед сном в ядре (0.10): до
     /// `spin.iterations` проверок кольца сервер -> клиент по позициям (и
-    /// новых `send`, и остановки). Один бюджет на каждое засыпание. По
-    /// умолчанию -- `SpinPolicy::NONE`. Пиру не виден.
+    /// новых `send`, и остановки). Один бюджет на каждое засыпание; после
+    /// удачного спина набор событий всё равно опрашивается (нулевой
+    /// таймаут).
+    ///
+    /// Во время спина `DISCONNECT` и смерть сервера не наблюдаются: они
+    /// замечаются не позже конца бюджета. Цена -- занятое ядро CPU на время
+    /// спина; длительность итерации (`pause`) зависит от CPU (порядка
+    /// 10..140 тактов). По умолчанию -- `SpinPolicy::NONE`. Пиру не виден.
     pub spin: SpinPolicy,
 }
 
@@ -940,22 +954,36 @@ impl MultiCore {
             // Спин (`MultiOptions::spin`) -- один бюджет на каждое засыпание:
             // только перед блокирующим ожиданием (без добора `backlog`) и
             // только при подключённых слотах. Увидели данные в кольце любого
-            // слота группы -- обрабатываем как пробуждение по `DATA`, без
-            // ядра (сигнал `DATA`, если писатель его взвёл, даст потом одно
-            // лишнее пробуждение; сбрасывать его нельзя). В простое бюджет
+            // слота группы -- читаем их, но ожидание НЕ пропускаем: оно идёт
+            // с нулевым таймаутом. Иначе один болтливый слот, чьё кольцо
+            // каждый раз непусто к концу спина, навсегда держал бы worker вне
+            // `wait_any`: ни `CONNECT_REQ`, ни `DISCONNECT`, ни смерти
+            // процесса для остальных слотов группы.
+            //
+            // Нулевое ожидание после спина идёт БЕЗ событий `DATA`: данные
+            // только что прочитаны, а NT отдаёт наименьший сигнальный индекс
+            // -- `DATA` болтливого слота (его писатель взводит сигнал к концу
+            // почти каждого спина) иначе всегда выигрывал бы у `CONNECT_REQ`
+            // и смерти процесса слотов с большими индексами. Пропущенный
+            // `DATA` остаётся взведённым (вручную его не сбрасываем) и даст
+            // одно лишнее пробуждение перед сном. В простое бюджет
             // отспинивается один раз, затем сон без таймаута.
-            if !backlog
+            let spun = !backlog
                 && !probes.is_empty()
-                && spin_until(self.options.spin, || {
+                && spin_until(self.options.spin, None, || {
                     probes.iter().any(UnreadProbe::has_unread)
                         || !self.running.load(Ordering::Acquire)
-                })
-            {
+                });
+            if spun {
                 backlog = self.poll_group_slots(range.clone(), &mut buffer);
-                continue;
+                let mut keep = sources
+                    .iter()
+                    .map(|source| !matches!(source, EventSource::SlotData));
+                handles.retain(|_| keep.next().unwrap_or(true));
+                sources.retain(|source| !matches!(source, EventSource::SlotData));
             }
 
-            let timeout = if backlog {
+            let timeout = if backlog || spun {
                 Some(Duration::ZERO)
             } else {
                 let until_deadline = sweep
@@ -1591,7 +1619,7 @@ fn spin_before_wait(
         return false;
     }
     let sends = outbox.sends.load(Ordering::Acquire);
-    spin_until(spin, || {
+    spin_until(spin, None, || {
         has_unread()
             || outbox.sends.load(Ordering::Acquire) != sends
             || !running.load(Ordering::Acquire)
@@ -1709,19 +1737,22 @@ fn client_worker(
             // Спин (`MultiClientOptions::spin`) -- один бюджет на каждое
             // засыпание (в простое: один раз, затем сон без таймаута).
             // Непустая очередь (`send` из колбэка этого прохода) -- без
-            // спина: `wake` уже взведён. Увидели данные -- сверяем сессию,
-            // как после пробуждения (кольцо могло достаться новому клиенту
-            // слота), и читаем без ядра; `DATA` не сбрасываем.
-            if spin_before_wait(options.spin, outbox, running, || {
+            // спина: `wake` уже взведён. Увидели данные (новый `send`) --
+            // ожидание всё равно идёт, но с нулевым таймаутом: `DISCONNECT`
+            // и смерть сервера проверяются после КАЖДОГО спина, а сверка
+            // сессии -- в ветках ниже, как после обычного пробуждения
+            // (кольцо могло достаться новому клиенту слота). `DATA` вручную
+            // не сбрасываем.
+            let spun = spin_before_wait(options.spin, outbox, running, || {
                 client.has_unread_from_server()
-            }) {
-                if !client.is_session_current() {
-                    break Some(DisconnectReason::Graceful);
-                }
-                continue;
-            }
+            });
+            let timeout = if spun {
+                Some(Duration::ZERO)
+            } else {
+                options.poll_timeout
+            };
 
-            let result = win::wait_any(&handles[..count], options.poll_timeout);
+            let result = win::wait_any(&handles[..count], timeout);
             shared.wakeups.fetch_add(1, Ordering::AcqRel);
             match result {
                 Ok(Some(0)) => {

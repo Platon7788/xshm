@@ -16,7 +16,7 @@ use xshm::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, ClientRegistration, DisconnectReason,
     DispatchClient, DispatchClientHandler, DispatchClientOptions, DispatchHandler, DispatchOptions,
     DispatchServer, MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler,
-    MultiOptions, MultiServer, SharedClient, SharedServer, ShmError,
+    MultiOptions, MultiServer, SharedClient, SharedServer, ShmError, SpinPolicy,
 };
 
 const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
@@ -608,4 +608,147 @@ fn multi_client_sees_server_death() {
     assert_eq!(reason, DisconnectReason::PeerDied);
     report("multi client on_disconnect_reason", at - t0);
     drop(client);
+}
+
+/// Журнал событий Multi-сервера по слотам (тест спина).
+#[derive(Default)]
+struct SlotLog {
+    connected: Mutex<Vec<u32>>,
+    disconnected: Mutex<Vec<(u32, DisconnectReason)>>,
+}
+
+impl SlotLog {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn connected(&self) -> Vec<u32> {
+        self.connected.lock().unwrap().clone()
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn reason(&self, id: u32) -> Option<DisconnectReason> {
+        self.disconnected
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(slot, _)| *slot == id)
+            .map(|&(_, reason)| reason)
+    }
+}
+
+impl MultiHandler for SlotLog {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_client_connect(&self, client_id: u32) {
+        self.connected.lock().unwrap().push(client_id);
+    }
+    fn on_client_disconnect(&self, _client_id: u32) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        self.disconnected.lock().unwrap().push((client_id, reason));
+    }
+    fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+}
+
+/// Task 12, fix round 1: спин worker-а группы Multi с бюджетом много длиннее
+/// паузы болтливого клиента (сообщение раз в 1..16 мс -- к концу каждого
+/// спина кольцо непусто) не заслоняет события остальных слотов группы:
+/// новый клиент подключается, штатный уход и смерть процесса другого
+/// клиента замечаются. До исправления удачный спин пропускал `wait_any`, и
+/// `CONNECT_REQ`/смерть процесса не наблюдались, пока шёл поток.
+///
+/// Бюджет конечен: в простое (до потока) события замечаются только к концу
+/// бюджета, `u32::MAX` растянул бы это на минуты (документированная цена).
+#[test]
+fn multi_spin_does_not_starve_group_events() {
+    // ~0,3..0,5 с спина на этой машине (`pause` ~140 тактов), десятки мс на
+    // CPU с коротким `pause` -- всё равно длиннее паузы потока.
+    const SPIN: SpinPolicy = SpinPolicy::new(10_000_000);
+    let name = unique_name("MU_SPIN");
+    let log = Arc::new(SlotLog::default());
+    let server = MultiServer::start(
+        &name,
+        log.clone(),
+        MultiOptions {
+            max_clients: 4,
+            spin: SPIN,
+            ..MultiOptions::default()
+        },
+    )
+    .unwrap();
+
+    // Клиент в дочернем процессе: его смерть сервер видит только событием
+    // процесса в наборе ожидания.
+    let mut peer = Peer::spawn("multi_client", &name);
+    wait_until(
+        "дочерний клиент",
+        Duration::from_secs(20),
+        || log.connected().len() == 1,
+    );
+    let child_id = log.connected()[0];
+
+    // Болтливый клиент: пишет непрерывно, пока идёт тест.
+    let chatty = Arc::new(
+        MultiClient::connect(&name, Arc::new(Noop), MultiClientOptions::default()).unwrap(),
+    );
+    wait_until(
+        "болтливый клиент",
+        Duration::from_secs(5),
+        || log.connected().len() == 2,
+    );
+    let streaming = Arc::new(AtomicBool::new(true));
+    let streamer = {
+        let (chatty, streaming) = (chatty.clone(), streaming.clone());
+        thread::spawn(move || {
+            while streaming.load(Ordering::Acquire) {
+                let _ = chatty.send(b"tick");
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(200));
+
+    // Новый клиент подключается при идущем потоке (CONNECT_REQ замечен).
+    let late = MultiClient::connect(&name, Arc::new(Noop), MultiClientOptions::default()).unwrap();
+    wait_until(
+        "подключение при потоке",
+        Duration::from_secs(3),
+        || log.connected().len() == 3 && late.is_connected(),
+    );
+    let late_id = late.slot_id();
+
+    // Штатный уход (DISCONNECT) замечен.
+    drop(late);
+    wait_until(
+        "штатный уход при потоке",
+        Duration::from_secs(3),
+        || log.reason(late_id) == Some(DisconnectReason::Graceful),
+    );
+
+    // Смерть процесса другого клиента замечена.
+    let _ = peer.kill();
+    wait_until(
+        "смерть клиента при потоке",
+        Duration::from_secs(3),
+        || log.reason(child_id) == Some(DisconnectReason::PeerDied),
+    );
+
+    streaming.store(false, Ordering::Release);
+    streamer.join().unwrap();
+    assert_eq!(
+        log.reason(chatty.slot_id()),
+        None,
+        "болтливый клиент на месте"
+    );
+    drop(chatty);
+    server.stop();
 }
