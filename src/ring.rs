@@ -14,6 +14,7 @@
 //! выравниванием -- мусор пира даёт `Corrupted`, а не зависание, панику или
 //! выход за пределы кольца.
 
+use std::os::windows::io::AsHandle;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering, compiler_fence, fence};
 use std::time::{Duration, Instant};
@@ -61,7 +62,7 @@ pub struct WriteOutcome {
 /// (`FRAME_HEADER_SIZE`) + payload, дополненные до кратного `FRAME_ALIGN`.
 #[must_use]
 pub const fn frame_size(payload_len: usize) -> usize {
-    (FRAME_HEADER_SIZE + payload_len + (FRAME_ALIGN - 1)) & !(FRAME_ALIGN - 1)
+    (FRAME_HEADER_SIZE + payload_len).next_multiple_of(FRAME_ALIGN)
 }
 
 /// Свободное место в исходящем кольце.
@@ -153,11 +154,33 @@ impl RingBuffer {
     /// `config.capacity` байт данных кольца; обе области не пересекаются и
     /// валидны всё время жизни кольца. `config` проверен
     /// (`RingConfig::validate`).
-    pub unsafe fn new(header: *mut RingHeader, data: *mut u8, config: &RingConfig) -> Self {
+    ///
+    /// Нулевой указатель -- `Err(Corrupted)`, а не паника. Библиотека
+    /// строит кольца из адресов отображения (`from_parts`); из сырых
+    /// указателей -- только тестовые фикстуры.
+    #[cfg(test)]
+    pub unsafe fn new(header: *mut RingHeader, data: *mut u8, config: &RingConfig) -> Result<Self> {
+        let (Some(header), Some(data)) = (NonNull::new(header), NonNull::new(data)) else {
+            return Err(ShmError::Corrupted);
+        };
+        // SAFETY: контракт `new` совпадает с контрактом `from_parts`.
+        Ok(unsafe { Self::from_parts(header, data, config) })
+    }
+
+    /// Кольцо из заведомо ненулевых указателей (`SharedView`: адреса внутри
+    /// отображения).
+    ///
+    /// # Safety
+    /// То же, что у [`RingBuffer::new`].
+    pub(crate) unsafe fn from_parts(
+        header: NonNull<RingHeader>,
+        storage: NonNull<u8>,
+        config: &RingConfig,
+    ) -> Self {
         debug_assert!(config.validate().is_ok());
         RingBuffer {
-            header: NonNull::new(header).expect("header pointer must be valid"),
-            storage: NonNull::new(data).expect("ring buffer pointer must be valid"),
+            header,
+            storage,
             capacity: config.capacity as u32,
             mask: config.capacity as u32 - 1,
             max_messages: config.max_messages,
@@ -208,11 +231,15 @@ impl RingBuffer {
             index.is_multiple_of(4) && index + 4 <= self.capacity as usize,
             "ring frame header index out of bounds"
         );
-        // SAFETY: index кратен 4 и index + 4 <= capacity (позиции кадров
-        // кратны FRAME_ALIGN, ёмкость кратна FRAME_ALIGN); storage выровнен
-        // на 64 (идёт сразу за RingHeader). Слово читается/пишется атомарно,
-        // поэтому гонка с перезаписью писателем -- не data race.
-        unsafe { &*self.data_ptr().add(index).cast::<AtomicU32>() }
+        // SAFETY: index + 4 <= capacity (проверено выше) -- адрес внутри
+        // данных кольца.
+        let word = unsafe { self.data_ptr().add(index) };
+        // SAFETY: контракт `AtomicU32::from_ptr`: адрес выровнен на 4 (index
+        // кратен 4, storage выровнен на 64 -- идёт сразу за RingHeader) и
+        // валиден всё время жизни `&self` (инвариант `new`); к слову заголовка
+        // кадра обе стороны обращаются только атомарно, поэтому гонка с
+        // перезаписью писателем -- не data race.
+        unsafe { AtomicU32::from_ptr(word.cast()) }
     }
 
     /// Скопировать `src` в кольцо с позиции `start` с переносом через
@@ -223,17 +250,16 @@ impl RingBuffer {
     unsafe fn copy_in(&self, start: usize, src: &[u8]) {
         let capacity = self.capacity as usize;
         let first = (capacity - start).min(src.len());
-        // SAFETY: [start, start+first) и [0, src.len()-first) лежат внутри
-        // кольца (контракт функции); источник -- локальный срез, не
-        // пересекается с разделяемой памятью.
-        unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), self.data_ptr().add(start), first);
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr().add(first),
-                self.data_ptr(),
-                src.len() - first,
-            );
-        }
+        let (head, tail) = src.split_at(first);
+        // SAFETY: start < capacity (контракт функции) -- адрес внутри кольца.
+        let dst = unsafe { self.data_ptr().add(start) };
+        // SAFETY: [start, start+first) лежит внутри кольца (first <=
+        // capacity - start); источник -- локальный срез, не пересекается с
+        // разделяемой памятью.
+        unsafe { std::ptr::copy_nonoverlapping(head.as_ptr(), dst, head.len()) };
+        // SAFETY: [0, src.len()-first) лежит внутри кольца (src.len() <=
+        // capacity); источник -- локальный срез.
+        unsafe { std::ptr::copy_nonoverlapping(tail.as_ptr(), self.data_ptr(), tail.len()) };
     }
 
     /// Скопировать `len` байт из кольца с позиции `start` в `dst`.
@@ -247,11 +273,16 @@ impl RingBuffer {
     unsafe fn copy_out(&self, start: usize, dst: *mut u8, len: usize) {
         let capacity = self.capacity as usize;
         let first = (capacity - start).min(len);
-        // SAFETY: см. контракт функции и `copy_in`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.data_ptr().add(start), dst, first);
-            std::ptr::copy_nonoverlapping(self.data_ptr(), dst.add(first), len - first);
-        }
+        // SAFETY: start < capacity (контракт функции) -- адрес внутри кольца.
+        let src = unsafe { self.data_ptr().add(start) };
+        // SAFETY: [start, start+first) внутри кольца, `dst` -- `len >= first`
+        // байт записи (контракт функции).
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, first) };
+        // SAFETY: first <= len -- адрес внутри буфера `dst`.
+        let dst_tail = unsafe { dst.add(first) };
+        // SAFETY: [0, len-first) внутри кольца (len <= capacity), `dst_tail`
+        // -- оставшиеся `len - first` байт записи.
+        unsafe { std::ptr::copy_nonoverlapping(self.data_ptr(), dst_tail, len - first) };
     }
 
     /// Кадр в позиции `read` при опубликованном `write`.
@@ -554,9 +585,10 @@ impl RingBuffer {
                     out.as_mut_ptr(),
                     frame.len,
                 );
-                // Первые frame.len байт только что инициализированы.
-                out.set_len(frame.len);
             }
+            // SAFETY: первые frame.len байт только что инициализированы
+            // (`copy_out` выше), ёмкость зарезервирована.
+            unsafe { out.set_len(frame.len) };
 
             // Барьер компилятора: копирование не должно «переехать» НИЖЕ CAS,
             // иначе валидация теряет смысл. На x86 успешный lock cmpxchg также
@@ -648,15 +680,16 @@ impl RingBuffer {
 
             // Индекс 0 -- место (приоритет: при одновременном сигнале NT
             // отдаёт наименьший индекс), затем отключение, затем смерть.
-            let mut handles = [space_event.raw_handle(), 0, 0];
+            // Хвост массива -- заполнитель, в ожидание уходит `[..count]`.
+            let mut handles = [space_event.as_handle(); 3];
             let mut count = 1;
             let disconnect_index = disconnect.map(|d| {
-                handles[count] = d.event.raw_handle();
+                handles[count] = d.event.as_handle();
                 count += 1;
                 count - 1
             });
             let peer_index = peer.map(|p| {
-                handles[count] = p.raw_handle();
+                handles[count] = p.as_handle();
                 count += 1;
                 count - 1
             });
@@ -747,7 +780,7 @@ mod overflow_race_tests {
         // SAFETY: data сразу за заголовком, в пределах выделения.
         let data = unsafe { ptr.add(header_size) };
         // SAFETY: header и data валидны, не пересекаются, живут пока жив RingMem.
-        let ring = unsafe { RingBuffer::new(header, data, &config) };
+        let ring = unsafe { RingBuffer::new(header, data, &config) }.unwrap();
         (ring, RingMem { ptr, layout })
     }
 

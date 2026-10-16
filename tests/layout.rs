@@ -121,6 +121,10 @@ impl AutoHandler for AutoRecorder {
     fn on_connect(&self) {
         self.connected.store(true, Ordering::Release);
     }
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, _direction: ChannelKind, payload: &[u8]) {
         self.received.lock().unwrap().push(payload.to_vec());
     }
@@ -180,6 +184,10 @@ impl MultiHandler for MultiServerRecorder {
         self.connected.fetch_add(1, Ordering::AcqRel);
     }
     fn on_client_disconnect(&self, _client_id: u32) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, _client_id: u32, data: &[u8]) {
         self.received.lock().unwrap().push(data.to_vec());
     }
@@ -196,6 +204,10 @@ impl MultiClientHandler for MultiClientRecorder {
         self.connected.store(true, Ordering::Release);
     }
     fn on_disconnect(&self) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, data: &[u8]) {
         self.received.lock().unwrap().push(data.to_vec());
     }
@@ -284,6 +296,10 @@ impl DispatchHandler for DispatchPolicy {
         self.connected.fetch_add(1, Ordering::AcqRel);
     }
     fn on_client_disconnect(&self, _client_id: u32) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, _client_id: u32, data: &[u8]) {
         self.received.lock().unwrap().push(data.to_vec());
     }
@@ -300,6 +316,10 @@ impl DispatchClientHandler for DispatchClientRecorder {
         self.connected.store(true, Ordering::Release);
     }
     fn on_disconnect(&self) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, data: &[u8]) {
         self.received.lock().unwrap().push(data.to_vec());
     }

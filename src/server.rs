@@ -1,3 +1,4 @@
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -43,7 +44,7 @@ impl SharedServer {
     pub fn start_with_layout(name: &str, layout: ChannelLayout) -> Result<Self> {
         layout.validate()?;
         let mapping = Mapping::create(&mapping_name(name), layout.segment_size())?;
-        let mut server = Self::from_mapping(mapping, layout);
+        let mut server = Self::from_mapping(mapping, layout)?;
         server.events = Some(SharedEvents::create(name)?);
         Ok(server)
     }
@@ -69,13 +70,13 @@ impl SharedServer {
     pub fn start_anonymous_with_layout(layout: ChannelLayout) -> Result<Self> {
         layout.validate()?;
         let mapping = Mapping::create_anonymous(layout.segment_size())?;
-        Ok(Self::from_mapping(mapping, layout))
+        Self::from_mapping(mapping, layout)
     }
 
     /// Инициализация свежей секции: сегмент публикуется (`magic`) до
     /// создания событий -- клиент, открывший секцию раньше событий, получит
     /// ошибку открытия событий и повторит попытку.
-    fn from_mapping(mapping: Mapping, layout: ChannelLayout) -> Self {
+    fn from_mapping(mapping: Mapping, layout: ChannelLayout) -> Result<Self> {
         // SAFETY: `Mapping` только что создал отображение размером не меньше
         // `layout.segment_size()` (адрес выровнен на гранулу выделения) и
         // держит его живым, пока жив сам, а он переезжает в возвращаемую
@@ -87,10 +88,10 @@ impl SharedServer {
                 std::process::id(),
                 crate::win::current_process_start_time(),
             )
-        };
+        }?;
         let ring_tx = view.ring_a();
         let ring_rx = view.ring_b();
-        Self {
+        Ok(Self {
             view,
             events: None,
             ring_tx,
@@ -98,7 +99,7 @@ impl SharedServer {
             connected: false,
             peer: None,
             _mapping: mapping,
-        }
+        })
     }
 
     /// Раскладка канала (параметры обоих направлений).
@@ -122,11 +123,11 @@ impl SharedServer {
         }
 
         // Для anonymous режима используем polling
-        if self.events.is_none() {
+        let Some(events) = self.events.as_ref() else {
             return self.wait_for_client_noevent(timeout);
-        }
+        };
 
-        if !self.events.as_ref().unwrap().connect_req.wait(timeout)? {
+        if !events.connect_req.wait(timeout)? {
             return Err(ShmError::Timeout);
         }
 
@@ -148,7 +149,7 @@ impl SharedServer {
     /// истёк `timeout` (`None` -- без таймаута). Только именованный сервер.
     pub(crate) fn wait_for_client_or(
         &mut self,
-        wake: isize,
+        wake: BorrowedHandle<'_>,
         timeout: Option<Duration>,
     ) -> Result<bool> {
         if self.connected {
@@ -160,7 +161,7 @@ impl SharedServer {
             ));
         };
         // CONNECT_REQ первым: при одновременном сигнале клиент важнее.
-        match wait_any(&[events.connect_req.raw_handle(), wake], timeout)? {
+        match wait_any(&[events.connect_req.as_handle(), wake], timeout)? {
             Some(0) => {}
             _ => return Ok(false),
         }
@@ -520,8 +521,8 @@ impl SharedServer {
     }
 
     /// Handle процесса клиента для набора ожидания worker-а (auto-режим).
-    pub(crate) fn peer_wait_handle(&self) -> Option<isize> {
-        self.peer.as_ref().map(ProcessWatch::raw_handle)
+    pub(crate) fn peer_wait_handle(&self) -> Option<BorrowedHandle<'_>> {
+        self.peer.as_ref().map(AsHandle::as_handle)
     }
 
     /// Забрать handle процесса клиента, не закрывая его (Multi: handle может
@@ -545,7 +546,7 @@ pub(crate) fn poll_with_peer(
     let Some(peer) = peer else {
         return data.wait(timeout);
     };
-    match wait_any(&[data.raw_handle(), peer.raw_handle()], timeout)? {
+    match wait_any(&[data.as_handle(), peer.as_handle()], timeout)? {
         Some(0) => Ok(true),
         Some(_) if !ring.is_empty() => Ok(true),
         Some(_) => Err(ShmError::PeerDied),

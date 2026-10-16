@@ -21,6 +21,10 @@ use xshm::{
 const CHILD_ENV: &str = "XSHM_BACKPRESSURE_CHILD";
 const CHILD_TOTAL_ENV: &str = "XSHM_BACKPRESSURE_TOTAL";
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn unique_name(tag: &str) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -50,6 +54,10 @@ fn make_payload(seq: u32, len: usize) -> Vec<u8> {
     v
 }
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn check_payload(expected_seq: u32, msg: &[u8]) {
     assert!(msg.len() >= 12, "слишком короткое сообщение: {}", msg.len());
     let seq = u32::from_le_bytes(msg[..4].try_into().unwrap());
@@ -108,6 +116,11 @@ fn child_slow_consumer_entry() {
     thread::sleep(Duration::from_millis(300));
 }
 
+#[expect(
+    clippy::expect_used,
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn spawn_child(name: &str, total: u32) -> Child {
     Command::new(std::env::current_exe().unwrap())
         .args([
@@ -189,7 +202,7 @@ fn cross_process_lossless_backpressure() {
             break status;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
+            drop(child.kill()); // best-effort: процесс мог уже выйти
             panic!("дочерний процесс не завершился");
         }
         thread::sleep(Duration::from_millis(20));
@@ -349,6 +362,10 @@ impl DispatchHandler for SlowServer {
         self.connected.fetch_add(1, Ordering::AcqRel);
     }
     fn on_client_disconnect(&self, _client_id: u32) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, _client_id: u32, data: &[u8]) {
         let mut received = self.received.lock().unwrap();
         let expected = received.len() as u32;
@@ -371,6 +388,10 @@ struct RecordingClient {
 impl DispatchClientHandler for RecordingClient {
     fn on_connect(&self, _client_id: u32, _channel_name: &str) {}
     fn on_disconnect(&self) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, data: &[u8]) {
         let expected = self.received.load(Ordering::Acquire);
         let seq = u32::from_le_bytes(data[..4].try_into().unwrap());

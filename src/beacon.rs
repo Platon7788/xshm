@@ -28,6 +28,7 @@
 //! - [`ProcessExit`] — удерживаемый handle процесса (сигнален, когда процесс
 //!   завершился); вместе с маяками ждётся через [`wait_any`].
 
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::time::Duration;
 
 use crate::error::Result;
@@ -35,16 +36,24 @@ use crate::naming::has_explicit_namespace;
 use crate::win::{EventHandle, ProcessWatch};
 
 mod sealed {
+    /// Запечатывающий трейт: неименуем снаружи намеренно -- иначе
+    /// `Waitable` можно было бы реализовать вне крейта.
+    #[expect(
+        unnameable_types,
+        reason = "паттерн sealed: трейт достижим через `Waitable`, но не именуем"
+    )]
     pub trait Sealed {}
 }
 
 /// Объект, который можно ждать в [`wait_any`]: [`Beacon`], [`ProcessExit`].
-/// Запечатан — реализации только внутри `xshm`.
-pub trait Waitable: sealed::Sealed {
-    /// Числовой handle для `NtWaitForMultipleObjects` (деталь реализации).
-    #[doc(hidden)]
-    fn wait_handle(&self) -> isize;
-}
+/// Запечатан — реализации только внутри `xshm`; дескриптор для ожидания
+/// отдаёт [`AsHandle`] (заимствование живёт не дольше объекта).
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` нельзя ждать в `xshm::wait_any`",
+    label = "не реализует `xshm::Waitable`",
+    note = "ждать можно только `xshm::Beacon` и `xshm::ProcessExit` (трейт запечатан)"
+)]
+pub trait Waitable: AsHandle + sealed::Sealed {}
 
 /// Ждать, пока сработает любой из объектов (`None` — без таймаута).
 /// `Some(i)` — индекс сработавшего (при одновременном срабатывании —
@@ -54,7 +63,7 @@ pub trait Waitable: sealed::Sealed {
 ///
 /// Ошибка ОС.
 pub fn wait_any(objects: &[&dyn Waitable], timeout: Option<Duration>) -> Result<Option<usize>> {
-    let handles: Vec<isize> = objects.iter().map(|o| o.wait_handle()).collect();
+    let handles: Vec<BorrowedHandle<'_>> = objects.iter().map(|o| o.as_handle()).collect();
     crate::win::wait_any(&handles, timeout)
 }
 
@@ -66,9 +75,11 @@ pub struct Beacon {
 
 impl sealed::Sealed for Beacon {}
 
-impl Waitable for Beacon {
-    fn wait_handle(&self) -> isize {
-        self.event.raw_handle()
+impl Waitable for Beacon {}
+
+impl AsHandle for Beacon {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.event.as_handle()
     }
 }
 
@@ -151,7 +162,7 @@ impl Beacon {
     ///
     /// Ошибка ОС.
     pub fn wait_any(beacons: &[&Self], timeout: Option<Duration>) -> Result<Option<usize>> {
-        let handles: Vec<isize> = beacons.iter().map(|b| b.event.raw_handle()).collect();
+        let handles: Vec<BorrowedHandle<'_>> = beacons.iter().map(|b| b.as_handle()).collect();
         crate::win::wait_any(&handles, timeout)
     }
 
@@ -178,9 +189,11 @@ pub struct ProcessExit {
 
 impl sealed::Sealed for ProcessExit {}
 
-impl Waitable for ProcessExit {
-    fn wait_handle(&self) -> isize {
-        self.watch.raw_handle()
+impl Waitable for ProcessExit {}
+
+impl AsHandle for ProcessExit {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.watch.as_handle()
     }
 }
 
@@ -354,6 +367,7 @@ mod tests {
             Some(1)
         );
         assert!(exit.has_exited());
-        let _ = child.wait();
+        // Процесс уже завершён: `wait` только забирает код выхода.
+        drop(child.wait());
     }
 }

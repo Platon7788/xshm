@@ -1,3 +1,4 @@
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -85,7 +86,7 @@ fn withdraw_hello(view: &SharedView, generation_before: u32) -> bool {
 /// `should_stop()` вернул `true` -- заявка отзывается, `connect` возвращает
 /// `Err(NotReady)`; иначе (например, `wake` от `send`) ожидание продолжается.
 pub(crate) struct Interrupt<'a> {
-    pub(crate) wake: isize,
+    pub(crate) wake: BorrowedHandle<'a>,
     pub(crate) should_stop: &'a mut dyn FnMut() -> bool,
 }
 
@@ -115,7 +116,7 @@ fn wait_ack(
             return AckWait::Abandoned(ShmError::Timeout);
         }
         let fired = match interrupt.as_deref_mut() {
-            Some(int) => wait_any(&[events.connect_ack.raw_handle(), int.wake], Some(left)),
+            Some(int) => wait_any(&[events.connect_ack.as_handle(), int.wake], Some(left)),
             None => events
                 .connect_ack
                 .wait(Some(left))
@@ -434,8 +435,8 @@ impl SharedClient {
         self.peer.as_ref().map(|peer| !peer.has_exited())
     }
 
-    pub(crate) fn peer_wait_handle(&self) -> Option<isize> {
-        self.peer.as_ref().map(ProcessWatch::raw_handle)
+    pub(crate) fn peer_wait_handle(&self) -> Option<BorrowedHandle<'_>> {
+        self.peer.as_ref().map(AsHandle::as_handle)
     }
 }
 

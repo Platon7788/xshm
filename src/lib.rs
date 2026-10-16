@@ -9,6 +9,7 @@ mod naming;
 mod ring;
 mod server;
 mod shared;
+mod sync_ext;
 mod thread_hook;
 mod win;
 

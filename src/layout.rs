@@ -17,10 +17,19 @@
 //! вправе разложить кольца иначе (например, выровнять на страницу), не меняя
 //! версию формата.
 
+use core::mem::offset_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
+
+// Wire-поля -- `AtomicU32` в `repr(C)`: раскладка пира C23 (`uint32_t`)
+// совпадает, только если `AtomicU32` выровнен как `u32`. На x86/x86_64 это
+// так (`"32"`); для 64 бит -- НЕТ на i686 (`AtomicU64` выровнен на 8, `u64`
+// -- на 4), поэтому 64-битных атомиков в wire-типах нет: время процесса
+// хранится двумя `u32` (`*_start_lo`/`*_hi`).
+#[cfg(not(target_has_atomic_primitive_alignment = "32"))]
+compile_error!("xshm: AtomicU32 обязан быть выровнен как u32 (раскладка разделяемой памяти)");
 
 /// Параметры одного направления канала (одного кольца).
 ///
@@ -203,6 +212,22 @@ pub struct RingHeader {
     pub reserved: [AtomicU32; 8],
 }
 
+// Раскладка `RingHeader` -- INTEROP §c.3: проверяется при каждой сборке
+// (в том числе у потребителя), а не только `cargo test`.
+const _: () = {
+    assert!(size_of::<RingHeader>() == 64);
+    assert!(align_of::<RingHeader>() == 64);
+    assert!(offset_of!(RingHeader, write_pos) == 0);
+    assert!(offset_of!(RingHeader, read_pos) == 4);
+    assert!(offset_of!(RingHeader, message_count) == 8);
+    assert!(offset_of!(RingHeader, drop_count) == 12);
+    assert!(offset_of!(RingHeader, sequence) == 16);
+    assert!(offset_of!(RingHeader, connection_gen) == 20);
+    assert!(offset_of!(RingHeader, handshake_state) == 24);
+    assert!(offset_of!(RingHeader, space_waiter) == 28);
+    assert!(offset_of!(RingHeader, reserved) == 32);
+};
+
 impl RingHeader {
     /// Relaxed: сброс выполняется либо до публикации сегмента (`magic`,
     /// Release), либо сервером в `complete_handshake` до публикации нового
@@ -261,6 +286,28 @@ pub struct ControlBlock {
     /// Резерв под число слотов Multi; сейчас всегда `0`.
     pub slot_count: AtomicU32,
 }
+
+// Раскладка `ControlBlock` -- INTEROP §c.1.
+const _: () = {
+    assert!(size_of::<ControlBlock>() == 64);
+    assert!(align_of::<ControlBlock>() == 64);
+    assert!(offset_of!(ControlBlock, magic) == 0);
+    assert!(offset_of!(ControlBlock, version) == 4);
+    assert!(offset_of!(ControlBlock, generation) == 8);
+    assert!(offset_of!(ControlBlock, server_state) == 12);
+    assert!(offset_of!(ControlBlock, client_state) == 16);
+    assert!(offset_of!(ControlBlock, slot_claim) == 20);
+    assert!(offset_of!(ControlBlock, slot_owner_pid) == 24);
+    assert!(offset_of!(ControlBlock, server_pid) == 28);
+    assert!(offset_of!(ControlBlock, client_pid) == 32);
+    assert!(offset_of!(ControlBlock, server_start_lo) == 36);
+    assert!(offset_of!(ControlBlock, server_start_hi) == 40);
+    assert!(offset_of!(ControlBlock, client_start_lo) == 44);
+    assert!(offset_of!(ControlBlock, client_start_hi) == 48);
+    assert!(offset_of!(ControlBlock, owner_start_lo) == 52);
+    assert!(offset_of!(ControlBlock, owner_start_hi) == 56);
+    assert!(offset_of!(ControlBlock, slot_count) == 60);
+};
 
 /// Склеить 64-битное время из половин `lo`/`hi` (на i686 атомарной 64-битной
 /// записи нет -- поля хранятся двумя `u32`).
@@ -348,15 +395,53 @@ pub struct LayoutBlock {
     pub reserved: [AtomicU32; 6],
 }
 
+// Раскладка `RingDescriptor`/`LayoutBlock` -- INTEROP §c.2 (смещения
+// `LayoutBlock` -- от его начала, т.е. от байта 64 сегмента).
+const _: () = {
+    assert!(size_of::<RingDescriptor>() == 16);
+    assert!(offset_of!(RingDescriptor, offset) == 0);
+    assert!(offset_of!(RingDescriptor, capacity) == 4);
+    assert!(offset_of!(RingDescriptor, max_messages) == 8);
+    assert!(offset_of!(RingDescriptor, max_message_size) == 12);
+
+    assert!(size_of::<LayoutBlock>() == 64);
+    assert!(align_of::<LayoutBlock>() == 64);
+    assert!(offset_of!(LayoutBlock, segment_size) == 0);
+    assert!(offset_of!(LayoutBlock, flags) == 4);
+    assert!(offset_of!(LayoutBlock, s2c) == 8);
+    assert!(offset_of!(LayoutBlock, s2c.offset) == 8);
+    assert!(offset_of!(LayoutBlock, s2c.capacity) == 12);
+    assert!(offset_of!(LayoutBlock, s2c.max_messages) == 16);
+    assert!(offset_of!(LayoutBlock, s2c.max_message_size) == 20);
+    assert!(offset_of!(LayoutBlock, c2s) == 24);
+    assert!(offset_of!(LayoutBlock, c2s.offset) == 24);
+    assert!(offset_of!(LayoutBlock, c2s.capacity) == 28);
+    assert!(offset_of!(LayoutBlock, c2s.max_messages) == 32);
+    assert!(offset_of!(LayoutBlock, c2s.max_message_size) == 36);
+    assert!(offset_of!(LayoutBlock, reserved) == 40);
+
+    assert!(SEGMENT_HEADER_SIZE == size_of::<ControlBlock>() + size_of::<LayoutBlock>());
+};
+
 impl RingDescriptor {
     /// Relaxed: запись до публикации `magic` (Release).
-    pub(crate) fn store(&self, offset: usize, ring: &RingConfig) {
-        self.offset.store(offset as u32, Ordering::Relaxed);
-        self.capacity.store(ring.capacity as u32, Ordering::Relaxed);
+    ///
+    /// Значения уходят в разделяемую память как `u32`: усечение молча
+    /// исказило бы раскладку, которую увидит пир, поэтому -- `try_from`.
+    /// Проверенная раскладка (`ChannelLayout::validate`, ёмкость до
+    /// `MAX_RING_CAPACITY`) всегда помещается; ошибка -- `InvalidConfig`.
+    pub(crate) fn store(&self, offset: usize, ring: &RingConfig) -> Result<()> {
+        let too_large = |_| ShmError::InvalidConfig("ring layout value does not fit into u32");
+        let offset = u32::try_from(offset).map_err(too_large)?;
+        let capacity = u32::try_from(ring.capacity).map_err(too_large)?;
+        let max_message_size = u32::try_from(ring.max_message_size).map_err(too_large)?;
+        self.offset.store(offset, Ordering::Relaxed);
+        self.capacity.store(capacity, Ordering::Relaxed);
         self.max_messages
             .store(ring.max_messages, Ordering::Relaxed);
         self.max_message_size
-            .store(ring.max_message_size as u32, Ordering::Relaxed);
+            .store(max_message_size, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Relaxed: чтение после Acquire-чтения `magic`, поля неизменны.
@@ -375,7 +460,6 @@ impl RingDescriptor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::offset_of;
 
     /// Размеры и смещения -- часть wire-формата (INTEROP §c): любое изменение
     /// ломает совместимость с нативными пирами и kernel-драйвером.

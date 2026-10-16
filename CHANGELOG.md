@@ -108,6 +108,46 @@
   Объявлены импорты для следующих задач 0.10 (`NtQuerySection`, токен и
   ACL, частные пространства имён, IOCP и пакеты ожидания завершения).
 
+### Изменено (возможности Rust 1.99, внутреннее)
+
+- **Политика отравления блокировок**: все `Mutex`/`RwLock` библиотеки
+  захватываются через `LockExt::lock_clean` / `RwLockExt::{read_clean,
+  write_clean}` (`unwrap_or_else(PoisonError::into_inner)`) вместо
+  `lock().unwrap()`. Паника в колбэке обработчика больше не превращается в
+  каскад паник в `stop()`/`Drop` (паника при раскрутке — `abort`):
+  `panic = "abort"` манифеста xshm потребителя не касается.
+- **`ShmError::WorkerPanicked { message }`** (новый вариант): паника
+  worker-потока не теряется в `let _ = handle.join()` — `DispatchServer::stop`
+  и `MultiServer::stop` передают её в `on_error(None, ..)` обработчика на
+  потоке, вызвавшем `stop()`, до возврата. `message` — литерал паники (иначе
+  общий текст; полный текст печатает panic hook). У `AutoServer`/`AutoClient`/
+  `MultiClient` обработчик живёт только в worker-е — там паника по-прежнему
+  только в panic hook.
+- Раскладка разделяемой памяти (INTEROP §c: размеры, выравнивания и все
+  смещения `ControlBlock`/`LayoutBlock`/`RingDescriptor`/`RingHeader`)
+  проверяется `const`-утверждениями при каждой сборке, в том числе у
+  потребителя; без `target_has_atomic_primitive_alignment = "32"` крейт не
+  собирается.
+- Значения, уходящие в `LayoutBlock` (`segment_size`, дескрипторы колец), и
+  размер секции пишутся через `try_from` — переполнение даёт
+  `InvalidConfig`, а не молчаливое усечение; `SharedView::initialize` и
+  `RingBuffer::new` возвращают `Result` (`Corrupted` на нулевой указатель)
+  вместо `expect`.
+- Наборы ожидания (`NtWaitForMultipleObjects`) — `&[BorrowedHandle<'_>]`:
+  время жизни дескрипторов проверяет компилятор. Владелец по-прежнему
+  `win::Handle` с `NtClose` в `Drop` (`OwnedHandle` закрывал бы через
+  `CloseHandle` kernel32). `Waitable: AsHandle + Sealed` с
+  `#[diagnostic::on_unimplemented]`; `Beacon`/`ProcessExit` реализуют
+  `AsHandle`. `EventHandle` (тип публичных полей `SharedEvents`)
+  реэкспортирован как `xshm::events::EventHandle`.
+- Разбор протокола лобби (`dispatch::protocol`) — `split_first_chunk` и
+  деструктуризация заголовка вместо индексов.
+- Линты: rust — `raw_borrows_via_references`, `trivial_casts`,
+  `let_underscore_drop`, `unnameable_types`; clippy —
+  `multiple_unsafe_ops_per_block`, `cast_sign_loss`, `cast_possible_wrap`,
+  `borrow_as_ptr`, `allow_attributes(_without_reason)`, `unwrap_used`,
+  `expect_used` (тестам `unwrap`/`expect` разрешены в `clippy.toml`).
+
 ## [0.9.0] — не выпущено (ветка `feat/beacon`)
 
 ### Зависимости (2026-10-06)

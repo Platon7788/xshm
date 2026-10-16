@@ -43,14 +43,20 @@ impl SharedView {
     /// `server_start` -- время создания процесса-сервера
     /// (`win::current_process_start_time`, `0` -- не сообщать); пишется
     /// вместе с `server_pid` до `magic`.
+    ///
+    /// Ошибки: `Corrupted` -- нулевой `base`; `InvalidConfig` -- значение
+    /// раскладки не помещается в `u32` поля `LayoutBlock` (проверенная
+    /// раскладка всегда помещается). При ошибке `magic` не публикуется.
     pub unsafe fn initialize(
         base: *mut u8,
         layout: ChannelLayout,
         server_pid: u32,
         server_start: u64,
-    ) -> Self {
+    ) -> Result<Self> {
+        let segment_size = u32::try_from(layout.segment_size())
+            .map_err(|_| ShmError::InvalidConfig("segment size does not fit into u32"))?;
         let view = Self {
-            base: NonNull::new(base).expect("shared mapping pointer must be valid"),
+            base: NonNull::new(base).ok_or(ShmError::Corrupted)?,
             layout,
             s2c_offset: ChannelLayout::s2c_offset(),
             c2s_offset: layout.c2s_offset(),
@@ -80,19 +86,17 @@ impl SharedView {
         control.slot_count.store(0, Ordering::Relaxed);
 
         let block = view.layout_block();
-        block
-            .segment_size
-            .store(layout.segment_size() as u32, Ordering::Relaxed);
+        block.segment_size.store(segment_size, Ordering::Relaxed);
         block.flags.store(0, Ordering::Relaxed);
-        block.s2c.store(view.s2c_offset, &layout.server_to_client);
-        block.c2s.store(view.c2s_offset, &layout.client_to_server);
+        block.s2c.store(view.s2c_offset, &layout.server_to_client)?;
+        block.c2s.store(view.c2s_offset, &layout.client_to_server)?;
 
         let (header_a, header_b) = view.headers();
         header_a.reset(1);
         header_b.reset(1);
 
         control.magic.store(SHARED_MAGIC, Ordering::Release);
-        view
+        Ok(view)
     }
 
     /// Разобрать чужой сегмент: `magic` (Acquire) -> версия -> раскладка ->
@@ -129,12 +133,10 @@ impl SharedView {
         }
 
         // SAFETY: LayoutBlock -- байты 64..128, внутри проверенного префикса.
-        let block = unsafe {
-            &*base
-                .as_ptr()
-                .add(size_of::<ControlBlock>())
-                .cast::<LayoutBlock>()
-        };
+        let block_ptr = unsafe { base.as_ptr().add(size_of::<ControlBlock>()) };
+        // SAFETY: адрес внутри префикса (выше), выровнен на 64 (база
+        // выровнена на 64, `ControlBlock` -- ровно 64 байта); поля атомарные.
+        let block = unsafe { &*block_ptr.cast::<LayoutBlock>() };
         if block.flags.load(Ordering::Relaxed) != 0 {
             return Err(ShmError::Corrupted);
         }
@@ -200,37 +202,37 @@ impl SharedView {
         unsafe { &*self.base.as_ptr().cast::<ControlBlock>() }
     }
 
-    fn layout_block(&self) -> &LayoutBlock {
+    const fn layout_block(&self) -> &LayoutBlock {
         // SAFETY: LayoutBlock лежит сразу за ControlBlock, внутри маппинга
         // (размер >= SEGMENT_HEADER_SIZE -- инвариант конструкторов).
-        unsafe {
-            &*self
-                .base
-                .as_ptr()
-                .add(size_of::<ControlBlock>())
-                .cast::<LayoutBlock>()
-        }
+        let block = unsafe { self.base.add(size_of::<ControlBlock>()) };
+        // SAFETY: адрес выше выровнен на 64 и валиден, пока жив `self`; все
+        // поля атомарные.
+        unsafe { block.cast::<LayoutBlock>().as_ref() }
     }
 
-    fn header_at(&self, offset: usize) -> &RingHeader {
-        // SAFETY: offset -- одно из двух проверенных смещений (кратно 64,
-        // заголовок и данные кольца внутри маппинга); поля атомарные.
-        unsafe { &*self.base.as_ptr().add(offset).cast::<RingHeader>() }
+    const fn header_at(&self, offset: usize) -> &RingHeader {
+        // SAFETY: offset -- одно из двух проверенных смещений (заголовок и
+        // данные кольца внутри маппинга).
+        let header = unsafe { self.base.add(offset) };
+        // SAFETY: смещение кратно 64 -- адрес выровнен; валиден, пока жив
+        // `self`; поля атомарные.
+        unsafe { header.cast::<RingHeader>().as_ref() }
     }
 
     /// Заголовок кольца Server -> Client.
-    pub fn header_a(&self) -> &RingHeader {
+    pub const fn header_a(&self) -> &RingHeader {
         self.header_at(self.s2c_offset)
     }
 
     /// Заголовок кольца Client -> Server.
-    pub fn header_b(&self) -> &RingHeader {
+    pub const fn header_b(&self) -> &RingHeader {
         self.header_at(self.c2s_offset)
     }
 
     /// Оба заголовка разом -- почти все операции протокола (reset, смена
     /// `handshake_state`, публикация `connection_gen`) делаются симметрично.
-    pub fn headers(&self) -> (&RingHeader, &RingHeader) {
+    pub const fn headers(&self) -> (&RingHeader, &RingHeader) {
         (self.header_a(), self.header_b())
     }
 
@@ -239,14 +241,12 @@ impl SharedView {
         // внутри маппинга (проверенное смещение, инвариант конструкторов);
         // кольцо не переживает маппинг -- владелец (`SharedServer`/
         // `SharedClient`) держит `Mapping` рядом с кольцами.
-        unsafe {
-            let header = self.base.as_ptr().add(offset);
-            RingBuffer::new(
-                header.cast::<RingHeader>(),
-                header.add(size_of::<RingHeader>()),
-                config,
-            )
-        }
+        let header = unsafe { self.base.add(offset) };
+        // SAFETY: данные -- сразу за 64-байтным заголовком, внутри маппинга.
+        let data = unsafe { header.add(size_of::<RingHeader>()) };
+        // SAFETY: см. выше: обе области внутри маппинга, не пересекаются,
+        // заголовок выровнен на 64; `config` проверен (`attach`/`initialize`).
+        unsafe { RingBuffer::from_parts(header.cast::<RingHeader>(), data, config) }
     }
 
     /// Кольцо Server -> Client.
@@ -301,7 +301,7 @@ mod tests {
         let layout = small();
         let m = mem(layout.segment_size());
         // SAFETY: m живёт до конца теста, размер = segment_size.
-        let _server = unsafe { SharedView::initialize(m.0, layout, 42, 0) };
+        let _server = unsafe { SharedView::initialize(m.0, layout, 42, 0) }.unwrap();
         // SAFETY: см. выше.
         let view = unsafe { SharedView::attach(m.0, layout.segment_size()) }.unwrap();
         assert_eq!(*view.layout(), layout);
@@ -316,7 +316,7 @@ mod tests {
         let m = mem(len);
         assert_eq!(attach(&m, len).unwrap_err(), ShmError::NotReady);
         // SAFETY: см. выше.
-        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0) };
+        let view = unsafe { SharedView::initialize(m.0, layout, 1, 0) }.unwrap();
         // Сегмент меньше заявленного.
         assert_eq!(attach(&m, len - 1).unwrap_err(), ShmError::Corrupted);
         // Чужая версия.

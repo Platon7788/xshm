@@ -32,7 +32,7 @@ mod tests {
         // SAFETY: выходной указатель -- локальная переменная; атрибуты не нужны
         // (безымянный объект), Count = 1.
         let status = unsafe {
-            NtCreateIoCompletion(&mut iocp, IO_COMPLETION_ALL_ACCESS, ptr::null_mut(), 1)
+            NtCreateIoCompletion(&raw mut iocp, IO_COMPLETION_ALL_ACCESS, ptr::null_mut(), 1)
         };
         assert_eq!(status, STATUS_SUCCESS);
         assert!(!iocp.is_null());
@@ -40,15 +40,14 @@ mod tests {
         let mut packet: HANDLE = ptr::null_mut();
         // SAFETY: выходной указатель -- локальная переменная, атрибутов нет.
         let status =
-            unsafe { NtCreateWaitCompletionPacket(&mut packet, GENERIC_ALL, ptr::null_mut()) };
+            unsafe { NtCreateWaitCompletionPacket(&raw mut packet, GENERIC_ALL, ptr::null_mut()) };
         assert_eq!(status, STATUS_SUCCESS);
         assert!(!packet.is_null());
 
-        // SAFETY: оба handle получены выше и закрываются ровно один раз.
-        unsafe {
-            assert_eq!(NtClose(packet), STATUS_SUCCESS);
-            assert_eq!(NtClose(iocp), STATUS_SUCCESS);
-        }
+        // SAFETY: handle получен выше и закрывается ровно один раз.
+        assert_eq!(unsafe { NtClose(packet) }, STATUS_SUCCESS);
+        // SAFETY: то же.
+        assert_eq!(unsafe { NtClose(iocp) }, STATUS_SUCCESS);
 
         let mut times = KERNEL_USER_TIMES::default();
         let mut returned: ULONG = 0;
@@ -60,7 +59,7 @@ mod tests {
                 ProcessTimes,
                 ptr::from_mut(&mut times).cast(),
                 size_of::<KERNEL_USER_TIMES>() as ULONG,
-                &mut returned,
+                &raw mut returned,
             )
         };
         assert_eq!(status, STATUS_SUCCESS);

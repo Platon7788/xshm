@@ -38,9 +38,10 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,7 @@ use crate::naming::{Direction, event_name, mapping_name};
 use crate::ring::FreeSpace;
 use crate::server::SharedServer;
 use crate::shared::SharedView;
+use crate::sync_ext::{LockExt, RwLockExt, join_worker};
 use crate::wait_delay_or;
 use crate::win::{self, EventHandle, Mapping, ProcessWatch};
 
@@ -264,10 +266,10 @@ impl ClientSlot {
 
     /// Handle процесса клиента для набора ожидания: из handshake (0.8+) или
     /// процесс-владелец claim-а (клиент старой версии).
-    fn peer_handle(&self) -> Option<isize> {
+    fn peer_handle(&self) -> Option<BorrowedHandle<'_>> {
         self.server
             .peer_wait_handle()
-            .or_else(|| self.owner_watch.as_ref().map(ProcessWatch::raw_handle))
+            .or_else(|| self.owner_watch.as_ref().map(AsHandle::as_handle))
     }
 
     /// PID наблюдаемого процесса клиента.
@@ -363,6 +365,10 @@ mod core_type {
 
     /// Состояние сервера, общее для ручки `MultiServer` и worker-ов. Вне
     /// крейта тип не именуем: его методы доступны через `Deref` ручки.
+    #[expect(
+        unnameable_types,
+        reason = "ядро -- деталь реализации: методы доступны через `Deref` ручки `MultiServer`"
+    )]
     pub struct MultiCore {
         pub(in crate::multi) base_name: String,
         pub(in crate::multi) slots: RwLock<Vec<Mutex<ClientSlot>>>,
@@ -452,7 +458,7 @@ impl MultiServer {
                 server_clone.worker_loop(group as usize, range);
             });
             match spawned {
-                Ok(handle) => server.worker_handles.lock().unwrap().push(handle),
+                Ok(handle) => server.worker_handles.lock_clean().push(handle),
                 Err(e) => {
                     // Уже запущенные worker-ы держат клон Arc -- остановить их.
                     server.stop();
@@ -468,11 +474,11 @@ impl MultiServer {
 impl MultiCore {
     /// Отправка сообщения конкретному клиенту
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         let slot_mutex = slots
             .get(client_id as usize)
             .ok_or(ShmError::NotConnected)?;
-        let slot = slot_mutex.lock().unwrap();
+        let slot = slot_mutex.lock_clean();
 
         if !slot.connected {
             return Err(ShmError::NotConnected);
@@ -486,11 +492,11 @@ impl MultiCore {
     /// (`SharedServer::try_send_to_client`): `Err(QueueFull)`, если в кольце
     /// слота нет места; кольцо тогда не меняется.
     pub fn try_send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         let slot_mutex = slots
             .get(client_id as usize)
             .ok_or(ShmError::NotConnected)?;
-        let slot = slot_mutex.lock().unwrap();
+        let slot = slot_mutex.lock_clean();
 
         if !slot.connected {
             return Err(ShmError::NotConnected);
@@ -506,18 +512,18 @@ impl MultiCore {
     /// клиент не подключён.
     #[must_use]
     pub fn free_space(&self, client_id: u32) -> Option<FreeSpace> {
-        let slots = self.slots.read().unwrap();
-        let slot = slots.get(client_id as usize)?.lock().unwrap();
+        let slots = self.slots.read_clean();
+        let slot = slots.get(client_id as usize)?.lock_clean();
         slot.connected.then(|| slot.server.free_space())
     }
 
     /// Отправка сообщения всем подключённым клиентам
     pub fn broadcast(&self, data: &[u8]) -> Result<u32> {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         let mut sent_count = 0u32;
 
         for slot_mutex in slots.iter() {
-            let slot = slot_mutex.lock().unwrap();
+            let slot = slot_mutex.lock_clean();
             if slot.connected && slot.server.send_to_client(data).is_ok() {
                 sent_count += 1;
             }
@@ -537,11 +543,11 @@ impl MultiCore {
 
     /// Разорвать подключение слота (если подключён) с причиной `reason`.
     fn force_disconnect(&self, client_id: u32, reason: DisconnectReason) {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         let Some(slot_mutex) = slots.get(client_id as usize) else {
             return;
         };
-        let mut slot = slot_mutex.lock().unwrap();
+        let mut slot = slot_mutex.lock_clean();
 
         if slot.connected {
             // Порядок: состояния handshake -> IDLE, потом `DISCONNECT` --
@@ -568,11 +574,11 @@ impl MultiCore {
 
     /// Получение списка подключённых клиентов
     pub fn connected_clients(&self) -> Vec<u32> {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         slots
             .iter()
             .filter_map(|slot_mutex| {
-                let slot = slot_mutex.lock().unwrap();
+                let slot = slot_mutex.lock_clean();
                 if slot.connected { Some(slot.id) } else { None }
             })
             .collect()
@@ -580,19 +586,19 @@ impl MultiCore {
 
     /// Количество подключённых клиентов
     pub fn client_count(&self) -> u32 {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         slots
             .iter()
-            .filter(|slot_mutex| slot_mutex.lock().unwrap().connected)
+            .filter(|slot_mutex| slot_mutex.lock_clean().connected)
             .count() as u32
     }
 
     /// Проверка подключения конкретного клиента
     pub fn is_client_connected(&self, client_id: u32) -> bool {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         slots
             .get(client_id as usize)
-            .is_some_and(|slot_mutex| slot_mutex.lock().unwrap().connected)
+            .is_some_and(|slot_mutex| slot_mutex.lock_clean().connected)
     }
 
     /// Жив ли процесс клиента: `Some(true/false)` -- клиент наблюдается через
@@ -600,8 +606,8 @@ impl MultiCore {
     /// нет (клиент старой версии, процесс не открылся).
     #[must_use]
     pub fn is_client_alive(&self, client_id: u32) -> Option<bool> {
-        let slots = self.slots.read().unwrap();
-        let slot = slots.get(client_id as usize)?.lock().unwrap();
+        let slots = self.slots.read_clean();
+        let slot = slots.get(client_id as usize)?.lock_clean();
         if !slot.connected {
             return None;
         }
@@ -631,17 +637,21 @@ impl MultiCore {
         }
         // Self-join исключён: если последний `Arc` отпустил сам worker (Drop
         // на его потоке), свой handle не джойним -- поток уже выходит.
-        let handles: Vec<_> = self.worker_handles.lock().unwrap().drain(..).collect();
+        let handles: Vec<_> = self.worker_handles.lock_clean().drain(..).collect();
         for handle in handles {
-            if handle.thread().id() != thread::current().id() {
-                let _ = handle.join();
+            if handle.thread().id() != thread::current().id()
+                && let Err(err) = join_worker(handle)
+            {
+                // Паника worker-а (колбэк обработчика) -- не молча: на
+                // потоке, вызвавшем `stop()`, до возврата из него.
+                self.handler.on_error(None, err);
             }
         }
         // Worker-ы остановлены (кроме, возможно, вызывающего -- он выйдет по
         // `running`): отключаем подключённые слоты под их mutex-ами.
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         for slot_mutex in slots.iter() {
-            let mut slot = slot_mutex.lock().unwrap();
+            let mut slot = slot_mutex.lock_clean();
             if slot.connected {
                 slot.reset_connection();
                 if let Some(events) = slot.server.events() {
@@ -707,12 +717,12 @@ impl MultiCore {
     /// мог бы отнять слот у легитимно подключающегося клиента.
     fn reclaim_stale_claims(&self, range: Range<u32>, now: Instant) -> Sweep {
         let mut sweep = Sweep::default();
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         for slot_id in range {
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 continue;
             };
-            let mut slot = slot_mutex.lock().unwrap();
+            let mut slot = slot_mutex.lock_clean();
             // Worker проснулся -- handle отключённых клиентов больше не в
             // ожидании, их можно закрыть.
             slot.retired.clear();
@@ -788,18 +798,33 @@ impl MultiCore {
     /// `C2S_CONNECT_REQ`. При одновременном сигнале NT отдаёт наименьший
     /// индекс; на `DISCONNECT` и смерть процесса кольцо всё равно дочитывается
     /// до колбэка, поэтому порядок внутри слота не теряет данных.
-    fn collect_wait_set(
-        &self,
+    ///
+    /// Дескрипторы заимствуются на время жизни `&self`, а не блокировок
+    /// слота: ожидание идёт уже без них. Это честно, потому что объекты
+    /// живут дольше ожидания: события и секции слотов создаются в `start` и
+    /// уничтожаются только после join worker-ов, а handle процесса клиента,
+    /// снятый с подключения, не закрывается, а уходит в `retired` -- его
+    /// закрывает сам worker группы, проснувшись (`reclaim_stale_claims`),
+    /// после того как набор прошлого ожидания очищен.
+    fn collect_wait_set<'s>(
+        &'s self,
         range: Range<u32>,
-        handles: &mut Vec<isize>,
+        handles: &mut Vec<BorrowedHandle<'s>>,
         sources: &mut Vec<EventSource>,
     ) {
-        let slots = self.slots.read().unwrap();
+        // Продлить заимствование с блокировки слота до `&'s self`.
+        let detach = |handle: BorrowedHandle<'_>| -> BorrowedHandle<'s> {
+            // SAFETY: дескриптор открыт всё время жизни `'s` (обоснование --
+            // в документации функции: слоты живут до join worker-ов, handle
+            // процесса закрывает только этот worker после ожидания).
+            unsafe { BorrowedHandle::borrow_raw(handle.as_raw_handle()) }
+        };
+        let slots = self.slots.read_clean();
         for slot_id in range {
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 continue;
             };
-            let slot = slot_mutex.lock().unwrap();
+            let slot = slot_mutex.lock_clean();
             // Слоты всегда named (MultiServer::start поднимает
             // SharedServer::start), но на anonymous-слоте событий нет --
             // молча пропускаем вместо паники в worker-потоке.
@@ -807,16 +832,16 @@ impl MultiCore {
                 continue;
             };
             if slot.connected {
-                handles.push(events.disconnect.raw_handle());
+                handles.push(detach(events.disconnect.as_handle()));
                 sources.push(EventSource::SlotDisconnect(slot.id));
-                handles.push(events.c2s.data.raw_handle());
+                handles.push(detach(events.c2s.data.as_handle()));
                 sources.push(EventSource::SlotData);
                 if let Some(peer) = slot.peer_handle() {
-                    handles.push(peer);
+                    handles.push(detach(peer));
                     sources.push(EventSource::SlotPeer(slot.id));
                 }
             } else {
-                handles.push(events.connect_req.raw_handle());
+                handles.push(detach(events.connect_req.as_handle()));
                 sources.push(EventSource::SlotConnect(slot.id));
             }
         }
@@ -828,13 +853,17 @@ impl MultiCore {
             return;
         };
         let mut buffer = Vec::new();
-        let mut handles: Vec<isize> = Vec::with_capacity(64);
+        let mut handles: Vec<BorrowedHandle<'_>> = Vec::with_capacity(64);
         let mut sources: Vec<EventSource> = Vec::with_capacity(64);
         // В каком-то кольце осталось больше `recv_batch` сообщений: следующее
         // ожидание -- нулевое (сперва события, затем добор), без сна.
         let mut backlog = false;
 
         while self.running.load(Ordering::Acquire) {
+            // Набор прошлого ожидания -- до `reclaim_stale_claims`: тот
+            // закрывает отложенные handle процессов (`retired`).
+            handles.clear();
+            sources.clear();
             let sweep = self.reclaim_stale_claims(range.clone(), Instant::now());
             for (slot_id, expected_claim, reason) in sweep.orphaned {
                 // Клиент мог уйти штатно (DISCONNECT, затем снял claim), а
@@ -844,10 +873,8 @@ impl MultiCore {
                 self.handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
             }
 
-            handles.clear();
-            sources.clear();
             self.collect_wait_set(range.clone(), &mut handles, &mut sources);
-            handles.push(wake.raw_handle());
+            handles.push(wake.as_handle());
             sources.push(EventSource::Wake);
 
             let timeout = if backlog {
@@ -912,11 +939,11 @@ impl MultiCore {
 
     /// `C2S_CONNECT_REQ` на свободном слоте.
     fn handle_slot_connect(&self, slot_id: u32) {
-        let slots = self.slots.read().unwrap();
+        let slots = self.slots.read_clean();
         let Some(slot_mutex) = slots.get(slot_id as usize) else {
             return;
         };
-        let mut slot = slot_mutex.lock().unwrap();
+        let mut slot = slot_mutex.lock_clean();
         if slot.connected {
             return; // Уже подключён
         }
@@ -969,11 +996,11 @@ impl MultiCore {
     /// успел записать (прощальное сообщение), доставляется ДО колбэка.
     fn handle_slot_disconnect(&self, slot_id: u32, buffer: &mut Vec<u8>) {
         {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 return;
             };
-            let slot = slot_mutex.lock().unwrap();
+            let slot = slot_mutex.lock_clean();
             if !slot.connected {
                 // Слот уже отключён локально (`disconnect_client`), а worker
                 // спал на старом наборе и поглотил сигнал, адресованный
@@ -988,11 +1015,11 @@ impl MultiCore {
         self.drain_slot(slot_id, buffer);
 
         let was_connected = {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 return;
             };
-            let mut slot = slot_mutex.lock().unwrap();
+            let mut slot = slot_mutex.lock_clean();
             let was = slot.connected;
             if was {
                 let session_claim = slot.session_claim;
@@ -1031,11 +1058,11 @@ impl MultiCore {
         self.drain_slot(slot_id, buffer);
 
         let was_connected = {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 return;
             };
-            let mut slot = slot_mutex.lock().unwrap();
+            let mut slot = slot_mutex.lock_clean();
             if !slot.connected {
                 return;
             }
@@ -1083,11 +1110,11 @@ impl MultiCore {
         reason: DisconnectReason,
     ) {
         let was_connected = {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 return;
             };
-            let mut slot = slot_mutex.lock().unwrap();
+            let mut slot = slot_mutex.lock_clean();
 
             if !slot.connected {
                 return; // уже обработан (например явным disconnect-событием)
@@ -1126,11 +1153,11 @@ impl MultiCore {
         let batch = self.options.recv_batch.max(1);
 
         {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             let Some(slot_mutex) = slots.get(slot_id as usize) else {
                 return false;
             };
-            let slot = slot_mutex.lock().unwrap();
+            let slot = slot_mutex.lock_clean();
             if !slot.connected {
                 return false;
             }
@@ -1175,12 +1202,12 @@ impl MultiCore {
     /// остались сообщения.
     fn poll_group_slots(&self, range: Range<u32>, buffer: &mut Vec<u8>) -> bool {
         let slot_ids: Vec<u32> = {
-            let slots = self.slots.read().unwrap();
+            let slots = self.slots.read_clean();
             range
                 .filter(|&id| {
                     slots
                         .get(id as usize)
-                        .is_some_and(|slot| slot.lock().unwrap().connected)
+                        .is_some_and(|slot| slot.lock_clean().connected)
                 })
                 .collect()
         };
@@ -1335,11 +1362,7 @@ impl MultiClient {
         }
         let data = data.to_vec();
         {
-            let mut queue = self
-                .outbox
-                .queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut queue = self.outbox.queue.lock_clean();
             if queue.len() >= self.max_send_queue {
                 queue.pop_front();
                 self.outbox.evicted.fetch_add(1, Ordering::AcqRel);
@@ -1366,7 +1389,7 @@ impl MultiClient {
     /// ещё ни разу не подключался.
     #[must_use]
     pub fn layout(&self) -> Option<ChannelLayout> {
-        *self.layout.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.layout.lock_clean()
     }
 
     /// Остановка клиента синхронно: принятое до вызова дописывается в
@@ -1375,13 +1398,12 @@ impl MultiClient {
     pub fn stop(&self) {
         self.running.store(false, Ordering::Release);
         let _ = self.wake.set();
-        let handle = self
-            .join
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let handle = self.join.lock_clean().take();
         if let Some(handle) = handle {
-            join_unless_self(handle);
+            // Обработчик (`MultiClientHandler`) есть только у worker-а:
+            // сообщить панику некуда, panic hook её уже напечатал;
+            // паниковать из `stop()`/`Drop` нельзя.
+            let _panicked = join_unless_self(handle);
         }
     }
 
@@ -1437,11 +1459,7 @@ fn flush_queue(
 ) -> bool {
     report_evicted(outbox, handler);
     loop {
-        let next = outbox
-            .queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front();
+        let next = outbox.queue.lock_clean().pop_front();
         let Some(data) = next else {
             return true;
         };
@@ -1518,7 +1536,7 @@ fn client_worker(
             &slot_name,
             effective_slot_timeout,
             Interrupt {
-                wake: wake.raw_handle(),
+                wake: wake.as_handle(),
                 should_stop: &mut should_stop,
             },
         );
@@ -1544,7 +1562,7 @@ fn client_worker(
         outbox
             .max_message
             .store(layout.client_to_server.max_message_size, Ordering::Release);
-        *shared.layout.lock().unwrap_or_else(PoisonError::into_inner) = Some(layout);
+        *shared.layout.lock_clean() = Some(layout);
         shared.slot_id.store(slot_id, Ordering::Release);
         handler.on_connect(slot_id);
 
@@ -1552,22 +1570,20 @@ fn client_worker(
         // сервера (0.8+), wake] -- меньший индекс важнее.
         let client_events = client.events();
         let peer = client.peer_wait_handle();
+        // Хвост массива -- заполнитель (`wake`), в ожидание уходит `[..count]`.
+        let wake_handle = wake.as_handle();
         let mut handles = [
-            client_events.disconnect.raw_handle(),
-            client_events.s2c.data.raw_handle(),
-            0,
-            0,
+            client_events.disconnect.as_handle(),
+            client_events.s2c.data.as_handle(),
+            wake_handle,
+            wake_handle,
         ];
         let (count, peer_index) = match peer {
             Some(peer) => {
                 handles[2] = peer;
-                handles[3] = wake.raw_handle();
                 (4, Some(2))
             }
-            None => {
-                handles[2] = wake.raw_handle();
-                (3, None)
-            }
+            None => (3, None),
         };
 
         let reason = loop {

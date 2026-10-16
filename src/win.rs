@@ -12,6 +12,7 @@ compile_error!("xShm поддерживает только x86 и x86_64 арх�
 compile_error!("xShm поддерживает только Windows (прямые вызовы NT API)!");
 
 use core::ffi::c_void;
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 
@@ -104,13 +105,29 @@ impl Handle {
     /// индекс в таблице дескрипторов. Поэтому берём `addr()` (strict provenance),
     /// а не `as isize`: провенанс здесь нечего сохранять.
     pub fn as_isize(&self) -> isize {
-        self.0.addr() as isize
+        self.0.addr().cast_signed()
+    }
+}
+
+impl AsRawHandle for Handle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.0
+    }
+}
+
+impl AsHandle for Handle {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: `Handle` владеет дескриптором и закрывает его только в
+        // `Drop`; заимствование не переживает `&self`, значит дескриптор
+        // открыт всё время жизни `BorrowedHandle`. NULL/INVALID контракт
+        // `borrow_raw` допускает (ожидание на них вернёт ошибку NT).
+        unsafe { BorrowedHandle::borrow_raw(self.0) }
     }
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
-        if !self.0.is_null() && self.0.addr() as isize != INVALID_HANDLE_VALUE {
+        if !self.0.is_null() && self.0.addr().cast_signed() != INVALID_HANDLE_VALUE {
             // SAFETY: `Handle` -- единственный владелец дескриптора (конструируется
             // только из свежего handle, полученного от NT), поэтому закрываем ровно
             // один раз; null/INVALID отсеяны условием выше.
@@ -127,7 +144,7 @@ impl Drop for Handle {
 
 const fn status_to_error(status: NTSTATUS, context: &'static str) -> ShmError {
     ShmError::WindowsError {
-        code: status as u32,
+        code: status.cast_unsigned(),
         context,
     }
 }
@@ -149,6 +166,18 @@ unsafe impl Send for EventHandle {}
 // SAFETY: см. выше -- у типа нет внутренней изменяемости на стороне Rust.
 unsafe impl Sync for EventHandle {}
 
+impl AsHandle for EventHandle {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
+    }
+}
+
+impl AsRawHandle for EventHandle {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 impl EventHandle {
     /// Создание события через NtCreateEvent с NULL DACL
     pub fn create(name: &str) -> Result<Self> {
@@ -163,9 +192,9 @@ impl EventHandle {
         // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
-                &mut handle,
+                &raw mut handle,
                 EVENT_ALL_ACCESS,
-                &mut obj_attr,
+                &raw mut obj_attr,
                 SYNCHRONIZATION_EVENT,
                 0, // InitialState = FALSE
             )
@@ -195,9 +224,9 @@ impl EventHandle {
         // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateEvent(
-                &mut handle,
+                &raw mut handle,
                 EVENT_ALL_ACCESS,
-                &mut obj_attr,
+                &raw mut obj_attr,
                 NOTIFICATION_EVENT,
                 0, // InitialState = FALSE (у нового; существующее не трогаем)
             )
@@ -235,7 +264,7 @@ impl EventHandle {
                 EVENT_BASIC_INFORMATION_CLASS,
                 (&raw mut info).cast::<c_void>(),
                 size_of::<EVENT_BASIC_INFORMATION>() as u32,
-                &mut returned,
+                &raw mut returned,
             )
         };
         if status != STATUS_SUCCESS {
@@ -262,7 +291,7 @@ impl EventHandle {
         // объект с дескриптором безопасности по умолчанию (токен процесса).
         let status = unsafe {
             NtCreateEvent(
-                &mut handle,
+                &raw mut handle,
                 EVENT_ALL_ACCESS,
                 null_mut(),
                 kind,
@@ -282,7 +311,7 @@ impl EventHandle {
         let mut previous_state: i32 = 0;
         // SAFETY: дескриптор валиден, пока жив `self`; `previous_state` --
         // валидный out-параметр на стеке.
-        let status = unsafe { NtResetEvent(self.handle.raw(), &mut previous_state) };
+        let status = unsafe { NtResetEvent(self.handle.raw(), &raw mut previous_state) };
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtResetEvent"));
         }
@@ -299,7 +328,7 @@ impl EventHandle {
 
         // SAFETY: `handle` -- валидный out-параметр; `obj_attr` (и `nt_name` внутри
         // него) живут до конца вызова.
-        let status = unsafe { NtOpenEvent(&mut handle, EVENT_ALL_ACCESS, &mut obj_attr) };
+        let status = unsafe { NtOpenEvent(&raw mut handle, EVENT_ALL_ACCESS, &raw mut obj_attr) };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtOpenEvent"));
@@ -328,7 +357,7 @@ impl EventHandle {
         let mut previous_state: i32 = 0;
         // SAFETY: дескриптор валиден, пока жив `self`; `previous_state` -- валидный
         // out-параметр на стеке.
-        let status = unsafe { NtSetEvent(self.handle.raw(), &mut previous_state) };
+        let status = unsafe { NtSetEvent(self.handle.raw(), &raw mut previous_state) };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtSetEvent"));
@@ -344,7 +373,7 @@ impl EventHandle {
         };
 
         let timeout_ptr = if timeout.is_some() {
-            &timeout_value as *const i64
+            &raw const timeout_value
         } else {
             null()
         };
@@ -395,6 +424,18 @@ unsafe impl Send for NamedMutex {}
 // SAFETY: см. выше.
 unsafe impl Sync for NamedMutex {}
 
+impl AsHandle for NamedMutex {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
+    }
+}
+
+impl AsRawHandle for NamedMutex {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 /// Захваченный мьютекс; освобождается в Drop тем же потоком.
 #[derive(Debug)]
 pub struct NamedMutexGuard<'a> {
@@ -424,9 +465,9 @@ impl NamedMutex {
         // вызова и держит внутри `nt_name`/`sd`, которые тоже ещё живы.
         let status = unsafe {
             NtCreateMutant(
-                &mut handle,
+                &raw mut handle,
                 MUTANT_ALL_ACCESS,
-                &mut obj_attr,
+                &raw mut obj_attr,
                 0, // InitialOwner = FALSE
             )
         };
@@ -477,7 +518,7 @@ impl Drop for NamedMutexGuard<'_> {
         // SAFETY: мьютекс захвачен этим потоком (guard не `Send`), дескриптор
         // жив, пока жив `NamedMutex`, на который ссылается guard.
         unsafe {
-            let _ = NtReleaseMutant(self.mutex.handle.raw(), &mut previous);
+            let _ = NtReleaseMutant(self.mutex.handle.raw(), &raw mut previous);
         }
     }
 }
@@ -515,8 +556,11 @@ impl Mapping {
         let mut obj_attr = OBJECT_ATTRIBUTES::new(object_name, OBJ_CASE_INSENSITIVE, sd.as_ptr());
 
         let mut section_handle: HANDLE = null_mut();
+        // Размер секции -- `LARGE_INTEGER` (знаковый): больше `i64::MAX` не
+        // бывает ни одной раскладки, но молча завернуть его в минус нельзя.
         let mut max_size = LARGE_INTEGER {
-            QuadPart: size as i64,
+            QuadPart: i64::try_from(size)
+                .map_err(|_| ShmError::InvalidConfig("section size exceeds i64::MAX"))?,
         };
 
         // SAFETY: все переданные указатели -- на локальные переменные, живущие до
@@ -524,10 +568,10 @@ impl Mapping {
         // `UNICODE_STRING`, который держит вызывающий (`Mapping::create`).
         let status = unsafe {
             NtCreateSection(
-                &mut section_handle,
+                &raw mut section_handle,
                 SECTION_ALL_ACCESS,
-                &mut obj_attr,
-                &mut max_size,
+                &raw mut obj_attr,
+                &raw mut max_size,
                 PAGE_READWRITE,
                 SEC_COMMIT,
                 null_mut(), // FileHandle = NULL
@@ -546,7 +590,7 @@ impl Mapping {
         // Проверка: Handle не должен быть NULL
         if section_handle.is_null() {
             return Err(status_to_error(
-                0xC0000008u32 as i32,
+                0xC000_0008_u32.cast_signed(), // STATUS_INVALID_HANDLE
                 "NtCreateSection returned NULL handle",
             ));
         }
@@ -563,11 +607,11 @@ impl Mapping {
             NtMapViewOfSection(
                 handle.raw(),
                 NT_CURRENT_PROCESS,
-                &mut base_address,
+                &raw mut base_address,
                 0,
                 0,
                 null_mut(), // SectionOffset
-                &mut view_size,
+                &raw mut view_size,
                 VIEW_UNMAP,
                 0,
                 PAGE_READWRITE,
@@ -647,8 +691,13 @@ impl Mapping {
 
         // SAFETY: out-параметр на стеке; `obj_attr` и `nt_name` внутри него живы до
         // конца вызова.
-        let status =
-            unsafe { NtOpenSection(&mut section_handle, SECTION_ALL_ACCESS, &mut obj_attr) };
+        let status = unsafe {
+            NtOpenSection(
+                &raw mut section_handle,
+                SECTION_ALL_ACCESS,
+                &raw mut obj_attr,
+            )
+        };
 
         if status != STATUS_SUCCESS {
             return Err(status_to_error(status, "NtOpenSection"));
@@ -675,11 +724,11 @@ impl Mapping {
             NtMapViewOfSection(
                 handle.raw(),
                 NT_CURRENT_PROCESS,
-                &mut base_address,
+                &raw mut base_address,
                 0,
                 0,
                 null_mut(),
-                &mut view_size,
+                &raw mut view_size,
                 VIEW_UNMAP,
                 0,
                 PAGE_READWRITE,
@@ -710,7 +759,7 @@ impl Mapping {
                 SectionBasicInformation,
                 info.as_mut_ptr().cast::<c_void>(),
                 size_of::<SECTION_BASIC_INFORMATION>(),
-                &mut returned,
+                &raw mut returned,
             )
         };
         if status != STATUS_SUCCESS {
@@ -750,7 +799,16 @@ impl Drop for Mapping {
 // wait_any - NtWaitForMultipleObjects
 // ============================================================================
 
-pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<usize>> {
+/// Ожидание любого из `handles` (`NtWaitForMultipleObjects`, `WaitAny`).
+///
+/// Набор -- заимствованные дескрипторы (`BorrowedHandle`): объекты обязаны
+/// жить всё ожидание, и это проверяет компилятор, а не соглашение о `isize`.
+/// `Ok(Some(i))` -- сигнален `handles[i]` (при одновременном сигнале --
+/// наименьший индекс), `Ok(None)` -- таймаут или пустой набор.
+pub fn wait_any(
+    handles: &[BorrowedHandle<'_>],
+    timeout: Option<Duration>,
+) -> Result<Option<usize>> {
     if handles.is_empty() {
         return Ok(None);
     }
@@ -761,16 +819,22 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
     };
 
     let timeout_ptr = if timeout.is_some() {
-        &timeout_value as *const i64
+        &raw const timeout_value
     } else {
         null()
     };
 
-    // SAFETY: `handles` -- непустой срез живых NT-дескрипторов (проверено выше),
-    // его длина и указатель согласованы; `timeout_ptr` живёт до конца вызова.
+    // Ядро принимает не больше MAXIMUM_WAIT_OBJECTS = 64 дескрипторов;
+    // длина больше `u32::MAX` -- заведомо ошибка параметра.
+    let count = u32::try_from(handles.len())
+        .map_err(|_| ShmError::InvalidConfig("too many handles to wait on"))?;
+    // SAFETY: `handles` -- непустой срез живых NT-дескрипторов (проверено
+    // выше; время жизни -- `BorrowedHandle`), `BorrowedHandle` --
+    // `repr(transparent)` над `RawHandle` = `HANDLE`, поэтому срез -- это
+    // массив `HANDLE` длины `count`; `timeout_ptr` живёт до конца вызова.
     let status = unsafe {
         NtWaitForMultipleObjects(
-            handles.len() as u32,
+            count,
             handles.as_ptr().cast::<HANDLE>(),
             WAIT_ANY,
             0, // Alertable = FALSE
@@ -787,7 +851,11 @@ pub fn wait_any(handles: &[isize], timeout: Option<Duration>) -> Result<Option<u
     // не должен полагаться на этот внешний инвариант.
     match status {
         STATUS_TIMEOUT => Ok(None),
-        s if s >= 0 && (s as usize) < handles.len() => Ok(Some(s as usize)),
+        s if let Ok(index) = usize::try_from(s)
+            && index < handles.len() =>
+        {
+            Ok(Some(index))
+        }
         _ => Err(status_to_error(status, "NtWaitForMultipleObjects")),
     }
 }
@@ -826,6 +894,18 @@ unsafe impl Send for ProcessWatch {}
 // SAFETY: см. выше.
 unsafe impl Sync for ProcessWatch {}
 
+impl AsHandle for ProcessWatch {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
+    }
+}
+
+impl AsRawHandle for ProcessWatch {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
 impl ProcessWatch {
     /// Открыть процесс `pid` для наблюдения. `None` -- PID неизвестен (0),
     /// процесса уже нет, либо не хватает прав (например, пир -- служба в
@@ -850,10 +930,10 @@ impl ProcessWatch {
         // живущие до конца вызова; ObjectName внутри `obj_attr` намеренно NULL.
         let open_status = unsafe {
             NtOpenProcess(
-                &mut raw_handle,
+                &raw mut raw_handle,
                 PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-                &mut obj_attr,
-                &mut client_id,
+                &raw mut obj_attr,
+                &raw mut client_id,
             )
         };
         if open_status != STATUS_SUCCESS || raw_handle.is_null() {
@@ -901,13 +981,9 @@ impl ProcessWatch {
         let zero_timeout: i64 = 0; // мгновенный опрос, без блокировки
         // SAFETY: дескриптор процесса валиден (открыт в `open`, закрывается
         // через Drop `Handle`); `zero_timeout` живёт до конца вызова.
-        let wait_status = unsafe { NtWaitForSingleObject(self.handle.raw(), 0, &zero_timeout) };
+        let wait_status =
+            unsafe { NtWaitForSingleObject(self.handle.raw(), 0, &raw const zero_timeout) };
         wait_status == STATUS_WAIT_0
-    }
-
-    /// Числовой handle для набора `wait_any` (сигналится при смерти процесса).
-    pub fn raw_handle(&self) -> isize {
-        self.handle.as_isize()
     }
 }
 
@@ -979,7 +1055,7 @@ fn query_start_time(process: HANDLE) -> Option<u64> {
             ProcessTimes,
             core::ptr::from_mut(&mut times).cast(),
             size_of::<KERNEL_USER_TIMES>() as ULONG,
-            &mut returned,
+            &raw mut returned,
         )
     };
     if status != STATUS_SUCCESS {
@@ -988,7 +1064,8 @@ fn query_start_time(process: HANDLE) -> Option<u64> {
     // SAFETY: LARGE_INTEGER -- объединение одинаковых по размеру i64 и пары
     // u32; любое битовое значение допустимо для `QuadPart`.
     let create_time = unsafe { times.CreateTime.QuadPart };
-    Some(create_time as u64).filter(|&time| time != 0)
+    // FILETIME -- беззнаковое по смыслу; битовый каст, без проверки знака.
+    Some(create_time.cast_unsigned()).filter(|&time| time != 0)
 }
 
 #[cfg(test)]
@@ -1038,10 +1115,10 @@ mod tests {
         // SAFETY: все указатели валидны и живут до конца вызова.
         let status = unsafe {
             NtCreateSection(
-                &mut handle,
+                &raw mut handle,
                 SECTION_ALL_ACCESS,
-                &mut obj_attr,
-                &mut max_size,
+                &raw mut obj_attr,
+                &raw mut max_size,
                 PAGE_READWRITE,
                 SEC_COMMIT,
                 null_mut(),
@@ -1054,13 +1131,13 @@ mod tests {
         // записанной в самом сегменте. Враждебная секция 4 КБ, которая
         // выдаёт себя за опубликованный сегмент на 4 МБ, -- отказ.
         let mapping = Mapping::open(&name).expect("open");
-        // SAFETY: view не меньше страницы (4 КБ), выровнен; пишем
-        // заголовок, как это сделал бы чужой процесс.
-        let word = |offset: usize| unsafe {
-            &*mapping
-                .as_ptr()
-                .add(offset)
-                .cast::<std::sync::atomic::AtomicU32>()
+        let word = |offset: usize| {
+            // SAFETY: view не меньше страницы (4 КБ), `offset` < 4 КБ.
+            let ptr = unsafe { mapping.as_ptr().add(offset) };
+            // SAFETY: адрес выровнен на 4 (view выровнен на страницу, смещения
+            // кратны 4) и живёт до конца теста; пишем заголовок атомарно, как
+            // это сделал бы чужой процесс.
+            unsafe { std::sync::atomic::AtomicU32::from_ptr(ptr.cast()) }
         };
         let relaxed = std::sync::atomic::Ordering::Relaxed;
         word(4).store(crate::constants::SHARED_VERSION, relaxed);
@@ -1092,10 +1169,10 @@ mod tests {
         // SAFETY: все указатели валидны и живут до конца вызова.
         let status = unsafe {
             NtCreateSection(
-                &mut handle,
+                &raw mut handle,
                 SECTION_ALL_ACCESS,
-                &mut obj_attr,
-                &mut max_size,
+                &raw mut obj_attr,
+                &raw mut max_size,
                 PAGE_READWRITE,
                 attributes,
                 null_mut(),
@@ -1193,7 +1270,7 @@ mod tests {
         let _event = EventHandle::create(&name).unwrap();
         match NamedMutex::open_or_create(&name) {
             Err(ShmError::WindowsError { code, .. }) => {
-                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH as u32);
+                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH.cast_unsigned());
             }
             other => panic!("ожидалась ошибка типа, получено {other:?}"),
         }
@@ -1207,7 +1284,7 @@ mod tests {
         let _squatter = EventHandle::create(&name).unwrap(); // SynchronizationEvent
         match EventHandle::open_or_create_notification(&name) {
             Err(ShmError::WindowsError { code, .. }) => {
-                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH as u32);
+                assert_eq!(code, STATUS_OBJECT_TYPE_MISMATCH.cast_unsigned());
             }
             other => panic!("подмена маяка не отвергнута: {other:?}"),
         }
@@ -1217,6 +1294,29 @@ mod tests {
         let second = EventHandle::open_or_create_notification(&fair).unwrap();
         assert_eq!(second.event_type().unwrap(), NOTIFICATION_EVENT);
         drop(first);
+    }
+
+    /// Набор ожидания -- заимствованные handle (`BorrowedHandle`): время
+    /// жизни объекта проверяет компилятор. Сигнал второго события -- индекс 1.
+    #[test]
+    fn wait_any_accepts_borrowed_handles() {
+        let first = EventHandle::create_unnamed(false).unwrap();
+        let second = EventHandle::create_unnamed(false).unwrap();
+        assert_eq!(
+            wait_any(
+                &[first.as_handle(), second.as_handle()],
+                Some(Duration::ZERO)
+            ),
+            Ok(None)
+        );
+        second.set().unwrap();
+        assert_eq!(
+            wait_any(
+                &[first.as_handle(), second.as_handle()],
+                Some(Duration::from_secs(1))
+            ),
+            Ok(Some(1))
+        );
     }
 
     #[test]

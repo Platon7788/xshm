@@ -12,6 +12,10 @@ use std::time::{Duration, Instant};
 
 use xshm::{SharedClient, SharedServer, ShmError};
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn unique_name(tag: &str) -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()
@@ -101,7 +105,9 @@ fn test_message_count_before_write_pos() {
         Ok(received)
     })();
 
-    let _ = server_thread.join();
+    // Исход сервера проверяет результат клиента ниже; паника сервера здесь
+    // не роняет тест отдельно (как и раньше).
+    drop(server_thread.join());
 
     match client_result {
         Ok(received) => {

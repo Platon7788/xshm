@@ -22,9 +22,9 @@ fn current_session_id() -> u32 {
         NtQueryInformationProcess(
             NT_CURRENT_PROCESS,
             PROCESS_SESSION_INFORMATION_CLASS,
-            &mut info as *mut _ as PVOID,
+            (&raw mut info).cast(),
             size_of::<PROCESS_SESSION_INFORMATION>() as ULONG,
-            &mut ret_len,
+            &raw mut ret_len,
         )
     };
     if status == STATUS_SUCCESS {
@@ -134,7 +134,7 @@ impl NtName {
 
     /// Получить указатель на UNICODE_STRING для передачи в NT функции
     pub const fn as_ptr(&mut self) -> *mut UNICODE_STRING {
-        &mut self.unicode
+        &raw mut self.unicode
     }
 }
 
@@ -160,7 +160,7 @@ pub fn duration_to_nt_timeout(duration: std::time::Duration) -> i64 {
     if units_100ns == 0 {
         if duration.is_zero() { 0 } else { -1 }
     } else {
-        -(units_100ns.min(i64::MAX as u128) as i64)
+        -i64::try_from(units_100ns).unwrap_or(i64::MAX)
     }
 }
 

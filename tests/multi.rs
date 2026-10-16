@@ -10,6 +10,10 @@ use xshm::multi::{
     MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
 };
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn unique_name(tag: &str) -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()
@@ -79,6 +83,10 @@ impl MultiHandler for TestServerHandler {
         self.disconnects.fetch_add(1, Ordering::Release);
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, client_id: u32, data: &[u8]) {
         println!(
             "[Server] Message from client {}: {:?}",
@@ -148,6 +156,10 @@ impl MultiClientHandler for TestClientHandler {
         println!("[Client] Disconnected");
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn on_message(&self, data: &[u8]) {
         println!("[Client] Received: {:?}", String::from_utf8_lossy(data));
         self.messages.fetch_add(1, Ordering::Release);

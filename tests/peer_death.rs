@@ -23,6 +23,10 @@ const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
 /// Граница задержки детекции, которую проверяем.
 const BOUND: Duration = Duration::from_millis(500);
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn unique_name(tag: &str) -> String {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -146,6 +150,11 @@ fn child_entry() {
 struct Peer(Child);
 
 impl Peer {
+    #[expect(
+        clippy::expect_used,
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn spawn(mode: &str, name: &str) -> Self {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
@@ -160,12 +169,20 @@ impl Peer {
     }
 
     /// Убить (TerminateProcess) и вернуть момент убийства.
+    #[expect(
+        clippy::expect_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn kill(&mut self) -> Instant {
         let t0 = Instant::now();
         self.0.kill().expect("kill child");
         t0
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn wait_exit(&mut self, limit: Duration) -> std::process::ExitStatus {
         let deadline = Instant::now() + limit;
         loop {
@@ -180,8 +197,8 @@ impl Peer {
 
 impl Drop for Peer {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        drop(self.0.kill()); // best-effort в Drop: процесс мог уже выйти
+        drop(self.0.wait());
     }
 }
 
@@ -202,6 +219,10 @@ struct Recorder {
 }
 
 impl Recorder {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn record(&self, reason: DisconnectReason) {
         let mut slot = self.reason.lock().unwrap();
         if slot.is_none() {
@@ -209,6 +230,10 @@ impl Recorder {
         }
     }
 
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
     fn wait_reason(&self, limit: Duration) -> (DisconnectReason, Instant) {
         let deadline = Instant::now() + limit;
         loop {

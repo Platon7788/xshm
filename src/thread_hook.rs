@@ -84,7 +84,8 @@ mod tests {
             inherited
         });
         let inherited = outer.join().unwrap();
-        assert_eq!(inherited.map(|f| f as usize), Some(mark as fn() as usize));
+        let expected: fn() = mark;
+        assert_eq!(inherited.map(|f| f as usize), Some(expected as usize));
         assert_eq!(CALLS.load(Ordering::SeqCst), 2);
         // Поток без хука — рабочие без хука.
         let none = spawn(Builder::new(), thread_start_hook)

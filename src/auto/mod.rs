@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -10,11 +11,13 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::ring::{FreeSpace, WriteOutcome, frame_size};
 use crate::server::SharedServer;
+use crate::sync_ext::{LockExt, join_worker};
 use crate::wait_delay_or;
 use crate::win::{self, EventHandle};
 
 pub(crate) fn map_spawn_error(err: std::io::Error, context: &'static str) -> ShmError {
-    let code = err.raw_os_error().map_or(u32::MAX, |c| c as u32);
+    // Код Win32 -- беззнаковый по смыслу (`GetLastError`): битовый каст.
+    let code = err.raw_os_error().map_or(u32::MAX, i32::cast_unsigned);
     ShmError::WindowsError { code, context }
 }
 
@@ -30,10 +33,13 @@ pub(crate) fn map_spawn_error(err: std::io::Error, context: &'static str) -> Shm
 /// При обнаружении self-join `JoinHandle` просто дропается без join: поток
 /// уже видит `running=false` (устанавливается до этого вызова) и завершится
 /// сам, как только колбэк вернёт управление.
-pub(crate) fn join_unless_self(handle: JoinHandle<()>) {
-    if handle.thread().id() != thread::current().id() {
-        let _ = handle.join();
+///
+/// `Err(WorkerPanicked)` -- worker завершился паникой (см. `join_worker`).
+pub(crate) fn join_unless_self(handle: JoinHandle<()>) -> Result<()> {
+    if handle.thread().id() == thread::current().id() {
+        return Ok(());
     }
+    join_worker(handle)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -189,7 +195,7 @@ impl Outbox {
     fn lock(&self) -> std::sync::MutexGuard<'_, SendQueue> {
         // Паника внутри lock-а невозможна (только операции VecDeque), но
         // отравленный mutex не должен валить поток отправителя.
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+        self.queue.lock_clean()
     }
 
     fn pop_front(&self) -> Option<Outgoing> {
@@ -248,11 +254,11 @@ impl ChannelState {
         };
         self.tx_max_message
             .store(ring.max_message_size, Ordering::Release);
-        *self.layout.lock().unwrap_or_else(PoisonError::into_inner) = Some(layout);
+        *self.layout.lock_clean() = Some(layout);
     }
 
     fn layout(&self) -> Option<ChannelLayout> {
-        *self.layout.lock().unwrap_or_else(PoisonError::into_inner)
+        *self.layout.lock_clean()
     }
 
     /// Проверка длины сообщения до постановки в очередь: против лимита
@@ -491,7 +497,7 @@ impl Endpoint {
         let _ = thread_name;
         let join = crate::thread_hook::spawn(builder, move || body(&worker))
             .map_err(|err| map_spawn_error(err, "spawn auto worker"))?;
-        *endpoint.join.lock().unwrap_or_else(PoisonError::into_inner) = Some(join);
+        *endpoint.join.lock_clean() = Some(join);
         Ok(endpoint)
     }
 
@@ -517,13 +523,14 @@ impl Endpoint {
     fn stop(&self) {
         self.running.store(false, Ordering::Release);
         let _ = self.wake.set();
-        let handle = self
-            .join
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        let handle = self.join.lock_clean().take();
         if let Some(handle) = handle {
-            join_unless_self(handle);
+            // Паника worker-а сообщать некуда: обработчик живёт только в
+            // контексте worker-а (`Worker::handler`), а держать его ещё и
+            // здесь -- риск цикла `Arc` (прокси Dispatch ссылаются на свои
+            // каналы). Текст паники уже напечатал panic hook потребителя;
+            // паниковать из `stop()`/`Drop` нельзя.
+            let _panicked = join_unless_self(handle);
         }
     }
 }
@@ -607,8 +614,8 @@ impl Worker {
     fn handle_wait<E: SendEndpoint + ReceiveEndpoint>(
         &self,
         endpoint: &E,
-        set: &WaitSet,
-        space: isize,
+        set: &WaitSet<'_>,
+        space: BorrowedHandle<'_>,
         result: Result<Option<usize>>,
         buffer: &mut Vec<u8>,
     ) -> Option<DisconnectReason> {
@@ -768,18 +775,12 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
     let mut buffer = Vec::new();
     // Anonymous-сервер не имеет событий, а auto-mode построен на ожидании
     // событий. Недостижимо: AutoServer::start всегда поднимает named-сервер.
-    let Some(server_events) = server.events() else {
+    if server.events().is_none() {
         worker.handler.on_error(ShmError::InvalidConfig(
             "anonymous server is not supported in auto-mode",
         ));
         return;
-    };
-    let base_handles = [
-        server_events.disconnect.raw_handle(),
-        server_events.c2s.data.raw_handle(),
-        server_events.s2c.space.raw_handle(),
-    ];
-    let space = server_events.s2c.space.raw_handle();
+    }
     let gauge = &worker.gauge;
     let mut connected = false;
 
@@ -791,7 +792,7 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
             // Ждём клиента ИЛИ команду/остановку (событие `wake`) -- без
             // опроса по таймеру.
             let accepted =
-                server.wait_for_client_or(worker.wake.raw_handle(), worker.options.poll_timeout);
+                server.wait_for_client_or(worker.wake.as_handle(), worker.options.poll_timeout);
             worker.stats.wake();
             match accepted {
                 Ok(true) => {
@@ -819,10 +820,21 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
                 // Ещё есть данные (или остановка) -- не блокируемся.
                 break 'session None;
             }
+            // Набор -- заимствование событий сервера на одно ожидание
+            // (`wait_for_client_or`/`mark_disconnected` требуют `&mut`).
+            let Some(events) = server.events() else {
+                // Недостижимо: события проверены на входе в worker.
+                break 'session Some(DisconnectReason::Error);
+            };
+            let space = events.s2c.space.as_handle();
             let set = WaitSet::new(
-                base_handles,
+                [
+                    events.disconnect.as_handle(),
+                    events.c2s.data.as_handle(),
+                    space,
+                ],
                 server.peer_wait_handle(),
-                worker.wake.raw_handle(),
+                worker.wake.as_handle(),
             );
             let result = win::wait_any(set.handles(), worker.options.poll_timeout);
             worker.stats.wake();
@@ -852,15 +864,20 @@ const SPACE_INDEX: usize = 2;
 
 /// Набор ожидания worker-а: DISCONNECT, DATA, SPACE, handle процесса пира
 /// (если наблюдается), `wake` (последним).
-struct WaitSet {
-    handles: [isize; 5],
+struct WaitSet<'a> {
+    /// Хвост за `count` -- заполнитель (копия `wake`), в ожидание не уходит.
+    handles: [BorrowedHandle<'a>; 5],
     count: usize,
     /// Индекс handle процесса пира.
     peer: Option<usize>,
 }
 
-impl WaitSet {
-    const fn new(base: [isize; 3], peer: Option<isize>, wake: isize) -> Self {
+impl<'a> WaitSet<'a> {
+    const fn new(
+        base: [BorrowedHandle<'a>; 3],
+        peer: Option<BorrowedHandle<'a>>,
+        wake: BorrowedHandle<'a>,
+    ) -> Self {
         match peer {
             Some(peer) => Self {
                 handles: [base[0], base[1], base[2], peer, wake],
@@ -868,14 +885,14 @@ impl WaitSet {
                 peer: Some(3),
             },
             None => Self {
-                handles: [base[0], base[1], base[2], wake, 0],
+                handles: [base[0], base[1], base[2], wake, wake],
                 count: 4,
                 peer: None,
             },
         }
     }
 
-    fn handles(&self) -> &[isize] {
+    fn handles(&self) -> &[BorrowedHandle<'a>] {
         &self.handles[..self.count]
     }
 }
@@ -1007,7 +1024,7 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             name,
             worker.options.connect_timeout,
             Interrupt {
-                wake: worker.wake.raw_handle(),
+                wake: worker.wake.as_handle(),
                 should_stop: &mut should_stop,
             },
         );
@@ -1043,12 +1060,12 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
         }
         worker.handler.on_connect();
         let client_events = client.events();
+        let space = client_events.c2s.space.as_handle();
         let base_handles = [
-            client_events.disconnect.raw_handle(),
-            client_events.s2c.data.raw_handle(),
-            client_events.c2s.space.raw_handle(),
+            client_events.disconnect.as_handle(),
+            client_events.s2c.data.as_handle(),
+            space,
         ];
-        let space = client_events.c2s.space.raw_handle();
 
         let reason = loop {
             if !worker.running() {
@@ -1071,7 +1088,7 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             let set = WaitSet::new(
                 base_handles,
                 client.peer_wait_handle(),
-                worker.wake.raw_handle(),
+                worker.wake.as_handle(),
             );
             let result = win::wait_any(set.handles(), worker.options.poll_timeout);
             worker.stats.wake();

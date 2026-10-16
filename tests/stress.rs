@@ -6,6 +6,10 @@ use xshm::{SharedClient, SharedServer, ShmError};
 
 const MIN_SLEEP: Duration = Duration::from_micros(50);
 
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
 fn unique_name(tag: &str) -> String {
     use std::time::SystemTime;
     let ts = SystemTime::now()

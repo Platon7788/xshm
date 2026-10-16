@@ -80,35 +80,46 @@ pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
 }
 
 /// Декодирует запрос регистрации из байтов.
+///
+/// Данные приходят от пира: длины проверяются типом (`split_first_chunk`,
+/// `get`), а не индексами -- короткий или испорченный буфер даёт ошибку,
+/// а не панику.
 pub fn decode_request(data: &[u8]) -> Result<RegistrationRequest> {
-    if data.len() < 13 {
+    let Some((header, rest)) = data.split_first_chunk::<13>() else {
         return Err(ShmError::MessageTooSmall);
-    }
+    };
+    let [
+        m0,
+        m1,
+        m2,
+        m3,
+        version,
+        msg_type,
+        p0,
+        p1,
+        p2,
+        p3,
+        r0,
+        r1,
+        name_len,
+    ] = *header;
 
-    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic != DISPATCH_MAGIC {
+    if u32::from_le_bytes([m0, m1, m2, m3]) != DISPATCH_MAGIC {
         return Err(ShmError::Corrupted);
     }
-
-    let version = data[4];
     if version != DISPATCH_VERSION {
         return Err(ShmError::HandshakeFailed);
     }
-
-    let msg_type = data[5];
     if msg_type != MSG_TYPE_REQUEST {
         return Err(ShmError::HandshakeFailed);
     }
 
-    let pid = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
-    let revision = u16::from_le_bytes([data[10], data[11]]);
-    let name_len = data[12] as usize;
-
-    if data.len() < 13 + name_len {
-        return Err(ShmError::MessageTooSmall);
-    }
-
-    let name = String::from_utf8_lossy(&data[13..13 + name_len]).into_owned();
+    let pid = u32::from_le_bytes([p0, p1, p2, p3]);
+    let revision = u16::from_le_bytes([r0, r1]);
+    let name = rest
+        .get(..usize::from(name_len))
+        .ok_or(ShmError::MessageTooSmall)?;
+    let name = String::from_utf8_lossy(name).into_owned();
 
     Ok(RegistrationRequest {
         pid,
@@ -158,35 +169,42 @@ pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
 }
 
 /// Декодирует ответ регистрации из байтов.
+///
+/// Разбор без индексов -- как в [`decode_request`].
 pub fn decode_response(data: &[u8]) -> Result<RegistrationResponse> {
-    if data.len() < 12 {
+    let Some((header, rest)) = data.split_first_chunk::<12>() else {
         return Err(ShmError::MessageTooSmall);
-    }
+    };
+    let [
+        m0,
+        m1,
+        m2,
+        m3,
+        version,
+        msg_type,
+        status,
+        c0,
+        c1,
+        c2,
+        c3,
+        name_len,
+    ] = *header;
 
-    let magic = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-    if magic != DISPATCH_MAGIC {
+    if u32::from_le_bytes([m0, m1, m2, m3]) != DISPATCH_MAGIC {
         return Err(ShmError::Corrupted);
     }
-
-    let version = data[4];
     if version != DISPATCH_VERSION {
         return Err(ShmError::HandshakeFailed);
     }
-
-    let msg_type = data[5];
     if msg_type != MSG_TYPE_RESPONSE {
         return Err(ShmError::HandshakeFailed);
     }
 
-    let status = data[6];
-    let client_id = u32::from_le_bytes([data[7], data[8], data[9], data[10]]);
-    let name_len = data[11] as usize;
-
-    if data.len() < 12 + name_len {
-        return Err(ShmError::MessageTooSmall);
-    }
-
-    let channel_name = String::from_utf8_lossy(&data[12..12 + name_len]).into_owned();
+    let client_id = u32::from_le_bytes([c0, c1, c2, c3]);
+    let channel_name = rest
+        .get(..usize::from(name_len))
+        .ok_or(ShmError::MessageTooSmall)?;
+    let channel_name = String::from_utf8_lossy(channel_name).into_owned();
 
     Ok(RegistrationResponse {
         status,

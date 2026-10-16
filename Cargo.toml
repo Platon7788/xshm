@@ -32,6 +32,13 @@ default = []
 unsafe_op_in_unsafe_fn = "forbid"
 missing_debug_implementations = "warn"
 unused_qualifications = "warn"
+# Rust 1.99 (исследование 2026-10-16): `&raw` вместо `&x as *const _`,
+# никаких лишних `as`, паника join-а worker-а не теряется в `let _ =`,
+# pub-типы в сигнатурах реэкспортированы или `pub(crate)`.
+raw_borrows_via_references = "warn"
+trivial_casts = "warn"
+let_underscore_drop = "warn"
+unnameable_types = "warn"
 
 [lints.clippy]
 # Правило проекта №3 (CLAUDE.md): у каждого unsafe -- обоснование. Теперь это
@@ -44,6 +51,19 @@ uninlined_format_args = "warn"
 missing_const_for_fn = "warn"
 redundant_clone = "warn"
 semicolon_if_nothing_returned = "warn"
+# Каждый unsafe-оп -- свой блок и свой `SAFETY` (разделяемая память).
+multiple_unsafe_ops_per_block = "warn"
+# Битовые касты знака -- только `cast_unsigned`/`cast_signed`.
+cast_sign_loss = "warn"
+cast_possible_wrap = "warn"
+# `&raw`/`ptr::from_mut` вместо `&mut x as *mut _` в NT-вызовах.
+borrow_as_ptr = "warn"
+# Конвенция №8: `#[expect(.., reason)]`, а не `#[allow]`.
+allow_attributes = "warn"
+allow_attributes_without_reason = "warn"
+# Без паник в библиотеке; тестам можно (`clippy.toml`).
+unwrap_used = "warn"
+expect_used = "warn"
 
 [profile.dev]
 panic = "abort"

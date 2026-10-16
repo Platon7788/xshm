@@ -64,6 +64,17 @@ pub enum ShmError {
     /// 0.8+ и handle удалось открыть).
     #[error("peer process died")]
     PeerDied,
+    /// Рабочий поток xshm завершился паникой (как правило -- паника в
+    /// колбэке обработчика). Сообщается в `on_error` обработчика при
+    /// `stop()`/`Drop`, на потоке, который их вызвал.
+    #[error("worker thread panicked: {message}")]
+    WorkerPanicked {
+        /// Текст паники, если это строковый литерал (`panic!("...")`);
+        /// иначе -- общий текст (полный уже напечатал panic hook). Только
+        /// `&'static str`: `ShmError` не владеет памятью (используется в
+        /// `const fn`).
+        message: &'static str,
+    },
 }
 
 /// Почему соединение разорвано (для `on_disconnect_reason` и аналогов).

@@ -1,0 +1,4 @@
+# Тестам паники разрешены: `unwrap`/`expect` в `#[test]` и `#[cfg(test)]` --
+# это и есть проверка (линты `unwrap_used`/`expect_used` в Cargo.toml).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

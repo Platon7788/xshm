@@ -126,7 +126,7 @@ impl SECURITY_DESCRIPTOR {
     }
 
     pub const fn as_ptr(&mut self) -> PVOID {
-        self as *mut _ as PVOID
+        core::ptr::from_mut(self).cast()
     }
 }
 
@@ -151,19 +151,21 @@ impl NullDaclSecurityDescriptor {
 
         let mut sd = SECURITY_DESCRIPTOR::new();
 
+        // Инициализируем SD.
         // SAFETY: `sd` -- локальная структура нужного размера, живущая до конца
-        // функции; обе Rtl-функции только заполняют её поля по переданной ссылке.
-        unsafe {
-            // Инициализируем SD
-            let _ = RtlCreateSecurityDescriptor(&mut sd, SECURITY_DESCRIPTOR_REVISION);
-            // Устанавливаем NULL DACL
-            let _ = RtlSetDaclSecurityDescriptor(
-                &mut sd,
+        // функции; Rtl-функция только заполняет её поля по переданному указателю.
+        let _ = unsafe { RtlCreateSecurityDescriptor(&raw mut sd, SECURITY_DESCRIPTOR_REVISION) };
+        // Устанавливаем NULL DACL.
+        // SAFETY: то же -- `sd` жив и инициализирован вызовом выше; Dacl = NULL
+        // допустим (NULL DACL -- полный доступ).
+        let _ = unsafe {
+            RtlSetDaclSecurityDescriptor(
+                &raw mut sd,
                 1,                     // DaclPresent = TRUE
                 core::ptr::null_mut(), // Dacl = NULL (full access)
                 0,                     // DaclDefaulted = FALSE
-            );
-        }
+            )
+        };
 
         Self { sd }
     }
@@ -251,7 +253,7 @@ pub const OBJ_OPENIF: ULONG = 0x0000_0080;
 /// Информационный успех `OBJ_OPENIF`: объект уже существовал и открыт.
 pub const STATUS_OBJECT_NAME_EXISTS: NTSTATUS = 0x4000_0000;
 /// Имя занято объектом другого типа (например, мьютекс лобби -- событием).
-pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024_u32 as NTSTATUS;
+pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024_u32.cast_signed();
 
 /// `EVENT_INFORMATION_CLASS::EventBasicInformation` для `NtQueryEvent` (0.9).
 pub const EVENT_BASIC_INFORMATION_CLASS: ULONG = 0;

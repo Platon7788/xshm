@@ -25,6 +25,7 @@
 pub mod protocol;
 
 use std::collections::HashMap;
+use std::os::windows::io::AsHandle;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -37,6 +38,7 @@ use crate::layout::{ChannelLayout, RingConfig};
 use crate::naming::mapping_name;
 use crate::ring::FreeSpace;
 use crate::server::SharedServer;
+use crate::sync_ext::{LockExt, RwLockExt, join_worker};
 use crate::wait_delay_or;
 use crate::win::{self, EventHandle, Mapping, NamedMutex};
 
@@ -270,14 +272,15 @@ struct ServerThreadScope(usize);
 
 impl ServerThreadScope {
     fn enter(owner: &ClientMap) -> Self {
-        let id = Arc::as_ptr(owner) as usize;
-        Self(SERVER_THREAD.with(|cell| cell.replace(id)))
+        // Адрес -- только идентичность, провенанс не нужен (`addr()`).
+        let id = Arc::as_ptr(owner).addr();
+        Self(SERVER_THREAD.replace(id))
     }
 }
 
 impl Drop for ServerThreadScope {
     fn drop(&mut self) {
-        SERVER_THREAD.with(|cell| cell.set(self.0));
+        SERVER_THREAD.set(self.0);
     }
 }
 
@@ -339,6 +342,10 @@ mod core_type {
 
     /// Состояние сервера, общее для ручки `DispatchServer` и потока лобби.
     /// Вне крейта тип не именуем: его методы доступны через `Deref` ручки.
+    #[expect(
+        unnameable_types,
+        reason = "ядро -- деталь реализации: методы доступны через `Deref` ручки `DispatchServer`"
+    )]
     pub struct DispatchCore {
         pub(in crate::dispatch) base_name: String,
         pub(in crate::dispatch) clients: ClientMap,
@@ -428,7 +435,7 @@ impl DispatchServer {
         })
         .map_err(|e| map_spawn_error(e, "spawn dispatch worker"))?;
 
-        *core.worker_handle.lock().unwrap() = Some(handle);
+        *core.worker_handle.lock_clean() = Some(handle);
 
         Ok(Arc::new(Self { core }))
     }
@@ -437,7 +444,7 @@ impl DispatchServer {
 impl DispatchCore {
     /// Отправляет сообщение конкретному клиенту.
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
-        let clients = self.clients.read().unwrap();
+        let clients = self.clients.read_clean();
         let client = clients.get(&client_id).ok_or(ShmError::NotConnected)?;
         client.server.send(data)
     }
@@ -448,7 +455,7 @@ impl DispatchCore {
     /// `AutoServer::try_send`; место освободилось --
     /// `DispatchHandler::on_space_available`.
     pub fn try_send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
-        let clients = self.clients.read().unwrap();
+        let clients = self.clients.read_clean();
         let client = clients.get(&client_id).ok_or(ShmError::NotConnected)?;
         client.server.try_send(data)
     }
@@ -458,8 +465,7 @@ impl DispatchCore {
     #[must_use]
     pub fn is_client_alive(&self, client_id: u32) -> Option<bool> {
         self.clients
-            .read()
-            .unwrap()
+            .read_clean()
             .get(&client_id)
             .and_then(|c| c.server.is_peer_alive())
     }
@@ -470,8 +476,7 @@ impl DispatchCore {
         self.lobby_wakeups.load(Ordering::Relaxed)
             + self
                 .clients
-                .read()
-                .unwrap()
+                .read_clean()
                 .values()
                 .map(|c| c.server.wakeups())
                 .sum::<u64>()
@@ -482,15 +487,14 @@ impl DispatchCore {
     #[must_use]
     pub fn free_space(&self, client_id: u32) -> Option<FreeSpace> {
         self.clients
-            .read()
-            .unwrap()
+            .read_clean()
             .get(&client_id)
             .map(|c| c.server.free_space())
     }
 
     /// Рассылает сообщение всем подключённым клиентам.
     pub fn broadcast(&self, data: &[u8]) -> Result<u32> {
-        let clients = self.clients.read().unwrap();
+        let clients = self.clients.read_clean();
         let mut sent = 0u32;
         for client in clients.values() {
             if client.server.send(data).is_ok() {
@@ -512,7 +516,7 @@ impl DispatchCore {
     /// закрывается в фоновом потоке (его дожидается `stop()`), поэтому два
     /// колбэка, отключающие друг друга, не ждут друг друга.
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
-        let removed = self.clients.write().unwrap().remove(&client_id);
+        let removed = self.clients.write_clean().remove(&client_id);
         let Some(client) = removed else {
             return Err(ShmError::NotConnected);
         };
@@ -533,8 +537,8 @@ impl DispatchCore {
     /// Вызов из потока самого сервера (поток лобби или колбэк в worker-е
     /// канала).
     fn on_own_thread(&self) -> bool {
-        let own = Arc::as_ptr(&self.clients) as usize;
-        SERVER_THREAD.with(std::cell::Cell::get) == own
+        let own = Arc::as_ptr(&self.clients).addr();
+        SERVER_THREAD.get() == own
     }
 
     /// Клиенты: подключённые и ожидающие подключения к каналу (живые
@@ -542,34 +546,32 @@ impl DispatchCore {
     fn active_clients(&self) -> usize {
         let pending = self
             .background
-            .lock()
-            .unwrap()
+            .lock_clean()
             .iter()
             .filter(|h| !h.is_finished())
             .count();
-        self.clients.read().unwrap().len() + pending
+        self.clients.read_clean().len() + pending
     }
 
     /// Возвращает список ID подключённых клиентов.
     pub fn connected_clients(&self) -> Vec<u32> {
-        self.clients.read().unwrap().keys().copied().collect()
+        self.clients.read_clean().keys().copied().collect()
     }
 
     /// Возвращает количество подключённых клиентов.
     pub fn client_count(&self) -> u32 {
-        self.clients.read().unwrap().len() as u32
+        self.clients.read_clean().len() as u32
     }
 
     /// Проверяет, подключён ли конкретный клиент.
     pub fn is_client_connected(&self, client_id: u32) -> bool {
-        self.clients.read().unwrap().contains_key(&client_id)
+        self.clients.read_clean().contains_key(&client_id)
     }
 
     /// Возвращает данные регистрации клиента.
     pub fn client_info(&self, client_id: u32) -> Option<ClientRegistration> {
         self.clients
-            .read()
-            .unwrap()
+            .read_clean()
             .get(&client_id)
             .map(|c| c.info.clone())
     }
@@ -578,8 +580,7 @@ impl DispatchCore {
     /// для единообразия с `MultiServer::channel_name` (0.6.0, аудит API).
     pub fn channel_name(&self, client_id: u32) -> Option<String> {
         self.clients
-            .read()
-            .unwrap()
+            .read_clean()
             .get(&client_id)
             .map(|c| c.channel_name.clone())
     }
@@ -622,10 +623,13 @@ impl DispatchCore {
         // Джойнится потоком-владельцем Self. Тот же фикс, что и для
         // MultiServer::stop() (аудит 2026-07-10): worker держит собственный
         // клон Arc<Self>, поэтому расчёт только на Drop гонял бы точно так же.
-        if let Some(handle) = self.worker_handle.lock().unwrap().take()
+        // Паника потока (колбэк обработчика) -- в `on_error`, на потоке,
+        // вызвавшем `stop()`, до возврата из него.
+        if let Some(handle) = self.worker_handle.lock_clean().take()
             && handle.thread().id() != thread::current().id()
+            && let Err(err) = join_worker(handle)
         {
-            let _ = handle.join();
+            self.handler.on_error(None, err);
         }
         // Поток лобби уже остановлен и карта клиентов опустошена -> новых
         // фоновых потоков не появится (worker канала, сам убравший себя из
@@ -634,9 +638,11 @@ impl DispatchCore {
         // остановят свои так и не зарегистрированные каналы; потоки закрытия
         // дождутся worker-ов каналов -- их колбэки отключения к возврату
         // `stop()` завершены.
-        let background: Vec<_> = self.background.lock().unwrap().drain(..).collect();
+        let background: Vec<_> = self.background.lock_clean().drain(..).collect();
         for handle in background {
-            let _ = handle.join();
+            if let Err(err) = join_worker(handle) {
+                self.handler.on_error(None, err);
+            }
         }
     }
 
@@ -711,7 +717,7 @@ impl DispatchCore {
             // Ждём CONNECT_REQ или остановку -- без опроса по таймеру.
             while self.running.load(Ordering::Acquire) {
                 let accepted = lobby_server
-                    .wait_for_client_or(self.stop_event.raw_handle(), self.options.poll_timeout);
+                    .wait_for_client_or(self.stop_event.as_handle(), self.options.poll_timeout);
                 self.lobby_wakeups.fetch_add(1, Ordering::Relaxed);
                 match accepted {
                     Ok(true) => {
@@ -747,7 +753,7 @@ impl DispatchCore {
         // взаимной блокировкой. `on_client_disconnect_reason` -- строго после
         // join: колбэки этого клиента (включая `on_client_connect`) к этому
         // моменту завершены.
-        let drained: Vec<(u32, DispatchedClient)> = self.clients.write().unwrap().drain().collect();
+        let drained: Vec<(u32, DispatchedClient)> = self.clients.write_clean().drain().collect();
         for (id, client) in drained {
             client.disconnected.store(true, Ordering::Release);
             client.server.stop();
@@ -800,11 +806,9 @@ impl DispatchCore {
                     // Блокируемся на событии — просыпаемся, когда клиент
                     // запишет данные, по остановке или по смерти клиента
                     // (0.9: не ждём `lobby_timeout` за упавшим клиентом).
-                    let mut handles = [
-                        events.c2s.data.raw_handle(),
-                        self.stop_event.raw_handle(),
-                        0,
-                    ];
+                    // Хвост массива -- заполнитель, в ожидание уходит `[..count]`.
+                    let data = events.c2s.data.as_handle();
+                    let mut handles = [data, self.stop_event.as_handle(), data];
                     let count = match lobby.peer_wait_handle() {
                         Some(peer) => {
                             handles[2] = peer;
@@ -896,7 +900,7 @@ impl DispatchCore {
         // worker стартует сразу, мог бы не найти канал при очень быстром
         // подключении клиента (клиент подключится только после ответа
         // лобби, но порядок гарантируем явно).
-        let mut slot_guard = slot.lock().unwrap();
+        let mut slot_guard = slot.lock_clean();
         match AutoServer::start(&channel_name, proxy_handler, auto_options) {
             Ok(s) => *slot_guard = Some(s),
             Err(err) => {
@@ -917,7 +921,7 @@ impl DispatchCore {
 
         if let Err(err) = lobby.send_to_client(&response) {
             self.handler.on_error(None, err);
-            let taken = slot.lock().unwrap().take();
+            let taken = slot.lock_clean().take();
             if let Some(server) = taken {
                 server.stop();
             }
@@ -939,13 +943,13 @@ impl DispatchCore {
         let waiter_slot = Arc::clone(&slot);
         let spawned = crate::thread_hook::spawn(thread::Builder::new(), move || {
             let _ = win::wait_any(
-                &[registered.raw_handle(), stop_event.raw_handle()],
+                &[registered.as_handle(), stop_event.as_handle()],
                 Some(channel_connect_timeout),
             );
             // Зарегистрированный канал прокси уже забрал из слота; остался --
             // клиент не пришёл: остановить (join worker-а -- из этого потока,
             // не из самого worker-а).
-            let taken = waiter_slot.lock().unwrap().take();
+            let taken = waiter_slot.lock_clean().take();
             drop(taken);
         });
         match spawned {
@@ -953,7 +957,7 @@ impl DispatchCore {
                 // Регистрируем handle для join'а в stop(); заодно вычищаем уже
                 // завершившиеся записи, чтобы вектор не рос неограниченно на
                 // долгоживущем сервере с большим потоком регистраций.
-                let mut background = self.background.lock().unwrap();
+                let mut background = self.background.lock_clean();
                 background.retain(|h| !h.is_finished());
                 background.push(join_handle);
             }
@@ -963,7 +967,7 @@ impl DispatchCore {
                 // worker-а канала). Пришедший клиент получит отказ канала.
                 self.handler
                     .on_error(None, map_spawn_error(err, "spawn dispatch waiter"));
-                let taken = slot.lock().unwrap().take();
+                let taken = slot.lock_clean().take();
                 drop(taken);
             }
         }
@@ -1005,13 +1009,13 @@ fn retire(background: &Background, client: DispatchedClient) {
     let slot = Arc::new(Mutex::new(Some(client)));
     let for_thread = Arc::clone(&slot);
     let spawned = crate::thread_hook::spawn(thread::Builder::new(), move || {
-        let taken = for_thread.lock().unwrap().take();
+        let taken = for_thread.lock_clean().take();
         drop(taken);
     });
     match spawned {
-        Ok(handle) => background.lock().unwrap().push(handle),
+        Ok(handle) => background.lock_clean().push(handle),
         Err(_) => {
-            let taken = slot.lock().unwrap().take();
+            let taken = slot.lock_clean().take();
             drop(taken);
         }
     }
@@ -1056,7 +1060,7 @@ impl AutoHandler for AutoProxyHandler {
         // уходили в `on_message` клиента, о котором обработчик ещё не знал
         // (и терялись).
         {
-            let mut clients = self.clients.write().unwrap();
+            let mut clients = self.clients.write_clean();
             // Сервер останавливается: не регистрировать -- поток ожидания
             // проснётся по остановке и уберёт канал сам.
             if !self.running.load(Ordering::Acquire) {
@@ -1064,7 +1068,7 @@ impl AutoHandler for AutoProxyHandler {
             }
             // Нет в слоте: поток ожидания уже убрал канал по таймауту, или
             // это повторное подключение к тому же каналу -- не объявлять.
-            let Some(server) = self.slot.lock().unwrap().take() else {
+            let Some(server) = self.slot.lock_clean().take() else {
                 return;
             };
             clients.insert(
@@ -1091,7 +1095,7 @@ impl AutoHandler for AutoProxyHandler {
         // дождётся его (а тот -- этого worker-а с его колбэком) до возврата.
         // Колбэк отключения после `stop()` невозможен.
         let removed = {
-            let mut clients = self.clients.write().unwrap();
+            let mut clients = self.clients.write_clean();
             let fresh = clients.get(&self.client_id).is_some_and(|client| {
                 client
                     .disconnected
@@ -1207,7 +1211,7 @@ impl DispatchClient {
             auto_options,
             Arc::clone(&server_pid),
         )?;
-        *slot.lock().unwrap() = Some(auto_client);
+        *slot.lock_clean() = Some(auto_client);
 
         // `on_connect` больше НЕ вызывается здесь: возврат `AutoClient::connect`
         // означает лишь "worker-поток запущен", а не "канал поднят". Уведомление
@@ -1232,7 +1236,7 @@ impl DispatchClient {
     /// не поднят, сервер старой версии, нет прав, остановлен локально).
     #[must_use]
     pub fn is_peer_alive(&self) -> Option<bool> {
-        if let Some(client) = self.auto_client.lock().unwrap().as_ref() {
+        if let Some(client) = self.auto_client.lock_clean().as_ref() {
             return client.is_peer_alive();
         }
         (self.disconnect_reason() == Some(DisconnectReason::PeerDied)).then_some(false)
@@ -1252,7 +1256,7 @@ impl DispatchClient {
     /// `None` -- канал жив или остановлен локально.
     #[must_use]
     pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        *self.last_reason.lock().unwrap()
+        *self.last_reason.lock_clean()
     }
 
     /// Отправляет сообщение серверу по выделенному каналу.
@@ -1260,7 +1264,7 @@ impl DispatchClient {
         if !self.running.load(Ordering::Acquire) {
             return Err(ShmError::NotReady);
         }
-        let guard = self.auto_client.lock().unwrap();
+        let guard = self.auto_client.lock_clean();
         match guard.as_ref() {
             Some(client) => client.send(data),
             None => Err(ShmError::NotConnected),
@@ -1279,7 +1283,7 @@ impl DispatchClient {
         if !self.running.load(Ordering::Acquire) {
             return Err(ShmError::NotReady);
         }
-        let guard = self.auto_client.lock().unwrap();
+        let guard = self.auto_client.lock_clean();
         match guard.as_ref() {
             Some(client) => client.try_send(data),
             None => Err(ShmError::NotConnected),
@@ -1291,8 +1295,7 @@ impl DispatchClient {
     #[must_use]
     pub fn free_space(&self) -> FreeSpace {
         self.auto_client
-            .lock()
-            .unwrap()
+            .lock_clean()
             .as_ref()
             .map_or(FreeSpace::ZERO, AutoClient::free_space)
     }
@@ -1310,8 +1313,7 @@ impl DispatchClient {
     #[cfg(test)]
     pub(crate) fn wakeups(&self) -> u64 {
         self.auto_client
-            .lock()
-            .unwrap()
+            .lock_clean()
             .as_ref()
             .map_or(0, AutoClient::wakeups)
     }
@@ -1334,7 +1336,7 @@ impl DispatchClient {
     /// стороны сервера -- прокси гасит `running` в `on_disconnect`.
     #[must_use]
     pub fn is_connected(&self) -> bool {
-        self.running.load(Ordering::Acquire) && self.auto_client.lock().unwrap().is_some()
+        self.running.load(Ordering::Acquire) && self.auto_client.lock_clean().is_some()
     }
 
     /// Останавливает клиента и отключается.
@@ -1351,7 +1353,7 @@ impl DispatchClient {
     /// `DispatchClientProxy::on_disconnect`, которому нужен тот же mutex --
     /// дроп под захваченным lock-ом дал бы взаимную блокировку.
     fn shutdown_channel(slot: &Arc<Mutex<Option<AutoClient>>>) {
-        let taken = slot.lock().unwrap().take();
+        let taken = slot.lock_clean().take();
         if let Some(client) = taken {
             client.stop();
             drop(client);
@@ -1468,13 +1470,13 @@ impl AutoHandler for DispatchClientProxy {
     }
 
     fn on_disconnect_reason(&self, reason: DisconnectReason) {
-        *self.last_reason.lock().unwrap() = Some(reason);
+        *self.last_reason.lock_clean() = Some(reason);
         self.running.store(false, Ordering::Release);
         // Вызывается СИНХРОННО из worker-потока самого AutoClient. Забираем
         // его из слота и роняем: `Drop for AutoClient` распознаёт self-join
         // (`join_unless_self`) и просто открепляет поток, поэтому deadlock-а
         // нет, а бесконечный reconnect прекращается.
-        let taken = self.slot.lock().unwrap().take();
+        let taken = self.slot.lock_clean().take();
         drop(taken);
         self.handler.on_disconnect_reason(reason);
     }
@@ -2327,17 +2329,19 @@ mod tests {
         let mut buffer = Vec::new();
         // Регистрация без подключения к каналу -- поток ожидания висит на
         // `channel_connect_timeout`.
-        let _ = lobby_register(
-            &name,
-            &ClientRegistration {
-                pid: 1,
-                revision: 1,
-                name: "stalled".into(),
-            },
-            &DispatchClientOptions::default(),
-            &mut buffer,
-        )
-        .expect("lobby_register");
+        drop(
+            lobby_register(
+                &name,
+                &ClientRegistration {
+                    pid: 1,
+                    revision: 1,
+                    name: "stalled".into(),
+                },
+                &DispatchClientOptions::default(),
+                &mut buffer,
+            )
+            .expect("lobby_register"),
+        );
         let started = std::time::Instant::now();
         server.stop();
         assert!(
