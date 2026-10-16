@@ -100,7 +100,7 @@ Rust-потребителей), протокол профайлера повер
 | Префикс | NT-путь |
 |---|---|
 | `Global\X` | `\BaseNamedObjects\X` |
-| `Local\X` или без префикса | сессия `S` = `NtQueryInformationProcess(ProcessSessionInformation)`; `S == 0` → `\BaseNamedObjects\X`, иначе `\Sessions\S\BaseNamedObjects\X` (ошибка запроса → как `S = 0`) |
+| `Local\X` или без префикса | сессия `S` = `NtQueryInformationProcess(ProcessSessionInformation)`; `S == 0` → `\BaseNamedObjects\X`, иначе `\Sessions\S\BaseNamedObjects\X` (0.10: ошибка запроса → отказ создания/открытия объекта, `WindowsError`; до 0.10 — как `S = 0`, т.е. молча в глобальный namespace) |
 | `\...` | как есть |
 
 `UNICODE_STRING`: `Length` = байты без терминатора, `MaximumLength` = `Length + 2`,
@@ -386,9 +386,10 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    поток не создаётся. Затем безымянное событие остановки, поток лобби.
    Только после `Ok` сервер вправе взвести маяк (§b.3).
 2. **Поток лобби** ждёт `{C2S_CONNECT_REQ, стоп}` без таймаута
-   (`src/dispatch/mod.rs:479-499`, `src/server.rs:163-192`); `CONNECT_REQ`
+   (`src/dispatch/mod.rs:479-499`, `src/server.rs:178-210`); `CONNECT_REQ`
    первым индексом. `CONNECT_REQ` без `CLIENT_HELLO` (клиент откатил заявку)
-   — 0.9: просто игнорируется, лобби **не** пересоздаётся.
+   — 0.9: просто игнорируется, лобби **не** пересоздаётся; 0.10: сигнал
+   поглощается внутри ожидания, оно продолжается (§«Изменения 0.10» п. 15).
 3. **0.9 — сериализация (R12).** До шага 3 клиент открывает мьютекс
    `<B>_lock` (§b.2) и захватывает его, ожидая не дольше `lobby_timeout`
    (истёк → `Timeout`, лобби не трогается). `STATUS_ABANDONED_WAIT_0` —
@@ -1060,6 +1061,8 @@ R1–R17), §g (фактический прогон).
 | 11 | Лобби Dispatch | 2 × 2 МиБ | по умолчанию 2 × 16 КиБ (самоописываемая раскладка — клиенту безразлично) | §c.2 |
 | 12 | Отказ Dispatch-сервера | только ошибки | также политика (`DispatchHandler::admit` → `Reject`) и лимит `max_clients` (по умолчанию 64): ответ `STATUS_REJECTED` | §d |
 | 13 | Личность процесса пира | только PID (`server_pid`/`client_pid`/`slot_owner_pid`): переиспользованный или подделанный PID наблюдался как пир | рядом с каждым PID — время создания процесса (`server_start_*`@36, `client_start_*`@44, `owner_start_*`@52, половины `lo`/`hi`); процесс с тем же PID, но другим `CreateTime` — не пир; `0` — сверки нет. Пир ДОЛЖЕН писать время до соответствующего PID | §c.1 |
+| 14 | `Local\`/без префикса при ошибке `NtQueryInformationProcess(ProcessSessionInformation)` | сессия считалась `0` — объект молча уходил в глобальный `\BaseNamedObjects` (мимо пира из своей сессии, навстречу чужим объектам) | ошибка `WindowsError { context: "NtQueryInformationProcess(session)" }`, объект не создаётся и не открывается | §b.1 |
+| 15 | `C2S_CONNECT_REQ` без `CLIENT_HELLO` (толчок Multi, откатившийся клиент, чужой процесс) у ждущего `SharedServer::wait_for_client`/worker-а Auto/лобби Dispatch | `wait_for_client` возвращал `HandshakeFailed`, worker Auto звал `on_error` | автосбросный сигнал поглощается, ожидание продолжается на остаток таймаута; пиру слать такой сигнал безопасно. Multi (`accept_pending`) — без изменений: claim не трогается | §d.2, §i.3 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации

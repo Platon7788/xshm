@@ -52,6 +52,18 @@
 
 ### Исправлено (аудит 16.10.2026)
 
+- **Medium** (находка 21) `SharedServer::wait_for_client` возвращал
+  `HandshakeFailed` на `C2S_CONNECT_REQ` без `CLIENT_HELLO` — любой процесс
+  (или «толчок» клиента Multi, или клиент, откатившийся по таймауту) одним
+  сигналом обрывал ожидание; worker Auto сообщал это в `on_error`. Теперь
+  ложный сигнал поглощается, ожидание (`wait_for_client`,
+  `wait_for_client_or`) продолжается на остаток таймаута. `accept_pending`
+  (Multi) по-прежнему отличает сигнал без заявки и молча его пропускает.
+- **Medium** (находка 22) Ошибка `NtQueryInformationProcess` при
+  определении сессии давала сессию `0`: имя `Local\X` молча уходило в
+  глобальный `\BaseNamedObjects`. Теперь `to_nt_path`/`NtName::new`
+  возвращают `WindowsError { context: "NtQueryInformationProcess(session)" }`.
+
 - **Medium** (находка 23) Наблюдение за пиром шло только по PID: процесс,
   получивший PID умершего пира (или пир, записавший чужой PID), считался
   живым пиром — смерть не замечалась, захват слота Multi не освобождался.

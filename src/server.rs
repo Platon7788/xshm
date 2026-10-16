@@ -1,6 +1,6 @@
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
@@ -10,6 +10,25 @@ use crate::naming::mapping_name;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::{Mapping, ProcessWatch, wait_any};
+
+/// Дедлайн ожидания клиента: повторные ожидания после ложного
+/// `CONNECT_REQ` получают остаток исходного таймаута, а не новый целиком.
+struct Deadline(Option<Instant>);
+
+impl Deadline {
+    /// `None` -- без таймаута; таймаут, не представимый как `Instant`
+    /// (переполнение), -- тоже без таймаута (ждать «вечно» и так).
+    fn new(timeout: Option<Duration>) -> Self {
+        Self(timeout.and_then(|t| Instant::now().checked_add(t)))
+    }
+
+    /// Остаток до дедлайна для очередного ожидания (`None` -- без таймаута).
+    /// Истёкший дедлайн даёт ноль: ожидание вернётся сразу (опрос).
+    fn remaining(&self) -> Option<Duration> {
+        self.0
+            .map(|at| at.saturating_duration_since(Instant::now()))
+    }
+}
 
 #[derive(Debug)]
 pub struct SharedServer {
@@ -127,20 +146,29 @@ impl SharedServer {
             return self.wait_for_client_noevent(timeout);
         };
 
-        if !events.connect_req.wait(timeout)? {
-            return Err(ShmError::Timeout);
+        // Находка 21: `CONNECT_REQ` без `CLIENT_HELLO` (толчок Multi,
+        // клиент, откатившийся по таймауту, чужой процесс) больше не обрывает
+        // ожидание `HandshakeFailed`: автосбросный сигнал поглощён, ждём
+        // дальше остаток таймаута.
+        let deadline = Deadline::new(timeout);
+        loop {
+            if !events.connect_req.wait(deadline.remaining())? {
+                return Err(ShmError::Timeout);
+            }
+            if self.hello_pending() {
+                return self.complete_handshake();
+            }
         }
+    }
 
-        let client_state = self
-            .view
+    /// Клиент выставил заявку (`client_state == CLIENT_HELLO`). Acquire:
+    /// PID/время клиента, записанные до заявки, видны `complete_handshake`.
+    fn hello_pending(&self) -> bool {
+        self.view
             .control_block()
             .client_state
-            .load(Ordering::Acquire);
-        if client_state != HANDSHAKE_CLIENT_HELLO {
-            return Err(ShmError::HandshakeFailed);
-        }
-
-        self.complete_handshake()
+            .load(Ordering::Acquire)
+            == HANDSHAKE_CLIENT_HELLO
     }
 
     /// Ждать клиента ИЛИ стороннее событие `wake` (дескриптор события этого
@@ -160,36 +188,37 @@ impl SharedServer {
                 "anonymous server has no events to wait on",
             ));
         };
-        // CONNECT_REQ первым: при одновременном сигнале клиент важнее.
-        match wait_any(&[events.connect_req.as_handle(), wake], timeout)? {
-            Some(0) => {}
-            _ => return Ok(false),
+        // Находка 21: `CONNECT_REQ` без `CLIENT_HELLO` -- не ошибка и не
+        // повод вернуть управление: сигнал поглощён, ждём остаток таймаута
+        // (как в `wait_for_client`). Наружу выходят только подключение,
+        // `wake`, таймаут и ошибки самого рукопожатия.
+        let deadline = Deadline::new(timeout);
+        loop {
+            // CONNECT_REQ первым: при одновременном сигнале клиент важнее.
+            match wait_any(
+                &[events.connect_req.as_handle(), wake],
+                deadline.remaining(),
+            )? {
+                Some(0) => {}
+                _ => return Ok(false),
+            }
+            if self.hello_pending() {
+                self.complete_handshake()?;
+                return Ok(true);
+            }
         }
-        let client_state = self
-            .view
-            .control_block()
-            .client_state
-            .load(Ordering::Acquire);
-        if client_state != HANDSHAKE_CLIENT_HELLO {
-            return Err(ShmError::HandshakeFailed);
-        }
-        self.complete_handshake()?;
-        Ok(true)
     }
 
     /// Принять клиента, чей `CONNECT_REQ` уже получен вызывающим (Multi ждёт
     /// события сразу всех слотов в одном наборе). `Err(HandshakeFailed)` --
-    /// `client_state` не `CLIENT_HELLO` (сигнал без заявки).
+    /// `client_state` не `CLIENT_HELLO` (сигнал без заявки): здесь ошибка
+    /// остаётся -- ожидания нет, а Multi по ней отличает «толчок»
+    /// (`nudge_stale_claims`) и откат клиента и молча продолжает свой цикл.
     pub(crate) fn accept_pending(&mut self) -> Result<()> {
         if self.connected {
             return Err(ShmError::AlreadyConnected);
         }
-        let client_state = self
-            .view
-            .control_block()
-            .client_state
-            .load(Ordering::Acquire);
-        if client_state != HANDSHAKE_CLIENT_HELLO {
+        if !self.hello_pending() {
             return Err(ShmError::HandshakeFailed);
         }
         self.complete_handshake()
@@ -203,7 +232,7 @@ impl SharedServer {
         }
 
         let control = self.view.control_block();
-        let start = std::time::Instant::now();
+        let start = Instant::now();
 
         loop {
             let client_state = control.client_state.load(Ordering::Acquire);
@@ -671,5 +700,79 @@ mod handshake_tests {
         let mut buf = Vec::new();
         let len = client.receive_from_server(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"bye");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::SharedClient;
+
+    fn unique(tag: &str) -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("XSHM_SRV_{tag}_{}_{}", std::process::id(), ts % 1_000_000)
+    }
+
+    /// Находка 21: `CONNECT_REQ` без `CLIENT_HELLO` (толчок, откатившийся
+    /// клиент, чужой процесс) не обрывает ожидание `HandshakeFailed` --
+    /// сервер дожидается настоящего клиента в пределах таймаута.
+    #[test]
+    fn stray_connect_req_does_not_fail_wait() {
+        let name = unique("STRAY");
+        let mut server = SharedServer::start(&name).unwrap();
+        let waiter = std::thread::spawn(move || {
+            let result = server.wait_for_client(Some(Duration::from_secs(2)));
+            (result, server)
+        });
+        // Даём серверу сесть на `CONNECT_REQ`, затем ложный сигнал без HELLO.
+        std::thread::sleep(Duration::from_millis(30));
+        let events = SharedEvents::open(&name).unwrap();
+        events.connect_req.set().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let client = SharedClient::connect(&name, Duration::from_secs(2)).unwrap();
+        let (result, server) = waiter.join().unwrap();
+        assert_eq!(result, Ok(()));
+        assert!(server.is_connected());
+        assert!(client.is_connected());
+    }
+
+    /// То же для `wait_for_client_or` (worker Auto, лобби Dispatch): ложный
+    /// сигнал не даёт ни ошибки, ни `Ok(false)` -- ожидание продолжается.
+    #[test]
+    fn stray_connect_req_does_not_end_wait_or() {
+        let name = unique("STRAYOR");
+        let mut server = SharedServer::start(&name).unwrap();
+        let waiter = std::thread::spawn(move || {
+            let wake = crate::win::EventHandle::create_unnamed(false).unwrap();
+            let result = server.wait_for_client_or(wake.as_handle(), Some(Duration::from_secs(2)));
+            (result, server)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let events = SharedEvents::open(&name).unwrap();
+        events.connect_req.set().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        let client = SharedClient::connect(&name, Duration::from_secs(2)).unwrap();
+        let (result, server) = waiter.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(server.is_connected());
+        assert!(client.is_connected());
+    }
+
+    /// Ложный сигнал при коротком таймауте: остаток пересчитывается, итог --
+    /// `Timeout`, а не `HandshakeFailed` и не ожидание сверх дедлайна.
+    #[test]
+    fn stray_connect_req_keeps_the_deadline() {
+        let name = unique("STRAYDL");
+        let mut server = SharedServer::start(&name).unwrap();
+        server.events().unwrap().connect_req.set().unwrap();
+        let started = Instant::now();
+        let result = server.wait_for_client(Some(Duration::from_millis(200)));
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err(ShmError::Timeout));
+        assert!(elapsed >= Duration::from_millis(190), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 }

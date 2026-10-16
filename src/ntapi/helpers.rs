@@ -12,37 +12,46 @@ use crate::error::{Result, ShmError};
 // ============================================================================
 
 /// Session id текущего процесса через NtQueryInformationProcess.
-/// При ошибке возвращает 0 (трактуется как глобальный namespace, безопасный
-/// дефолт для служб/сессии 0).
-fn current_session_id() -> u32 {
+///
+/// Находка 22: раньше ошибка запроса молча давала 0, и `Local\` имя
+/// процесса из пользовательской сессии уезжало в ГЛОБАЛЬНЫЙ
+/// `\BaseNamedObjects` -- мимо своего пира и навстречу чужим объектам.
+/// Теперь ошибка возвращается вызывающему.
+fn current_session_id() -> Result<u32> {
     let mut info = PROCESS_SESSION_INFORMATION { SessionId: 0 };
     let mut ret_len: ULONG = 0;
+    // Размер структуры (4 байта) заведомо помещается в ULONG.
+    let info_len = ULONG::try_from(size_of::<PROCESS_SESSION_INFORMATION>()).unwrap_or(4);
     // SAFETY: передаём валидный буфер нужного размера; NT_CURRENT_PROCESS = -1.
     let status = unsafe {
         NtQueryInformationProcess(
             NT_CURRENT_PROCESS,
             PROCESS_SESSION_INFORMATION_CLASS,
             (&raw mut info).cast(),
-            size_of::<PROCESS_SESSION_INFORMATION>() as ULONG,
+            info_len,
             &raw mut ret_len,
         )
     };
     if status == STATUS_SUCCESS {
-        info.SessionId
+        Ok(info.SessionId)
     } else {
-        0
+        Err(ShmError::WindowsError {
+            code: status.cast_unsigned(),
+            context: "NtQueryInformationProcess(session)",
+        })
     }
 }
 
 /// Построить session-local NT путь. В сессии 0 локальный namespace совпадает
-/// с глобальным (\BaseNamedObjects) — как и в Win32.
-fn session_local_path(name: &str) -> String {
-    let sid = current_session_id();
-    if sid == 0 {
+/// с глобальным (\BaseNamedObjects) — как и в Win32. Сессию узнать не
+/// удалось -- ошибка (не подмена глобальным namespace).
+fn session_local_path(name: &str) -> Result<String> {
+    let sid = current_session_id()?;
+    Ok(if sid == 0 {
         format!("\\BaseNamedObjects\\{name}")
     } else {
         format!("\\Sessions\\{sid}\\BaseNamedObjects\\{name}")
-    }
+    })
 }
 
 /// Преобразование Win32 имени в NT путь.
@@ -59,13 +68,16 @@ fn session_local_path(name: &str) -> String {
 /// Для IPC МЕЖДУ сессиями (например, служба в сессии 0 <-> процесс на десктопе)
 /// обе стороны должны явно использовать префикс `Global\` (и иметь
 /// SeCreateGlobalPrivilege для создания глобальных объектов).
-pub fn to_nt_path(name: &str) -> String {
+///
+/// `Err(WindowsError)` -- для session-local имени не удалось узнать сессию
+/// процесса (находка 22).
+pub fn to_nt_path(name: &str) -> Result<String> {
     if let Some(stripped) = name.strip_prefix("Global\\") {
-        format!("\\BaseNamedObjects\\{stripped}")
+        Ok(format!("\\BaseNamedObjects\\{stripped}"))
     } else if let Some(stripped) = name.strip_prefix("Local\\") {
         session_local_path(stripped)
     } else if name.starts_with('\\') {
-        name.to_owned()
+        Ok(name.to_owned())
     } else {
         session_local_path(name)
     }
@@ -105,8 +117,9 @@ impl NtName {
     /// `UNICODE_STRING.Length` (u16) -- раньше это молча заворачивалось
     /// (`as u16`), давая NT укороченную длину при полностью записанном
     /// длинном буфере, т.е. рассинхронизацию Length/Buffer.
+    /// `Err(WindowsError)` -- сессия процесса неизвестна (см. `to_nt_path`).
     pub fn new(name: &str) -> Result<Self> {
-        let nt_path = to_nt_path(name);
+        let nt_path = to_nt_path(name)?;
         let wide = to_wide(&nt_path);
         let units = wide.len() - 1; // без null-терминатора
 
@@ -168,19 +181,44 @@ pub fn duration_to_nt_timeout(duration: std::time::Duration) -> i64 {
 mod tests {
     use super::*;
 
+    /// Находка 22: сессия известна (ошибка больше не маскируется сессией 0)
+    /// и совпадает с независимым повторным запросом.
+    #[test]
+    fn session_id_is_known() {
+        let mut info = PROCESS_SESSION_INFORMATION {
+            SessionId: u32::MAX,
+        };
+        let mut ret_len: ULONG = 0;
+        // SAFETY: валидный буфер нужного размера; NT_CURRENT_PROCESS = -1.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                NT_CURRENT_PROCESS,
+                PROCESS_SESSION_INFORMATION_CLASS,
+                (&raw mut info).cast(),
+                ULONG::try_from(size_of::<PROCESS_SESSION_INFORMATION>()).unwrap(),
+                &raw mut ret_len,
+            )
+        };
+        assert_eq!(status, STATUS_SUCCESS);
+        assert_eq!(current_session_id().unwrap(), info.SessionId);
+    }
+
     #[test]
     fn global_maps_to_base_named_objects() {
-        assert_eq!(to_nt_path("Global\\Foo"), "\\BaseNamedObjects\\Foo");
+        assert_eq!(
+            to_nt_path("Global\\Foo").unwrap(),
+            "\\BaseNamedObjects\\Foo"
+        );
     }
 
     #[test]
     fn raw_nt_path_unchanged() {
-        assert_eq!(to_nt_path("\\Device\\Bar"), "\\Device\\Bar");
+        assert_eq!(to_nt_path("\\Device\\Bar").unwrap(), "\\Device\\Bar");
     }
 
     #[test]
     fn local_is_session_scoped() {
-        let p = to_nt_path("Local\\Foo");
+        let p = to_nt_path("Local\\Foo").unwrap();
         // Либо сессия 0 (глобальный), либо session-local.
         assert!(
             p == "\\BaseNamedObjects\\Foo"
@@ -191,7 +229,10 @@ mod tests {
 
     #[test]
     fn no_prefix_is_session_scoped() {
-        assert_eq!(to_nt_path("Foo"), to_nt_path("Local\\Foo"));
+        assert_eq!(
+            to_nt_path("Foo").unwrap(),
+            to_nt_path("Local\\Foo").unwrap()
+        );
     }
 
     #[test]
