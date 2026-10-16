@@ -323,10 +323,40 @@ impl SharedServer {
     /// `Err(InvalidConfig)` (событий нет; его путь --
     /// `wait_for_client_noevent`).
     ///
-    /// ```ignore
-    /// // tokio -- только пример: крейт от исполнителя не зависит.
+    /// Любой исполнитель (здесь -- минимальный `block_on` на `thread::park`;
+    /// с tokio -- `tokio::time::timeout(d, server.accept_async()).await
+    /// .map_err(|_| ShmError::Timeout)??`, как в README):
+    ///
+    /// ```no_run
+    /// # use std::future::Future;
+    /// # use std::pin::pin;
+    /// # use std::sync::Arc;
+    /// # use std::task::{Context, Poll, Wake, Waker};
+    /// # use std::thread::{self, Thread};
+    /// # struct Unpark(Thread);
+    /// # impl Wake for Unpark {
+    /// #     fn wake(self: Arc<Self>) {
+    /// #         self.0.unpark();
+    /// #     }
+    /// # }
+    /// # /// Минимальный исполнитель: опрос, пока не готово, сон до `wake`.
+    /// # fn block_on<F: Future>(future: F) -> F::Output {
+    /// #     let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    /// #     let mut cx = Context::from_waker(&waker);
+    /// #     let mut future = pin!(future);
+    /// #     loop {
+    /// #         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+    /// #             return value;
+    /// #         }
+    /// #         thread::park();
+    /// #     }
+    /// # }
     /// let mut server = xshm::SharedServer::start("MyChannel")?;
-    /// tokio::time::timeout(Duration::from_secs(5), server.accept_async()).await??;
+    /// block_on(server.accept_async())?;
+    /// let mut buf = Vec::new();
+    /// let len = block_on(server.recv_async(&mut buf))?;
+    /// block_on(server.send_async(&buf[..len]))?;
+    /// # Ok::<(), xshm::ShmError>(())
     /// ```
     pub fn accept_async(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
         AcceptFuture {
@@ -348,6 +378,9 @@ impl SharedServer {
     /// `&mut self`: future -- `Send` (`tokio::spawn`), а приём и отправка
     /// одной стороны одновременно требуют разделения (`Mutex`, задача-
     /// владелец с каналом команд).
+    ///
+    /// Future выполняет операцию на каждом опросе: после `Ready` его не
+    /// опрашивают снова (повторный опрос выполнит ещё одну операцию).
     pub fn recv_async<'a>(
         &'a mut self,
         buf: &'a mut Vec<u8>,
@@ -362,6 +395,9 @@ impl SharedServer {
     /// умерший -- `Err(PeerDied)` (если места так и нет; сервер при этом НЕ
     /// отмечается отключённым -- входящее кольцо дочитывает `recv_async`).
     /// Anonymous-сервер -- `Err(InvalidConfig)`.
+    ///
+    /// Future выполняет операцию на каждом опросе: после `Ready` его не
+    /// опрашивают снова (повторный опрос выполнит ещё одну операцию).
     pub fn send_async<'a>(
         &'a mut self,
         data: &'a [u8],

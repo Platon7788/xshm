@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::asynch::{Endpoint, OP, RecvFuture, SendFuture, WaitSet};
+use crate::asynch::{Endpoint, OP, PEER, RecvFuture, SendFuture, WaitSet};
 use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -276,6 +276,13 @@ impl SharedClient {
     /// `S2C_CONNECT` в реакторе IOCP; подключение засчитывается по смене
     /// `generation`, устаревший сигнал поглощается.
     ///
+    /// Процесс сервера наблюдается (PID и время создания из сегмента, как
+    /// у `ProcessWatch::open_peer`): сервер умер, не ответив, --
+    /// `Err(PeerDied)` с тем же откатом заявки, что у таймаута. Сервер без
+    /// PID (старая версия) или процесс, который не открылся (другая сессия
+    /// без прав), не наблюдается -- тогда границу задаёт только таймаут
+    /// исполнителя.
+    ///
     /// Таймаута нет -- он у исполнителя. Брошенный future отзывает заявку
     /// так же, как синхронный таймаут: CAS `CLIENT_HELLO -> IDLE` и откат
     /// PID/заголовков. Если сервер успел зафиксировать рукопожатие (его CAS
@@ -286,18 +293,47 @@ impl SharedClient {
     /// Ошибки открытия -- как у `connect` (канала нет --
     /// `WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`).
     ///
-    /// ```ignore
-    /// let client = tokio::time::timeout(
-    ///     Duration::from_secs(5),
-    ///     xshm::SharedClient::connect_async("MyChannel"),
-    /// )
-    /// .await??;
+    /// Любой исполнитель (здесь -- минимальный `block_on`; с tokio --
+    /// `tokio::time::timeout(d, SharedClient::connect_async(name)).await
+    /// .map_err(|_| ShmError::Timeout)??`, как в README):
+    ///
+    /// ```no_run
+    /// # use std::future::Future;
+    /// # use std::pin::pin;
+    /// # use std::sync::Arc;
+    /// # use std::task::{Context, Poll, Wake, Waker};
+    /// # use std::thread::{self, Thread};
+    /// # struct Unpark(Thread);
+    /// # impl Wake for Unpark {
+    /// #     fn wake(self: Arc<Self>) {
+    /// #         self.0.unpark();
+    /// #     }
+    /// # }
+    /// # /// Минимальный исполнитель: опрос, пока не готово, сон до `wake`.
+    /// # fn block_on<F: Future>(future: F) -> F::Output {
+    /// #     let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    /// #     let mut cx = Context::from_waker(&waker);
+    /// #     let mut future = pin!(future);
+    /// #     loop {
+    /// #         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+    /// #             return value;
+    /// #         }
+    /// #         thread::park();
+    /// #     }
+    /// # }
+    /// let mut client = block_on(xshm::SharedClient::connect_async("MyChannel"))?;
+    /// block_on(client.send_async(b"ping"))?;
+    /// let mut buf = Vec::new();
+    /// let len = block_on(client.recv_async(&mut buf))?;
+    /// assert!(len > 0);
+    /// # Ok::<(), xshm::ShmError>(())
     /// ```
     pub fn connect_async(name: &str) -> impl Future<Output = Result<Self>> + Send + 'static {
         ConnectFuture {
             name: name.to_owned(),
             hello: None,
             started: false,
+            server: None,
             waits: WaitSet::default(),
         }
     }
@@ -306,6 +342,9 @@ impl SharedClient {
     /// `SharedServer::recv_async`): отключение сервера -- `Err(NotConnected)`,
     /// смерть его процесса -- `Err(PeerDied)`, обе -- после дочитанного
     /// кольца, затем клиент отмечен неподключённым.
+    ///
+    /// Future выполняет операцию на каждом опросе: после `Ready` его не
+    /// опрашивают снова (повторный опрос выполнит ещё одну операцию).
     pub fn recv_async<'a>(
         &'a mut self,
         buf: &'a mut Vec<u8>,
@@ -315,6 +354,9 @@ impl SharedClient {
 
     /// Отправить сообщение серверу асинхронно без перезаписи (0.10;
     /// семантика -- `SharedServer::send_async`).
+    ///
+    /// Future выполняет операцию на каждом опросе: после `Ready` его не
+    /// опрашивают снова (повторный опрос выполнит ещё одну операцию).
     pub fn send_async<'a>(
         &'a mut self,
         data: &'a [u8],
@@ -463,6 +505,12 @@ struct ConnectFuture {
     hello: Option<Hello>,
     /// Первый опрос уже был (заявка выставлялась).
     started: bool,
+    /// Процесс сервера (PID и время создания из `ControlBlock`): его смерть
+    /// во время рукопожатия -- `Err(PeerDied)`. `None` -- сервер старой
+    /// версии без PID или процесс не открылся (другая сессия без прав):
+    /// тогда, как у синхронного `connect`, границу задаёт только таймаут
+    /// (у async -- таймаут исполнителя).
+    server: Option<ProcessWatch>,
     waits: WaitSet,
 }
 
@@ -483,24 +531,43 @@ impl ConnectFuture {
                     Err(err)
                 });
             }
+            let control = hello.view.control_block();
+            self.server = ProcessWatch::open_peer(
+                control.server_pid.load(Ordering::Acquire),
+                control.server_start_time(),
+            );
             self.hello = Some(hello);
         }
         let Some(hello) = self.hello.as_ref() else {
             // Повторный опрос завершённого future.
             return Poll::Ready(Err(ShmError::NotReady));
         };
+        let fired = self.waits.harvest(waker);
         // Как `wait_ack`: подтверждение -- только `S2C_CONNECT` со сменой
         // `generation`; сигнал без смены -- устаревший, поглощён.
-        if self.waits.harvest(waker)[OP] && hello.accepted() {
+        if fired[OP] && hello.accepted() {
             return match self.hello.take() {
                 Some(hello) => Poll::Ready(Ok(hello.finish())),
                 None => Poll::Ready(Err(ShmError::NotReady)),
             };
         }
-        match self
+        if fired[PEER] {
+            // Сервер умер, не ответив: откат, как у синхронного таймаута
+            // (CAS `CLIENT_HELLO -> IDLE`). Отзыв проиграл -- сервер успел
+            // зафиксировать рукопожатие: подключены, смерть увидит приём.
+            return Poll::Ready(match self.hello.take() {
+                Some(hello) if hello.withdraw() => Ok(hello.finish()),
+                _ => Err(ShmError::PeerDied),
+            });
+        }
+        let registered = self
             .waits
             .ensure_handle(OP, hello.events.connect_ack.as_handle(), waker)
-        {
+            .and_then(|()| match self.server.as_ref() {
+                Some(server) => self.waits.ensure_handle(PEER, server.as_handle(), waker),
+                None => Ok(()),
+            });
+        match registered {
             Ok(()) => Poll::Pending,
             Err(err) => {
                 // Ждать нельзя -- заявку отзываем, как при ошибке ожидания.

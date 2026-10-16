@@ -3,12 +3,17 @@
 //!
 //! Исполнитель -- свой минимальный `block_on` (`Wake` + `thread::park`):
 //! крейт исполнитель-агностичен, tokio не нужен даже в dev-зависимостях.
+//! Future досыпают только до пробуждения реактора (`thread::park` без
+//! таймаута, никаких переопросов по времени); общий предел ожидания держит
+//! сторожевой поток (`Watchdog`), который роняет процесс тестов, -- так
+//! потерянное пробуждение проваливает тест, а не маскируется переопросом.
 
 use std::future::Future;
 use std::pin::{Pin, pin};
 use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
@@ -59,25 +64,47 @@ fn unpark_waker() -> (Arc<Unpark>, Waker) {
     (state, waker)
 }
 
-/// Выполнить future до готовности на текущем потоке; вернуть результат и
-/// число вызовов `poll`. Паника, если не готово за `DEADLINE`.
-fn block_on_counted<F: Future>(future: F) -> (F::Output, usize) {
-    let (_state, waker) = unpark_waker();
-    let mut cx = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    let deadline = Instant::now() + DEADLINE;
+/// Сторож общего предела: не снят за `DEADLINE` -- сообщение и `abort`
+/// процесса тестов (паника в чужом потоке тест не провалила бы). `Drop`
+/// (в т.ч. при панике теста) снимает сторожа.
+struct Watchdog {
+    _cancel: mpsc::Sender<()>,
+}
+
+impl Watchdog {
+    fn arm(what: &'static str) -> Self {
+        let (cancel, cancelled) = mpsc::channel::<()>();
+        thread::spawn(move || {
+            if cancelled.recv_timeout(DEADLINE) == Err(RecvTimeoutError::Timeout) {
+                eprintln!("watchdog: {what} не готов за {DEADLINE:?} -- потерянное пробуждение?");
+                std::process::abort();
+            }
+        });
+        Self { _cancel: cancel }
+    }
+}
+
+/// Опрашивать future с `waker` до готовности, засыпая только до его
+/// пробуждения (`thread::park` без таймаута; ложный возврат `park`
+/// безвреден). Вернуть результат и число опросов.
+fn drive<F: Future>(mut future: Pin<&mut F>, waker: &Waker) -> (F::Output, usize) {
+    let _watchdog = Watchdog::arm("future");
+    let mut cx = Context::from_waker(waker);
     let mut polls = 0;
     loop {
         polls += 1;
         if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
             return (value, polls);
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        assert!(!left.is_zero(), "future не готов за {DEADLINE:?}");
-        // Парковка с таймаутом: потерянное пробуждение -- провал по
-        // дедлайну, а не зависание прогона. Ложный возврат `park` безвреден.
-        thread::park_timeout(left);
+        thread::park();
     }
+}
+
+/// Выполнить future до готовности на текущем потоке; вернуть результат и
+/// число вызовов `poll`.
+fn block_on_counted<F: Future>(future: F) -> (F::Output, usize) {
+    let (_state, waker) = unpark_waker();
+    drive(pin!(future), &waker)
 }
 
 fn block_on<F: Future>(future: F) -> F::Output {
@@ -114,13 +141,28 @@ const fn assert_send<T: Send>(_: &T) {}
 
 // ─── дочерний процесс ───────────────────────────────────────────────────────
 
-/// Точка входа дочернего процесса. Без переменной окружения -- no-op.
+/// Точка входа дочернего процесса (`режим|имя`). Без переменной окружения
+/// -- no-op. Режимы: `client` -- подключиться и жить; `client_send` --
+/// подключиться, отправить `last-words` и жить; `server` -- поднять сервер и
+/// жить, не принимая клиентов.
 #[test]
 fn child_entry() {
-    let Ok(name) = std::env::var(CHILD_ENV) else {
+    let Ok(spec) = std::env::var(CHILD_ENV) else {
         return;
     };
-    let _client = SharedClient::connect(&name, DEADLINE).unwrap();
+    let (mode, name) = spec.split_once('|').unwrap();
+    let mut _server = None;
+    let mut _client = None;
+    match mode {
+        "client" => _client = Some(SharedClient::connect(name, DEADLINE).unwrap()),
+        "client_send" => {
+            let client = SharedClient::connect(name, DEADLINE).unwrap();
+            client.try_send_to_server(b"last-words").unwrap();
+            _client = Some(client);
+        }
+        "server" => _server = Some(SharedServer::start(name).unwrap()),
+        other => panic!("неизвестный режим {other}"),
+    }
     // Живёт, пока его не убьют (потолок -- если родитель упал сам).
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
@@ -137,10 +179,10 @@ impl Peer {
         clippy::unwrap_used,
         reason = "тестовый помощник: паника -- провал теста"
     )]
-    fn spawn(name: &str) -> Self {
+    fn spawn(mode: &str, name: &str) -> Self {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "child_entry", "--nocapture", "--test-threads=1"])
-            .env(CHILD_ENV, name)
+            .env(CHILD_ENV, format!("{mode}|{name}"))
             .spawn()
             .expect("spawn child");
         Self(child)
@@ -217,15 +259,8 @@ fn async_send_waits_for_space() {
         }
         client
     });
-    let deadline = Instant::now() + DEADLINE;
-    loop {
-        if let Poll::Ready(result) = poll_once(future.as_mut(), &waker) {
-            result.unwrap();
-            break;
-        }
-        assert!(Instant::now() < deadline, "send_async не дождался места");
-        thread::park_timeout(Duration::from_millis(500));
-    }
+    // Только пробуждение реактора: потерянный SPACE -- провал по сторожу.
+    drive(future.as_mut(), &waker).0.unwrap();
     assert!(state.wakes.load(Ordering::SeqCst) >= 1, "разбудил SPACE");
     drop(reader.join().unwrap());
 }
@@ -257,7 +292,7 @@ fn async_recv_sees_disconnect() {
 fn async_recv_sees_peer_death() {
     let name = unique_name("DEATH");
     let mut server = SharedServer::start(&name).unwrap();
-    let mut peer = Peer::spawn(&name);
+    let mut peer = Peer::spawn("client", &name);
     block_on(server.accept_async()).unwrap();
     assert_eq!(server.peer_pid(), Some(peer.0.id()));
 
@@ -266,15 +301,135 @@ fn async_recv_sees_peer_death() {
     let mut future = pin!(server.recv_async(&mut buf));
     assert!(poll_once(future.as_mut(), &waker).is_pending());
     peer.0.kill().unwrap();
-    let deadline = Instant::now() + DEADLINE;
-    let result = loop {
-        if let Poll::Ready(result) = poll_once(future.as_mut(), &waker) {
-            break result;
+    // Только пробуждение реактора по процессу пира.
+    assert_eq!(drive(future.as_mut(), &waker).0, Err(ShmError::PeerDied));
+}
+
+/// Данные, записанные пиром до смерти, `recv_async` отдаёт раньше
+/// `Err(PeerDied)` («сначала дочитать кольцо»).
+#[test]
+fn async_recv_drains_before_peer_death() {
+    let name = unique_name("DRAIN");
+    let mut server = SharedServer::start(&name).unwrap();
+    let mut peer = Peer::spawn("client_send", &name);
+    block_on(server.accept_async()).unwrap();
+    // Сообщение в кольце (по позициям; сигнал DATA не важен).
+    wait_until("клиент записал сообщение", || {
+        server.poll_client(Some(Duration::ZERO)).unwrap_or(false)
+    });
+    peer.0.kill().unwrap();
+    peer.0.wait().unwrap();
+    let mut buf = Vec::new();
+    let len = block_on(server.recv_async(&mut buf)).unwrap();
+    assert_eq!(&buf[..len], b"last-words");
+    assert_eq!(
+        block_on(server.recv_async(&mut buf)),
+        Err(ShmError::PeerDied)
+    );
+    assert!(!server.is_connected());
+}
+
+/// Заполнить кольцо сервер -> клиент сообщениями `payload`.
+fn fill_to_client(server: &SharedServer, payload: &[u8]) {
+    let mut sent = 0usize;
+    while server.try_send_to_client(payload).is_ok() {
+        sent += 1;
+    }
+    assert!(sent > 0);
+}
+
+/// Ожидающий места `send_async`: клиент ушёл штатно -- `Err(NotConnected)`.
+#[test]
+fn async_send_sees_disconnect() {
+    let name = unique_name("SENDDISC");
+    let config = ChannelConfig::default().layout(ChannelLayout::symmetric(RingConfig::new(4096)));
+    let (mut server, client) = connected_pair(&name, &config);
+    let payload = [3u8; 1000];
+    fill_to_client(&server, &payload);
+    let (_state, waker) = unpark_waker();
+    let mut future = pin!(server.send_async(&payload));
+    assert!(poll_once(future.as_mut(), &waker).is_pending(), "места нет");
+    let leaver = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(100));
+        drop(client); // IDLE -> DISCONNECT, кольцо не читано
+    });
+    assert_eq!(
+        drive(future.as_mut(), &waker).0,
+        Err(ShmError::NotConnected)
+    );
+    leaver.join().unwrap();
+}
+
+/// Ожидающий места `send_async`: процесс клиента убит -- `Err(PeerDied)`.
+#[test]
+fn async_send_sees_peer_death() {
+    let name = unique_name("SENDDEATH");
+    let config = ChannelConfig::default().layout(ChannelLayout::symmetric(RingConfig::new(4096)));
+    let mut server = SharedServer::start_with(&name, &config).unwrap();
+    let mut peer = Peer::spawn("client", &name);
+    block_on(server.accept_async()).unwrap();
+    let payload = [5u8; 1000];
+    fill_to_client(&server, &payload);
+    let (_state, waker) = unpark_waker();
+    let mut future = pin!(server.send_async(&payload));
+    assert!(poll_once(future.as_mut(), &waker).is_pending(), "места нет");
+    peer.0.kill().unwrap();
+    assert_eq!(drive(future.as_mut(), &waker).0, Err(ShmError::PeerDied));
+}
+
+/// Сервер умер посреди рукопожатия (заявка выставлена, ответа нет):
+/// `connect_async` -- `Err(PeerDied)`, а не вечное ожидание.
+#[test]
+fn async_connect_sees_server_death() {
+    let name = unique_name("CONNDEATH");
+    let mut peer = Peer::spawn("server", &name);
+    let (_state, waker) = unpark_waker();
+    // Сервер поднимается в дочернем процессе: пока его нет -- открытие
+    // секции/событий отказывает, пробуем снова.
+    let started = Instant::now();
+    let mut future = loop {
+        let mut future = Box::pin(SharedClient::connect_async(&name));
+        match poll_once(future.as_mut(), &waker) {
+            Poll::Pending => break future,
+            Poll::Ready(Ok(_)) => panic!("сервер не принимает клиентов"),
+            Poll::Ready(Err(_)) => {
+                assert!(started.elapsed() < DEADLINE, "сервер не поднялся");
+                thread::sleep(Duration::from_millis(20));
+            }
         }
-        assert!(Instant::now() < deadline, "смерть пира не замечена");
-        thread::park_timeout(Duration::from_millis(500));
     };
-    assert_eq!(result, Err(ShmError::PeerDied));
+    peer.0.kill().unwrap();
+    assert_eq!(
+        drive(future.as_mut(), &waker).0.err(),
+        Some(ShmError::PeerDied)
+    );
+}
+
+/// Смена `Waker` между опросами (регистрации живут между опросами, им
+/// только обновляется `Waker`): срабатывание будит последний, а не первый.
+#[test]
+fn rewake_uses_latest_waker() {
+    let name = unique_name("REWAKE");
+    let (mut server, client) = connected_pair(&name, &ChannelConfig::default());
+    let (state_a, waker_a) = unpark_waker();
+    let (state_b, waker_b) = unpark_waker();
+    let mut buf = Vec::new();
+    let len = {
+        let mut future = pin!(server.recv_async(&mut buf));
+        assert!(poll_once(future.as_mut(), &waker_a).is_pending());
+        assert!(poll_once(future.as_mut(), &waker_b).is_pending());
+        client.try_send_to_server(b"to-b").unwrap();
+        wait_until("DATA разбудил waker B", || {
+            state_b.wakes.load(Ordering::SeqCst) >= 1
+        });
+        assert_eq!(
+            state_a.wakes.load(Ordering::SeqCst),
+            0,
+            "разбужен прежний waker"
+        );
+        drive(future.as_mut(), &waker_b).0.unwrap()
+    };
+    assert_eq!(&buf[..len], b"to-b");
 }
 
 /// Брошенный future снимает свои регистрации: данные, пришедшие после
