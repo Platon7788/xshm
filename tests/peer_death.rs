@@ -109,11 +109,7 @@ fn child_entry() {
         "dispatch_client" | "dispatch_client_graceful" => {
             let client = DispatchClient::connect(
                 name,
-                ClientRegistration {
-                    pid: std::process::id(),
-                    revision: 1,
-                    name: "peer-death-child".into(),
-                },
+                ClientRegistration::new(std::process::id(), 1, "peer-death-child"),
                 Arc::new(Noop),
                 DispatchClientOptions::default(),
             )
@@ -496,11 +492,7 @@ fn dispatch_client_sees_server_death() {
     wait_until("child lobby", Duration::from_secs(20), || {
         client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "peer-death-parent".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "peer-death-parent"),
             rec.clone(),
             DispatchClientOptions {
                 lobby_timeout: Duration::from_millis(300),

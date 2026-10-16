@@ -79,11 +79,33 @@ pub fn encode_request(req: &RegistrationRequest) -> Vec<u8> {
     buf
 }
 
+/// Строгий разбор хвоста сообщения -- имени длины `len` (0.10).
+///
+/// Хвост обязан состоять ровно из имени: `len > max`, байты после имени и
+/// невалидный UTF-8 -- `Corrupted` (раньше лишнее молча отбрасывалось, а
+/// битый UTF-8 заменялся на U+FFFD); байтов меньше `len` -- `MessageTooSmall`.
+fn strict_name(rest: &[u8], len: u8, max: usize) -> Result<String> {
+    let len = usize::from(len);
+    if len > max {
+        return Err(ShmError::Corrupted);
+    }
+    let (name, tail) = rest
+        .split_at_checked(len)
+        .ok_or(ShmError::MessageTooSmall)?;
+    if !tail.is_empty() {
+        return Err(ShmError::Corrupted);
+    }
+    std::str::from_utf8(name)
+        .map(str::to_owned)
+        .map_err(|_| ShmError::Corrupted)
+}
+
 /// Декодирует запрос регистрации из байтов.
 ///
 /// Данные приходят от пира: длины проверяются типом (`split_first_chunk`,
-/// `get`), а не индексами -- короткий или испорченный буфер даёт ошибку,
-/// а не панику.
+/// `split_at_checked`), а не индексами -- короткий или испорченный буфер
+/// даёт ошибку, а не панику. Декодер строгий (0.10, `strict_name`): сервер
+/// отвечает на любую ошибку разбора `STATUS_REJECTED`.
 pub fn decode_request(data: &[u8]) -> Result<RegistrationRequest> {
     let Some((header, rest)) = data.split_first_chunk::<13>() else {
         return Err(ShmError::MessageTooSmall);
@@ -116,10 +138,7 @@ pub fn decode_request(data: &[u8]) -> Result<RegistrationRequest> {
 
     let pid = u32::from_le_bytes([p0, p1, p2, p3]);
     let revision = u16::from_le_bytes([r0, r1]);
-    let name = rest
-        .get(..usize::from(name_len))
-        .ok_or(ShmError::MessageTooSmall)?;
-    let name = String::from_utf8_lossy(name).into_owned();
+    let name = strict_name(rest, name_len, MAX_NAME_LEN)?;
 
     Ok(RegistrationRequest {
         pid,
@@ -170,7 +189,7 @@ pub fn encode_response(resp: &RegistrationResponse) -> Vec<u8> {
 
 /// Декодирует ответ регистрации из байтов.
 ///
-/// Разбор без индексов -- как в [`decode_request`].
+/// Разбор без индексов и так же строго, как в [`decode_request`].
 pub fn decode_response(data: &[u8]) -> Result<RegistrationResponse> {
     let Some((header, rest)) = data.split_first_chunk::<12>() else {
         return Err(ShmError::MessageTooSmall);
@@ -201,10 +220,7 @@ pub fn decode_response(data: &[u8]) -> Result<RegistrationResponse> {
     }
 
     let client_id = u32::from_le_bytes([c0, c1, c2, c3]);
-    let channel_name = rest
-        .get(..usize::from(name_len))
-        .ok_or(ShmError::MessageTooSmall)?;
-    let channel_name = String::from_utf8_lossy(channel_name).into_owned();
+    let channel_name = strict_name(rest, name_len, MAX_CHANNEL_NAME_LEN)?;
 
     Ok(RegistrationResponse {
         status,
@@ -275,6 +291,68 @@ mod tests {
             decoded.name
         );
         assert_eq!(decoded.name, "Ж".repeat(32));
+    }
+
+    /// Заголовок запроса с заданным `name_len` и произвольным хвостом.
+    fn raw_request(name_len: u8, tail: &[u8]) -> Vec<u8> {
+        let mut buf = encode_request(&RegistrationRequest {
+            pid: 7,
+            revision: 1,
+            name: String::new(),
+        });
+        buf[12] = name_len;
+        buf.extend_from_slice(tail);
+        buf
+    }
+
+    /// Ответ с заданным `channel_name_len` и произвольным хвостом.
+    fn raw_response(name_len: u8, tail: &[u8]) -> Vec<u8> {
+        let mut buf = encode_response(&RegistrationResponse {
+            status: STATUS_OK,
+            client_id: 1,
+            channel_name: String::new(),
+        });
+        buf[11] = name_len;
+        buf.extend_from_slice(tail);
+        buf
+    }
+
+    /// Строгий декодер (0.10): `name_len` больше 64 -- мусор, даже если
+    /// байтов в буфере хватает.
+    #[test]
+    fn decode_rejects_oversized_name() {
+        let data = raw_request(65, &[b'A'; 65]);
+        assert!(matches!(decode_request(&data), Err(ShmError::Corrupted)));
+        let resp = raw_response(65, &[b'A'; 65]);
+        assert!(matches!(decode_response(&resp), Err(ShmError::Corrupted)));
+    }
+
+    /// Хвостовые байты после имени -- мусор, а не «лишнее, проигнорируем».
+    #[test]
+    fn decode_rejects_trailing_bytes() {
+        let data = raw_request(3, b"abcX");
+        assert!(matches!(decode_request(&data), Err(ShmError::Corrupted)));
+        let resp = raw_response(4, b"chan\0");
+        assert!(matches!(decode_response(&resp), Err(ShmError::Corrupted)));
+    }
+
+    /// Невалидный UTF-8 -- `Corrupted`, а не молчаливая замена на U+FFFD.
+    #[test]
+    fn decode_rejects_invalid_utf8() {
+        let data = raw_request(2, &[0xC3, 0x28]);
+        assert!(matches!(decode_request(&data), Err(ShmError::Corrupted)));
+        let resp = raw_response(1, &[0xFF]);
+        assert!(matches!(decode_response(&resp), Err(ShmError::Corrupted)));
+    }
+
+    /// Короткое имя (байтов меньше `name_len`) -- по-прежнему `MessageTooSmall`.
+    #[test]
+    fn decode_short_name_is_too_small() {
+        let data = raw_request(5, b"ab");
+        assert!(matches!(
+            decode_request(&data),
+            Err(ShmError::MessageTooSmall)
+        ));
     }
 
     #[test]

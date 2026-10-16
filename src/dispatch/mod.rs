@@ -47,11 +47,38 @@ pub use protocol::{RegistrationRequest, RegistrationResponse};
 // ─── Public types ────────────────────────────────────────────────────────────
 
 /// Данные регистрации клиента, полученные во время handshake в лобби.
-#[derive(Debug, Clone)]
+///
+/// Клиент заполняет `pid`/`revision`/`name` (обычно через
+/// [`ClientRegistration::new`]); `handshake_pid` -- поле сервера.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClientRegistration {
+    /// PID, который клиент **заявил** в запросе регистрации (не проверяется).
     pub pid: u32,
     pub revision: u16,
     pub name: String,
+    /// PID процесса, проведшего рукопожатие с лобби (0.10): взят сервером из
+    /// сегмента лобби и сверен по времени создания процесса
+    /// (`ProcessWatch::open_peer`), в отличие от заявленного `pid`. `None` --
+    /// пир PID не сообщил (старая версия), процесс не открылся (нет прав) или
+    /// время создания не совпало. Тот же PID обязан провести рукопожатие
+    /// выделенного канала, иначе канал закрывается до `on_client_connect`
+    /// (`on_error(Some(id), HandshakeFailed)`). `DispatchClient::connect`
+    /// поле игнорирует -- в запрос оно не попадает.
+    pub handshake_pid: Option<u32>,
+}
+
+impl ClientRegistration {
+    /// Регистрация клиента: заявленный PID, ревизия, имя (`handshake_pid` --
+    /// `None`, его заполняет сервер).
+    #[must_use]
+    pub fn new(pid: u32, revision: u16, name: impl Into<String>) -> Self {
+        Self {
+            pid,
+            revision,
+            name: name.into(),
+            handshake_pid: None,
+        }
+    }
 }
 
 /// Решение сервера по зарегистрировавшемуся клиенту
@@ -750,6 +777,15 @@ impl DispatchCore {
                         // (`client_state` -- CAS: HELLO следующего клиента,
                         // вошедшего по мьютексу лобби, не затирается).
                         lobby_server.mark_disconnected();
+                        // 0.10: сессия лобби закрыта -- `DISCONNECT` после
+                        // `IDLE` (R14). Клиент, ждущий ответа, просыпается
+                        // сразу, если ответа не будет (таймаут чтения, ошибка,
+                        // остановка); ответ, если он есть, уже в кольце, и
+                        // клиент читает его первым. Следующему клиенту сигнал
+                        // не мешает: `complete_handshake` сбрасывает его.
+                        if let Some(events) = lobby_server.events() {
+                            let _ = events.disconnect.set();
+                        }
                     }
                     Ok(false) => continue,
                     Err(ShmError::AlreadyConnected) => {
@@ -819,7 +855,10 @@ impl DispatchCore {
                 Ok(len) => match protocol::decode_request(&buffer[..len]) {
                     Ok(req) => break req,
                     Err(err) => {
+                        // 0.10: мусор получает явный отказ -- клиент не ждёт
+                        // свой `response_timeout` в тишине.
                         self.handler.on_error(None, err);
+                        self.reject(lobby);
                         return;
                     }
                 },
@@ -858,6 +897,9 @@ impl DispatchCore {
             pid: request.pid,
             revision: request.revision,
             name: request.name,
+            // PID из рукопожатия лобби (сверен по времени создания процесса),
+            // а не заявленный в запросе.
+            handshake_pid: lobby.peer_pid(),
         };
 
         // Лимит и допуск -- ДО создания канала: отказ ничего не стоит.
@@ -877,6 +919,12 @@ impl DispatchCore {
                 return;
             }
         };
+        // `admit` -- код обработчика, мог идти долго: остановленный за это
+        // время сервер канал не создаёт и не отвечает (лобби уходит с
+        // `DISCONNECT`, клиент узнаёт об этом сразу -- `lobby_register`).
+        if !self.running.load(Ordering::Acquire) {
+            return;
+        }
 
         // Relaxed: уникальный счётчик, ничего не публикует.
         let client_id = self.next_client_id.fetch_add(1, Ordering::Relaxed);
@@ -1062,6 +1110,15 @@ fn retire(
 
 // ─── AutoProxyHandler — bridges AutoServer events to DispatchHandler ─────────
 
+/// Провёл ли рукопожатие канала тот же процесс, что и рукопожатие лобби
+/// (0.10). PID лобби неизвестен (пир старой версии, нет прав, время
+/// создания не сошлось) -- сверять не с чем, канал принимается, как до 0.10.
+/// Известен -- канал обязан провести процесс с тем же PID (тоже сверенным по
+/// времени создания); канал без PID при известном PID лобби -- чужой.
+fn channel_peer_matches(lobby: Option<u32>, channel: Option<u32>) -> bool {
+    lobby.is_none_or(|pid| channel == Some(pid))
+}
+
 struct AutoProxyHandler {
     client_id: u32,
     info: ClientRegistration,
@@ -1110,6 +1167,34 @@ impl AutoHandler for AutoProxyHandler {
             let Some(server) = self.slot.lock_clean().take() else {
                 return;
             };
+            // 0.10: канал обязан подключить тот же процесс, что прошёл
+            // лобби. Имя канала секретно, но любой, кто его узнал (или
+            // занял канал раньше клиента), иначе получил бы чужую
+            // регистрацию. Чужой канал закрывается ДО `on_client_connect`;
+            // закрытие -- через поток закрытия под логом карты (как в
+            // `on_disconnect_reason`: `stop()` его дождётся), колбэк -- уже
+            // без лога.
+            if !channel_peer_matches(self.info.handshake_pid, server.peer_pid()) {
+                self.disconnected.store(true, Ordering::Release);
+                retire(
+                    &self.background,
+                    &self.clients,
+                    &self.handler,
+                    self.client_id,
+                    DispatchedClient {
+                        server,
+                        info: self.info.clone(),
+                        channel_name: self.channel_name.clone(),
+                        disconnected: Arc::clone(&self.disconnected),
+                    },
+                );
+                drop(clients);
+                // Поток ожидания больше не нужен: слот пуст.
+                let _ = self.registered_event.set();
+                self.handler
+                    .on_error(Some(self.client_id), ShmError::HandshakeFailed);
+                return;
+            }
             clients.insert(
                 self.client_id,
                 DispatchedClient {
@@ -1460,9 +1545,13 @@ fn lobby_register(
     // Сигналим серверу о наличии данных через событие
     let _ = client.events().c2s.data.set();
 
-    // Ожидаем ответ через событие s2c.data (по событию, без опроса)
+    // Ожидаем ответ по событиям, без опроса: `[S2C_DATA, S2C_DISCONNECT,
+    // процесс сервера]` (0.10). Сервер, ушедший без ответа (остановка,
+    // ошибка, смерть процесса), будит сразу, а не через `response_timeout`.
     let events = client.events();
     let start = std::time::Instant::now();
+    // Сервер ушёл: ещё одно чтение (ответ мог лечь до ухода) -- и эта ошибка.
+    let mut gone: Option<ShmError> = None;
     loop {
         let remaining = options.response_timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
@@ -1481,10 +1570,25 @@ fn lobby_register(
                 return Ok((response.client_id, response.channel_name));
             }
             Err(ShmError::QueueEmpty) => {
-                // Блокируемся на событии — просыпаемся, когда сервер запишет
-                // ответ (или истечёт дедлайн).
-                let _ = events.s2c.data.wait(Some(remaining));
-                continue;
+                if let Some(err) = gone {
+                    return Err(err);
+                }
+                // Хвост массива -- заполнитель, в ожидание уходит `[..count]`.
+                let data = events.s2c.data.as_handle();
+                let mut handles = [data, events.disconnect.as_handle(), data];
+                let count = match client.peer_wait_handle() {
+                    Some(peer) => {
+                        handles[2] = peer;
+                        3
+                    }
+                    None => 2,
+                };
+                match win::wait_any(&handles[..count], Some(remaining))? {
+                    // `DISCONNECT` устаревший (сессия жива) -- поглощён, ждём дальше.
+                    Some(1) if client.server_left() => gone = Some(ShmError::NotConnected),
+                    Some(2) => gone = Some(ShmError::PeerDied),
+                    _ => {}
+                }
             }
             Err(err) => return Err(err),
         }
@@ -1649,11 +1753,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let registration = ClientRegistration {
-            pid: 12345,
-            revision: 1,
-            name: "test.exe".into(),
-        };
+        let registration = ClientRegistration::new(12345, 1, "test.exe");
 
         let client = DispatchClient::connect(
             &name,
@@ -1707,11 +1807,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let registration = ClientRegistration {
-            pid: 99999,
-            revision: 1,
-            name: "dc_test.exe".into(),
-        };
+        let registration = ClientRegistration::new(99999, 1, "dc_test.exe");
 
         let client = DispatchClient::connect(
             &name,
@@ -1758,11 +1854,7 @@ mod tests {
         let mut clients = Vec::new();
         for i in 0..3u32 {
             let handler = Arc::new(TestClientHandler::new());
-            let reg = ClientRegistration {
-                pid: 1000 + i,
-                revision: 1,
-                name: format!("client_{i}.exe"),
-            };
+            let reg = ClientRegistration::new(1000 + i, 1, format!("client_{i}.exe"));
             let client = DispatchClient::connect(
                 &name,
                 reg,
@@ -1828,11 +1920,7 @@ mod tests {
         thread::sleep(Duration::from_millis(100));
 
         let client_handler = Arc::new(TestClientHandler::new());
-        let registration = ClientRegistration {
-            pid: 55555,
-            revision: 1,
-            name: "deadlock_test.exe".into(),
-        };
+        let registration = ClientRegistration::new(55555, 1, "deadlock_test.exe");
         let client = DispatchClient::connect(
             &name,
             registration,
@@ -1886,11 +1974,7 @@ mod tests {
         // Клиент A: только lobby-регистрация, БЕЗ подключения к выделенному
         // каналу -- симулирует зависшего/медленного клиента.
         let mut buffer = Vec::new();
-        let reg_a = ClientRegistration {
-            pid: 111,
-            revision: 1,
-            name: "stalled.exe".into(),
-        };
+        let reg_a = ClientRegistration::new(111, 1, "stalled.exe");
         let (_id_a, _channel_a) = lobby_register(
             &name,
             &reg_a,
@@ -1904,11 +1988,7 @@ mod tests {
         // Клиент B: полноценное подключение сразу после A.
         let start = std::time::Instant::now();
         let client_handler_b = Arc::new(TestClientHandler::new());
-        let reg_b = ClientRegistration {
-            pid: 222,
-            revision: 1,
-            name: "prompt.exe".into(),
-        };
+        let reg_b = ClientRegistration::new(222, 1, "prompt.exe");
         let client_b = DispatchClient::connect(
             &name,
             reg_b,
@@ -1979,11 +2059,7 @@ mod tests {
         let client_handler = Arc::new(TestClientHandler::new());
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "cflag.exe".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "cflag.exe"),
             client_handler,
             DispatchClientOptions::default(),
         )
@@ -2057,11 +2133,7 @@ mod tests {
         let handler = Arc::new(TestClientHandler::new());
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "ns".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "ns"),
             handler.clone(),
             DispatchClientOptions::default(),
         )
@@ -2124,11 +2196,7 @@ mod tests {
                     let me = format!("client-{i}");
                     let client = DispatchClient::connect(
                         &name,
-                        ClientRegistration {
-                            pid: std::process::id(),
-                            revision: 1,
-                            name: me.clone(),
-                        },
+                        ClientRegistration::new(std::process::id(), 1, me.clone()),
                         Arc::new(TestClientHandler::new()),
                         DispatchClientOptions::default(),
                     )
@@ -2190,11 +2258,7 @@ mod tests {
         let client_h = Arc::new(TestClientHandler::new());
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "idle".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "idle"),
             client_h.clone(),
             DispatchClientOptions::default(),
         )
@@ -2319,11 +2383,7 @@ mod tests {
             let client = Arc::new(
                 DispatchClient::connect(
                     &name,
-                    ClientRegistration {
-                        pid: std::process::id(),
-                        revision: 1,
-                        name: format!("eager_{i}"),
-                    },
+                    ClientRegistration::new(std::process::id(), 1, format!("eager_{i}")),
                     client_handler.clone(),
                     DispatchClientOptions::default(),
                 )
@@ -2394,11 +2454,7 @@ mod tests {
         });
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "panicky".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "panicky"),
             client_handler.clone(),
             DispatchClientOptions::default(),
         )
@@ -2468,11 +2524,7 @@ mod tests {
         });
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "stop_on_error".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "stop_on_error"),
             client_handler.clone(),
             DispatchClientOptions::default(),
         )
@@ -2519,11 +2571,7 @@ mod tests {
         drop(
             lobby_register(
                 &name,
-                &ClientRegistration {
-                    pid: 1,
-                    revision: 1,
-                    name: "stalled".into(),
-                },
+                &ClientRegistration::new(1, 1, "stalled"),
                 &DispatchClientOptions::default(),
                 &mut buffer,
             )
@@ -2573,11 +2621,7 @@ mod tests {
             let client_handler = Arc::new(FarewellClient::default());
             let client = DispatchClient::connect(
                 &name,
-                ClientRegistration {
-                    pid: std::process::id(),
-                    revision: 1,
-                    name: "farewell".into(),
-                },
+                ClientRegistration::new(std::process::id(), 1, "farewell"),
                 client_handler.clone(),
                 DispatchClientOptions::default(),
             )
@@ -2659,11 +2703,7 @@ mod tests {
         let waker = Arc::new(Waker::default());
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "space".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "space"),
             waker.clone(),
             DispatchClientOptions {
                 max_send_queue: 8,
@@ -2751,11 +2791,7 @@ mod tests {
             let client_handler = Arc::new(FarewellClient::default());
             let client = DispatchClient::connect(
                 &name,
-                ClientRegistration {
-                    pid: std::process::id(),
-                    revision: 1,
-                    name: "refused".into(),
-                },
+                ClientRegistration::new(std::process::id(), 1, "refused"),
                 client_handler.clone(),
                 DispatchClientOptions::default(),
             )
@@ -2859,11 +2895,7 @@ mod tests {
         let client_handler = Arc::new(FarewellClient::default());
         let client = DispatchClient::connect(
             &name,
-            ClientRegistration {
-                pid: std::process::id(),
-                revision: 1,
-                name: "stopper".into(),
-            },
+            ClientRegistration::new(std::process::id(), 1, "stopper"),
             client_handler.clone(),
             DispatchClientOptions::default(),
         )
@@ -2903,5 +2935,212 @@ mod tests {
         joiner.join().unwrap();
         assert!(server.worker_handle.lock().unwrap().is_none());
         client.stop();
+    }
+
+    /// 0.10: мусор в лобби (не регистрация, хвостовые байты, битый UTF-8)
+    /// получает `STATUS_REJECTED` сразу, а не тишину до `response_timeout`
+    /// клиента; канал не создаётся.
+    #[test]
+    fn bad_registration_gets_rejected_fast() {
+        let name = format!("TEST_DISPATCH_GARBAGE_{}", std::process::id());
+        let handler = Arc::new(TestServerHandler::new());
+        let options = DispatchOptions {
+            lobby_timeout: Duration::from_secs(10),
+            ..DispatchOptions::default()
+        };
+        let server = DispatchServer::start(&name, handler.clone(), options).unwrap();
+        let mut trailing = protocol::encode_request(&RegistrationRequest {
+            pid: std::process::id(),
+            revision: 1,
+            name: "tail".into(),
+        });
+        trailing.push(0);
+        let mut bad_utf8 = protocol::encode_request(&RegistrationRequest {
+            pid: std::process::id(),
+            revision: 1,
+            name: "ab".into(),
+        });
+        let last = bad_utf8.len() - 1;
+        bad_utf8[last] = 0xFF;
+        let garbage: [&[u8]; 3] = [b"definitely not a registration", &trailing, &bad_utf8];
+        for (i, payload) in garbage.into_iter().enumerate() {
+            let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+            let started = std::time::Instant::now();
+            client.send_to_server(payload).unwrap();
+            // `S2C_DATA` сервер сигналит дважды (запись в пустое кольцо и
+            // явно), поэтому сигнал прошлого раунда может разбудить зря --
+            // читаем до ответа, как `lobby_register`.
+            let mut buf = Vec::new();
+            let len = loop {
+                match client.receive_from_server(&mut buf) {
+                    Ok(len) => break len,
+                    Err(ShmError::QueueEmpty) => {
+                        let left = Duration::from_secs(3).saturating_sub(started.elapsed());
+                        assert!(
+                            client.poll_server(Some(left)).unwrap(),
+                            "мусор #{i}: ответа нет"
+                        );
+                    }
+                    Err(err) => panic!("мусор #{i}: {err:?}"),
+                }
+            };
+            let response = protocol::decode_response(&buf[..len]).unwrap();
+            assert_eq!(response.status, protocol::STATUS_REJECTED, "мусор #{i}");
+            assert!(started.elapsed() < Duration::from_secs(3), "мусор #{i}");
+            drop(client);
+        }
+        assert_eq!(handler.connects.load(Ordering::Acquire), 0);
+        server.stop();
+    }
+
+    /// Обработчик, задерживающий допуск, пока тест не отпустит.
+    #[derive(Default)]
+    struct StallingAdmit {
+        entered: AtomicBool,
+        release: AtomicBool,
+    }
+
+    impl DispatchHandler for StallingAdmit {
+        fn admit(&self, _info: &ClientRegistration) -> Admission {
+            self.entered.store(true, Ordering::Release);
+            while !self.release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Admission::Accept
+        }
+        fn on_client_connect(&self, _client_id: u32, _info: &ClientRegistration) {}
+        fn on_client_disconnect(&self, _client_id: u32) {}
+        fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+    }
+
+    /// 0.10: сервер уходит посреди рукопожатия лобби (`stop()` до ответа) --
+    /// клиент узнаёт об этом по `DISCONNECT`/процессу сервера, а не спит
+    /// весь `response_timeout`.
+    #[test]
+    fn lobby_client_notices_dead_server() {
+        let name = format!("TEST_DISPATCH_DEADLOBBY_{}", std::process::id());
+        let handler = Arc::new(StallingAdmit::default());
+        let server =
+            DispatchServer::start(&name, handler.clone(), DispatchOptions::default()).unwrap();
+        let client_thread = thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = DispatchClient::connect(
+                &name,
+                ClientRegistration::new(std::process::id(), 1, "orphan"),
+                Arc::new(TestClientHandler::new()),
+                DispatchClientOptions {
+                    response_timeout: Duration::from_secs(10),
+                    ..DispatchClientOptions::default()
+                },
+            );
+            (result.map(drop), started.elapsed())
+        });
+        wait_for("допуск начат", Duration::from_secs(5), || {
+            handler.entered.load(Ordering::Acquire)
+        });
+        let stopper = {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.stop())
+        };
+        wait_for(
+            "сервер остановлен",
+            Duration::from_secs(5),
+            || !server.running.load(Ordering::Acquire),
+        );
+        handler.release.store(true, Ordering::Release);
+        stopper.join().unwrap();
+        let (result, elapsed) = client_thread.join().unwrap();
+        assert!(
+            result.is_err(),
+            "регистрация у остановленного сервера: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "клиент ждал ответа {elapsed:?} -- смерть сервера не замечена"
+        );
+    }
+
+    /// Обработчик, записывающий PID рукопожатия лобби и отказы каналов.
+    #[derive(Default)]
+    struct PidProbe {
+        admitted: Mutex<Vec<Option<u32>>>,
+        connects: AtomicU32,
+        handshake_failures: AtomicU32,
+    }
+
+    impl DispatchHandler for PidProbe {
+        fn admit(&self, info: &ClientRegistration) -> Admission {
+            self.admitted.lock().unwrap().push(info.handshake_pid);
+            Admission::Accept
+        }
+        fn on_client_connect(&self, _client_id: u32, info: &ClientRegistration) {
+            assert_eq!(info.handshake_pid, Some(std::process::id()));
+            self.connects.fetch_add(1, Ordering::AcqRel);
+        }
+        fn on_client_disconnect(&self, _client_id: u32) {}
+        fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+        fn on_error(&self, client_id: Option<u32>, err: ShmError) {
+            if client_id.is_some() && matches!(err, ShmError::HandshakeFailed) {
+                self.handshake_failures.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    }
+
+    /// 0.10: `ClientRegistration::handshake_pid` -- PID рукопожатия лобби;
+    /// канал, рукопожатие которого провёл другой процесс (здесь -- клиент
+    /// без PID), закрывается до `on_client_connect` с
+    /// `on_error(Some(id), HandshakeFailed)`.
+    #[test]
+    fn channel_peer_must_match_lobby_pid() {
+        let name = format!("TEST_DISPATCH_PIDCHECK_{}", std::process::id());
+        let handler = Arc::new(PidProbe::default());
+        let server =
+            DispatchServer::start(&name, handler.clone(), DispatchOptions::default()).unwrap();
+        let me = std::process::id();
+
+        // Чужой на канале: регистрация легальная, рукопожатие канала -- без PID.
+        let mut buf = Vec::new();
+        let (_id, channel) = lobby_register(
+            &name,
+            &ClientRegistration::new(me, 1, "honest"),
+            &DispatchClientOptions::default(),
+            &mut buf,
+        )
+        .unwrap();
+        let intruder =
+            SharedClient::connect_impl(&channel, Duration::from_secs(5), false, None).unwrap();
+        wait_for("отказ каналу", Duration::from_secs(5), || {
+            handler.handshake_failures.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(handler.connects.load(Ordering::Acquire), 0);
+        assert_eq!(server.client_count(), 0);
+        drop(intruder);
+
+        // Честный клиент: PID канала совпадает с PID лобби.
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration::new(me, 1, "honest"),
+            Arc::new(TestClientHandler::new()),
+            DispatchClientOptions::default(),
+        )
+        .unwrap();
+        wait_for("подключение", Duration::from_secs(5), || {
+            handler.connects.load(Ordering::Acquire) == 1
+        });
+        assert_eq!(*handler.admitted.lock().unwrap(), [Some(me), Some(me)]);
+        assert_eq!(handler.handshake_failures.load(Ordering::Acquire), 1);
+        client.stop();
+        server.stop();
+    }
+
+    #[test]
+    fn channel_peer_match_rules() {
+        // PID лобби неизвестен -- сверять не с чем.
+        assert!(channel_peer_matches(None, None));
+        assert!(channel_peer_matches(None, Some(7)));
+        // Известен -- канал обязан провести тот же процесс.
+        assert!(channel_peer_matches(Some(7), Some(7)));
+        assert!(!channel_peer_matches(Some(7), Some(8)));
+        assert!(!channel_peer_matches(Some(7), None));
     }
 }

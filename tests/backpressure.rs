@@ -434,11 +434,7 @@ fn dispatch_client_try_send_is_lossless() {
     let client_handler = Arc::new(RecordingClient::default());
     let client = DispatchClient::connect(
         &name,
-        ClientRegistration {
-            pid: std::process::id(),
-            revision: 1,
-            name: "bp-producer".into(),
-        },
+        ClientRegistration::new(std::process::id(), 1, "bp-producer"),
         client_handler,
         DispatchClientOptions {
             max_send_queue: 16,
@@ -513,11 +509,7 @@ fn dispatch_server_try_send_to_is_lossless() {
     let client_handler = Arc::new(RecordingClient::default());
     let client = DispatchClient::connect(
         &name,
-        ClientRegistration {
-            pid: std::process::id(),
-            revision: 1,
-            name: "bp-viewer-side".into(),
-        },
+        ClientRegistration::new(std::process::id(), 1, "bp-viewer-side"),
         client_handler.clone(),
         DispatchClientOptions::default(),
     )

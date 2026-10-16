@@ -326,11 +326,7 @@ impl DispatchClientHandler for DispatchClientRecorder {
 }
 
 fn registration(name: &str) -> ClientRegistration {
-    ClientRegistration {
-        pid: std::process::id(),
-        revision: 1,
-        name: name.to_owned(),
-    }
+    ClientRegistration::new(std::process::id(), 1, name.to_owned())
 }
 
 #[test]

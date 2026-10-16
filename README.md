@@ -453,11 +453,7 @@ impl DispatchClientHandler for ClientHandler {
 fn main() -> Result<()> {
     let server = DispatchServer::start("MyService", Arc::new(ServerHandler), DispatchOptions::default())?;
 
-    let registration = ClientRegistration {
-        pid: std::process::id(),
-        revision: 1,
-        name: "my_app".to_string(),
-    };
+    let registration = ClientRegistration::new(std::process::id(), 1, "my_app");
     let client = DispatchClient::connect(
         "MyService",
         registration,

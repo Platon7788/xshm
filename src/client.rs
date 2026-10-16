@@ -307,6 +307,18 @@ impl SharedClient {
         self.view.control_block().generation.load(Ordering::Acquire) == self.generation
     }
 
+    /// Сервер закрыл нашу сессию: `server_state` уже не `SERVER_READY` или
+    /// `generation` сменился. Отличает свежий `DISCONNECT` от устаревшего
+    /// (0.10: ожидание ответа лобби Dispatch).
+    pub(crate) fn server_left(&self) -> bool {
+        self.view
+            .control_block()
+            .server_state
+            .load(Ordering::Acquire)
+            != HANDSHAKE_SERVER_READY
+            || !self.is_session_current()
+    }
+
     #[must_use]
     pub const fn is_connected(&self) -> bool {
         self.connected
