@@ -1378,6 +1378,8 @@ struct SlotJournal {
     panic_slot: AtomicU32,
     /// Слот, чей `on_message` медленный (1 мс; `u32::MAX` -- никакой).
     slow_slot: AtomicU32,
+    /// Первые 4 байта каждого сообщения (LE) по слотам.
+    seqs: Mutex<Vec<(u32, u32)>>,
 }
 
 impl SlotJournal {
@@ -1412,13 +1414,19 @@ impl MultiHandler for SlotJournal {
             .unwrap()
             .push((client_id, reason, Instant::now()));
     }
-    fn on_message(&self, client_id: u32, _data: &[u8]) {
+    fn on_message(&self, client_id: u32, data: &[u8]) {
         assert!(
             client_id != self.panic_slot.load(Ordering::Acquire),
             "тестовая паника колбэка"
         );
         if client_id == self.slow_slot.load(Ordering::Acquire) {
             thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(seq) = data.first_chunk::<4>() {
+            self.seqs
+                .lock()
+                .unwrap()
+                .push((client_id, u32::from_le_bytes(*seq)));
         }
         self.messages[client_id as usize].fetch_add(1, Ordering::AcqRel);
     }
@@ -1519,13 +1527,19 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
         || journal.disconnect_of(1).is_some(),
     );
     let (reason, at) = journal.disconnect_of(1).unwrap();
-    assert_eq!(reason, DisconnectReason::Graceful);
+    // `Graceful` -- дочитано до снимка; `Error` -- писатель с перезаписью
+    // сдвинул `read_pos` во время дочитывания (своя позиция чтения это
+    // замечает: `Corrupted`, fix round 2).
+    assert!(
+        matches!(reason, DisconnectReason::Graceful | DisconnectReason::Error),
+        "{reason:?}"
+    );
     assert!(
         at.saturating_duration_since(signalled_at) < Duration::from_secs(2),
         "отключение через {:?}",
         at.saturating_duration_since(signalled_at)
     );
-    assert!(flooding.load(Ordering::Acquire), "поток шёл всё это время");
+    assert!(!flooder.is_finished(), "поток шёл всё это время");
 
     flooding.store(false, Ordering::Release);
     let written = flooder.join().unwrap();
@@ -1654,4 +1668,232 @@ fn failed_rearm_is_retried() {
     );
     drop(client);
     server.stop();
+}
+
+/// Сервер без потока-диспетчера (остановлен), слот 0 захвачен token-ом
+/// `claim` и подключён `SharedClient`-ом через диспетчер, ведомый вручную
+/// на потоке теста. Возвращает клиента; сервер -- в `server`.
+fn connect_manually(server: &MultiServer, name: &str, claim: u32) -> SharedClient {
+    stop_workers(server);
+    // Потока нет -- колбэки зовёт тест; `running` нужен доставке сообщений.
+    server.running.store(true, Ordering::Release);
+    let mut leftover = Vec::new();
+    server
+        .port
+        .wait_batch(&mut leftover, Some(Duration::ZERO))
+        .unwrap();
+    let slot_name = format!("{name}_0");
+    assert!(try_claim_slot(None, &slot_name, claim).unwrap());
+    let mut dispatcher = Dispatcher::new(&server.core);
+    dispatcher.reconcile(0);
+    let connecting =
+        thread::spawn(move || SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !server.is_client_connected(0) {
+        assert!(Instant::now() < deadline, "рукопожатие вручную");
+        let mut batch = Vec::new();
+        server
+            .port
+            .wait_batch(&mut batch, Some(Duration::from_millis(100)))
+            .unwrap();
+        for completion in batch {
+            dispatcher.complete(completion);
+        }
+    }
+    dispatcher.release_all();
+    drop(dispatcher);
+    connecting.join().unwrap()
+}
+
+/// Fix round 2, п. 1: враждебный пир перематывает `read_pos` назад во время
+/// дочитывания (кольцо с огромным `max_messages`). Своя позиция чтения
+/// замечает сдвиг -- `Corrupted` и разрыв с `Error`; ни один кадр не
+/// доставлен дважды, дочитывание кончается быстро и не дальше физической
+/// ёмкости кольца. (Дочитывание идёт на потоке теста вместо диспетчера:
+/// пока оно кончается быстро, диспетчер свободен для остальных слотов --
+/// это свойство на живом сервере проверяет
+/// `hostile_disconnect_flood_does_not_stall_dispatcher`.)
+#[test]
+fn hostile_rewind_during_drain_is_corrupted_and_delivers_once() {
+    const FRAMES: u32 = 200;
+    let name = unique("REWIND");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(
+        &name,
+        journal.clone(),
+        MultiOptions {
+            max_clients: 1,
+            layout: ChannelLayout::symmetric(
+                crate::layout::RingConfig::new(64 << 10).max_messages(1_000_000),
+            ),
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start");
+    let client = connect_manually(&server, &name, 0xBAD0_0002);
+    for seq in 0..FRAMES {
+        client.try_send_to_server(&seq.to_le_bytes()).unwrap();
+    }
+    // Вид враждебного пира на ту же секцию: заголовок кольца клиент -> сервер.
+    let mapping = Mapping::open(ObjectPath::mapping(None, &format!("{name}_0"))).unwrap();
+    // SAFETY: отображение живо до конца теста, размер -- его собственный.
+    let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+    let c2s = view.header_b();
+    assert_eq!(c2s.write_pos.load(Ordering::Acquire), FRAMES * 16);
+    let start = c2s.read_pos.load(Ordering::Acquire);
+    journal.slow_slot.store(0, Ordering::Release);
+
+    let rewinding = AtomicBool::new(true);
+    let took = thread::scope(|scope| {
+        scope.spawn(|| {
+            while rewinding.load(Ordering::Acquire) {
+                c2s.read_pos.store(start, Ordering::Release);
+                thread::yield_now();
+            }
+        });
+        let t0 = Instant::now();
+        server.core.drain_slot(0, &mut Vec::new());
+        let took = t0.elapsed();
+        rewinding.store(false, Ordering::Release);
+        took
+    });
+
+    let seqs: Vec<u32> = journal
+        .seqs
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|&(_, seq)| seq)
+        .collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "кадр доставлен повторно: {seqs:?}"
+    );
+    assert!(seqs.len() <= FRAMES as usize);
+    // Физический предел: (64 КиБ / 16) + 1 кадров по 1 мс -- секунды; сдвиг
+    // замечается после первой же пачки.
+    assert!(took < Duration::from_secs(2), "дочитывание {took:?}");
+    assert!(
+        journal
+            .errors
+            .lock()
+            .unwrap()
+            .contains(&(Some(0), ShmError::Corrupted)),
+        "перемотка не замечена"
+    );
+    assert_eq!(
+        journal.disconnect_of(0).map(|(reason, _)| reason),
+        Some(DisconnectReason::Error)
+    );
+    drop(client);
+}
+
+/// Fix round 2, п. 1: лимит дочитывания -- физическая ёмкость кольца, а не
+/// `max_messages`.
+#[test]
+fn drain_cap_is_physical_not_configured() {
+    let name = unique("DRAIN_CAP");
+    let server = MultiServer::start(
+        &name,
+        Arc::new(TestHandler::new()),
+        MultiOptions {
+            max_clients: 1,
+            layout: ChannelLayout::symmetric(
+                crate::layout::RingConfig::new(4096).max_messages(u32::MAX),
+            ),
+            ..MultiOptions::default()
+        },
+    )
+    .expect("start");
+    let bound = server.slots.read().unwrap()[0]
+        .lock()
+        .unwrap()
+        .server
+        .client_drain_snapshot();
+    assert_eq!(bound.left, 4096 / 16 + 1);
+    server.stop();
+}
+
+/// Fix round 2, п. 3: паника `on_message` при дочитывании уходящего
+/// клиента (`DISCONNECT`) -- `on_error(WorkerPanicked)`, остаток
+/// дочитывания не доставлен, но причина отключения -- исходная `Graceful`,
+/// и claim сессии снят обычным путём (без ожидания `RESERVE_TIMEOUT`).
+#[test]
+fn panic_while_draining_keeps_reason_and_releases_claim() {
+    let name = unique("PANIC_DRAIN");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(&name, journal.clone(), single_slot(1)).expect("start");
+    let client = connect_manually(&server, &name, 0xBAD0_0003);
+    for seq in 0..3u32 {
+        client.try_send_to_server(&seq.to_le_bytes()).unwrap();
+    }
+    client.events().disconnect.set().unwrap();
+    journal.panic_slot.store(0, Ordering::Release);
+
+    server.core.handle_slot_disconnect(0, &mut Vec::new());
+
+    assert_eq!(journal.count(0), 0, "остаток дочитывания не доставляется");
+    assert_eq!(
+        journal.errors.lock().unwrap().as_slice(),
+        &[(
+            Some(0),
+            ShmError::WorkerPanicked {
+                message: "тестовая паника колбэка"
+            }
+        )]
+    );
+    assert_eq!(
+        journal.disconnect_of(0).map(|(reason, _)| reason),
+        Some(DisconnectReason::Graceful)
+    );
+    let claim = server.slots.read().unwrap()[0].lock().unwrap().claim();
+    assert_eq!(claim, CLAIM_FREE, "claim сессии не снят");
+    drop(client);
+}
+
+/// Fix round 2, п. 2: паника `on_error(Corrupted)` отбрасывается: второго
+/// `on_error` нет, причина разрыва остаётся `Error`.
+#[test]
+fn panic_in_on_error_keeps_error_reason() {
+    /// Обработчик, чей `on_error` паникует.
+    #[derive(Default)]
+    struct PanickyErrors {
+        errors: AtomicU32,
+        reasons: Mutex<Vec<DisconnectReason>>,
+    }
+    impl MultiHandler for PanickyErrors {
+        fn on_client_connect(&self, _client_id: u32) {}
+        fn on_client_disconnect(&self, _client_id: u32) {}
+        fn on_client_disconnect_reason(&self, _client_id: u32, reason: DisconnectReason) {
+            self.reasons.lock().unwrap().push(reason);
+        }
+        fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+        fn on_error(&self, _client_id: Option<u32>, _err: ShmError) {
+            self.errors.fetch_add(1, Ordering::AcqRel);
+            panic!("тестовая паника on_error");
+        }
+    }
+
+    let name = unique("PANIC_ON_ERROR");
+    let handler = Arc::new(PanickyErrors::default());
+    let server = MultiServer::start(&name, handler.clone(), single_slot(1)).expect("start");
+    let client = connect_manually(&server, &name, 0xBAD0_0004);
+    // Порча кольца клиент -> сервер: `write_pos` не кратен 8.
+    let mapping = Mapping::open(ObjectPath::mapping(None, &format!("{name}_0"))).unwrap();
+    // SAFETY: отображение живо до конца теста, размер -- его собственный.
+    let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+    view.header_b().write_pos.store(3, Ordering::Release);
+
+    let mut dispatcher = Dispatcher::new(&server.core);
+    dispatcher.enqueue(0);
+    dispatcher.round();
+
+    assert_eq!(handler.errors.load(Ordering::Acquire), 1, "on_error дважды");
+    assert_eq!(
+        handler.reasons.lock().unwrap().as_slice(),
+        &[DisconnectReason::Error]
+    );
+    dispatcher.release_all();
+    drop(dispatcher);
+    drop(client);
 }

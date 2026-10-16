@@ -160,9 +160,15 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 /// перехватывается, сервер вызывает `on_error(Some(slot),
 /// ShmError::WorkerPanicked { .. })` и отключает этот слот обычным локальным
 /// путём (как `disconnect_client`: клиент получает `DISCONNECT`, claim
-/// снимает он сам); остальные слоты обслуживаются дальше. Паника самого
-/// `on_error` (и колбэка этого отключения) отбрасывается -- текст печатает
-/// panic hook. Перехват возможен только при `panic = "unwind"` у итогового
+/// снимает он сам; `on_client_disconnect_reason(Local)`), остаток пачки
+/// сообщений этого слота не доставляется; остальные слоты обслуживаются
+/// дальше. Исключение -- паника `on_message` при дочитывании кольца
+/// уходящего клиента (`DISCONNECT`, смерть процесса, снятый claim): остаток
+/// дочитывания не доставляется, а отключение идёт обычным путём ухода -- с
+/// исходной причиной (`Graceful`/`PeerDied`) и обычным снятием claim-а, без
+/// задержки `RESERVE_TIMEOUT`. Паника самого `on_error` (и колбэка
+/// отключения после паники) отбрасывается без второго вызова `on_error` и
+/// без смены причины разрыва -- текст печатает panic hook. Перехват возможен только при `panic = "unwind"` у итогового
 /// бинарника; при `panic = "abort"` паника завершает процесс.
 ///
 /// Клиент, который шлёт `CONNECT_REQ` без `CLIENT_HELLO` («толчки») без
@@ -1016,6 +1022,18 @@ impl MultiCore {
         while self.receive_from_slot(slot_id, buffer, Some(&mut bound)) {}
     }
 
+    /// `drain_slot` ушедшего клиента с изоляцией паники колбэка: паника
+    /// `on_message` -- `on_error(Some(slot), WorkerPanicked)` (его паника
+    /// отбрасывается), остаток дочитывания не доставляется, а отключение
+    /// идёт дальше обычным путём ухода -- с исходной причиной (`Graceful`,
+    /// `PeerDied`, причина осиротевшего слота) и обычным снятием claim-а.
+    fn drain_departed(&self, slot_id: u32, buffer: &mut Vec<u8>) {
+        let drained = catch_unwind(AssertUnwindSafe(|| self.drain_slot(slot_id, buffer)));
+        if let Err(payload) = drained {
+            report(self, Some(slot_id), panic_error(&*payload));
+        }
+    }
+
     /// `S2C_DISCONNECT` подключённого слота: клиент ушёл штатно. Всё, что он
     /// успел записать (прощальное сообщение), доставляется ДО колбэка.
     fn handle_slot_disconnect(&self, slot_id: u32, buffer: &mut Vec<u8>) {
@@ -1036,7 +1054,7 @@ impl MultiCore {
             }
         }
 
-        self.drain_slot(slot_id, buffer);
+        self.drain_departed(slot_id, buffer);
 
         let was_connected = {
             let slots = self.slots.read_clean();
@@ -1079,7 +1097,7 @@ impl MultiCore {
     /// именно умерший процесс (PID владельца совпадает) -- новый захват не
     /// затирается.
     fn handle_slot_peer_died(&self, slot_id: u32, buffer: &mut Vec<u8>) {
-        self.drain_slot(slot_id, buffer);
+        self.drain_departed(slot_id, buffer);
 
         let was_connected = {
             let slots = self.slots.read_clean();
@@ -1194,14 +1212,21 @@ impl MultiCore {
                 return false;
             }
             for _ in 0..batch {
-                if let Some(bound) = bound.as_deref_mut() {
-                    if !slot.server.client_before_bound(bound) {
-                        reached = true;
-                        break;
-                    }
-                    bound.left -= 1;
-                }
-                match slot.server.receive_from_client(buffer) {
+                let received = match bound.as_deref_mut() {
+                    // Дочитывание: только до снимка, своей позицией чтения;
+                    // сдвиг `read_pos` пиром -- `Corrupted` (обычный путь
+                    // ошибки ниже: `on_error` и разрыв с `Error`).
+                    Some(bound) => match slot.server.drain_from_client(buffer, bound) {
+                        Ok(Some(len)) => Ok(len),
+                        Ok(None) => {
+                            reached = true;
+                            break;
+                        }
+                        Err(err) => Err(err),
+                    },
+                    None => slot.server.receive_from_client(buffer),
+                };
+                match received {
                     Ok(len) => messages.push(buffer[..len].to_vec()),
                     Err(ShmError::QueueEmpty) => break,
                     Err(err) => {
@@ -1225,7 +1250,9 @@ impl MultiCore {
 
         if let Some(err) = error {
             let corrupted = err == ShmError::Corrupted;
-            self.handler.on_error(Some(slot_id), err);
+            // Паника `on_error` отбрасывается (rustdoc `MultiHandler`): ни
+            // второго `on_error`, ни подмены причины разрыва на `Local`.
+            report(self, Some(slot_id), err);
             if corrupted {
                 // Клиент испортил кольцо: `read_pos` не сдвинется, и без
                 // разрыва слот навсегда остался бы «подключённым», а каждое
@@ -1416,7 +1443,7 @@ impl<'a> Dispatcher<'a> {
                 // диспетчер разобрал проход раньше его DISCONNECT: всё, что
                 // клиент успел записать до обнаружения, -- до колбэка.
                 self.isolate(Some(slot_id), |d| {
-                    d.core.drain_slot(slot_id, &mut d.buffer);
+                    d.core.drain_departed(slot_id, &mut d.buffer);
                     d.core
                         .handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
                 });
@@ -1651,6 +1678,11 @@ impl<'a> Dispatcher<'a> {
                 let Some(arm) = waits.arms.get_mut(kind.index()) else {
                     continue;
                 };
+                if desired.is_none() {
+                    // Привязка больше не нужна: серия отказов закончилась,
+                    // следующий отказ -- новая серия (снова сообщается).
+                    arm.failed = false;
+                }
                 let target = desired.map(|handle| handle.as_raw_handle().addr());
                 if arm.armed && target != Some(arm.target) && arm.cancel() {
                     // Сигнал потреблён снятой привязкой -- вернуть.

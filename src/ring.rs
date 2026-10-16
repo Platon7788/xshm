@@ -179,15 +179,20 @@ impl<'a> UnreadProbe<'a> {
 }
 
 /// Граница дочитывания кольца ушедшего пира (Multi, 0.10): кадры
-/// читаются, только пока `read_pos` раньше снимка `write_pos`, сделанного в
-/// момент обнаружения ухода, и не больше `left` штук. Всё, что пир дописал
-/// после снимка, не доставляется: враждебный писатель не удержит читателя
-/// в дочитывании.
+/// читаются, только пока своя позиция чтения раньше снимка `write_pos`,
+/// сделанного в момент обнаружения ухода, и не больше `left` штук
+/// (физическая ёмкость кольца, а не настройка). Всё, что пир дописал после
+/// снимка, не доставляется; сдвиг `read_pos` пиром во время дочитывания
+/// (перемотка назад, перезапись) -- `Corrupted`. Враждебный писатель не
+/// удержит читателя в дочитывании и не заставит доставить кадр дважды.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DrainBound {
     /// Снимок `write_pos`.
     pub(crate) until: u32,
-    /// Сколько кадров ещё можно прочитать.
+    /// Своя позиция чтения: снимок `read_pos`, далее -- сдвиги за
+    /// прочитанные этим читателем кадры (PAD и сообщения).
+    pub(crate) read: u32,
+    /// Сколько кадров (PAD и сообщений) ещё можно прочитать.
     pub(crate) left: u32,
 }
 
@@ -1256,24 +1261,86 @@ impl RingBuffer {
         self.unread_probe().has_unread()
     }
 
-    /// Читатель: граница дочитывания ушедшего пира -- снимок
-    /// опубликованного `write_pos` (Acquire) и лимит сообщений кольца
-    /// (кадров до снимка не бывает больше; запас -- на законное отставание
-    /// счётчика, см. INTEROP «Изменения 0.10» п. 25).
+    /// Читатель: граница дочитывания ушедшего пира -- снимки
+    /// опубликованного `write_pos` и `read_pos` (Acquire) и лимит кадров.
+    ///
+    /// Лимит не зависит от настройки `max_messages` (её может задать
+    /// большой пользователь): `min(max_messages, capacity /
+    /// frame_size(MIN_MESSAGE_SIZE)) + 1` -- не больше кадров, чем физически
+    /// помещается в кольце (+1 -- PAD перед кадром с индекса 0).
     pub(crate) fn drain_snapshot(&self) -> DrainBound {
+        let header = self.header();
+        // `frame_size(MIN_MESSAGE_SIZE)` = 16 -- в u32 без потерь.
+        let min_frame = u32::try_from(frame_size(MIN_MESSAGE_SIZE)).unwrap_or(u32::MAX);
+        let physical = self.capacity / min_frame;
         DrainBound {
-            until: self.header().write_pos.load(Ordering::Acquire),
-            left: self.max_messages.saturating_add(1),
+            until: header.write_pos.load(Ordering::Acquire),
+            read: header.read_pos.load(Ordering::Acquire),
+            left: self.max_messages.min(physical).saturating_add(1),
         }
     }
 
-    /// Читатель: лежит ли следующий кадр до границы `bound` (позиции по
-    /// модулю 2^32: `read_pos` строго «раньше» снимка). Пир, сдвинувший
-    /// `read_pos` за снимок (перезапись старейшего, порча), дочитывание
-    /// заканчивает.
-    pub(crate) fn before_bound(&self, bound: &DrainBound) -> bool {
-        let read = self.header().read_pos.load(Ordering::Acquire);
-        bound.left > 0 && bound.until.wrapping_sub(read).cast_signed() > 0
+    /// Дочитывание ушедшего пира (Multi): прочитать следующее сообщение до
+    /// границы `bound` в `out`. `Ok(Some(len))` -- сообщение, `Ok(None)` --
+    /// граница достигнута (снимок `write_pos` или лимит кадров),
+    /// `Err(Corrupted)` -- пир сдвинул `read_pos` (общий не равен своей
+    /// позиции `bound.read`) или испортил кадр.
+    ///
+    /// Кадры проверяются по снимку `write_pos`, а не по текущему: дописанное
+    /// после снимка не читается вовсе. Своя позиция сдвигается только за
+    /// кадры, забранные этим читателем (CAS `read_pos` со своей позиции):
+    /// перемотанный пиром `read_pos` не вернёт уже доставленный кадр.
+    pub(crate) fn drain_message(
+        &self,
+        out: &mut Vec<u8>,
+        bound: &mut DrainBound,
+    ) -> Result<Option<usize>> {
+        let header = self.header();
+        loop {
+            let read = bound.read;
+            if header.read_pos.load(Ordering::Acquire) != read {
+                return Err(ShmError::Corrupted);
+            }
+            if bound.left == 0 || bound.until.wrapping_sub(read).cast_signed() <= 0 {
+                return Ok(None);
+            }
+            bound.left -= 1;
+            let Some(frame) = self.frame_at(read, bound.until)? else {
+                return Ok(None);
+            };
+            let next = read.wrapping_add(frame.total);
+            if frame.pad {
+                // PAD -- не сообщение: забрать CAS-ом со своей позиции.
+                if header
+                    .read_pos
+                    .compare_exchange(read, next, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    return Err(ShmError::Corrupted);
+                }
+                bound.read = next;
+                continue;
+            }
+            // Копирование до фиксации (как `read_message`): перезапись во
+            // время копирования провалит CAS ниже.
+            out.clear();
+            out.reserve(frame.len);
+            // SAFETY: payload кадра лежит внутри кольца одним куском
+            // (`frame_at`), в `out` зарезервировано не меньше frame.len байт,
+            // области не пересекаются.
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.payload_ptr(read), out.as_mut_ptr(), frame.len);
+            }
+            // SAFETY: первые frame.len байт только что инициализированы.
+            unsafe { out.set_len(frame.len) };
+            compiler_fence(Ordering::Release);
+            if !self.commit_read(read, frame) {
+                // Пир сдвинул `read_pos` во время копирования.
+                return Err(ShmError::Corrupted);
+            }
+            bound.read = next;
+            return Ok(Some(frame.len));
+        }
     }
 
     /// Читатель: дождаться данных (`poll_*`). `Ok(true)` -- в кольце есть
@@ -3015,5 +3082,42 @@ mod tests {
         set_word(&ring, 4072, 20);
         header.write_pos.store(4072 + 32, O::Relaxed);
         expect_corrupted("payload через границу");
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    //! Дочитывание ушедшего пира (Multi, 0.10): граница снимка, своя
+    //! позиция чтения, физический лимит кадров.
+    use super::overflow_race_tests::make_ring_with;
+    use super::*;
+
+    /// Дописанное после снимка не читается; перемотка `read_pos` пиром --
+    /// `Corrupted`, уже доставленный кадр повторно не отдаётся.
+    #[test]
+    fn drain_stops_at_snapshot_and_rejects_rewind() {
+        let (ring, _mem) = make_ring_with(&RingConfig::new(4096).max_messages(u32::MAX));
+        let mut out = Vec::new();
+        for seq in 0..3u32 {
+            ring.write_message(&seq.to_le_bytes()).unwrap();
+        }
+        let mut bound = ring.drain_snapshot();
+        assert_eq!(bound.left, 4096 / 16 + 1, "лимит -- физический");
+        ring.write_message(&99u32.to_le_bytes()).unwrap(); // после снимка
+        for seq in 0..3u32 {
+            assert_eq!(ring.drain_message(&mut out, &mut bound), Ok(Some(4)));
+            assert_eq!(out, seq.to_le_bytes());
+        }
+        assert_eq!(ring.drain_message(&mut out, &mut bound), Ok(None));
+
+        // Перемотка назад во время дочитывания.
+        let mut bound = ring.drain_snapshot();
+        let start = bound.read;
+        assert_eq!(ring.drain_message(&mut out, &mut bound), Ok(Some(4)));
+        ring.header().read_pos.store(start, Ordering::Release);
+        assert_eq!(
+            ring.drain_message(&mut out, &mut bound),
+            Err(ShmError::Corrupted)
+        );
     }
 }

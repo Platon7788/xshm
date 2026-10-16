@@ -917,9 +917,20 @@ impl SharedServer {
         self.ring_rx.drain_snapshot()
     }
 
-    /// Multi: следующий кадр от клиента лежит до границы `bound`.
-    pub(crate) fn client_before_bound(&self, bound: &DrainBound) -> bool {
-        self.ring_rx.before_bound(bound)
+    /// Multi: дочитывание ушедшего клиента до границы `bound`
+    /// (`RingBuffer::drain_message`); прочитанное освобождает место, как
+    /// `receive_from_client`.
+    pub(crate) fn drain_from_client(
+        &self,
+        buffer: &mut Vec<u8>,
+        bound: &mut DrainBound,
+    ) -> Result<Option<usize>> {
+        self.ensure_connected()?;
+        let len = self.ring_rx.drain_message(buffer, bound)?;
+        if len.is_some() {
+            self.signal_space_after_read();
+        }
+        Ok(len)
     }
 
     /// Multi: проба кольца от клиента для спина диспетчера.
