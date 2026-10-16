@@ -376,10 +376,11 @@ impl RingBuffer {
     /// (байт или слотов `max_messages`) вытесняет самые старые непрочитанные
     /// сообщения, число вытесненных -- в `WriteOutcome::overwritten`.
     ///
-    /// Число итераций ограничено: каждая успешная итерация вытеснения
-    /// сдвигает `read_pos` минимум на `FRAME_ALIGN` к `write_pos`, а
-    /// несогласованное состояние пира (пустое кольцо при исчерпанном лимите
-    /// счётчика, занятость больше ёмкости) даёт `Corrupted`.
+    /// Число итераций ограничено: вытеснение идёт только при `used > 0`
+    /// (см. `admits`), каждая итерация либо сдвигает `read_pos` к
+    /// `write_pos` (наше вытеснение или чтение читателя), либо застаёт
+    /// кольцо пустым -- а пустое кольцо кадр принимает всегда. `Corrupted`
+    /// -- только по позициям и заголовкам кадров, не по счётчику.
     pub fn write_message(&self, payload: &[u8]) -> Result<WriteOutcome> {
         let total = self.frame_len(payload.len())?;
         let header = self.header();
@@ -390,7 +391,7 @@ impl RingBuffer {
             let read = header.read_pos.load(Ordering::Acquire);
             let used = self.writer_used(write, read)?;
             let count = header.message_count.load(Ordering::Acquire);
-            if self.capacity - used >= total && count < self.max_messages {
+            if self.admits(used, total, count) {
                 let was_empty = self.commit(write, payload, total);
                 return Ok(WriteOutcome {
                     overwritten,
@@ -398,8 +399,10 @@ impl RingBuffer {
                 });
             }
             if used == 0 {
-                // Пусто, а лимит сообщений «исчерпан» -- счётчик испорчен
-                // (кадр сам по себе всегда помещается в пустое кольцо).
+                // Недостижимо: пустое кольцо принимает любой допустимый кадр
+                // (`admits`, `RingConfig::validate`). Ветка держит цикл
+                // конечным, если инвариант конфигурации когда-нибудь
+                // нарушат: вытеснять из пустого кольца нечего.
                 return Err(ShmError::Corrupted);
             }
             if self.discard_oldest(read, write)? {
@@ -441,7 +444,7 @@ impl RingBuffer {
         let read = header.read_pos.load(Ordering::Acquire);
         let count = header.message_count.load(Ordering::Acquire);
         let used = self.writer_used(write, read)?;
-        if self.capacity - used < total || count >= self.max_messages {
+        if !self.admits(used, total, count) {
             return Err(ShmError::QueueFull);
         }
 
@@ -450,6 +453,22 @@ impl RingBuffer {
             overwritten: 0,
             was_empty,
         })
+    }
+
+    /// Принять ли кадр `total` байт при занятости `used` (позиции уже
+    /// проверены `writer_used`) и значении `message_count == count`.
+    ///
+    /// `message_count` -- подсказка, а не истина: его пишет и пир
+    /// (недоверенный), и законно отстаёт на 1 -- читатель уменьшает его
+    /// ПОСЛЕ сдвига `read_pos` (CAS), так что пустое по позициям кольцо
+    /// может показывать `count == max_messages` (при `max_messages = 1` --
+    /// обычная гонка). Поэтому лимит сообщений вытесняет/отказывает только
+    /// при `used > 0`; пустое кольцо принимает любой кадр, помещающийся по
+    /// байтам (а помещается любой допустимый: `max_message_size <=
+    /// capacity - FRAME_HEADER_SIZE`). Счётчик здесь не правим -- его
+    /// сводит насыщающий `decrement_count` читателя.
+    const fn admits(&self, used: u32, total: u32, count: u32) -> bool {
+        self.capacity - used >= total && (used == 0 || count < self.max_messages)
     }
 
     /// Копирует кадр в позицию `write` и публикует его.
@@ -533,11 +552,14 @@ impl RingBuffer {
         let read = header.read_pos.load(Ordering::Acquire);
         let count = header.message_count.load(Ordering::Acquire);
         let used = write.wrapping_sub(read);
+        let messages = self.max_messages.saturating_sub(count);
         FreeSpace {
             // Занятость больше ёмкости -- только на испорченном заголовке:
             // трактуем как «места нет».
             bytes: self.capacity.saturating_sub(used) as usize,
-            messages: self.max_messages.saturating_sub(count),
+            // Пустое кольцо принимает кадр при любом (отстающем) счётчике --
+            // то же правило, что у записи (`admits`).
+            messages: if used == 0 { messages.max(1) } else { messages },
             max_message_size: self.max_message_size as usize,
         }
     }
@@ -1174,9 +1196,29 @@ mod try_write_tests {
         let header = ring.header();
         let mut out = Vec::new();
 
+        // Счётчик -- подсказка: пустое по позициям кольцо принимает кадр при
+        // любом его значении (ни `Corrupted`, ни `QueueFull`).
         header.message_count.store(u32::MAX, O::Relaxed);
-        assert_eq!(ring.write_message(b"xx"), Err(ShmError::Corrupted));
-        assert_eq!(ring.try_write_message(b"xx"), Err(ShmError::QueueFull));
+        assert!(ring.free_space().fits(2));
+        let outcome = ring.write_message(b"xx").unwrap();
+        assert_eq!(outcome.overwritten, 0);
+        assert_eq!(ring.read_message(&mut out), Ok(2));
+        header.message_count.store(u32::MAX, O::Relaxed);
+        ring.try_write_message(b"yy").unwrap();
+        assert_eq!(ring.read_message(&mut out), Ok(2));
+        assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
+
+        // Непустое кольцо при «исчерпанном» счётчике: try_write отказывает,
+        // write вытесняет до пустого кольца и пишет -- цикл конечен.
+        ring.try_write_message(b"a1").unwrap();
+        ring.try_write_message(b"a2").unwrap();
+        header.message_count.store(u32::MAX, O::Relaxed);
+        assert_eq!(ring.try_write_message(b"zz"), Err(ShmError::QueueFull));
+        let outcome = ring.write_message(b"zz").unwrap();
+        assert_eq!(outcome.overwritten, 2);
+        assert!(outcome.was_empty, "вытеснение опустошило кольцо");
+        assert_eq!(ring.read_message(&mut out), Ok(2));
+        assert_eq!(out, b"zz");
         assert_eq!(ring.read_message(&mut out), Err(ShmError::QueueEmpty));
 
         header.message_count.store(0, O::Relaxed);
@@ -1419,6 +1461,56 @@ mod try_write_tests {
             ring.read_message(&mut out).err(),
             Some(ShmError::QueueEmpty)
         );
+    }
+
+    /// Счётчик отстаёт от `read_pos` (`max_messages = 1`): читатель CAS-ом
+    /// забрал единственный кадр и «замер» до `decrement_count` -- кольцо
+    /// пусто по позициям, а `message_count == max_messages`. Это законная
+    /// гонка, а не порча: оба пути записи обязаны принять кадр (пустое
+    /// кольцо принимает любой кадр, помещающийся по байтам), без вытеснения
+    /// и без `QueueFull`; счётчик потом сходится с насыщением.
+    #[test]
+    fn lagging_count_does_not_reject_write_into_empty_ring() {
+        type Write = fn(&RingBuffer, &[u8]) -> Result<WriteOutcome>;
+        let paths: [(&str, Write); 2] = [
+            ("write_message", RingBuffer::write_message),
+            ("try_write_message", RingBuffer::try_write_message),
+        ];
+        for (path, write) in paths {
+            let config = RingConfig::new(4096).max_messages(1);
+            let (ring, _mem) = make_ring_with(&config);
+            let header = ring.header();
+            let mut out = Vec::new();
+            write(&ring, &[1u8; 16]).unwrap();
+
+            // Читатель: CAS read_pos за кадр, decrement_count ещё не сделан.
+            let read0 = header.read_pos.load(O::Acquire);
+            let write0 = header.write_pos.load(O::Acquire);
+            let frame = ring.frame_at(read0, write0).unwrap().unwrap();
+            header
+                .read_pos
+                .compare_exchange(read0, read0 + frame.total, O::AcqRel, O::Acquire)
+                .unwrap();
+            assert_eq!(header.message_count.load(O::Acquire), 1);
+
+            let outcome = write(&ring, &[2u8; 16])
+                .unwrap_or_else(|e| panic!("{path}: пустое кольцо отвергло кадр: {e:?}"));
+            assert_eq!(outcome.overwritten, 0, "{path}: вытеснять нечего");
+            assert!(outcome.was_empty, "{path}: читатель выбрал всё до кадра");
+
+            // Читатель досчитывает; счётчик -- 1 (новый кадр), не ниже нуля.
+            ring.decrement_count();
+            assert_eq!(header.message_count.load(O::Acquire), 1, "{path}");
+            assert_eq!(ring.read_message(&mut out).unwrap(), 16, "{path}");
+            assert_eq!(out, [2u8; 16]);
+            assert_eq!(header.message_count.load(O::Acquire), 0, "{path}");
+            assert_eq!(
+                ring.read_message(&mut out).err(),
+                Some(ShmError::QueueEmpty)
+            );
+            assert_eq!(header.message_count.load(O::Acquire), 0, "{path}");
+            assert_eq!(drop_count(&ring), 0, "{path}");
+        }
     }
 
     /// Вторая половина протокола: снимок читателя «пусто» снят ДО

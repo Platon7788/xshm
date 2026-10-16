@@ -144,6 +144,15 @@
 
 ### Исправлено (аудит 16.10.2026)
 
+- **High** Ложный `Corrupted` при `max_messages = 1`: читатель уменьшает
+  `message_count` после CAS `read_pos`, и писатель в этом окне видел пустое
+  по позициям кольцо с `count == max_messages` — `write_message` отвечал
+  `Corrupted` (в Auto — фатальный разрыв), `try_write_message` — `QueueFull`.
+  Теперь лимит сообщений вытесняет/отказывает только при `used > 0`, пустое
+  кольцо принимает кадр при любом счётчике (`RingBuffer::admits`,
+  `free_space`); `Corrupted` — только по позициям и кадрам. Тест
+  `ring::try_write_tests::lagging_count_does_not_reject_write_into_empty_ring`.
+  Пир-видимо: `INTEROP.md` §e.2 п. 1.
 - **High** (регрессия формата 0.10, найдена бенчмарком `bench throughput 16`)
   Потерянный сигнал `DATA`: писатель решал «сигналить» по прежнему
   `message_count == 0`, а читатель с 0.10 считает кольцо пустым по
