@@ -120,12 +120,24 @@
   рабочего потока не теряется в `let _ = handle.join()`. Куда сообщается:
   - `DispatchHandler::on_error(Some(client_id), ..)` — паника worker-а канала
     клиента (там идут его `on_client_connect`/`on_message`/
-    `on_space_available`/`on_client_disconnect_reason`), когда канал
-    закрывается: в `DispatchServer::stop` (на потоке, вызвавшем `stop()`, до
-    возврата), в `disconnect_client` (на вызвавшем потоке) или в потоке
-    закрытия после отключения клиента (его `stop()` дожидается);
+    `on_space_available`/`on_client_disconnect_reason`). Сообщается, когда
+    канал закрывается (join его worker-а), по пути закрытия:
+    - остановка сервера (`stop`/Drop): в хвосте потока лобби, который
+      закрывает оставшиеся каналы; `stop()` из чужого потока дожидается
+      этого потока, т.е. `on_error` приходит до возврата из `stop()`;
+      порядок для клиента — `on_error`, затем
+      `on_client_disconnect_reason(Local)`;
+    - `disconnect_client` из чужого (не серверного) потока: на этом потоке,
+      до возврата; `on_error`, затем `on_client_disconnect_reason(Local)`;
+    - `disconnect_client` из колбэка обработчика и отключение самого
+      клиента (его `DISCONNECT`/смерть): канал закрывается в фоновом потоке
+      закрытия (его дожидается `stop()`), `on_error` приходит оттуда —
+      ПОСЛЕ `on_client_disconnect_reason`. Поток закрытия считается потоком
+      сервера: `stop()` из `on_error` там отложенный, как в колбэках
+      worker-ов каналов;
   - `DispatchHandler::on_error(None, ..)` — паника потока лобби или
-    фонового потока, в `DispatchServer::stop`;
+    фонового потока (ожидания/закрытия канала), в `DispatchServer::stop` на
+    потоке, вызвавшем `stop()`, до возврата;
   - `MultiHandler::on_error(None, ..)` — паника worker-а группы слотов, в
     `MultiServer::stop` (на вызвавшем потоке, до возврата).
 
