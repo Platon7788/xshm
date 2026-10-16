@@ -69,10 +69,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::auto::{join_unless_self, map_spawn_error};
-use crate::client::{Interrupt, SharedClient};
+use crate::client::{ClaimMode, Interrupt, SharedClient};
 use crate::constants::{
     CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, MAX_RING_CAPACITY,
-    MIN_MESSAGE_SIZE, SLOT_ID_NO_SLOT,
+    MIN_MESSAGE_SIZE, RESERVE_SAFETY_MARGIN, RESERVE_TIMEOUT, SLOT_ID_NO_SLOT,
 };
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
@@ -116,19 +116,6 @@ const WAKE_ANY: usize = usize::MAX;
 /// нужен, чтобы слот не остался глухим, а пауза -- чтобы стойкий отказ не
 /// стал горячим циклом.
 const REARM_BACKOFF: Duration = Duration::from_millis(100);
-
-/// Таймаут, после которого «зависшая» резервация слота освобождается
-/// (клиент захватил claim, но не подключился к слоту).
-const RESERVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Гарантированный запас между эффективным клиентским `slot_timeout` и
-/// серверным `RESERVE_TIMEOUT`. Клиент обязан сам отвалиться по таймауту и
-/// освободить claim РАНЬШЕ, чем сервер сочтёт его протухшим и заберёт claim
-/// силой — иначе сервер может отнять слот у ещё легитимно ожидающего
-/// клиента (аудит 2026-07-10). `slot_timeout` из `MultiClientOptions`
-/// клампится этим запасом в `client_worker`, независимо от того, что задал
-/// вызывающий (значение в `MultiClientOptions` сверху не ограничено).
-const RESERVE_SAFETY_MARGIN: Duration = Duration::from_secs(2);
 
 /// Разовая (не периодическая) проверка «брошенного рукопожатия» после
 /// handshake: клиент, чьё ожидание `S2C_CONNECT` истекло ровно в момент
@@ -966,9 +953,9 @@ impl MultiCore {
         match slot.server.accept_pending() {
             Ok(()) => {
                 slot.connected = true;
-                // Claim клиент ставит до `CLIENT_HELLO` (Acquire-чтение
-                // заявки в `accept_pending` делает его видимым).
-                slot.session_claim = slot.claim();
+                // Ревизия 3: claim сессии -- из рукопожатия (S6: claim
+                // владельца зафиксированной заявки, а не следующего клиента).
+                slot.session_claim = slot.server.session_claim();
                 slot.claim_seen = None;
                 slot.last_liveness_check = None;
                 slot.verify_at = Some(Instant::now() + HANDSHAKE_VERIFY_DELAY);
@@ -2128,6 +2115,9 @@ fn client_worker(
             namespace,
             &slot_name,
             effective_slot_timeout,
+            // Ревизия 3: claim слота уже наш (`try_claim_slot`) -- рукопожатие
+            // его не берёт и не освобождает (снимает `release_claim` ниже).
+            ClaimMode::Held(token),
             Interrupt {
                 wake: wake.as_handle(),
                 should_stop: &mut should_stop,
@@ -2277,35 +2267,6 @@ fn client_worker(
     }
 }
 
-/// Процесс-локальный счётчик попыток захвата (гарантирует, что в пределах
-/// одного процесса токены не повторяются, пока живёт процесс).
-static CLAIM_TOKEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-
-/// Генерирует токен захвата, устойчивый к ABA между процессами.
-///
-/// Раньше токен строился как `pid<<8 ^ n` — как только процесс-локальный
-/// счётчик `n` превышал 255, XOR начинал портить биты pid, и токен мог
-/// совпасть с токеном другого процесса. Из-за этого устаревший (уже
-/// неактуальный) вызов `release_claim` с таким совпавшим токеном мог
-/// CAS-ом освободить ЖИВОЙ claim чужого процесса (аудит 2026-07-10).
-///
-/// `RandomState` (std, без внешних зависимостей) на каждый вызов `new()`
-/// сидируется свежей ОС-энтропией — смешивая её с pid и процесс-локальным
-/// счётчиком, получаем токен, практически уникальный и внутри процесса,
-/// и между процессами (в отличие от детерминированной XOR-схемы).
-fn next_claim_token() -> u32 {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-
-    let n = CLAIM_TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let mut hasher = RandomState::new().build_hasher();
-    hasher.write_u32(pid);
-    hasher.write_u32(n);
-    let token = hasher.finish() as u32;
-    if token == CLAIM_FREE { 1 } else { token }
-}
-
 /// Пытается атомарно захватить конкретный слот через `compare_exchange`.
 /// `Ok(true)` — захвачено нами; `Ok(false)` — слот занят/невалиден;
 /// `Err(AccessDenied)` (0.10) — слот есть, но DACL не даёт его этому
@@ -2416,7 +2377,7 @@ fn claim_free_slot(
     namespace: Option<&PrivateNamespace>,
     base_name: &str,
 ) -> Result<(u32, String, u32)> {
-    let token = next_claim_token();
+    let token = crate::shared::claim_token();
     let mut saw_slot = false;
     let mut denied = false;
     for slot_id in 0..MAX_MULTI_CLIENTS {

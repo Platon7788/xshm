@@ -507,9 +507,8 @@ impl AsRawHandle for NamedMutex {
 pub struct NamedMutexGuard<'a> {
     mutex: &'a NamedMutex,
     /// Захват достался «брошенным»: прежний владелец умер посреди работы
-    /// (лобби Dispatch относится к этому одинаково -- сервер сам заметит
-    /// смерть по handle процесса; флаг нужен тестам).
-    #[cfg_attr(not(test), expect(dead_code, reason = "читается только тестами"))]
+    /// (ревизия 3: клиент лобби Dispatch тогда перехватывает claim лобби
+    /// умершего держателя -- `ClaimMode::TakeOverAbandoned`).
     abandoned: bool,
     /// Не `Send`: освобождать обязан поток-владелец.
     _not_send: PhantomData<*const ()>,
@@ -572,7 +571,7 @@ impl NamedMutex {
 
 impl NamedMutexGuard<'_> {
     /// Прежний владелец умер, не освободив мьютекс.
-    #[cfg(test)]
+    #[must_use]
     pub const fn was_abandoned(&self) -> bool {
         self.abandoned
     }

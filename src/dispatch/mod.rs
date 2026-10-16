@@ -32,7 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind, map_spawn_error};
-use crate::client::SharedClient;
+use crate::client::{ClaimMode, SharedClient};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
 use crate::namespace::PrivateNamespace;
@@ -1660,8 +1660,24 @@ fn lobby_register(
     let Some(_turn) = lock.lock(Some(options.lobby_timeout))? else {
         return Err(ShmError::Timeout);
     };
-    let client =
-        SharedClient::connect_impl(namespace, base_name, options.lobby_timeout, true, None)?;
+    // Ревизия 3 (§4.3 дизайна): при соблюдении R12 claim лобби к захвату
+    // мьютекса свободен -- прежний клиент снимает его (Drop) до
+    // `NtReleaseMutant`. Мьютекс достался брошенным -- прежний держатель
+    // умер, не сняв claim: его захват перехватываем, а не ждём дедлайна
+    // `RESERVE_TIMEOUT` (он длиннее `lobby_timeout`).
+    let claim = if _turn.was_abandoned() {
+        ClaimMode::TakeOverAbandoned
+    } else {
+        ClaimMode::Take
+    };
+    let client = SharedClient::connect_impl(
+        namespace,
+        base_name,
+        options.lobby_timeout,
+        true,
+        claim,
+        None,
+    )?;
 
     // Отправляем запрос на регистрацию
     let request = protocol::encode_request(&RegistrationRequest {
@@ -1778,6 +1794,8 @@ impl AutoHandler for DispatchClientProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::CLAIM_FREE;
+    use crate::shared::SharedView;
     use std::sync::atomic::AtomicU32;
 
     struct TestServerHandler {
@@ -3271,9 +3289,15 @@ mod tests {
             &mut buf,
         )
         .unwrap();
-        let intruder =
-            SharedClient::connect_impl(None, &channel, Duration::from_secs(5), false, None)
-                .unwrap();
+        let intruder = SharedClient::connect_impl(
+            None,
+            &channel,
+            Duration::from_secs(5),
+            false,
+            ClaimMode::Take,
+            None,
+        )
+        .unwrap();
         wait_for("отказ каналу", Duration::from_secs(5), || {
             handler.handshake_failures.load(Ordering::Acquire) == 1
         });
@@ -3317,7 +3341,14 @@ mod tests {
     /// Подключение к каналу с подменённым временем создания (PID сообщается).
     fn connect_channel_with_start(channel: &str, start: Option<u64>) -> SharedClient {
         crate::client::FORGED_START_TIME.with(|cell| cell.set(start));
-        let client = SharedClient::connect_impl(None, channel, Duration::from_secs(5), true, None);
+        let client = SharedClient::connect_impl(
+            None,
+            channel,
+            Duration::from_secs(5),
+            true,
+            ClaimMode::Take,
+            None,
+        );
         crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
         client.unwrap()
     }
@@ -3375,5 +3406,78 @@ mod tests {
         assert!(channel_peer_matches(Some(7), Some(7)));
         assert!(!channel_peer_matches(Some(7), Some(8)));
         assert!(!channel_peer_matches(Some(7), None));
+    }
+
+    // ─── Ревизия 3 (Task 22) ────────────────────────────────────────────────
+
+    /// §7.1 п. 14: прежний клиент лобби умер, держа мьютекс `<B>_lock` и
+    /// claim лобби. Следующий получает мьютекс брошенным и перехватывает
+    /// claim (`ClaimMode::TakeOverAbandoned`) -- регистрация проходит сразу,
+    /// а не после дедлайна `RESERVE_TIMEOUT`.
+    #[test]
+    fn lobby_takes_over_claim_of_abandoned_mutex() {
+        let name = format!("TEST_DISPATCH_ABANDONED_{}", std::process::id());
+        let server = DispatchServer::start(
+            &name,
+            Arc::new(TestServerHandler::new()),
+            DispatchOptions::default(),
+        )
+        .unwrap();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        let control = SharedView::peek_control(&mapping).unwrap();
+        let lock_name = lobby_lock_name(&name);
+        let (grabbed_tx, grabbed_rx) = std::sync::mpsc::channel();
+        let dead = thread::spawn(move || {
+            let mutex = NamedMutex::open_or_create(
+                lock_name.as_str(),
+                &ObjectSecurity::default().attributes().unwrap(),
+            )
+            .unwrap();
+            let guard = mutex.lock(Some(Duration::from_secs(5))).unwrap().unwrap();
+            grabbed_tx.send(()).unwrap();
+            // Поток уходит, не освободив мьютекс: он станет брошенным.
+            std::mem::forget(guard);
+        });
+        grabbed_rx.recv().unwrap();
+        control.slot_claim.store(0xDEAD_C1A1, Ordering::Release);
+        dead.join().unwrap();
+
+        let started = std::time::Instant::now();
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration::new(std::process::id(), 1, "takeover"),
+            Arc::new(TestClientHandler::new()),
+            DispatchClientOptions::default(),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        client.stop();
+        server.stop();
+    }
+
+    /// §7.1 п. 10: лобби занято чужим claim, никто не толкает -- поток
+    /// лобби не просыпается ни разу.
+    #[test]
+    fn idle_lobby_with_foreign_claim_does_not_wake_up() {
+        let name = format!("TEST_DISPATCH_IDLE_CLAIM_{}", std::process::id());
+        let server = DispatchServer::start(
+            &name,
+            Arc::new(TestServerHandler::new()),
+            DispatchOptions::default(),
+        )
+        .unwrap();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        let control = SharedView::peek_control(&mapping).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let s0 = server.wakeups();
+        control.slot_claim.store(0x1D1E_C1A1, Ordering::Release);
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(server.wakeups() - s0, 0, "лобби просыпалось в простое");
+        server.stop();
     }
 }

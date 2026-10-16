@@ -818,3 +818,45 @@ fn multi_spin_does_not_starve_group_events() {
     drop(chatty);
     server.stop();
 }
+
+// ─── Ревизия 3: claim канала ────────────────────────────────────────────────
+
+/// §7.1 п. 11: канал занят клиентом-процессом (свой клиент -- сразу
+/// `AlreadyConnected`); клиент убит в сессии -- сервер освобождает его claim
+/// при разборе смерти, и новый клиент подключается сразу, а не через
+/// `RESERVE_TIMEOUT` (10 с).
+#[test]
+fn peer_death_releases_claim_immediately() {
+    let name = unique_name("CLAIM");
+    let rec = Arc::new(Recorder::default());
+    let server = AutoServer::start(&name, rec.clone(), AutoOptions::default()).unwrap();
+    let mut peer = Peer::spawn("auto_client", &name);
+    wait_until("child connect", Duration::from_secs(20), || {
+        rec.connected.load(Ordering::Acquire)
+    });
+    assert_eq!(
+        SharedClient::connect(&name, Duration::from_secs(1)).unwrap_err(),
+        ShmError::AlreadyConnected
+    );
+    let t0 = peer.kill();
+    let (reason, _) = rec.wait_reason(Duration::from_secs(10));
+    assert_eq!(reason, DisconnectReason::PeerDied);
+    let mut client = None;
+    wait_until(
+        "подключение после смерти",
+        Duration::from_secs(3),
+        || match SharedClient::connect(&name, Duration::from_millis(500)) {
+            Ok(c) => {
+                client = Some(c);
+                true
+            }
+            Err(ShmError::AlreadyConnected) => false,
+            Err(err) => panic!("подключение: {err:?}"),
+        },
+    );
+    let waited = t0.elapsed();
+    println!("peer_death_releases_claim_immediately: канал свободен через {waited:?}");
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+    drop(client);
+    drop(server);
+}

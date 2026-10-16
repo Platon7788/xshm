@@ -268,6 +268,63 @@ impl SharedView {
     }
 }
 
+/// Финализатор murmur3 (`fmix32`): биекция `u32 -> u32` с хорошим
+/// перемешиванием -- разные входы дают разные токены.
+const fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
+/// Токен владельца заявки `ControlBlock::slot_claim` (ревизия 3, INTEROP
+/// §i.1, R18): Multi-слот и single-client канал.
+///
+/// Требования: `!= CLAIM_FREE`; уникален внутри процесса (два клиента одного
+/// процесса неразличимы по PID и времени создания -- владение различают
+/// только токены); практически уникален между процессами.
+///
+/// `seed` -- один раз на процесс: ОС-энтропия `RandomState` ⊕ PID ⊕ время
+/// создания процесса. Токен -- `fmix32(seed + n)`, `n` -- процесс-локальный
+/// счётчик: биекция над `seed + n` гарантирует различие токенов процесса на
+/// 2^32 вызовов подряд, а случайный seed делает совпадение живых токенов
+/// разных процессов событием 2^-32. Совпадение не ломает исключительность
+/// (CAS `0 -> T` выигрывает один), опасно только запоздалое `CAS T -> 0`
+/// после отъёма по дедлайну.
+pub(crate) fn claim_token() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+    use std::sync::atomic::AtomicU32;
+
+    static SEED: OnceLock<u32> = OnceLock::new();
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    let seed = *SEED.get_or_init(|| {
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        let (lo, hi) = split_time(crate::win::current_process_start_time());
+        // Усечение до u32 -- намеренно: нужна лишь энтропия хеша.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "энтропия хеша, старшие биты не нужны"
+        )]
+        let entropy = hasher.finish() as u32;
+        entropy ^ std::process::id() ^ lo ^ hi
+    });
+    loop {
+        // Relaxed: счётчик не публикует никаких данных -- нужна лишь
+        // атомарность RMW (каждый вызов получает своё `n`).
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let token = fmix32(seed.wrapping_add(n));
+        if token != CLAIM_FREE {
+            return token;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

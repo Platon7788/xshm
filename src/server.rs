@@ -9,7 +9,9 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::asynch::{ANONYMOUS, Endpoint, OP, RecvFuture, SendFuture, WaitSet};
-use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
+use crate::constants::{
+    CLAIM_FREE, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY,
+};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
@@ -22,6 +24,102 @@ use crate::ring::{
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
 use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
+
+/// Тесты (Task 22): точка рукопожатия сервера, в которой срабатывает
+/// `HANDSHAKE_HOOK`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HandshakePoint {
+    /// Между публикацией `generation`/`SERVER_READY` (S3, S4) и фиксацией S5.
+    BeforeCommit,
+    /// Между фиксацией S5 и сигналом `S2C_CONNECT` (S6, S7).
+    AfterCommit,
+}
+
+/// Тесты: хук рукопожатия -- получает отображение сервера.
+#[cfg(test)]
+pub(crate) type HandshakeHook = Box<dyn FnOnce(&SharedView)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Тесты (Task 22): одноразовый хук в точке `HandshakePoint` внутри
+    /// `complete_handshake` -- играет роль клиента, успевшего в этом окне
+    /// (G1, G2 дизайна). В release ни кода, ни TLS нет.
+    pub(crate) static HANDSHAKE_HOOK: core::cell::RefCell<Option<(HandshakePoint, HandshakeHook)>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Вызвать тестовый хук рукопожатия, если он назначен на точку `at`.
+#[cfg(test)]
+fn handshake_hook(view: &SharedView, at: HandshakePoint) {
+    let hook = HANDSHAKE_HOOK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(point, _)| *point == at) {
+            slot.take().map(|(_, hook)| hook)
+        } else {
+            None
+        }
+    });
+    if let Some(hook) = hook {
+        hook(view);
+    }
+}
+
+/// Держатель claim-а подтверждённо умер, и это его заявка (S2/S6 ревизии
+/// 3): PID заявки `pid` ненулевой и совпадает с PID владельца claim-а
+/// (`slot_owner_pid`; иначе PID прочитан у прежнего клиента -- ABA G2), а
+/// процесс подтверждённо ушёл (`is_process_gone`) и по времени заявки, и
+/// по времени владельца.
+///
+/// Отклонение от дизайна §2.2 S2: дизайн сверял только время заявки
+/// (`client_start`). Его клиент заявляет сам, и живой клиент с неверным
+/// временем (подмена, `FORGED_START_TIME` в тестах) снимался бы как
+/// умерший -- вместо прежнего поведения «подключён без наблюдения»
+/// (`peer_tests::client_with_forged_start_time_is_reported_dead`). Время
+/// владельца пишет держатель claim-а из настоящего времени своего процесса
+/// (C2) -- по нему живой процесс «умершим» не станет.
+fn claim_holder_gone(control: &crate::layout::ControlBlock, pid: u32, start: u64) -> bool {
+    pid != 0
+        && control.slot_owner_pid.load(Ordering::Acquire) == pid
+        && crate::win::is_process_gone(pid, start)
+        && crate::win::is_process_gone(pid, control.owner_start_time())
+}
+
+/// Протухший захват single-client канала (ревизия 3, §2.3 дизайна, R18):
+/// вызывается только по `CONNECT_REQ` без заявки (толчок проигравшего
+/// клиента, C1) у неподключённого сервера -- таймера нет, ожидания остаются
+/// без таймаута («ноль пробуждений в простое»).
+///
+/// Claim без заявки впервые увиден -- запомнить токен и момент; тот же
+/// токен виден не раньше `reserve` спустя, а заявки так и нет, -- отнять
+/// CAS-ом (держатель умер между захватом и `CLIENT_HELLO` или, «не
+/// заметив» отключения сервером, держит канал). Новый токен -- новый отсчёт.
+fn observe_idle_claim(view: &SharedView, seen: &mut Option<(u32, Instant)>, reserve: Duration) {
+    let control = view.control_block();
+    let claim = control.slot_claim.load(Ordering::Acquire);
+    if claim == CLAIM_FREE {
+        *seen = None;
+        return;
+    }
+    let now = Instant::now();
+    match *seen {
+        Some((token, at)) if token == claim => {
+            if now.saturating_duration_since(at) >= reserve
+                && control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO
+            {
+                // CAS: если claim успел смениться, это уже другой захват.
+                let _ = control.slot_claim.compare_exchange(
+                    claim,
+                    CLAIM_FREE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                );
+                *seen = None;
+            }
+        }
+        _ => *seen = Some((claim, now)),
+    }
+}
 
 /// Дедлайн ожидания клиента: повторные ожидания после ложного
 /// `CONNECT_REQ` получают остаток исходного таймаута, а не новый целиком.
@@ -133,6 +231,22 @@ pub struct SharedServer {
     /// сверенное при открытии `peer` (`0` -- клиент время не сообщил, сверки
     /// не было; см. `verified_peer_pid`).
     peer_start: u64,
+    /// Ревизия 3: сервер single-client канала (`start_with` и каналы
+    /// Auto/Dispatch, не Multi-слот и не anonymous) -- освобождает claim
+    /// умершего клиента и отнимает протухший захват по толчку.
+    exclusive: bool,
+    /// Claim (токен) клиента текущей сессии, прочитанный при фиксации
+    /// рукопожатия (S6); `CLAIM_FREE` -- клиент без claim.
+    session_claim: u32,
+    /// Не подключён: чужой claim без заявки и момент его ПЕРВОГО наблюдения
+    /// (отъём -- не раньше `reserve_timeout` от него, §2.3 дизайна).
+    claim_seen: Option<(u32, Instant)>,
+    /// Срок протухшего захвата (`RESERVE_TIMEOUT`; тесты подменяют).
+    reserve_timeout: Duration,
+    /// Тесты: пробуждения ожиданий `wait_for_client*` (включая внутренние
+    /// повторы после `CONNECT_REQ` без заявки).
+    #[cfg(test)]
+    wait_wakeups: Arc<std::sync::atomic::AtomicU64>,
     _mapping: Mapping,
     /// Частное пространство имён канала (0.10): держим, пока живы объекты
     /// -- с последним handle пространство исчезает, и клиент не нашёл бы
@@ -203,6 +317,8 @@ impl SharedServer {
             security,
         )?;
         let mut server = Self::from_mapping(mapping, layout, slot_count)?;
+        // Ревизия 3: не Multi-слот (claim слота ведёт диспетчер Multi).
+        server.exclusive = slot_count == 0;
         server.events = Some(SharedEvents::create(root, name, security)?);
         server._namespace = namespace.cloned();
         Ok(server)
@@ -265,6 +381,12 @@ impl SharedServer {
             connected: false,
             peer: None,
             peer_start: 0,
+            exclusive: false,
+            session_claim: CLAIM_FREE,
+            claim_seen: None,
+            reserve_timeout: crate::constants::RESERVE_TIMEOUT,
+            #[cfg(test)]
+            wait_wakeups: Arc::default(),
             _namespace: None,
             _mapping: mapping,
             _not_sync: PhantomData,
@@ -302,11 +424,18 @@ impl SharedServer {
         // дальше остаток таймаута.
         let deadline = Deadline::new(timeout);
         loop {
-            if !events.connect_req.wait(deadline.remaining())? {
+            let fired = events.connect_req.wait(deadline.remaining())?;
+            #[cfg(test)]
+            self.wait_wakeups.fetch_add(1, Ordering::AcqRel);
+            if !fired {
                 return Err(ShmError::Timeout);
             }
             if self.hello_pending() {
                 return self.complete_handshake();
+            }
+            // Толчок без заявки (ревизия 3): проверить протухший захват.
+            if self.exclusive {
+                observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
             }
         }
     }
@@ -439,16 +568,23 @@ impl SharedServer {
         let deadline = Deadline::new(timeout);
         loop {
             // CONNECT_REQ первым: при одновременном сигнале клиент важнее.
-            match wait_any(
+            let fired = wait_any(
                 &[events.connect_req.as_handle(), wake],
                 deadline.remaining(),
-            )? {
+            )?;
+            #[cfg(test)]
+            self.wait_wakeups.fetch_add(1, Ordering::AcqRel);
+            match fired {
                 Some(0) => {}
                 _ => return Ok(false),
             }
             if self.hello_pending() {
                 self.complete_handshake()?;
                 return Ok(true);
+            }
+            // Толчок без заявки (ревизия 3): проверить протухший захват.
+            if self.exclusive {
+                observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
             }
         }
     }
@@ -496,54 +632,104 @@ impl SharedServer {
         self.complete_handshake()
     }
 
-    /// Завершение серверной стороны handshake, общее для событийного и
-    /// polling-путей: сброс колец -> публикация нового generation ->
-    /// SERVER_READY -> фиксация CAS `client_state: CLIENT_HELLO ->
-    /// SERVER_READY` -> сброс `DISCONNECT` -> сигнал connect_ack.
+    /// Серверная сторона рукопожатия (ревизия 3, INTEROP R16/R18), общая для
+    /// событийного и polling-путей; вызывается при `client_state ==
+    /// CLIENT_HELLO` (Acquire в `hello_pending`/`wait_for_client_noevent`).
     ///
-    /// Порядок критичен: буферы сбрасываются ДО публикации generation
-    /// (`Release`), поэтому клиент, прочитавший новый generation (`Acquire`),
-    /// гарантированно видит уже очищенные кольца.
-    ///
-    /// Ревизия 2 (25.09.2026, INTEROP R16): рукопожатие фиксирует CAS
-    /// `client_state`, а не store. Клиент, у которого истёк таймаут, отзывает
-    /// заявку встречным CAS `CLIENT_HELLO -> IDLE`; проиграл сервер --
-    /// рукопожатия нет: `server_state`/заголовки обратно в `IDLE`,
-    /// `S2C_CONNECT` НЕ сигналится (раньше он оставался взведённым для
-    /// следующего клиента), `Err(HandshakeFailed)`. Новый `generation` при
-    /// этом остаётся опубликованным (кольца пусты, клиентов нет) -- клиент
-    /// отличает «принят» по смене generation только вместе с проигранным
-    /// отзывом, так что лишний инкремент никого не вводит в заблуждение.
+    /// - S1: предварительно -- claim `T`, самоописание клиента (PID, время)
+    ///   и наблюдение его процесса (`open_peer`);
+    /// - S2: заявка подтверждённо умершего держателя claim-а снимается до
+    ///   фиксации -- без нового `generation` и без `S2C_CONNECT`;
+    /// - S3: сброс колец -> `generation + 1` (Release) -> заголовки и
+    ///   `server_state = SERVER_READY`. Буферы сбрасываются ДО публикации
+    ///   generation, поэтому клиент, увидевший фиксацию (S5 публикуется
+    ///   позже), видит уже очищенные кольца;
+    /// - S4: сброс `DISCONNECT` -- ДО фиксации (ревизия 3, G1): прощальный
+    ///   сигнал клиента, принятого по проигранному отзыву и сразу ушедшего,
+    ///   больше не съедается;
+    /// - S5: фиксация CAS `CLIENT_HELLO -> SERVER_READY`; проиграна
+    ///   (клиент отозвал заявку) -- `server_state`/заголовки в `IDLE`,
+    ///   `S2C_CONNECT` НЕ сигналится, `Err(HandshakeFailed)`. Опубликованный
+    ///   `generation` остаётся: клиент засчитывает его только при
+    ///   проигранном отзыве;
+    /// - S6: самоописание и claim сессии -- владельца зафиксированной заявки
+    ///   (G2: им мог оказаться следующий клиент -- тогда наблюдается его
+    ///   процесс);
+    /// - S7: `S2C_CONNECT`, подключён.
     fn complete_handshake(&mut self) -> Result<()> {
         let control = self.view.control_block();
-        // Протокол 0.8+: PID клиента, записанный им ДО CLIENT_HELLO (видим
-        // благодаря Acquire-чтению client_state в wait_for_client*). `swap(0)`:
-        // значение одноразовое -- клиент старой версии, пришедший следом,
-        // не унаследует чужой PID. 0 -- клиент старой версии, наблюдения нет.
-        let client_pid = control.client_pid.swap(0, Ordering::AcqRel);
-        // Находка 23: время создания процесса клиента -- парой с PID и тоже
-        // одноразово; половины видны после AcqRel-`swap` выше (клиент пишет
-        // их до `client_pid`). `0` -- клиент время не сообщил.
-        let client_start = control.take_client_start();
-        let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
+        // S1. PID и время клиента, записанные им ДО `CLIENT_HELLO` (видны
+        // благодаря Acquire-чтению `client_state`), -- пока без потребления:
+        // одноразовыми их делает S6. 0 -- клиент без PID (старая версия).
+        let claim = control.slot_claim.load(Ordering::Acquire);
+        let pid = control.client_pid.load(Ordering::Acquire);
+        let start = control.client_start_time();
+        let mut watch = ProcessWatch::open_peer(pid, start);
 
+        // S2. Заявка умершего: процесс не наблюдается, он же держатель
+        // claim-а (защита от ABA G2: PID прочитан у прежнего клиента) и
+        // подтверждённо ушёл. Снимаем CAS-ом -- отзыв самого клиента или
+        // гонка с ним решаются однозначно.
+        if watch.is_none() && claim_holder_gone(control, pid, start) {
+            if control
+                .client_state
+                .compare_exchange(
+                    HANDSHAKE_CLIENT_HELLO,
+                    HANDSHAKE_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                control.client_pid.store(0, Ordering::Release);
+                control.announce_client_start(0);
+                let (header_a, header_b) = self.view.headers();
+                header_a
+                    .handshake_state
+                    .store(HANDSHAKE_IDLE, Ordering::Release);
+                header_b
+                    .handshake_state
+                    .store(HANDSHAKE_IDLE, Ordering::Release);
+                // Claim -- последним: пока он стоит, новой заявки нет.
+                if claim != CLAIM_FREE {
+                    let _ = control.slot_claim.compare_exchange(
+                        claim,
+                        CLAIM_FREE,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+            }
+            return Err(ShmError::HandshakeFailed);
+        }
+
+        // S3.
+        let new_generation = control.generation.load(Ordering::Acquire).wrapping_add(1);
         let (header_a, header_b) = self.view.headers();
         header_a.reset(new_generation);
         header_b.reset(new_generation);
-
         control.generation.store(new_generation, Ordering::Release);
-
         header_a
             .handshake_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
         header_b
             .handshake_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-
         control
             .server_state
             .store(HANDSHAKE_SERVER_READY, Ordering::Release);
-        // Точка фиксации (ревизия 2): заявка ещё стоит -- рукопожатие наше.
+
+        // S4. `DISCONNECT` -- одно автосбросное событие на обе стороны:
+        // сигнал прошлой сессии (никто его не дождался) иначе мгновенно
+        // «отключил» бы нового клиента. ДО фиксации: после неё клиент может
+        // уже уйти и взвести свой.
+        if let Some(events) = &self.events {
+            let _ = events.disconnect.reset();
+        }
+        #[cfg(test)]
+        handshake_hook(&self.view, HandshakePoint::BeforeCommit);
+
+        // S5. Точка фиксации: заявка ещё стоит -- рукопожатие наше.
         if control
             .client_state
             .compare_exchange(
@@ -566,21 +752,105 @@ impl SharedServer {
                 .store(HANDSHAKE_IDLE, Ordering::Release);
             return Err(ShmError::HandshakeFailed);
         }
-        self.peer = ProcessWatch::open_peer(client_pid, client_start);
-        self.peer_start = if self.peer.is_some() { client_start } else { 0 };
+        #[cfg(test)]
+        handshake_hook(&self.view, HandshakePoint::AfterCommit);
 
+        // S6. Отклонение от дизайна §2.2 S6 (найдено моделью
+        // `handshake_model`): дизайн забирал самоописание `swap`-ом и брал
+        // `T2 = slot_claim` без сверки. Если владелец сессии (клиент,
+        // принятый по проигранному отзыву) успел уйти и освободить claim, а
+        // следующий клиент -- захватить его и записать своё самоописание,
+        // `swap` забрал бы ЕГО PID (его сессия осталась бы без наблюдения, а
+        // при совпадении PID одного процесса -- ABA значения), а
+        // `session_claim` назвал бы чужой токен. Поэтому: прочитать claim и
+        // самоописание, затем убедиться, что владелец ещё в сессии
+        // (`client_state == SERVER_READY`: свой claim он освобождает только
+        // после CAS `SERVER_READY -> IDLE`, R18) -- значит, прочитанное --
+        // его. Потребить CAS-ом; если после этого claim уже не `t2` (токены
+        // уникальны), потреблённое могло оказаться значением следующего
+        // клиента -- вернуть его.
+        let session_claim = control.slot_claim.load(Ordering::Acquire);
+        let pid2 = control.client_pid.load(Ordering::Acquire);
+        let start2 = control.client_start_time();
+        let owner_present = control.client_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
+        let (mut peer_start, claim) = (start, if owner_present { session_claim } else { claim });
+        if owner_present {
+            if control
+                .client_pid
+                .compare_exchange(pid2, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                if control.slot_claim.load(Ordering::Acquire) == session_claim {
+                    control.announce_client_start(0);
+                } else {
+                    let _ = control.client_pid.compare_exchange(
+                        0,
+                        pid2,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    );
+                }
+            }
+            if (pid2, start2) != (pid, start) {
+                // G2: зафиксирована заявка следующего клиента (прежний
+                // отозвал свою между S1 и S5) -- наблюдаем его процесс.
+                watch = ProcessWatch::open_peer(pid2, start2);
+                peer_start = start2;
+                if watch.is_none() && claim_holder_gone(control, pid2, start2) {
+                    return Err(self.abort_session(claim));
+                }
+            }
+        }
+
+        // S7.
+        self.peer_start = if watch.is_some() { peer_start } else { 0 };
+        self.peer = watch;
+        self.session_claim = claim;
+        self.claim_seen = None;
         // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
         // опросом `server_state`.
         if let Some(events) = &self.events {
-            // 0.9: `DISCONNECT` -- одно автосбросное событие на обе стороны;
-            // сигнал, оставшийся от прошлой сессии (никто его не дождался),
-            // иначе мгновенно «отключил» бы нового клиента. Сбрасываем ДО
-            // `S2C_CONNECT`: клиент начнёт ждать `DISCONNECT` только после него.
-            let _ = events.disconnect.reset();
             events.connect_ack.set()?;
         }
         self.connected = true;
         Ok(())
+    }
+
+    /// S6: зафиксированная сессия принадлежит подтверждённо умершему
+    /// клиенту -- закрыть её, как `mark_disconnected`, освободить его claim
+    /// и взвести `DISCONNECT` (на случай ложного «умер»: живой клиент,
+    /// засчитавший подключение по проигранному отзыву, увидит разрыв, а не
+    /// сессию без сервера). `S2C_CONNECT` не сигналится.
+    fn abort_session(&mut self, claim: u32) -> ShmError {
+        let control = self.view.control_block();
+        control
+            .server_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        let _ = control.client_state.compare_exchange(
+            HANDSHAKE_SERVER_READY,
+            HANDSHAKE_IDLE,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        let (header_a, header_b) = self.view.headers();
+        header_a
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        header_b
+            .handshake_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        if claim != CLAIM_FREE {
+            let _ = control.slot_claim.compare_exchange(
+                claim,
+                CLAIM_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        if let Some(events) = &self.events {
+            let _ = events.disconnect.set();
+        }
+        ShmError::HandshakeFailed
     }
 
     #[must_use]
@@ -615,11 +885,31 @@ impl SharedServer {
         &self.view
     }
 
+    /// Claim (токен) клиента текущей сессии (ревизия 3, S6); Multi сверяет
+    /// с ним штатный уход клиента.
+    pub(crate) const fn session_claim(&self) -> u32 {
+        self.session_claim
+    }
+
+    /// Тесты: подменить срок протухшего захвата.
+    #[cfg(test)]
+    pub(crate) const fn set_reserve_timeout(&mut self, timeout: Duration) {
+        self.reserve_timeout = timeout;
+    }
+
+    /// Тесты: счётчик пробуждений ожиданий `wait_for_client*`.
+    #[cfg(test)]
+    pub(crate) fn wait_wakeups(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.wait_wakeups)
+    }
+
     pub(crate) fn mark_disconnected(&mut self) {
         self.connected = false;
-        // Закрываем handle процесса бывшего клиента (RAII).
-        self.peer = None;
         self.peer_start = 0;
+        // Handle процесса бывшего клиента закрывается в конце (RAII): по нему
+        // ещё решается освобождение claim-а.
+        let peer = self.peer.take();
+        let session_claim = core::mem::replace(&mut self.session_claim, CLAIM_FREE);
 
         // Сбрасываем состояние в shared memory для возможности reconnect
         let control = self.view.control_block();
@@ -645,6 +935,33 @@ impl SharedServer {
         header_b
             .handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
+
+        // Ревизия 3 (R18): клиент умер в сессии (handle процесса с
+        // подтверждённым временем создания сигнален) -- сам он claim уже не
+        // снимет: освобождаем его claim сессии сразу, ПОСЛЕ сброса
+        // состояния. Штатный уход и отключение сервером claim не трогают:
+        // его снимает клиент (L), «не заметившего» -- дедлайн по толчку.
+        if self.exclusive
+            && session_claim != CLAIM_FREE
+            && peer.as_ref().is_some_and(ProcessWatch::has_exited)
+        {
+            let _ = control.slot_claim.compare_exchange(
+                session_claim,
+                CLAIM_FREE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        drop(peer);
+    }
+
+    /// `CONNECT_REQ` без заявки у неподключённого сервера single-client
+    /// канала (ревизия 3, §2.3 дизайна): толчок проигравшего клиента --
+    /// повод проверить протухший захват (см. `observe_idle_claim`).
+    fn observe_idle(&mut self) {
+        if self.exclusive && !self.connected {
+            observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
+        }
     }
 
     const fn ensure_connected(&self) -> Result<()> {
@@ -1052,8 +1369,12 @@ impl AcceptFuture<'_> {
         // `CONNECT_REQ` (клиент ставит `CLIENT_HELLO` до сигнала); сигнал
         // без заявки (толчок Multi, откатившийся клиент) поглощён -- ждём
         // дальше.
-        if self.waits.harvest(waker)[OP] && self.server.hello_pending() {
-            return Poll::Ready(self.server.complete_handshake());
+        if self.waits.harvest(waker)[OP] {
+            if self.server.hello_pending() {
+                return Poll::Ready(self.server.complete_handshake());
+            }
+            // Толчок без заявки (ревизия 3): проверить протухший захват.
+            self.server.observe_idle();
         }
         let Some(events) = self.server.events.as_ref() else {
             return Poll::Ready(Err(ANONYMOUS));
@@ -1211,6 +1532,219 @@ mod handshake_tests {
         let mut buf = Vec::new();
         let len = client.receive_from_server(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"bye");
+    }
+
+    // ─── Ревизия 3 (Task 22) ────────────────────────────────────────────────
+
+    use crate::client::{AckWait, ClaimMode, Hello};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Назначить одноразовый хук рукопожатия на точку `at` (этот поток).
+    fn set_hook(at: HandshakePoint, hook: impl FnOnce(&SharedView) + 'static) {
+        HANDSHAKE_HOOK.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
+    }
+
+    /// PID и время создания уже завершившегося процесса.
+    fn dead_process() -> (u32, u64) {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let watch = ProcessWatch::open(pid).unwrap();
+        let start = watch.start_time().unwrap();
+        child.wait().unwrap();
+        drop(watch);
+        drop(child);
+        (pid, start)
+    }
+
+    /// G2 (§7.1 п. 5): между публикацией `generation` (S3) и фиксацией (S5)
+    /// клиент P отозвал заявку, а A выставил свою -- уже при новом
+    /// `generation`. Фиксация легла на заявку A: A принят по `SERVER_READY`
+    /// (по старому правилу «`generation != g0`» -- устаревший сигнал), сервер
+    /// наблюдает процесс A. `forge_p` -- P заявил чужое время создания:
+    /// самоописание A иное, и S6 переоткрывает процесс по нему.
+    fn inflight_aba(forge_p: bool) {
+        let name = format!("{}_{forge_p}", unique("ABA"));
+        let mut server = SharedServer::start(&name).unwrap();
+        if forge_p {
+            let forged = crate::win::current_process_start_time().wrapping_add(1);
+            crate::client::FORGED_START_TIME.with(|cell| cell.set(Some(forged)));
+        }
+        let p = Hello::post(None, &name, true, ClaimMode::Take);
+        crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
+        let p = p.unwrap();
+        let slot: Rc<RefCell<Option<Hello>>> = Rc::default();
+        let (a_slot, a_name) = (slot.clone(), name);
+        set_hook(HandshakePoint::BeforeCommit, move |_| {
+            assert!(!p.withdraw(), "P отозвал заявку");
+            let a = Hello::post(None, &a_name, true, ClaimMode::Take).unwrap();
+            *a_slot.borrow_mut() = Some(a);
+        });
+        server.complete_handshake().unwrap();
+        let a = slot.borrow_mut().take().unwrap();
+        assert!(server.is_connected());
+        assert_eq!(server.peer_pid(), Some(std::process::id()));
+        assert_eq!(server.is_peer_alive(), Some(true));
+        assert!(
+            matches!(a.wait_ack(Duration::from_secs(1), None), AckWait::Accepted),
+            "A не принял фиксацию своей заявки"
+        );
+        let client = a.finish();
+        assert_eq!(server.session_claim(), client.claim());
+        client.send_to_server(b"aba").unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(server.receive_from_client(&mut buf), Ok(3));
+    }
+
+    #[test]
+    fn inflight_aba_accepts_by_ready() {
+        inflight_aba(false);
+        inflight_aba(true);
+    }
+
+    /// G1 (§7.1 п. 6): клиент засчитал рукопожатие по проигранному отзыву и
+    /// сразу ушёл, пока сервер между фиксацией (S5) и `S2C_CONNECT` (S7).
+    /// Его `DISCONNECT` не съеден сбросом: сервер сбрасывает событие ДО
+    /// фиксации (S4).
+    #[test]
+    fn fast_leaver_disconnect_not_eaten() {
+        let name = unique("FASTLEAVE");
+        let mut server = SharedServer::start(&name).unwrap();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        set_hook(HandshakePoint::AfterCommit, move |_| {
+            assert!(hello.withdraw(), "отзыв обязан проиграть фиксации");
+            drop(hello.finish());
+        });
+        server.complete_handshake().unwrap();
+        assert!(Endpoint::peer_left(&server), "уход клиента не виден");
+        assert!(
+            server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "DISCONNECT ушедшего клиента съеден"
+        );
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+    }
+
+    /// Заявка процесса `pid`/`start` с владельцем claim-а `owner`.
+    fn post_foreign_hello(server: &SharedServer, (pid, start): (u32, u64), owner: (u32, u64)) {
+        let control = server.view().control_block();
+        control.slot_claim.store(0x0BAD_C1A1, Ordering::Release);
+        control.announce_owner_start(owner.1);
+        control.slot_owner_pid.store(owner.0, Ordering::Release);
+        control.announce_client_start(start);
+        control.client_pid.store(pid, Ordering::Release);
+        control
+            .client_state
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+    }
+
+    /// §7.1 п. 7 (S2): заявка подтверждённо умершего процесса, который сам
+    /// и держит claim, снимается до фиксации -- без нового `generation`, без
+    /// `S2C_CONNECT`, claim свободен.
+    #[test]
+    fn dead_hello_withdrawn_before_commit() {
+        let name = unique("DEADHELLO");
+        let mut server = SharedServer::start(&name).unwrap();
+        let dead = dead_process();
+        post_foreign_hello(&server, dead, dead);
+        let control = server.view().control_block();
+        let generation = control.generation.load(Ordering::Acquire);
+        assert_eq!(server.complete_handshake(), Err(ShmError::HandshakeFailed));
+        assert!(!server.is_connected());
+        let control = server.view().control_block();
+        assert_eq!(control.generation.load(Ordering::Acquire), generation);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.server_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert!(
+            !server
+                .events()
+                .unwrap()
+                .connect_ack
+                .wait(Some(Duration::ZERO))
+                .unwrap()
+        );
+    }
+
+    /// §7.1 п. 8: PID заявки не совпадает с владельцем claim-а (ABA G2: PID
+    /// прочитан у прежнего клиента) -- S2 не срабатывает, смерть P не
+    /// снимает заявку живого владельца.
+    #[test]
+    fn dead_hello_of_other_pid_not_withdrawn() {
+        let name = unique("DEADOTHER");
+        let mut server = SharedServer::start(&name).unwrap();
+        let me = (std::process::id(), crate::win::current_process_start_time());
+        post_foreign_hello(&server, dead_process(), me);
+        let generation = server
+            .view()
+            .control_block()
+            .generation
+            .load(Ordering::Acquire);
+        assert_eq!(server.complete_handshake(), Ok(()));
+        let control = server.view().control_block();
+        assert_ne!(control.generation.load(Ordering::Acquire), generation);
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_SERVER_READY
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0x0BAD_C1A1);
+        assert_eq!(server.session_claim(), 0x0BAD_C1A1);
+    }
+
+    /// §7.1 п. 9 (§2.3): протухший захват без заявки отнимается только по
+    /// толчку проигравшего клиента и не раньше `reserve_timeout` от первого
+    /// наблюдения; без толчка сервер не просыпается.
+    #[test]
+    fn stale_claim_reclaimed_on_nudge_only() {
+        use crate::win::Mapping;
+        let name = unique("STALECLAIM");
+        let mut server = SharedServer::start(&name).unwrap();
+        server.set_reserve_timeout(Duration::from_millis(200));
+        let wakeups = server.wait_wakeups();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        let control = SharedView::peek_control(&mapping).unwrap();
+        control.slot_claim.store(0x5747_0001, Ordering::Release);
+        let waiter = std::thread::spawn(move || {
+            let wake = EventHandle::create_unnamed(false).unwrap();
+            let result = server.wait_for_client_or(wake.as_handle(), Some(Duration::from_secs(10)));
+            (result, server)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(wakeups.load(Ordering::Acquire), 0, "сервер не спал");
+
+        let started = Instant::now();
+        let err = SharedClient::connect(&name, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(err, ShmError::AlreadyConnected);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while wakeups.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "толчок не разбудил сервер");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Первое наблюдение -- не отъём.
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0x5747_0001);
+
+        std::thread::sleep(Duration::from_millis(250));
+        let err = SharedClient::connect(&name, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(err, ShmError::AlreadyConnected);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.slot_claim.load(Ordering::Acquire) != 0 {
+            assert!(Instant::now() < deadline, "протухший захват не отнят");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let client = SharedClient::connect(&name, Duration::from_secs(2)).unwrap();
+        let (result, server) = waiter.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(server.is_connected() && client.is_connected());
     }
 }
 

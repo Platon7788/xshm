@@ -6,7 +6,9 @@
 //!   операции дольше бюджета, ни ошибки вне перечня. Single-client и слот
 //!   Multi (поля 0.10: времена старта, `slot_count`, PAD-кадры,
 //!   `LayoutBlock`).
-//! - `handshake_storm` -- 8 клиентов × 200 подключений к одному `AutoServer`.
+//! - `handshake_storm` -- 8 клиентов × 200 подключений к одному `AutoServer`:
+//!   ревизия 3 -- каждое принятие клиентом ровно одна сессия сервера, занятый
+//!   канал -- `AlreadyConnected`, причины отключений -- только `Graceful`.
 //! - `overwrite_flood_*` -- 10⁶ малых сообщений с перезаписью: ни одного
 //!   потерянного `DATA`, порядок и сходимость счётчиков (`drop_count`).
 //!
@@ -404,7 +406,8 @@ fn connect_pair(name: &str, case: &Case) -> (SharedServer, SharedClient) {
 /// неиспорченное -- `Timeout`. Допустимо (`SharedClient::connect`):
 /// `NotReady` (`magic == 0`), `VersionMismatch`, `Corrupted` (чужая магия,
 /// раскладка не прошла проверки §c.2), `Timeout` (раскладка цела -- никто
-/// не ответил).
+/// не ответил), `AlreadyConnected` -- только при порче `client_state`/
+/// `slot_claim` (ревизия 3: канал выглядит занятым).
 fn attach_after_corruption(rng: &mut Rng, name: &str, seg: &Segment, case: &mut Case) {
     let offset = if rng.below(2) == 0 {
         CONTROL + 4 * rng.index(16)
@@ -418,6 +421,10 @@ fn attach_after_corruption(rng: &mut Rng, name: &str, seg: &Segment, case: &mut 
     let result = timed(case, "connect после порчи", || {
         SharedClient::connect(name, Duration::from_millis(20))
     });
+    // Ревизия 3 (Task 22): `client_state` (@16) не `IDLE` или `slot_claim`
+    // (@20) не свободен -- канал выглядит занятым (чужая заявка/сессия или
+    // чужой claim): C1/C6 дают `AlreadyConnected`, ничего не записав.
+    let occupied = offset == CONTROL + 16 || offset == CONTROL + 20;
     match result {
         Err(
             ShmError::NotReady
@@ -425,6 +432,7 @@ fn attach_after_corruption(rng: &mut Rng, name: &str, seg: &Segment, case: &mut 
             | ShmError::Corrupted
             | ShmError::Timeout,
         ) => {}
+        Err(ShmError::AlreadyConnected) if occupied => {}
         other => panic!("connect после порчи: {:?}; {case:?}", other.map(drop)),
     }
     seg.store(offset, old);
@@ -927,7 +935,7 @@ fn handshake_storm() {
             let name = name.clone();
             thread::spawn(move || {
                 let mut rng = Rng(SEED ^ (index + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-                let (mut accepted, mut timeouts) = (0u32, 0u32);
+                let (mut accepted, mut timeouts, mut busy) = (0u32, 0u32, 0u32);
                 for round in 0..ROUNDS {
                     let t = Instant::now();
                     let result = SharedClient::connect(&name, Duration::from_millis(200));
@@ -946,19 +954,24 @@ fn handshake_storm() {
                             assert!(t.elapsed() < HANG, "drop; клиент {index}, раунд {round}");
                         }
                         Err(ShmError::Timeout) => timeouts += 1,
-                        Err(err) => panic!("connect: {err:?}; клиент {index}, раунд {round}"),
+                        // Ревизия 3: канал занят другим клиентом шторма.
+                        Err(ShmError::AlreadyConnected) => busy += 1,
+                        Err(err) => panic!(
+                            "connect: {err:?}; seed {SEED:#x}, клиент {index}, раунд {round}"
+                        ),
                     }
                     thread::sleep(Duration::from_micros(rng.below(2001)));
                 }
-                (accepted, timeouts)
+                (accepted, timeouts, busy)
             })
         })
         .collect();
-    let (mut accepted, mut timeouts) = (0u32, 0u32);
+    let (mut accepted, mut timeouts, mut busy) = (0u32, 0u32, 0u32);
     for worker in workers {
-        let (a, t) = worker.join().unwrap();
+        let (a, t, b) = worker.join().unwrap();
         accepted += a;
         timeouts += t;
+        busy += b;
     }
     let storm = started.elapsed();
 
@@ -981,16 +994,20 @@ fn handshake_storm() {
     let current = u32::from(probe.connected.load(Ordering::Acquire));
     let reasons = probe.reasons.each_ref().map(|r| r.load(Ordering::Acquire));
     println!(
-        "handshake_storm: {storm:?}, клиент: принято {accepted}, таймаутов {timeouts}; \
+        "handshake_storm: seed {SEED:#x}, {storm:?}, клиент: принято {accepted}, \
+         таймаутов {timeouts}, занято {busy}; \
          сервер: on_connect {connects}, on_disconnect_reason {disconnects}, сейчас {current}; \
-         принято клиентами сверх сессий сервера {}; \
-         причины [Graceful, PeerDied, Local, Error] = {reasons:?}",
-        accepted.saturating_sub(connects)
+         причины [Graceful, PeerDied, Local, Error] = {reasons:?}"
     );
-    // TODO(Task 22): assert_eq!(accepted, connects) -- несколько ждущих
-    // клиентов засчитывают одно рукопожатие по смене `generation`.
-    // TODO(Task 22): assert_eq!(reasons, [disconnects, 0, 0, 0]) -- только
-    // `Graceful` (сейчас двойной писатель C2S может дать `Error`).
+    // Ревизия 3 (Task 22): каждое принятие клиентом -- ровно одна сессия
+    // сервера (раньше несколько ждущих засчитывали одно рукопожатие по смене
+    // `generation`), и ни одного разрыва из-за двух писателей в C2S.
+    assert_eq!(accepted, connects, "seed {SEED:#x}: принятия против сессий");
+    assert_eq!(
+        reasons,
+        [disconnects, 0, 0, 0],
+        "seed {SEED:#x}: причины отключений"
+    );
     assert_eq!(
         probe.violations.load(Ordering::Acquire),
         0,

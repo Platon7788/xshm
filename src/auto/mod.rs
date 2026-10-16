@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::client::{Interrupt, SharedClient};
+use crate::client::{ClaimMode, Interrupt, SharedClient};
 use crate::constants::{FRAME_ALIGN, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
@@ -79,6 +79,12 @@ pub trait AutoHandler: Send + Sync + 'static {
     /// вызова worker уже дописал в кольцо из своей очереди всё, что влезло,
     /// — `try_send`, получивший `QueueFull`, стоит повторить.
     fn on_space_available(&self, _direction: ChannelKind) {}
+    /// Ошибка worker-а. Клиент (`AutoClient::connect`): неудачная попытка
+    /// подключения приходит сюда и повторяется через `reconnect_delay`. В
+    /// том числе `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал
+    /// занят другим клиентом -- раз в `reconnect_delay`, пока канал не
+    /// освободится (как `Timeout` при недоступном сервере). Выделенный канал
+    /// Dispatch не повторяет: `AlreadyConnected` там -- канал занят чужим.
     fn on_error(&self, _err: ShmError) {}
 }
 
@@ -1232,6 +1238,10 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             worker.options.namespace.as_deref(),
             name,
             worker.options.connect_timeout,
+            // Ревизия 3: канал Auto (и выделенный канал Dispatch) -- свой
+            // захват claim; занят -- `AlreadyConnected`, повтор через
+            // `reconnect_delay` (выделенный -- без повтора).
+            ClaimMode::Take,
             Interrupt {
                 wake: worker.wake.as_handle(),
                 should_stop: &mut should_stop,
@@ -2159,5 +2169,110 @@ mod lossless_tests {
                 "stop = {use_stop}: лучшая из трёх {best:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    //! Ревизия 3 (Task 22): исключительная заявка канала Auto.
+
+    use super::*;
+    use crate::naming::ObjectPath;
+    use crate::shared::SharedView;
+    use crate::win::Mapping;
+    use std::time::Instant;
+
+    fn unique(tag: &str) -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("AUTO_CLAIM_{tag}_{}_{}", std::process::id(), ts % 1_000_000)
+    }
+
+    fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !cond() {
+            assert!(Instant::now() < deadline, "таймаут: {what}");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[derive(Default)]
+    struct Log {
+        connected: AtomicBool,
+        errors: Mutex<Vec<ShmError>>,
+    }
+
+    impl AutoHandler for Log {
+        fn on_connect(&self) {
+            self.connected.store(true, Ordering::Release);
+        }
+        fn on_error(&self, err: ShmError) {
+            self.errors.lock().unwrap().push(err);
+        }
+    }
+
+    /// §7.1 п. 13: канал занят `SharedClient` -- `AutoClient` получает
+    /// `on_error(AlreadyConnected)` и повторяет через `reconnect_delay`;
+    /// держатель ушёл -- подключение в пределах двух интервалов.
+    #[test]
+    fn auto_client_retries_after_already_connected() {
+        let name = unique("RETRY");
+        let server_log = Arc::new(Log::default());
+        let server = AutoServer::start(&name, server_log.clone(), AutoOptions::default()).unwrap();
+        let holder = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until("держатель", Duration::from_secs(5), || {
+            server_log.connected.load(Ordering::Acquire)
+        });
+        let reconnect_delay = AutoOptions::default().reconnect_delay;
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        wait_until("AlreadyConnected", Duration::from_secs(3), || {
+            log.errors
+                .lock()
+                .unwrap()
+                .contains(&ShmError::AlreadyConnected)
+        });
+        assert!(!log.connected.load(Ordering::Acquire));
+        assert!(
+            log.errors
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|err| *err == ShmError::AlreadyConnected),
+            "{:?}",
+            log.errors.lock().unwrap()
+        );
+        assert!(holder.is_connected());
+
+        let left = Instant::now();
+        drop(holder);
+        wait_until(
+            "подключение после ухода",
+            Duration::from_secs(5),
+            || log.connected.load(Ordering::Acquire),
+        );
+        let waited = left.elapsed();
+        assert!(waited < reconnect_delay * 2, "{waited:?}");
+        drop(client);
+        drop(server);
+    }
+
+    /// §7.1 п. 10: канал занят чужим claim, никто не толкает -- worker
+    /// сервера не просыпается ни разу.
+    #[test]
+    fn idle_server_with_foreign_claim_does_not_wake_up() {
+        let name = unique("IDLE");
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        let control = SharedView::peek_control(&mapping).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let s0 = server.wakeups();
+        control.slot_claim.store(0x1D1E_C1A1, Ordering::Release);
+        thread::sleep(Duration::from_secs(1));
+        assert_eq!(server.wakeups() - s0, 0, "сервер просыпался в простое");
+        drop(server);
     }
 }

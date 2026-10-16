@@ -360,13 +360,14 @@ impl ControlBlock {
         self.client_start_hi.store(hi, Ordering::Release);
     }
 
-    /// Сервер: забрать время клиента (одноразово, как `client_pid`). Вызывать
-    /// ПОСЛЕ `client_pid.swap` (AcqRel), иначе половины могут быть ещё не
-    /// видны.
-    pub(crate) fn take_client_start(&self) -> u64 {
+    /// Сервер: время клиента без потребления (ревизия 3: S1/S6 читают, а
+    /// одноразовым его делает обнуление в S6 после сверки владельца). Читать
+    /// ПОСЛЕ Acquire-чтения `client_state`/`client_pid`.
+    #[must_use]
+    pub(crate) fn client_start_time(&self) -> u64 {
         join_time(
-            self.client_start_lo.swap(0, Ordering::AcqRel),
-            self.client_start_hi.swap(0, Ordering::AcqRel),
+            self.client_start_lo.load(Ordering::Acquire),
+            self.client_start_hi.load(Ordering::Acquire),
         )
     }
 

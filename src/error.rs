@@ -12,6 +12,8 @@ pub enum ShmError {
     #[error("endpoint is not ready yet")]
     NotReady,
     /// Половина соединения уже активна; повторное подключение невозможно.
+    /// Клиент single-client канала (0.10, ревизия 3): канал занят другим
+    /// клиентом (его claim, заявка или сессия).
     #[error("endpoint is already connected")]
     AlreadyConnected,
     /// Ожидаемое событие не произошло в отведённое время.

@@ -146,11 +146,11 @@ fn send_queue_is_bounded_while_disconnected() {
 fn claim_tokens_are_never_free_and_practically_unique() {
     use std::collections::HashSet;
 
-    let tokens: HashSet<u32> = (0..1000).map(|_| next_claim_token()).collect();
+    let tokens: HashSet<u32> = (0..1000).map(|_| crate::shared::claim_token()).collect();
 
     assert!(
         !tokens.contains(&CLAIM_FREE),
-        "next_claim_token() никогда не должен вернуть CLAIM_FREE"
+        "claim_token() никогда не должен вернуть CLAIM_FREE"
     );
     // При случайной 32-битной генерации 1000 значений коллизии
     // практически исключены (день рождений: ~1e-4 при 2^32 пространстве).
@@ -937,7 +937,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
             try_claim_slot(None, &slot_name, TOKEN_A).unwrap(),
             "раунд {round}"
         );
-        let mut a = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
+        let mut a = connect_held(&slot_name, TOKEN_A).unwrap();
         wait_for("подключение A", Duration::from_secs(5), || {
             server.client_count() == 1
         });
@@ -965,7 +965,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
             try_claim_slot(None, &slot_name, TOKEN_B).unwrap(),
             "раунд {round}"
         );
-        let b = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
+        let b = connect_held(&slot_name, TOKEN_B).unwrap();
         wait_for("подключение B", Duration::from_secs(5), || {
             server.client_count() == 1
         });
@@ -991,7 +991,7 @@ fn claim_of_a_kicked_client_that_never_leaves_is_released_at_deadline() {
             .expect("start");
     let slot_name = format!("{name}_0");
     assert!(try_claim_slot(None, &slot_name, 0xDEAD_0001).unwrap());
-    let client = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
+    let client = connect_held(&slot_name, 0xDEAD_0001).unwrap();
     wait_for("подключение", Duration::from_secs(5), || {
         server.client_count() == 1
     });
@@ -1491,7 +1491,7 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
     let flooder = {
         let flooding = flooding.clone();
         thread::spawn(move || {
-            let client = SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap();
+            let client = connect_held(&slot_name, 0xBAD0_0001).unwrap();
             for _ in 0..BEFORE {
                 client.try_send_to_server(b"before").unwrap();
             }
@@ -1682,6 +1682,21 @@ fn failed_rearm_is_retried() {
 /// Сервер без потока-диспетчера (остановлен), слот 0 захвачен token-ом
 /// `claim` и подключён `SharedClient`-ом через диспетчер, ведомый вручную
 /// на потоке теста. Возвращает клиента; сервер -- в `server`.
+/// Рукопожатие клиента Multi по уже захваченному claim слота
+/// (`try_claim_slot` с `token`), как у `MultiClient`: ревизия 3 --
+/// `ClaimMode::Held` (`SharedClient::connect` с `Take` получил бы
+/// `AlreadyConnected` -- claim уже занят нами же).
+fn connect_held(slot_name: &str, token: u32) -> Result<SharedClient> {
+    SharedClient::connect_impl(
+        None,
+        slot_name,
+        Duration::from_secs(5),
+        true,
+        ClaimMode::Held(token),
+        None,
+    )
+}
+
 fn connect_manually(server: &MultiServer, name: &str, claim: u32) -> SharedClient {
     stop_workers(server);
     // Потока нет -- колбэки зовёт тест; `running` нужен доставке сообщений.
@@ -1695,8 +1710,7 @@ fn connect_manually(server: &MultiServer, name: &str, claim: u32) -> SharedClien
     assert!(try_claim_slot(None, &slot_name, claim).unwrap());
     let mut dispatcher = Dispatcher::new(&server.core);
     dispatcher.reconcile(0);
-    let connecting =
-        thread::spawn(move || SharedClient::connect(&slot_name, Duration::from_secs(5)).unwrap());
+    let connecting = thread::spawn(move || connect_held(&slot_name, claim).unwrap());
     let deadline = Instant::now() + Duration::from_secs(5);
     while !server.is_client_connected(0) {
         assert!(Instant::now() < deadline, "рукопожатие вручную");
@@ -1905,4 +1919,60 @@ fn panic_in_on_error_keeps_error_reason() {
     dispatcher.release_all();
     drop(dispatcher);
     drop(client);
+}
+
+/// Ревизия 3 (§7.1 п. 15): рукопожатие Multi идёт по уже захваченному
+/// claim слота (`ClaimMode::Held`) -- в сессии `slot_claim` равен токену
+/// клиента и claim сессии сервера; после `stop()` клиента claim свободен.
+#[test]
+fn multi_handshake_reuses_slot_token() {
+    let name = unique("HELD_TOKEN");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).expect("start");
+    let client = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .expect("connect");
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1 && client.is_connected()
+    });
+    {
+        let slots = server.slots.read().unwrap();
+        let slot = slots[0].lock().unwrap();
+        let claim = slot.claim();
+        assert_ne!(claim, CLAIM_FREE);
+        assert_eq!(slot.session_claim, claim);
+        assert_eq!(slot.server.session_claim(), claim);
+    }
+    client.stop();
+    wait_for("claim снят", Duration::from_secs(5), || {
+        server.slots.read().unwrap()[0].lock().unwrap().claim() == CLAIM_FREE
+    });
+    server.stop();
+}
+
+/// Ревизия 3 (§7.1 п. 10): слот занят чужим claim без заявки, и никто не
+/// толкает -- диспетчер не просыпается ни разу (дедлайн назначается только
+/// при пробуждении по другой причине).
+#[test]
+fn idle_server_with_foreign_claim_does_not_wake_up() {
+    let name = unique("IDLE_CLAIM");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    thread::sleep(Duration::from_millis(200));
+    let s0 = server.wakeups();
+    {
+        let slots = server.slots.read().unwrap();
+        let slot = slots[0].lock().unwrap();
+        slot.server
+            .view()
+            .control_block()
+            .slot_claim
+            .store(0x1D1E_C1A1, Ordering::Release);
+    }
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(server.wakeups() - s0, 0, "диспетчер просыпался в простое");
+    server.stop();
 }

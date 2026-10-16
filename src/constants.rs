@@ -84,3 +84,18 @@ pub const SLOT_ID_NO_SLOT: u32 = 0xFFFF_FFFF;
 
 /// Значение «слот свободен» для `ControlBlock::slot_claim`.
 pub const CLAIM_FREE: u32 = 0;
+
+/// Срок «протухшего» захвата `slot_claim` без заявки (claim взят, но
+/// `CLIENT_HELLO` так и нет): сервер отнимает его не раньше этого срока от
+/// первого наблюдения. Общий для Multi (дедлайн диспетчера) и single-client
+/// канала (ревизия 3, отъём по толчку проигравшего клиента, INTEROP R18).
+pub(crate) const RESERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Гарантированный запас между эффективным клиентским `slot_timeout` Multi и
+/// серверным `RESERVE_TIMEOUT`. Клиент обязан сам отвалиться по таймауту и
+/// освободить claim РАНЬШЕ, чем сервер сочтёт его протухшим и заберёт claim
+/// силой -- иначе сервер может отнять слот у ещё легитимно ожидающего
+/// клиента (аудит 2026-07-10). `slot_timeout` из `MultiClientOptions`
+/// клампится этим запасом в `client_worker`, независимо от того, что задал
+/// вызывающий (значение в `MultiClientOptions` сверху не ограничено).
+pub(crate) const RESERVE_SAFETY_MARGIN: std::time::Duration = std::time::Duration::from_secs(2);

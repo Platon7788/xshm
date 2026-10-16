@@ -26,6 +26,17 @@
 раздел [«Изменения после ревизии 2»](#изменения-после-ревизии-2-25092026)
 в конце документа; основной текст ниже уже приведён к ней.
 
+**Ревизия 3 (17.10.2026, Task 22).** Исключительная заявка single-client
+канала: клиент захватывает `slot_claim` токеном (как клиент Multi),
+`CLIENT_HELLO` ставится только CAS-ом из `IDLE`, принятие — по фиксации
+своей заявки, уход — только при неизменном `generation` сессии с
+освобождением claim последним; сервер сбрасывает `S2C_DISCONNECT` до
+фиксации, снимает заявку умершего, потребляет самоописание клиента только
+застав владельца в сессии, освобождает claim умершего в сессии сразу, а
+протухший — по толчку проигравшего клиента (R15, R16, R18). Формат памяти
+прежний (`0x00020000`). Дельта — п. 28 раздела «Изменения 0.10»; основной
+текст ниже приведён к ревизии 3.
+
 Связанные документы: [`CHANGELOG.md`](CHANGELOG.md) (что поменялось, для
 Rust-потребителей), протокол профайлера поверх Dispatch —
 `useful-lib/prof-shm/PROTOCOL.md`.
@@ -67,7 +78,7 @@ Rust-потребителей), протокол профайлера повер
 | 16 | `DispatchHandler::on_space_available(client_id)`, `DispatchClientHandler::on_space_available()` | внутр. | ЖЕЛАТЕЛЬНО | Нет |
 | 17 | Multi-client переведён на события (§i): `MultiOptions`/`MultiClientOptions::poll_timeout: Option<Duration>` = `None`, новое `MultiClientOptions::retry_delay` (250 мс, только вне подключения); worker-ы сервера по 21 слоту; смерть клиента — по handle процесса; протухший захват — по дедлайну | тайминг | Требования к пиру-клиенту Multi — **ОБЯЗАТЕЛЬНО** (§i.4, R13) | Клиент 0.8 без PID в handshake наблюдается по PID владельца claim-а (`reserved[1]`); без обоих — только на пробуждениях (§i.5) |
 | 18 | `SharedServer/SharedClient::wait_for_space`: одно ожидание `[SPACE, DISCONNECT, процесс пира]` на весь таймаут вместо срезов по 50 мс; штатное отключение пира → `Err(NotConnected)` (§i.6) | тайминг | ЖЕЛАТЕЛЬНО (для своей реализации ожидания места) | Читатель без заявки (≤ 0.7) будит только опустошив кольцо (R2) — задержка, не зависание |
-| 19 | `complete_handshake` сбрасывает `S2C_DISCONNECT` (`NtResetEvent`) **до** `S2C_CONNECT` | ядро (состояние события) | **ОБЯЗАТЕЛЬНО** для сервера (иначе устаревший сигнал «отключает» нового клиента) | Старый сервер не сбрасывает — риск §h.3 остаётся с ним |
+| 19 | `complete_handshake` сбрасывает `S2C_DISCONNECT` (`NtResetEvent`) **до** `S2C_CONNECT` (ревизия 3 — до фиксации, S4, п. 28 «Изменений 0.10») | ядро (состояние события) | **ОБЯЗАТЕЛЬНО** для сервера (иначе устаревший сигнал «отключает» нового клиента) | Старый сервер не сбрасывает — риск §h.3 остаётся с ним |
 | 20 | `mark_disconnected`: `client_state` сбрасывается CAS `SERVER_READY → IDLE`, а не store (не затирает `CLIENT_HELLO` следующего клиента) | wire (порядок записи) | **ОБЯЗАТЕЛЬНО** для сервера лобби (иначе ломается сериализация R12) | Нет |
 | 21 | Мьютекс лобби `<лобби>_lock` (Mutant, `OBJ_OPENIF`): клиент Dispatch держит его всё рукопожатие с лобби (§d.2) | ядро (новый объект) | **ОБЯЗАТЕЛЬНО** для клиента лобби (R12) | Клиент 0.8/0.9-ранний мьютекс не берёт — с ним гонка §h.2 остаётся |
 | 22 | Имя канала Dispatch наследует namespace лобби: `Global\<hex>` / `Local\<hex>` / `\Dir\<hex>` / `<hex>` | wire (содержимое `channel_name`) | **ОБЯЗАТЕЛЬНО** для Dispatch-сервера; клиент открывает имя из ответа как есть (так и было) | Клиент любой версии открывает имя как есть — совместимо |
@@ -149,8 +160,8 @@ handle пространства и относительное имя, §b.4).
 | `P C2S_DATA` | | SynchronizationEvent | FALSE | сервер | клиент | писатель-клиент | читатель-сервер |
 | `P S2C_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-клиент** | писатель-сервер |
 | `P C2S_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-сервер** | писатель-клиент |
-| `P S2C_CONNECT` (connect_ack) | | SynchronizationEvent | FALSE | сервер | клиент | сервер (после handshake, только при удачном CAS фиксации — R16); клиент делает `NtResetEvent` до своей заявки (R15, ревизия 2) | клиент |
-| `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`) | сервер |
+| `P S2C_CONNECT` (connect_ack) | | SynchronizationEvent | FALSE | сервер | клиент | сервер (после handshake, только при удачном CAS фиксации — R16; ревизия 3: `S2C_DISCONNECT` сброшен **до** фиксации, S4); клиент делает `NtResetEvent` до своей заявки (R15) | клиент |
+| `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`); ревизия 3 — и клиент, проигравший захват claim-а, если `server_state != SERVER_READY` («толчок», R18, §i.3) | сервер |
 | `P S2C_DISCONNECT` | | SynchronizationEvent | FALSE | сервер | клиент | **обе** стороны при штатном закрытии (одно событие на оба направления, несмотря на `S2C` в имени) | обе стороны |
 | **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`src/win.rs:164-193`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
 | **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, дескриптор — политика создателя маяка (та же, что у `_beacon`; 0.10, до 0.10 — NULL DACL); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они; второй — в том числе DACL чужой секции не включает этого пользователя) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
@@ -388,15 +399,15 @@ B+64   кольцо C2S           ┘ ёмкость c2s.capacity
 | 8 | `generation` | как в 0.9 (R15/R16) |
 | 12 | `server_state` | `IDLE=0`, `CLIENT_HELLO=1`, `SERVER_READY=2` |
 | 16 | `client_state` | то же |
-| 20 | `slot_claim` | Multi: токен захватившего клиента, `0` — свободен (бывш. `reserved[0]`) |
-| 24 | `slot_owner_pid` | Multi: PID захватившего (бывш. `reserved[1]`) |
+| 20 | `slot_claim` | Multi и single-client (ревизия 3, R18): токен владельца заявки/сессии, `0` — свободно. Захват — `CAS 0 → T`, освобождение — `CAS T → 0` (бывш. `reserved[0]`; до ревизии 3 — только Multi) |
+| 24 | `slot_owner_pid` | Multi и single-client (рев. 3): PID процесса-владельца claim-а; пишет захвативший сразу после CAS (Release) (бывш. `reserved[1]`) |
 | 28 | `server_pid` | PID сервера (бывш. `reserved[2]`) |
-| 32 | `client_pid` | PID клиента, одноразовый `swap(0)` (бывш. `reserved[3]`) |
+| 32 | `client_pid` | PID клиента: пишется до `CLIENT_HELLO`, одноразовый — сервер потребляет его после фиксации, только застав владельца заявки в сессии (ревизия 3, S6: CAS `pid → 0`; до ревизии 3 — `swap(0)`) (бывш. `reserved[3]`) |
 | 36 | `server_start_lo` | Время создания процесса-сервера (`KERNEL_USER_TIMES::CreateTime`, 100-нс FILETIME), младшие 32 бита. Пишет сервер при инициализации **до** `magic` вместе с `server_pid` |
 | 40 | `server_start_hi` | старшие 32 бита `server_start` |
-| 44 | `client_start_lo` | Время создания процесса-клиента, младшие 32 бита. Пишет клиент **до** `client_pid` (т.е. до `CLIENT_HELLO`); сервер забирает парой сразу после `swap(client_pid, 0)` — `swap(0)` обеих половин; откат handshake клиентом обнуляет вместе с `client_pid` |
+| 44 | `client_start_lo` | Время создания процесса-клиента, младшие 32 бита. Пишет клиент **до** `client_pid` (т.е. до `CLIENT_HELLO`); сервер читает парой с `client_pid` и обнуляет вместе с его потреблением (ревизия 3, S6); откат handshake клиентом обнуляет вместе с `client_pid` |
 | 48 | `client_start_hi` | старшие 32 бита `client_start` |
-| 52 | `owner_start_lo` | Multi: время создания процесса, захватившего слот, младшие 32 бита. Пишет клиент сразу после CAS `slot_claim`, **до** `slot_owner_pid` (Release) |
+| 52 | `owner_start_lo` | Multi и single-client (рев. 3): время создания процесса-владельца claim-а (**настоящее**, не заявляемое), младшие 32 бита. Пишет клиент сразу после CAS `slot_claim`, **до** `slot_owner_pid` (Release). По нему сервер подтверждает смерть держателя (S2) |
 | 56 | `owner_start_hi` | старшие 32 бита `owner_start` |
 | 60 | `slot_count` | Multi: число слотов сервера (`max_clients`, 1..=256), одинаковое во всех слотах; пишет сервер при инициализации **до** `magic`. Подсказка: клиенты по нему перебор НЕ ограничивают (§i.1). Не Multi — `0` |
 
@@ -677,47 +688,115 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    стороны сбрасывает `client_state` лобби только CAS `SERVER_READY → IDLE`
    (п. 20 §a), поэтому `HELLO` следующего клиента, записанный раньше, чем
    сервер закончил свой `mark_disconnected`, не затирается.
-3a. **Клиент** (`SharedClient::connect_impl`, `src/client.rs`; ревизия 2 —
-   R15): `NtOpenSection` лобби, проверка размера, magic, version; открывает
-   7 событий; затем строго по порядку:
-   1. `g0 = generation` (Acquire) — **до** заявки;
-   2. `NtResetEvent(S2C_CONNECT)` — сигнал чужого/брошенного рукопожатия не
-      должен подтвердить нашу заявку;
-   3. (0.10) время создания своего процесса в `client_start_lo`/`hi`, затем
-      свой PID в `reserved[3]` (Release) (§c.1);
-   4. `client_state = CLIENT_HELLO` (Release, store) → `handshake_state =
-      CLIENT_HELLO` в обоих заголовках;
-   5. `NtSetEvent(C2S_CONNECT_REQ)`;
-   6. ждать `S2C_CONNECT` до `lobby_timeout` (по умолчанию 5 с; prof-shm —
-      200 мс). Сигнал при `generation == g0` — устаревший (сервер старой
-      версии): поглотить и ждать дальше. Сигнал при `generation != g0` —
-      **принят**, `server_state` **не проверяется** (сервер мог уже
-      отключить клиента и быть `IDLE` — тогда `S2C_DISCONNECT` взведён, а
-      прощальные данные лежат в кольце: их надо дочитать, а не
-      откатываться). Rust-worker-ы ждут здесь ещё и свой `wake` (остановка
-      прерывает ожидание, это внутреннее);
-   7. таймаут/остановка/ошибка → отзыв заявки `CAS client_state:
-      CLIENT_HELLO → IDLE`. CAS удался → откат: `reserved[3] = 0`,
-      `handshake_state = IDLE` в заголовках, ошибка. CAS не удался **и**
-      `generation != g0` → сервер зафиксировал рукопожатие раньше: клиент
-      **подключён** (как в п. 6). CAS не удался при `generation == g0`
-      (состояние снял уходящий сервер без рукопожатия) → откат, ошибка;
-   8. подключён: PID сервера из `reserved[2]`, `connection_gen =
-      generation` и `handshake_state = SERVER_READY` в заголовках.
+   **Ревизия 3 (R18):** claim лобби (`slot_claim`) клиент берёт строго
+   после захвата мьютекса (шаг 3a, C1) и освобождает последним шагом ухода
+   (шаг 7), до `NtReleaseMutant`, — при соблюдении R12 claim к захвату
+   мьютекса свободен. Мьютекс достался брошенным (`STATUS_ABANDONED_WAIT_0`)
+   — прежний держатель умер, возможно, не сняв claim: ЖЕЛАТЕЛЬНО перехватить
+   его — при проигранном `CAS 0 → T` с наблюдённым `c ≠ 0` выполнить `CAS c
+   → T` (Rust: `ClaimMode::TakeOverAbandoned`); если затем не удался C6
+   (сессию умершего сервер ещё не разобрал) — `AlreadyConnected`, как любой
+   отказ лобби. Без перехвата лобби отказывает до дедлайна протухшего
+   захвата (`RESERVE_TIMEOUT` = 10 с, длиннее `lobby_timeout`).
+3a. **Клиент** (`SharedClient::connect_impl` → `Hello::post`,
+   `src/client.rs`; ревизия 3 — R15, R18; `T` — свой токен, §i.1) строго по
+   порядку:
+   0. (C0) `NtOpenSection` лобби/канала, проверки §c.5 (размер, `magic`,
+      `version`, `LayoutBlock`), открыть 7 событий. Ошибки — без побочных
+      эффектов в памяти;
+   1. (C1) `CAS slot_claim: 0 → T` (AcqRel/Acquire). Не удался — канал занят:
+      если `server_state != SERVER_READY` (Acquire) —
+      `NtSetEvent(C2S_CONNECT_REQ)` («толчок», §i.3), и `AlreadyConnected`.
+      **Больше ничего не писать.** Клиент Multi (claim слота уже захвачен
+      перебором §i.1) пропускает шаги 1–2;
+   2. (C2) `owner_start_lo`/`hi` = **настоящее** время создания своего
+      процесса, затем `slot_owner_pid = PID` (Release);
+   3. (C3) `g0 = generation` (Acquire) — **до** заявки;
+   4. (C4) `NtResetEvent(S2C_CONNECT)` — сигнал чужого/брошенного
+      рукопожатия не должен подтвердить нашу заявку;
+   5. (C5) время создания своего процесса в `client_start_lo`/`hi`, затем
+      свой PID в `client_pid` (Release) (§c.1);
+   6. (C6) **`CAS client_state: IDLE → CLIENT_HELLO`** (AcqRel/Acquire;
+      ревизия 2 — store). Не удался (чужая заявка или сессия клиента без
+      claim, мусор) — `client_pid = 0`, `client_start = 0`, `CAS slot_claim:
+      T → 0`, `AlreadyConnected` (Multi — `HandshakeFailed`: снять claim и
+      повторить захват);
+   7. (C7) `handshake_state = CLIENT_HELLO` в обоих заголовках (Release);
+   8. (C8) `slot_claim == T` (Acquire)? Нет — claim отняли по дедлайну
+      (держатель завис между C1 и C6 дольше `RESERVE_TIMEOUT` — нарушение
+      допущения A1, §h п. 10): отзыв (п. 11); если отзыв покажет «принят» —
+      немедленный уход (шаг 7); итог `AlreadyConnected`;
+   9. (C9) `NtSetEvent(C2S_CONNECT_REQ)`;
+   10. (C10) ждать `S2C_CONNECT` до `lobby_timeout` (по умолчанию 5 с;
+       prof-shm — 200 мс). На сигнале `s = client_state` (Acquire):
+       **принят**, если `s == SERVER_READY` (сервер зафиксировал нашу
+       заявку; другой заявки нет — её ставит только держатель claim-а) или
+       `s == IDLE` и `generation != g0` (зафиксировал и уже отключил:
+       `S2C_DISCONNECT` взведён, прощальные данные в кольце — их надо
+       дочитать, а не откатываться). `s == CLIENT_HELLO` — сигнал
+       **устаревший** при любом `generation` (ревизия 3: это `S2C_CONNECT`
+       прошлой сессии, а сервер мог уже опубликовать `generation` новой, ещё
+       не зафиксировав её) — поглотить и ждать дальше. Rust-worker-ы ждут
+       здесь ещё и свой `wake` (остановка прерывает ожидание, это
+       внутреннее);
+   11. (W) таймаут/остановка/ошибка → отзыв `CAS client_state: CLIENT_HELLO
+       → IDLE` (AcqRel/Acquire). Удался → откат: `client_pid = 0`,
+       `client_start = 0`, `handshake_state = IDLE` в заголовках, затем `CAS
+       slot_claim: T → 0` (Multi — claim снимает перебор после рукопожатия),
+       ошибка. Не удался: наблюдён `SERVER_READY` → **подключён**; наблюдён
+       `IDLE` при `generation != g0` → **подключён** (как в п. 10); иначе
+       (`IDLE` при `generation == g0`: сервер ушёл без рукопожатия или снял
+       заявку умершего, шаг 4 S2; мусор) → откат и освобождение, как выше,
+       ошибка;
+   12. (A) подключён: `G = generation` (Acquire), PID сервера из
+       `server_pid`, `connection_gen = G` и `handshake_state = SERVER_READY`
+       в заголовках.
 4. **Сервер** видит `CONNECT_REQ`, проверяет `client_state == CLIENT_HELLO`
-   (иначе — `HandshakeFailed`, который поток лобби **игнорирует**: лобби
-   цело и не пересоздаётся, см. шаг 2), выполняет `complete_handshake`
-   (`src/server.rs`; ревизия 2 — R16): `swap(reserved[3], 0)` → (0.10)
-   `swap(client_start_lo/hi, 0)` → сброс обоих
-   заголовков колец с `generation+1` → публикация `generation` (Release) →
-   `handshake_state = SERVER_READY` в заголовки → `server_state =
-   SERVER_READY` → **фиксация** `CAS client_state: CLIENT_HELLO →
-   SERVER_READY`. CAS не удался (клиент отозвал заявку) → `server_state` и
-   заголовки обратно в `IDLE`, `S2C_CONNECT` **не** сигналится, handle
-   процесса не открывается, `HandshakeFailed` (поток лобби его
-   игнорирует); опубликованный `generation` остаётся (кольца пусты — вреда
-   нет). CAS удался → открыть handle процесса клиента (если процесс жив) →
-   `NtResetEvent(S2C_DISCONNECT)` (п. 19 §a) → `NtSetEvent(S2C_CONNECT)`.
+   (Acquire; иначе — толчок или откатившийся клиент: сигнал поглощается,
+   single-client сервер проверяет протухший захват, §i.3; лобби не
+   пересоздаётся, см. шаг 2) и выполняет `complete_handshake`
+   (`src/server.rs`; ревизия 3 — R16, R18):
+   - **S1:** `T = slot_claim`, `pid = client_pid`, `start = client_start`
+     (Acquire, **без** потребления); handle процесса `pid` с проверкой
+     времени (`open_peer`, §c.1);
+   - **S2 (заявка умершего):** handle не открылся, `pid ≠ 0`, `pid ==
+     slot_owner_pid` (тот же процесс заявил и захватил: защита от ABA, когда
+     `pid` прочитан у прежнего клиента) и процесс подтверждённо ушёл
+     (`STATUS_INVALID_CID`, завершён или другое `CreateTime`) **и по
+     `client_start`, и по `owner_start`** → `CAS client_state: CLIENT_HELLO →
+     IDLE`; удался — `client_pid = 0`, `client_start = 0`, заголовки `IDLE`,
+     затем при `T ≠ 0` `CAS slot_claim: T → 0`. Итог — `HandshakeFailed`
+     **без** смены `generation` и без `S2C_CONNECT`;
+   - **S3:** сброс обоих заголовков колец с `new = generation + 1` →
+     `generation = new` (Release) → `handshake_state = SERVER_READY` в
+     заголовки → `server_state = SERVER_READY` (Release);
+   - **S4:** **`NtResetEvent(S2C_DISCONNECT)` — до фиксации** (ревизия 3;
+     раньше — после, п. 19 §a): сигнал прошлой сессии сброшен, а прощальный
+     сигнал клиента, засчитавшего подключение по проигранному отзыву и сразу
+     ушедшего (он взводится уже после фиксации), не теряется;
+   - **S5:** **фиксация** `CAS client_state: CLIENT_HELLO → SERVER_READY`. Не
+     удался (клиент отозвал заявку) → `server_state` и заголовки в `IDLE`,
+     `S2C_CONNECT` **не** сигналится, `HandshakeFailed` (поток лобби его
+     игнорирует); опубликованный `generation` остаётся (кольца пусты, вреда
+     нет: клиент засчитывает его только при проигранном отзыве);
+   - **S6:** `T2 = slot_claim`, `pid2 = client_pid`, `start2 = client_start`
+     (Acquire), затем `client_state == SERVER_READY` (Acquire)?
+     - **да** — владелец зафиксированной заявки ещё в сессии (свой claim он
+       снимает только после `CAS SERVER_READY → IDLE`), прочитанное — его.
+       Потребить: `CAS client_pid: pid2 → 0`; удался и `slot_claim` всё ещё
+       `T2` — обнулить `client_start`, иначе вернуть `CAS client_pid: 0 →
+       pid2` (claim сменился — потреблённое могло оказаться значением
+       следующего клиента того же процесса). Claim сессии = `T2`. Если
+       `(pid2, start2) ≠ (pid, start)` (между S1 и S5 прежний клиент отозвал
+       заявку, а зафиксирована заявка следующего) — открыть handle процесса
+       `pid2`; не открылся и держатель подтверждённо умер (как в S2) →
+       закрыть сессию (`server_state = IDLE`, `CAS client_state:
+       SERVER_READY → IDLE`, заголовки `IDLE`, `CAS slot_claim: T2 → 0`,
+       `NtSetEvent(S2C_DISCONNECT)`), `HandshakeFailed`;
+     - **нет** — владелец уже ушёл (принят по проигранному отзыву), сессию
+       закончит его `DISCONNECT`: поля **не трогать** (они могут быть уже
+       следующего клиента), наблюдение и claim сессии — из S1;
+   - **S7:** `NtSetEvent(S2C_CONNECT)`, подключён.
 5. **Клиент** записывает `RegistrationRequest` в кольцо B. Rust сигналит
    `C2S_DATA` дважды: из `send_to_server` (если кольцо было пусто) и явно
    (`src/dispatch/mod.rs:1069-1072`). **Нативный клиент ОБЯЗАН сигналить
@@ -751,11 +830,17 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    читается кольцо (ответ, записанный до ухода сервера, не теряется); кольцо
    пусто после `DISCONNECT` при `server_state != SERVER_READY` или сменившемся
    `generation` — `NotConnected`, после смерти процесса сервера — `PeerDied`;
-   `DISCONNECT` при живой сессии — устаревший, поглощается. Читает, закрывает лобби (Drop клиента,
-   ревизия 2: `CAS client_state: SERVER_READY → IDLE` — не store, не
-   затирает `CLIENT_HELLO` следующего; `reserved[3]` не трогается — PID уже
-   забран сервером; `handshake_state = IDLE` в заголовках; затем
-   `NtSetEvent(S2C_DISCONNECT)`), и только потом отпускает мьютекс.
+   `DISCONNECT` при живой сессии — устаревший, поглощается. Читает, закрывает лобби —
+   **уход L** (Drop клиента, ревизия 3, R15): если `generation == G`
+   (Acquire) — `CAS client_state: SERVER_READY → IDLE` (не store, не
+   затирает `CLIENT_HELLO` следующего), `handshake_state = IDLE` в
+   заголовках, затем `NtSetEvent(S2C_DISCONNECT)`; `generation != G` —
+   сессия уже не наша (сервер отключил клиента, claim отнят, канал у
+   следующего), ничего из этого; `reserved[3]` не трогается — PID уже
+   забран сервером; затем **всегда последним** `CAS slot_claim: T → 0`, и
+   только потом отпускает мьютекс. Клиент, уже узнавший об уходе сервера
+   (`DISCONNECT`), — только освобождение claim, без ответного
+   `DISCONNECT`.
    **Нативный сервер лобби ОБЯЗАН сигналить `S2C_DATA` после записи
    ответа** (и `STATUS_OK`, и `REJECTED`).
 8. **Клиент** подключается к каналу `channel_name` обычным handshake
@@ -904,19 +989,23 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    ещё не записал её в кольцо, заявки `space_waiter` может не быть — тогда
    разбудит **только** правило (а) «кольцо опустело». Поэтому (а) ОБЯЗАТЕЛЬНО,
    даже если (б) реализовано.
-4. **`CONNECT_REQ`** — клиент после `CLIENT_HELLO`; **`S2C_CONNECT`** — сервер
-   после `complete_handshake`, **только** если его CAS `client_state:
-   CLIENT_HELLO → SERVER_READY` удался (ревизия 2, R16). 0.9: непосредственно
-   **перед** `S2C_CONNECT` сервер делает `NtResetEvent(S2C_DISCONNECT)` —
-   сигнал прошлой сессии, которого никто не дождался, иначе мгновенно
-   «отключил» бы нового клиента (он начинает ждать `DISCONNECT` только после
-   `S2C_CONNECT`). Ревизия 2: клиент делает `NtResetEvent(S2C_CONNECT)`
-   **до** своего `CLIENT_HELLO` и засчитывает сигнал, только если
-   `generation` сменился (R15, §d.2 шаг 3a).
+4. **`CONNECT_REQ`** — клиент после `CLIENT_HELLO`; ревизия 3 — и клиент,
+   проигравший захват claim-а (C1), если `server_state != SERVER_READY`
+   («толчок», §i.3). **`S2C_CONNECT`** — сервер после `complete_handshake`,
+   **только** если его CAS `client_state: CLIENT_HELLO → SERVER_READY` удался
+   (R16). `NtResetEvent(S2C_DISCONNECT)` сервер делает **до** фиксации
+   (ревизия 3, S4; 0.9 и ревизия 2 — после, непосредственно перед
+   `S2C_CONNECT`): сигнал прошлой сессии иначе мгновенно «отключил» бы
+   нового клиента, а сброс после фиксации съедал прощальный сигнал клиента,
+   уже засчитавшего подключение по проигранному отзыву и ушедшего. Клиент
+   делает `NtResetEvent(S2C_CONNECT)` **до** своего `CLIENT_HELLO` и
+   засчитывает сигнал, только наблюдая фиксацию своей заявки (R15, §d.2
+   шаг 3a п. 10).
 5. **`S2C_DISCONNECT`** — штатное закрытие любой стороны **после** записи
-   последних сообщений: клиент (Drop, `src/client.rs`, ревизия 2) — `CAS
-   client_state: SERVER_READY → IDLE`, `handshake_state = IDLE` в
-   заголовках, затем сигнал (`reserved[3]` не трогается); сервер (Drop,
+   последних сообщений: клиент (Drop, `src/client.rs`, ревизия 3) — только
+   пока `generation == G` своей сессии: `CAS client_state: SERVER_READY →
+   IDLE`, `handshake_state = IDLE` в заголовках, затем сигнал (`reserved[3]`
+   не трогается); затем всегда `CAS slot_claim: T → 0` последним (R18); сервер (Drop,
    `src/server.rs`) — состояния `IDLE`, сигнал только если был
    подключён. Кольца при закрытии **не** сбрасываются (их сбрасывает только
    следующий `complete_handshake`) — приёмник успевает дочитать. Порядок
@@ -959,13 +1048,15 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 | R12 (0.9) | Клиент лобби: захватить мьютекс `<B>_lock` до `CLIENT_HELLO`, держать до отключения от лобби, освободить тем же потоком (§d.2 п. 3) | Не зависание: два одновременных клиента снова могут пройти рукопожатие оба, писать в одно кольцо и прочитать чужой ответ (§h.2) — `Timeout`/битый ответ у проигравшего | Мьютекса не было |
 | R13 (0.9) | Клиент Multi: `reserved[1]` = свой PID сразу после CAS захвата, `reserved[3]` = PID до `CLIENT_HELLO`, сигнал `C2S_CONNECT_REQ` сразу после `HELLO`; при уходе — `S2C_DISCONNECT` **до** снятия claim (§i.4) | Без PID смерть клиента после рукопожатия замечается только при пробуждении сервера по другой причине (§i.5); без `CONNECT_REQ` захват освободится лишь по дедлайну 10 с | Опрос 50 мс и проверка PID раз в 3 с маскировали |
 | R14 (0.9) | Уходя штатно, сначала перевести своё состояние handshake в `IDLE`, потом `NtSetEvent(S2C_DISCONNECT)` | `wait_for_space` пира примет сигнал за устаревший и продолжит ждать места (до своего таймаута / смерти процесса) | `wait_for_space` просыпался по срезу 50 мс, но о разрыве не узнавал |
-| R15 (рев. 2) | Клиент (любой канал): `g0 = generation` до заявки; `NtResetEvent(S2C_CONNECT)` до `CLIENT_HELLO`; принятым считать `S2C_CONNECT` при `generation != g0`, **не** проверяя `server_state`; отзыв заявки — только `CAS client_state: CLIENT_HELLO → IDLE`, при неудаче CAS и `generation != g0` — подключён; Drop — `CAS client_state: SERVER_READY → IDLE` (§d.2 шаг 3a, шаг 7) | Сервер, отключивший клиента сразу после рукопожатия, для него «не отвечал»: клиент откатывается, `DISCONNECT` и прощальные данные теряются, Dispatch-клиент без R15 повторяет подключение к снесённому каналу. Без сброса `S2C_CONNECT` — чужой сигнал подтверждает заявку, которую никто не принял; без CAS-отзыва — сервер «подключён» к ушедшему клиенту | Так же терялось |
-| R16 (рев. 2) | Сервер: фиксировать рукопожатие `CAS client_state: CLIENT_HELLO → SERVER_READY` после публикации `generation` и `server_state`; CAS не удался — `server_state`/заголовки в `IDLE`, `S2C_CONNECT` **не** сигналить (§d.2 шаг 4) | Клиент, отозвавший заявку по таймауту в момент ответа, оставляет сервер подключённым к никому (Auto/Dispatch-канал ждёт `DISCONNECT`, которого не будет), а взведённый `S2C_CONNECT` достаётся следующему клиенту | Так же |
+| R15 (рев. 3) | Клиент (любой именованный канал, §d.2 шаг 3a): `CAS slot_claim: 0 → T` до всего остального (Multi — уже захвачен), проигрыш — толчок и `AlreadyConnected` без записей; `g0 = generation` до заявки; `NtResetEvent(S2C_CONNECT)` до заявки; заявка — `CAS client_state: IDLE → CLIENT_HELLO`, после неё сверка `slot_claim == T`; принятым считать `S2C_CONNECT` при `client_state == SERVER_READY` или `IDLE` и `generation != g0` (при `CLIENT_HELLO` — устаревший); отзыв — только `CAS CLIENT_HELLO → IDLE` с разбором наблюдённого (`SERVER_READY` или `IDLE` при `generation != g0` — подключён); Drop — записи состояния только при `generation == G`: `CAS SERVER_READY → IDLE`, затем `DISCONNECT`; освобождение claim — последним (§d.2 шаг 3a, шаг 7) | Два ждущих клиента засчитывают одно рукопожатие — два писателя в одном SPSC-кольце; отзыв снимает чужую заявку — клиент «подключён к никому»; уход «призрака» рвёт следующую сессию; принятие по устаревшему `S2C_CONNECT` до фиксации; сервер, отключивший клиента сразу после рукопожатия, для него «не отвечал» (откат, прощальные данные теряются) | Гонка существовала (Concern 1 ревью Task 18) |
+| R16 (рев. 3) | Сервер (§d.2 шаг 4): S1 — claim и самоописание без потребления; S2 — заявку подтверждённо умершего держателя claim-а снять CAS-ом до фиксации, без `generation` и `S2C_CONNECT`; S3 — кольца, `generation`, `server_state`; S4 — `NtResetEvent(S2C_DISCONNECT)` **до** фиксации; S5 — фиксация `CAS client_state: CLIENT_HELLO → SERVER_READY`, не удался — `IDLE`, без `S2C_CONNECT`; S6 — потребить самоописание и взять claim сессии, только застав владельца в сессии (`client_state == SERVER_READY`), при иной зафиксированной заявке — наблюдать её процесс; S7 — `S2C_CONNECT` | Клиент, отозвавший заявку в момент ответа, оставляет сервер подключённым к никому; сброс `DISCONNECT` после фиксации съедает прощальный сигнал быстро ушедшего клиента (сервер ждёт вечно); потребление без сверки забирает самоописание следующего клиента (его сессия без наблюдения, claim сессии — чужой) | Так же |
 | R17 (рев. 2) | Multi: сервер в `disconnect_client`/`stop` claim **не** освобождает (только `IDLE` → `DISCONNECT`); клиент, получив `DISCONNECT` от сервера, **ОБЯЗАН** снять claim сам (`CAS token → 0`); при штатном уходе клиента сервер снимает claim только `CAS <claim сессии> → 0`; клиент на каждом пробуждении сверяет `generation` (§i.2, §i.4) | Без снятия клиентом слот занят до дедлайна `RESERVE_TIMEOUT` (10 с). Сервер, освобождающий claim сам, открывает гонку: новый клиент захватывает слот, его рукопожатие сбрасывает `DISCONNECT` прежнего — два клиента на одном SPSC-кольце | Гонка существовала |
+| R18 (рев. 3) | Single-client канал (не Multi-слот, не anonymous): исключительная заявка — клиент `CAS slot_claim 0 → T` (токен уникален и внутри процесса, §i.1), `CLIENT_HELLO` — только CAS из `IDLE`, освобождение claim — последним шагом отзыва и ухода (лобби — до `NtReleaseMutant`). Сервер: claim **не** освобождает при штатном уходе клиента и при своём отключении клиента (снимает клиент; «не заметившего» — дедлайн); освобождает claim умершего в сессии сразу (`mark_disconnected`: handle процесса клиента с подтверждённым временем сигнален → `CAS <claim сессии> → 0` после сброса состояния) и снимает заявку умершего до фиксации (S2); протухший захват без заявки — **только по толчку** проигравшего клиента: на каждом `CONNECT_REQ` без `HELLO` у неподключённого сервера — `observe_idle_claim` (§i.3), без таймера | Два клиента на одном SPSC-кольце, сессия-призрак, разрыв чужой сессии уходящим «призраком»; без освобождения claim умершего — канал отдаёт `AlreadyConnected` до дедлайна (10 с с первого толчка); без толчка и дедлайна — до перезапуска сервера | claim в single-client не использовался (внешняя сериализация — только мьютекс лобби R12) |
 
 Обратное направление (что нативной стороне ждать от Rust 0.9): Rust
-выполняет R1–R17 всегда (R3 — с 0.8, R6 — с 0.8, R10 — с 0.9 при
-использовании `Beacon`, R12–R14 — с 0.9, R15–R17 — с ревизии 2).
+выполняет R1–R18 всегда (R3 — с 0.8, R6 — с 0.8, R10 — с 0.9 при
+использовании `Beacon`, R12–R14 — с 0.9, R15–R17 — с ревизии 2, R15/R16 в
+редакции ревизии 3 и R18 — с ревизии 3).
 
 ### e.5 Оставшиеся таймауты и таймеры в 0.9
 
@@ -992,6 +1083,10 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
   пересоздания лобби (`src/dispatch/mod.rs:174`); дедлайны `lobby_timeout`
   (5 с), `channel_connect_timeout` (30 с); клиент — `lobby_timeout` (5 с),
   `response_timeout` (5 с), `channel_timeout` (10 с).
+- **Single-client канал (ревизия 3, R18)**: таймера нет — протухший
+  захват (`RESERVE_TIMEOUT` = 10 с от первого наблюдения) проверяется только
+  на толчке проигравшего клиента (`CONNECT_REQ` без `HELLO`); ожидание
+  сервера остаётся `[CONNECT_REQ, wake]` без таймаута.
 - `poll_timeout = Some(t)` в Auto/Dispatch — необязательная страховка
   (просыпаться не реже `t`), по умолчанию выключена.
 
@@ -1045,7 +1140,8 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    data_signal_on_eviction_by_bytes_that_empties_ring}`,
    `tests/zero_copy.rs`.
 2. **PID в handshake (R6)**: `reserved[2]` сервером при создании секции,
-   `reserved[3]` клиентом до `CLIENT_HELLO`, `swap(0)` сервером,
+   `reserved[3]` клиентом до `CLIENT_HELLO`, одноразовое потребление сервером
+   (ревизия 3 — CAS в S6, только застав владельца в сессии),
    откат обнуляет. Тесты: `peer_tests::{old_client_interoperates_without_peer_watch,
    old_server_interoperates_without_peer_watch, stale_dead_pid_is_not_reported_as_peer_death,
    rollback_clears_announced_pid, disconnect_drops_peer_watch}`,
@@ -1128,6 +1224,33 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
     drop_during_slot_handshake_is_prompt}`; остановка во время
     рукопожатия — `auto::lossless_tests::stop_during_connect_is_prompt`; prof-shm —
     `prof-shm/tests/live.rs::revision_refusal_from_on_client_connect_is_a_rejection`.
+    Ревизия 3 переписала R15/R16 — эталоны рукопожатия теперь п. 13.
+13. **Ревизия 3 (R15/R16/R18, исключительная заявка)**: модель —
+    `handshake_model::{handshake_model, handshake_model_finds_revision_two_defect,
+    handshake_model_design_c10_accepts_before_commit,
+    handshake_model_design_s6_loses_next_description}` (исчерпывающий
+    перебор чередований двух клиентов и сервера, ≈1,9 млн состояний;
+    варианты протокола ревизии 2 и дизайна без двух поправок обязаны
+    нарушать инварианты); клиент —
+    `client::tests::{loser_gets_already_connected_and_writes_nothing,
+    same_process_competition_single_acceptance, withdraw_never_removes_foreign_hello,
+    ghost_drop_does_not_tear_next_session, connect_async_loser_already_connected,
+    connect_async_drop_releases_claim, connect_async_drop_after_commit_leaves,
+    withdraw_hello_loses_only_to_a_committed_handshake}`; сервер —
+    `server::handshake_tests::{inflight_aba_accepts_by_ready,
+    fast_leaver_disconnect_not_eaten, dead_hello_withdrawn_before_commit,
+    dead_hello_of_other_pid_not_withdrawn, stale_claim_reclaimed_on_nudge_only}`;
+    совместимость — `peer_tests::{legacy_client_without_claim_connects,
+    client_with_forged_start_time_is_reported_dead}`; Auto/Dispatch/Multi —
+    `auto::claim_tests::{auto_client_retries_after_already_connected,
+    idle_server_with_foreign_claim_does_not_wake_up}`,
+    `dispatch::tests::{lobby_takes_over_claim_of_abandoned_mutex,
+    idle_lobby_with_foreign_claim_does_not_wake_up}`,
+    `multi::tests::{multi_handshake_reuses_slot_token,
+    idle_server_with_foreign_claim_does_not_wake_up}`; смерть —
+    `tests/peer_death.rs::peer_death_releases_claim_immediately`; шторм —
+    `tests/hostile.rs::handshake_storm` (принятий клиентами ровно столько,
+    сколько сессий сервера; причины отключений — только `Graceful`).
 
 Прогон: `cargo test --all-features` (на 2026-09-25, рабочее дерево 0.9.0
 после ревизии 2: 116 unit + 1 ignored, 7 backpressure, 5 multi, 4 ordering,
@@ -1147,7 +1270,8 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 
 ## h. Известные неоднозначности и риски
 
-Пункты 1 и 2 **исправлены в 0.9** (п. 22 и 21 §a), пункт 3 — смягчён (п. 19),
+Пункты 1 и 2 **исправлены в 0.9** (п. 22 и 21 §a; пункт 2 для любого
+single-client канала — ревизией 3, R18), пункт 3 — смягчён (п. 19),
 пункт 4 — частично (п. 23: тип проверяется, но первый создатель по-прежнему
 может занять имя). Текст ниже описывает поведение до исправления и остаётся
 верным при смешении со старыми пирами.
@@ -1172,6 +1296,11 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    повторяет (у prof-shm — с отступом). Поведение существовало и в 0.8, но
    маяк делает одновременный старт клиентов типичным. Нативная реализация
    должна вести себя так же (или лучше — но тогда это новый протокол).
+   **Ревизия 3:** это и есть новый протокол — single-client канал (лобби,
+   канал Dispatch, `SharedServer`/`AutoServer`) сериализует подключения сам
+   исключительным claim-ом (R18), внешняя сериализация не требуется;
+   проигравший получает `AlreadyConnected` сразу. Со старыми клиентами без
+   claim — п. 10.
 3. **`S2C_DISCONNECT` — одно автосбросное событие на оба направления.**
    Лишний/запоздавший сигнал остаётся взведённым до следующего ожидания
    любой стороной; с 0.9 его сбрасывает `complete_handshake` перед
@@ -1231,6 +1360,34 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
    `max_messages` (§c.5) — но только в канале самого вандала; байтовая
    граница (`write_pos − read_pos ≤ capacity`) и проверки кадров соблюдаются
    всегда, читатель счётчик на соответствие лимиту не проверяет.
+10. **(Ревизия 3) Исключительная заявка: допущения и остаточные риски.**
+    Single-client канал сериализует подключения сам (R18): внешняя
+    сериализация не требуется (мьютекс лобби R12 остаётся — очередь клиентов
+    лобби и перехват claim-а умершего). Остаётся:
+    - **Допущение A1** (как у Multi, `clamp_slot_timeout`): живой держатель
+      проходит C1→C6 (прямолинейный участок без ожиданий, микросекунды)
+      быстрее `RESERVE_TIMEOUT` (10 с). Нарушение (заморозка ≥ 10 с ровно
+      там при толчке другого клиента): claim отнимают; C6 или C8 это
+      ловят, но окна в наносекунды (откат `client_pid` держателя после
+      чужого C5; поздний уход «забытого» клиента одновременно с фиксацией
+      следующего) остаются — тот же класс, что у Multi.
+    - **Смешанный режим** с черновыми клиентами ревизии 2 (store `HELLO`,
+      без claim): сервер принимает такую заявку «наследным» путём (claim
+      сессии `0`, как anonymous/драйвер), но store чернового клиента может
+      перетереть `HELLO` нового — дефект ревизии 2 сохраняется **только** в
+      смешанном режиме; сервер подделку отличить не может, исправить можно
+      только версией формата (если черновой пир уже развёрнут — поднять
+      `SHARED_VERSION` до `0x0002_0001`, тогда несовместимость явная).
+    - **Занятый канал**: клиент, не заметивший отключения сервером и не
+      уничтоженный (`SharedClient` пользователя, `mem::forget`), держит
+      claim до отъёма — ≥ 10 с с первого толчка. Его поздний уход ничего не
+      пишет (`generation != G`); продолжающий писать в кольцо после отъёма —
+      тот же риск, что у Multi (сверка `generation` в отправке — вне
+      ревизии 3).
+    - **Ненаблюдаемый мёртвый клиент** (R6: процесс не открылся — другая
+      сессия без прав): S2 не срабатывает (`is_process_gone`
+      консервативен), claim умершего в сессии не освобождается сразу —
+      только дедлайном по толчку после отключения.
 
 ---
 
@@ -1256,6 +1413,16 @@ handshake (0.8+), `reserved[2]` — PID сервера. Захват: `CAS reser
 0 → token` (AcqRel), сразу за ним (0.10) `owner_start_lo`/`hi` и `store
 reserved[1] = PID` (Release, §c.1);
 освобождение клиентом — `CAS token → 0`.
+
+**Токен (ревизия 3, общий с single-client каналом).** `T ≠ 0`, уникален
+внутри процесса (два клиента одного процесса неразличимы по PID и времени
+создания — владение различают только токены) и практически уникален между
+процессами. Rust (`shared::claim_token`): `seed` — один раз на процесс
+(ОС-энтропия `RandomState` ⊕ PID ⊕ время создания), `T = fmix32(seed + n)`
+(финализатор murmur3 — биекция `u32`), `n` — процесс-локальный счётчик
+(атомарный `fetch_add`), значение `0` пропускается. Нативный пир вправе
+использовать любой генератор с теми же гарантиями; `pid << k | counter` — нет
+(32 бит не хватает: PID до 2²⁶+, счётчик быстро заворачивается).
 
 **Перебор слотов и число слотов (0.10).** Клиент перебирает `B_0, B_1, …`
 по порядку и останавливается на **первом не открывшемся** слоте, но не
@@ -1301,7 +1468,8 @@ Handle процесса клиента: из handshake (`reserved[3]`, клие�
 `ProcessWatch::open_peer`); если PID не передан (клиент ≤ 0.7) — процесс
 **владельца claim-а** из `reserved[1]` (его пишут клиенты 0.5+). Handshake
 слота теперь общий с `SharedServer` (`accept_pending` → `complete_handshake`:
-`swap(reserved[3], 0)`, сброс `DISCONNECT`, `S2C_CONNECT`).
+S1–S7 ревизии 3, §d.2 шаг 4: потребление `reserved[3]` в S6, сброс
+`DISCONNECT` до фиксации, `S2C_CONNECT`).
 
 Реакция (диспетчер; до 0.10 — `worker_loop`):
 - `CONNECT_REQ` при `client_state == CLIENT_HELLO` — рукопожатие,
@@ -1363,6 +1531,7 @@ Handle процесса клиента: из handshake (`reserved[3]`, клие�
 | Свободный слот, claim ≠ 0 (клиент захватил и не подключился — упал между CAS и `HELLO`) | момент **первого наблюдения** этого token + `RESERVE_TIMEOUT` (10 с) | `CAS token → 0` |
 | Подключённый слот (разово) | handshake + 2 с (`HANDSHAKE_VERIFY_DELAY`) | claim = 0 → «брошенное рукопожатие» (клиент отвалился по своему `slot_timeout` ровно в момент ответа, снял claim без `DISCONNECT`) → отключить (`Graceful`). С ревизии 2 клиент по R15 такого не оставляет (CAS-отзыв либо проигрывает — и клиент подключён, либо выигрывает — и сервер рукопожатие не фиксирует); проверка остаётся для старых клиентов |
 | Слот, отключённый `disconnect_client` (ревизия 2) | как свободный слот с claim ≠ 0: первое наблюдение + `RESERVE_TIMEOUT` | клиент не снял claim (умер) → `CAS token → 0` |
+| **Single-client канал** (ревизия 3, R18; `SharedServer::start*`, Auto, лобби и каналы Dispatch): сервер не подключён, claim ≠ 0 без `HELLO` | **только по толчку** — дедлайна-таймера нет: на `CONNECT_REQ` без `HELLO` (`wait_for_client`, `wait_for_client_or`, `accept_async`) — первое наблюдение token; толчок не раньше `RESERVE_TIMEOUT` от первого наблюдения при всё ещё отсутствующем `HELLO` | `CAS token → 0`; новый token — новый отсчёт. Ожидание сервера остаётся `[CONNECT_REQ, wake]` без таймаута: пока каналом никто не интересуется, отъём не нужен |
 
 «Первое наблюдение» случается при любом пробуждении worker-а. Чтобы
 брошенный захват не висел, пока сервер спит, **клиент, получивший
@@ -1396,6 +1565,15 @@ PeerDied)`; в ответ `DISCONNECT` клиент **не** сигналит (�
 Вне подключения (сервера нет, свободных слотов нет, ошибка) — пауза
 `retry_delay`, прерываемая `wake`.
 
+Ревизия 3: рукопожатие слота — §d.2 шаг 3a с уже захваченным claim (Rust:
+`ClaimMode::Held`): шаги C1/C2 пропускаются (их сделал перебор), C6 — `CAS
+client_state: IDLE → CLIENT_HELLO` (не удался — `HandshakeFailed`: снять
+claim и повторить захват), C8 — сверка `slot_claim == token`, C10 и отзыв —
+правила ревизии 3; уход — L: записи состояния и `DISCONNECT` только при
+`generation == G`. Claim по-прежнему снимает клиент после ухода
+(`release_claim`), порядок R13/R14 сохранён. Claim сессии сервер Multi
+берёт из рукопожатия (S6), а не перечитывает после него.
+
 Нативный **клиент** Multi ОБЯЗАН (R13, R15, R17): после CAS захвата записать
 свой PID в `reserved[1]`; рукопожатие слота — по R15 (§d.2 шаг 3a); до
 `CLIENT_HELLO` — PID в `reserved[3]`; после `HELLO` —
@@ -1419,6 +1597,9 @@ token → 0` (R14); получив `DISCONNECT` от сервера — `CAS tok
 | Клиент ≤ 0.8 (без толчка) | Брошенный им захват освобождается по дедлайну, как только сервер проснётся по любой причине; толкать будут клиенты 0.9 |
 | Клиент ≤ 0.9 до ревизии 2 | Claim после `DISCONNECT` снимает (так было всегда) — работает; рукопожатие без R15: сервер, отключивший его сразу, для него «не ответил» (откат, повтор захвата) |
 | Сервер 0.9 до ревизии 2 / ≤ 0.8 | `disconnect_client` освобождает claim сам — гонка двух клиентов на слоте остаётся; клиент ревизии 2 замечает её по `generation` на ближайшем пробуждении |
+| Черновой C-клиент 0.10 (R15 ревизии 2: store `HELLO`, без claim) ↔ сервер ревизии 3 | Заявка без claim принимается «наследным» путём (claim сессии `0`, как у anonymous/драйвера): один такой клиент — безопасно. Смесь с клиентами ревизии 3 на одном канале — его store может перетереть их `HELLO`: дефект ревизии 2 остаётся **только** в смешанном режиме (§h п. 10) |
+| Клиент ревизии 3 ↔ черновой C-сервер (R16 ревизии 2) | Клиенты взаимно исключены через claim независимо от сервера; C10 и отзыв совместимы со старым порядком сервера (`generation` до фиксации). Старый сервер не освобождает claim умершего и не делает дедлайн: после краха держателя канал отдаёт `AlreadyConnected`, пока сервер не перезапущен (отказ закрыт — без двух писателей); G1 (сброс `DISCONNECT` после фиксации) остаётся со старым сервером |
+| Старый Multi-сервер ↔ клиент Multi ревизии 3 | Как строка выше; claim слота дедлайном снимает он сам |
 | Сервер ≤ 0.8 | Клиент 0.9 ждёт `DATA`/`DISCONNECT` без таймаута — старый сервер сигналит их по R1/R7, работает. Сервер ≤ 0.8 не сбрасывает `DISCONNECT` перед `S2C_CONNECT` (риск §h.3) и на `CONNECT_REQ` без `HELLO` (толчок) сбрасывает claim в `0` — толчок клиента 0.9 может освободить чужой ещё не подключённый захват; тот клиент тогда получит отказ рукопожатия и повторит попытку |
 
 ### i.6 `wait_for_space` (SharedServer/SharedClient)
@@ -1491,7 +1672,7 @@ R1–R17), §g (фактический прогон).
 Аудит 16.10.2026 и запрос «настраиваемые размеры по каждому направлению».
 Формат памяти сменился (`SHARED_VERSION = 0x00020000`), имена и типы
 объектов ядра, рукопожатие (R2–R17), событийная модель и протокол лобби
-(`DISPATCH_VERSION = 2`, байты сообщений) — **прежние**; строгость разбора и ожидания лобби — п. 18–21; правило сигнала `DATA` (R1) — п. 24; PAD-кадры и непрерывный payload — п. 26.
+(`DISPATCH_VERSION = 2`, байты сообщений) — **прежние**; строгость разбора и ожидания лобби — п. 18–21; правило сигнала `DATA` (R1) — п. 24; PAD-кадры и непрерывный payload — п. 26; рукопожатие ревизии 3 (R15/R16/R18, исключительная заявка single-client канала) — п. 28.
 
 | # | Правило | Было (0.9) | Стало (0.10) | Где |
 |---|---|---|---|---|
@@ -1522,7 +1703,29 @@ R1–R17), §g (фактический прогон).
 | 25 | Лимит `max_messages` у писателя | по `message_count` при любом заполнении; пустое кольцо при «полном» счётчике — `Corrupted` | лимит (вытеснение/«полно») — только при `write_pos − read_pos > 0`; пустое по позициям кольцо принимает кадр при любом счётчике. Счётчик законно отстаёт от `read_pos` на 1 и может кратковременно быть `max_messages + 1` — читатель это порчей не считает | §c.5, §e.2 п. 1 |
 | 26 | Непрерывный payload (zero-copy) | payload кадра мог разрываться границей кольца (хвост — с начала кольца); `flags` всегда `0`; `max_message_size ≤ capacity − 8`; `space_waiter = frame_size(len)` | кадр никогда не пересекает конец кольца: если `frame_size(len) > tail(W)`, писатель пишет PAD-кадр (`flags` бит 0 = `FRAME_PAD`, `len = tail(W) − 8`, может быть 0) на остаток и кладёт кадр с индекса 0; PAD + кадр — одна публикация `write_pos`, сигнал `DATA` по позиции до PAD; место и `space_waiter` — `need(W, F)` = PAD + кадр; PAD не сообщение (`message_count`, `drop_count`, `max_messages` не трогает), не доставляется, вытесняется перезаписью без учёта. Читатель: PAD обязан кончаться ровно на границе, стоять не на индексе 0 и лежать до `write_pos`; кадр сообщения через границу, PAD в другом месте, неизвестные биты `flags` — `Corrupted`. `max_message_size ≤ capacity / 2 − 8` (вывод — §c.2), сегмент с большим — `Corrupted`. Пир ОБЯЗАН реализовать PAD на чтении и на записи | §c.2, §c.3, §c.4, §c.5, §e.2 п. 1–2 |
 | 27 | Лимит `max_messages` при счётчике на пределе (Task 18, решение 28) | непустое кольцо при `message_count ≥ max_messages` — вытеснение старейшего (`send`) или «полно» (`try_send`) по одному счётчику: отставший на 1 счётчик (читатель между CAS `read_pos` и декрементом) вытеснял сообщение на кадр раньше | один снимок `W`/`R`/`C` на решение о байтах и лимите; при `C ≥ max_messages`: `max_messages ≤ RECOUNT_MAX` (= 64) — пересчёт сообщений по кадрам `[R, W)` (без PAD, до `max_messages`, ≤ 129 заголовков; кадр не по §c.4 — «полно»), «полно» при пересчитанных `max_messages`; `max_messages > 64` — «полно» только при `C > max_messages` (O(1), кольцо может держать `max_messages + 1`). Писатель ОБЯЗАН применять то же правило с тем же порогом; гарантия лимита — при честном читателе (§h п. 9); читателю не видно | §c.5, §h |
+| 28 | **Ревизия 3 рукопожатия (Task 22): исключительная заявка single-client канала** | — | — | R15, R16, R18, §d.2 шаги 3–4, 7 |
+| 28.1 | C1: захват | single-client — без claim, конкурирующие клиенты писали заявку поверх друг друга | `CAS slot_claim: 0 → T` до любых записей; проигрыш — толчок `CONNECT_REQ` (если `server_state != SERVER_READY`) и `AlreadyConnected`, ничего не записано; затем `owner_start`, `slot_owner_pid` | §d.2 шаг 3a п. 1–2 |
+| 28.2 | C6: заявка | store `client_state = CLIENT_HELLO` (даже поверх `SERVER_READY` чужой сессии) | `CAS client_state: IDLE → CLIENT_HELLO`; не удался — откат PID/времени, `CAS T → 0`, `AlreadyConnected`; после заявки C8 — сверка `slot_claim == T` | §d.2 шаг 3a п. 6, 8 |
+| 28.3 | C10: принятие | `S2C_CONNECT` при `generation != g0` | `S2C_CONNECT` при `client_state == SERVER_READY` или `IDLE` и `generation != g0`; при `CLIENT_HELLO` — устаревший при любом `generation` | §d.2 шаг 3a п. 10 |
+| 28.4 | W: отзыв | CAS не удался и `generation != g0` — подключён | CAS не удался: наблюдён `SERVER_READY` — подключён; `IDLE` и `generation != g0` — подключён; иначе откат; откат — затем `CAS T → 0` | §d.2 шаг 3a п. 11 |
+| 28.5 | L: уход клиента | `CAS SERVER_READY → IDLE` и `DISCONNECT` всегда | только при `generation == G` (иначе — ничего); затем всегда `CAS T → 0` **последним** | §d.2 шаг 7, §e.2 п. 5 |
+| 28.6 | S2: заявка умершего | фиксировалась (сессия с мёртвым клиентом) | процесс не открылся, `pid == slot_owner_pid` и подтверждённо ушёл по `client_start` и `owner_start` — `CAS HELLO → IDLE`, откат полей, `CAS T → 0`, `HandshakeFailed` без `generation` и `S2C_CONNECT` | §d.2 шаг 4 |
+| 28.7 | S4: сброс `DISCONNECT` | после фиксации, перед `S2C_CONNECT` | **до** фиксации | §d.2 шаг 4, §e.2 п. 4 |
+| 28.8 | S1/S6: самоописание клиента | `swap(client_pid, 0)` и `swap(client_start, 0)` до публикации `generation` | S1 — чтение без потребления; S6 — потребление CAS-ом и claim сессии, только застав владельца в сессии (`client_state == SERVER_READY`), с возвратом при сменившемся claim; иная зафиксированная заявка (ABA) — наблюдать её процесс | §c.1, §d.2 шаг 4 |
+| 28.9 | `mark_disconnected` | состояние `IDLE`, claim не трогался (single-client claim не было) | после сброса состояния: handle процесса клиента сигнален (подтверждённая смерть) — `CAS <claim сессии> → 0`; штатный уход и отключение сервером claim не трогают | R18 |
+| 28.10 | Протухший захват single-client | — | на `CONNECT_REQ` без `HELLO` у неподключённого сервера: первое наблюдение token; не раньше `RESERVE_TIMEOUT` (10 с) от него и без `HELLO` — `CAS token → 0`; без таймера | §i.3, §e.5 |
+| 28.11 | Токен claim-а | Multi: `RandomState` на вызов, внутри процесса мог повториться (2⁻³² на пару) | общий генератор `fmix32(seed + n)` (уникален в процессе) | §i.1 |
+| 28.12 | Лобби: мьютекс достался брошенным | — | ЖЕЛАТЕЛЬНО перехватить claim умершего держателя: `CAS c → T` после проигранного `CAS 0 → T` | §d.2 шаг 3 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации
-§c.5 (`magic` последним); (4) читатель — проверки границы доверия.
+§c.5 (`magic` последним); (4) читатель — проверки границы доверия;
+(5) ревизия 3 (п. 28): клиент — генератор токена, C1–C10, отзыв W с разбором
+наблюдённого, уход L (сверка `generation`, claim последним), толчок при
+проигрыше, Multi — заявка по уже захваченному claim; сервер — S1–S7
+(S2 и S6 — `NtOpenProcess` + `NtQueryInformationProcess(ProcessTimes)`, §c.1),
+`NtResetEvent(DISCONNECT)` до фиксации, освобождение claim умершего в
+`mark_disconnected`, проверка протухшего захвата на каждом `CONNECT_REQ` без
+`HELLO` (минимальная безопасная реализация — без дедлайна: хуже только
+живучесть); клиент лобби — перехват claim при брошенном мьютексе
+(ЖЕЛАТЕЛЬНО). Тесты-эталоны — §g п. 13.

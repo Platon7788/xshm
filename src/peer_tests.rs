@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
+use crate::client::ClaimMode;
 use crate::{SharedClient, SharedServer, ShmError};
 
 fn unique(tag: &str) -> String {
@@ -36,8 +37,15 @@ fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServ
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client =
-        SharedClient::connect_impl(None, name, Duration::from_secs(5), announce_pid, None).unwrap();
+    let client = SharedClient::connect_impl(
+        None,
+        name,
+        Duration::from_secs(5),
+        announce_pid,
+        ClaimMode::Take,
+        None,
+    )
+    .unwrap();
     (server_thread.join().unwrap(), client)
 }
 
@@ -129,8 +137,15 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client =
-        SharedClient::connect_impl(None, &name, Duration::from_secs(5), false, None).unwrap();
+    let client = SharedClient::connect_impl(
+        None,
+        &name,
+        Duration::from_secs(5),
+        false,
+        ClaimMode::Take,
+        None,
+    )
+    .unwrap();
     let server = server_thread.join().unwrap();
     assert_eq!(server.peer_pid(), None);
     assert_eq!(server.is_peer_alive(), None);
@@ -183,7 +198,14 @@ fn client_with_forged_start_time_is_reported_dead() {
     thread::sleep(Duration::from_millis(30));
     let forged = crate::win::current_process_start_time().wrapping_add(1);
     crate::client::FORGED_START_TIME.with(|cell| cell.set(Some(forged)));
-    let client = SharedClient::connect_impl(None, &name, Duration::from_secs(5), true, None);
+    let client = SharedClient::connect_impl(
+        None,
+        &name,
+        Duration::from_secs(5),
+        true,
+        ClaimMode::Take,
+        None,
+    );
     crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
     let client = client.unwrap();
     let server = server_thread.join().unwrap();
@@ -221,4 +243,36 @@ fn corrupted_server_start_hi_is_not_a_live_server() {
     // Честное время клиента сервер принимает.
     assert_eq!(server.is_peer_alive(), Some(true));
     roundtrip(&server, &client);
+}
+
+/// Ревизия 3 (§7.1 п. 16, §5 дизайна): черновой клиент ревизии 2 без claim
+/// (store `HELLO`, `slot_claim` не трогает) подключается к новому серверу
+/// «наследным» путём -- как анонимный пир или драйвер.
+#[test]
+fn legacy_client_without_claim_connects() {
+    let name = unique("LEGACY");
+    let mut server = SharedServer::start(&name).unwrap();
+    let server_thread = thread::spawn(move || {
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+    });
+    let client = SharedClient::connect_impl(
+        None,
+        &name,
+        Duration::from_secs(5),
+        true,
+        ClaimMode::Legacy,
+        None,
+    )
+    .unwrap();
+    let server = server_thread.join().unwrap();
+    let control = server.view().control_block();
+    assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+    assert_eq!(server.session_claim(), 0);
+    assert_eq!(server.peer_pid(), Some(std::process::id()));
+    roundtrip(&server, &client);
+    drop(client);
+    assert_eq!(control.client_state.load(Ordering::Acquire), 0);
 }
