@@ -54,7 +54,13 @@ pub struct WriteOutcome {
     /// Сколько старейших непрочитанных сообщений вытеснено (только запись
     /// с перезаписью; у `try_send*` всегда `0`).
     pub overwritten: u32,
-    /// Кольцо было пусто до записи (переход empty -> non-empty).
+    /// Сигналить `DATA`: после публикации кадра и полного барьера писатель
+    /// увидел `read_pos ==` прежнему `write_pos` -- читатель уже выбрал всё,
+    /// что было до этого кадра, и мог уснуть (протокол «публикация ->
+    /// перепроверка», см. `RingBuffer::commit`). Не «счётчик был 0»:
+    /// `message_count` читатель уменьшает ПОСЛЕ сдвига `read_pos`, и решение по
+    /// нему теряло пробуждение. Лишний `true` безвреден, ложного `false` при
+    /// спящем читателе нет.
     pub was_empty: bool,
 }
 
@@ -447,7 +453,21 @@ impl RingBuffer {
     }
 
     /// Копирует кадр в позицию `write` и публикует его.
-    /// Возвращает `true`, если кольцо было пусто (переход empty -> non-empty).
+    /// Возвращает `true`, если читатель мог уснуть, не увидев кадр, --
+    /// вызывающий сигналит `DATA` (`WriteOutcome::was_empty`).
+    ///
+    /// Протокол «публикация -> перепроверка» (Dekker, пара к
+    /// `confirm_empty` читателя; зеркало `arm_space_waiter`/
+    /// `take_space_waiter`): писатель публикует `write_pos`, ставит
+    /// `fence(SeqCst)` и ЗАТЕМ читает `read_pos`; читатель, увидев пустоту
+    /// (`read_pos == write_pos`), ставит `fence(SeqCst)` и ЗАТЕМ перечитывает
+    /// `write_pos`. Сдвиг `read_pos` читателем (его CAS) предшествует его
+    /// фенсу. Два SeqCst-фенса гарантируют, что хотя бы одна сторона увидит
+    /// запись другой: либо читатель при перепроверке увидит новый
+    /// `write_pos` и прочитает кадр, либо писатель увидит `read_pos ==
+    /// write` (всё до кадра выбрано) и просигналит событие -- потерянного
+    /// пробуждения нет. `message_count` и `sequence` -- лимит и статистика,
+    /// на решение о сигнале не влияют.
     ///
     /// Вызывающий обязан предварительно убедиться, что `total` байт начиная
     /// с `write` свободны и `message_count < max_messages`.
@@ -465,17 +485,41 @@ impl RingBuffer {
         }
 
         // ВАЖНО: сначала увеличиваем message_count, потом обновляем write_pos:
-        // писатель, проверяющий лимит, не увидит «лишнего» места.
-        let prev_count = header.message_count.fetch_add(1, Ordering::AcqRel);
+        // писатель, проверяющий лимит, не увидит «лишнего» места. Прежнее
+        // значение счётчика на сигнал НЕ влияет (см. протокол выше).
+        header.message_count.fetch_add(1, Ordering::AcqRel);
         header
             .write_pos
             .store(write.wrapping_add(total), Ordering::Release);
 
-        if prev_count == 0 {
+        // Публикация write_pos упорядочена перед чтением read_pos -- первая
+        // половина Dekker-пары с `confirm_empty` (на x86 -- mfence: TSO сам
+        // по себе разрешает обгон store -> load).
+        fence(Ordering::SeqCst);
+        // Acquire -- по конвенции; порядок с перепроверкой читателя дал фенс.
+        // `read_pos == write`: читатель (или наше же вытеснение в
+        // `write_message`) выбрал всё до этого кадра. Больше `write` -- кадр
+        // уже прочитан, будить некого; меньше -- читатель ещё не дочитал
+        // старые кадры и не уснёт, не дойдя до этого.
+        let was_empty = header.read_pos.load(Ordering::Acquire) == write;
+        if was_empty {
             // Relaxed: счётчик статистики переходов empty -> non-empty.
             header.sequence.fetch_add(1, Ordering::Relaxed);
         }
-        prev_count == 0
+        was_empty
+    }
+
+    /// Читатель: перед тем как признать кольцо пустым (и, возможно,
+    /// уснуть на `DATA`), убедиться, что писатель не опубликовал кадр после
+    /// снимка `write_seen` (при котором `read_pos == write_seen`). `true` --
+    /// пусто и спать безопасно: писатель, публикующий кадр позже, увидит
+    /// `read_pos == write_seen` и просигналит `DATA` (Dekker-пара с
+    /// `commit`, см. там). `false` -- кадр появился, читать снова.
+    fn confirm_empty(&self, write_seen: u32) -> bool {
+        // Парный фенс к `commit`: сдвиг read_pos этим читателем (CAS в
+        // `read_message`) упорядочен перед повторным чтением write_pos.
+        fence(Ordering::SeqCst);
+        self.header().write_pos.load(Ordering::Acquire) == write_seen
     }
 
     /// Свободное место кольца (байты и слоты сообщений).
@@ -560,7 +604,12 @@ impl RingBuffer {
             let write = header.write_pos.load(Ordering::Acquire);
             let frame = match self.frame_at(read, write) {
                 Ok(Some(frame)) => frame,
-                Ok(None) => return Err(ShmError::QueueEmpty),
+                // Пусто по снимку -- перепроверка после полного барьера
+                // (вторая половина Dekker-пары с `commit`): кадр, опубликованный
+                // после снимка, читаем сейчас, а не ждём `DATA`, которого
+                // писатель тогда может не дать.
+                Ok(None) if self.confirm_empty(write) => return Err(ShmError::QueueEmpty),
+                Ok(None) => continue,
                 Err(err) => {
                     // Заголовок мог быть «порван» перезаписью писателя: если
                     // read_pos уже сдвинулся -- это гонка, повторяем.
@@ -730,9 +779,15 @@ impl RingBuffer {
     }
 
     /// Нет опубликованных непрочитанных данных (`write_pos == read_pos`).
+    ///
+    /// Для читателя «пусто» подтверждается после полного барьера
+    /// (`confirm_empty`): ответ `true` перед сном на `DATA` (`poll_*`)
+    /// безопасен -- кадр, опубликованный позже, писатель просигналит.
     pub fn is_empty(&self) -> bool {
         let header = self.header();
-        header.read_pos.load(Ordering::Acquire) == header.write_pos.load(Ordering::Acquire)
+        let read = header.read_pos.load(Ordering::Acquire);
+        let write = header.write_pos.load(Ordering::Acquire);
+        read == write && self.confirm_empty(write)
     }
 }
 
@@ -1220,6 +1275,92 @@ mod try_write_tests {
                 total_written / RING_CAPACITY
             );
         }
+    }
+
+    /// Детерминированный интерливинг потерянного сигнала `DATA` (Task 21):
+    /// читатель CAS-ом забрал последний кадр и «замер» до уменьшения
+    /// `message_count`, его снимок позиций -- «пусто»; писатель кладёт
+    /// следующий кадр; читатель досчитывает счётчик. Если читатель уснёт по
+    /// своему снимку, разбудить его может только сигнал писателя: запись
+    /// обязана вернуть `was_empty`. Оба пути записи: без перезаписи и с ней.
+    #[test]
+    fn data_signal_survives_reader_draining_concurrently() {
+        type Write = fn(&RingBuffer, &[u8]) -> Result<WriteOutcome>;
+        let paths: [(&str, Write); 2] = [
+            ("try_write_message", RingBuffer::try_write_message),
+            ("write_message", RingBuffer::write_message),
+        ];
+        for (path, write) in paths {
+            let (ring, _mem) = make_ring();
+            let header = ring.header();
+            let mut out = Vec::new();
+            write(&ring, &[1u8; 16]).unwrap();
+
+            // Читатель: шаги `read_message` до `decrement_count`.
+            let read0 = header.read_pos.load(O::Acquire);
+            let write0 = header.write_pos.load(O::Acquire);
+            let frame = ring.frame_at(read0, write0).unwrap().unwrap();
+            header
+                .read_pos
+                .compare_exchange(read0, read0 + frame.total, O::AcqRel, O::Acquire)
+                .unwrap();
+            // Снимок читателя ДО публикации нового кадра: пусто по позициям.
+            let snapshot_read = header.read_pos.load(O::Acquire);
+            let snapshot_write = header.write_pos.load(O::Acquire);
+            assert!(
+                ring.frame_at(snapshot_read, snapshot_write)
+                    .unwrap()
+                    .is_none()
+            );
+
+            // Писатель кладёт следующий кадр, пока счётчик ещё 1.
+            let outcome = write(&ring, &[2u8; 16]).unwrap();
+            // Читатель досчитывает message_count.
+            ring.decrement_count();
+
+            assert!(
+                outcome.was_empty,
+                "{path}: читатель уже выбрал всё до этого кадра -- без сигнала \
+                 DATA он уснёт навсегда"
+            );
+            assert_eq!(outcome.overwritten, 0);
+            assert_eq!(ring.read_message(&mut out).unwrap(), 16, "{path}");
+            assert_eq!(out, [2u8; 16]);
+            assert_eq!(
+                ring.read_message(&mut out).err(),
+                Some(ShmError::QueueEmpty)
+            );
+        }
+    }
+
+    /// Вторая половина протокола: снимок читателя «пусто» снят ДО
+    /// публикации, перепроверка после барьера -- ПОСЛЕ. Читатель обязан
+    /// увидеть кадр (не уснуть), а писатель в этом порядке тоже сигналит:
+    /// хотя бы одна сторона видит запись другой, здесь -- обе.
+    #[test]
+    fn reader_recheck_sees_frame_published_after_empty_snapshot() {
+        let (ring, _mem) = make_ring();
+        let header = ring.header();
+        let mut out = Vec::new();
+        let snapshot_write = header.write_pos.load(O::Acquire);
+        assert_eq!(header.read_pos.load(O::Acquire), snapshot_write);
+        assert!(ring.confirm_empty(snapshot_write), "пустое кольцо -- пусто");
+
+        let outcome = ring.try_write_message(&[3u8; 16]).unwrap();
+        assert!(outcome.was_empty);
+        assert!(
+            !ring.confirm_empty(snapshot_write),
+            "перепроверка после барьера обязана увидеть новый write_pos"
+        );
+        assert!(!ring.is_empty());
+        assert_eq!(ring.read_message(&mut out).unwrap(), 16);
+        assert!(ring.is_empty());
+
+        // Читатель отстаёт (в кольце два кадра): сигнал не нужен -- он не
+        // уснёт, не дочитав до нового кадра.
+        ring.try_write_message(&[4u8; 16]).unwrap();
+        let outcome = ring.try_write_message(&[5u8; 16]).unwrap();
+        assert!(!outcome.was_empty);
     }
 
     /// Заявка писателя: читатель снимает её и «будит» только когда места
