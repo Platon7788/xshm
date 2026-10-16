@@ -306,13 +306,6 @@ unsafe extern "system" {
     // ========================================================================
 
     /// Создание порта завершения ввода-вывода
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtCreateIoCompletion(
         IoCompletionHandle: *mut HANDLE,
         DesiredAccess: ACCESS_MASK,
@@ -323,13 +316,6 @@ unsafe extern "system" {
     /// Извлечение до `Count` пакетов из порта
     ///
     /// Timeout: NULL = бесконечно, отрицательное = относительное (100ns units)
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtRemoveIoCompletionEx(
         IoCompletionHandle: HANDLE,
         IoCompletionInformation: *mut FILE_IO_COMPLETION_INFORMATION,
@@ -340,13 +326,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Постановка пакета в порт
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtSetIoCompletion(
         IoCompletionHandle: HANDLE,
         KeyContext: PVOID,
@@ -356,13 +335,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Создание пакета ожидания завершения
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtCreateWaitCompletionPacket(
         WaitCompletionPacketHandle: *mut HANDLE,
         DesiredAccess: ACCESS_MASK,
@@ -370,13 +342,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Привязка пакета: при сигнале `TargetObjectHandle` пакет попадёт в порт
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtAssociateWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         IoCompletionHandle: HANDLE,
@@ -389,13 +354,6 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     /// Отмена привязки пакета
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-        )
-    )]
     pub fn NtCancelWaitCompletionPacket(
         WaitCompletionPacketHandle: HANDLE,
         RemoveSignaledPacket: BOOLEAN,

@@ -1,10 +1,14 @@
 use std::cell::Cell;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use crate::asynch::{ANONYMOUS, Endpoint, OP, RecvFuture, SendFuture, WaitSet};
 use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -17,7 +21,7 @@ use crate::ring::{
 };
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
-use crate::win::{Mapping, ProcessWatch, wait_any};
+use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
 
 /// Дедлайн ожидания клиента: повторные ожидания после ложного
 /// `CONNECT_REQ` получают остаток исходного таймаута, а не новый целиком.
@@ -305,6 +309,64 @@ impl SharedServer {
                 return self.complete_handshake();
             }
         }
+    }
+
+    /// Принять клиента асинхронно (0.10; семантика -- `wait_for_client` без
+    /// таймаута): future ждёт `C2S_CONNECT_REQ` в реакторе IOCP, сигнал без
+    /// `CLIENT_HELLO` поглощает и ждёт дальше, при заявке проводит
+    /// рукопожатие (ревизия 2: фиксация CAS `client_state`, проигранный CAS
+    /// -- `Err(HandshakeFailed)`, как у синхронного пути). Таймаут -- у
+    /// исполнителя: брошенный future снимает ожидание и возвращает
+    /// потреблённый `CONNECT_REQ` событию (лишний сигнал протокол допускает).
+    ///
+    /// `Err(AlreadyConnected)` -- клиент уже подключён; anonymous-сервер --
+    /// `Err(InvalidConfig)` (событий нет; его путь --
+    /// `wait_for_client_noevent`).
+    ///
+    /// ```ignore
+    /// // tokio -- только пример: крейт от исполнителя не зависит.
+    /// let mut server = xshm::SharedServer::start("MyChannel")?;
+    /// tokio::time::timeout(Duration::from_secs(5), server.accept_async()).await??;
+    /// ```
+    pub fn accept_async(&mut self) -> impl Future<Output = Result<()>> + Send + '_ {
+        AcceptFuture {
+            server: self,
+            waits: WaitSet::default(),
+        }
+    }
+
+    /// Принять сообщение клиента асинхронно (0.10): `Ok(len)` -- payload в
+    /// `buf[..len]`. Ждёт `C2S_DATA` в реакторе IOCP без потока на канал и
+    /// без опроса (подробно -- модуль `asynch`: порядок «регистрация ->
+    /// перепроверка» без потерянного пробуждения).
+    ///
+    /// Отключение клиента -- `Err(NotConnected)`, смерть его процесса --
+    /// `Err(PeerDied)`; обе -- только когда кольцо дочитано, и после них
+    /// сервер отмечен неподключённым (`is_connected() == false`, можно снова
+    /// `accept_async`). Anonymous-сервер -- `Err(InvalidConfig)`.
+    ///
+    /// `&mut self`: future -- `Send` (`tokio::spawn`), а приём и отправка
+    /// одной стороны одновременно требуют разделения (`Mutex`, задача-
+    /// владелец с каналом команд).
+    pub fn recv_async<'a>(
+        &'a mut self,
+        buf: &'a mut Vec<u8>,
+    ) -> impl Future<Output = Result<usize>> + Send + 'a {
+        RecvFuture::new(self, buf)
+    }
+
+    /// Отправить сообщение клиенту асинхронно **без перезаписи** (0.10):
+    /// нет места -- future ждёт его (`S2C_SPACE` через заявку
+    /// `space_waiter`, как `wait_for_space`), затем пишет. Ошибки длины --
+    /// как у `try_send_to_client`; ушедший клиент -- `Err(NotConnected)`,
+    /// умерший -- `Err(PeerDied)` (если места так и нет; сервер при этом НЕ
+    /// отмечается отключённым -- входящее кольцо дочитывает `recv_async`).
+    /// Anonymous-сервер -- `Err(InvalidConfig)`.
+    pub fn send_async<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        SendFuture::new(self, data)
     }
 
     /// Клиент выставил заявку (`client_state == CLIENT_HELLO`). Acquire:
@@ -864,6 +926,116 @@ impl SharedServer {
     }
 }
 
+impl Endpoint for SharedServer {
+    fn ensure_connected(&self) -> Result<()> {
+        Self::ensure_connected(self)
+    }
+
+    fn channel_events(&self) -> Option<&SharedEvents> {
+        self.events.as_ref()
+    }
+
+    fn rx_data(events: &SharedEvents) -> &EventHandle {
+        &events.c2s.data
+    }
+
+    fn tx_space(events: &SharedEvents) -> &EventHandle {
+        &events.s2c.space
+    }
+
+    fn rx(&self) -> &RingBuffer {
+        &self.ring_rx
+    }
+
+    fn tx(&self) -> &RingBuffer {
+        &self.ring_tx
+    }
+
+    fn peer_process(&self) -> Option<BorrowedHandle<'_>> {
+        self.peer_wait_handle()
+    }
+
+    fn peer_left(&self) -> bool {
+        self.view
+            .control_block()
+            .client_state
+            .load(Ordering::Acquire)
+            != HANDSHAKE_SERVER_READY
+    }
+
+    fn receive(&self, buf: &mut Vec<u8>) -> Result<usize> {
+        self.receive_from_client(buf)
+    }
+
+    fn try_send(&self, data: &[u8]) -> Result<()> {
+        self.try_send_to_client(data).map(drop)
+    }
+
+    fn mark_gone(&mut self) {
+        self.mark_disconnected();
+    }
+}
+
+/// Future `accept_async`: ожидание `CONNECT_REQ` в реакторе и рукопожатие.
+struct AcceptFuture<'a> {
+    server: &'a mut SharedServer,
+    waits: WaitSet,
+}
+
+impl AcceptFuture<'_> {
+    fn step(&mut self, waker: &Waker) -> Poll<Result<()>> {
+        if self.server.connected {
+            return Poll::Ready(Err(ShmError::AlreadyConnected));
+        }
+        if self.server.events.is_none() {
+            return Poll::Ready(Err(ANONYMOUS));
+        }
+        // Как `wait_for_client`: заявку проверяем только по сигналу
+        // `CONNECT_REQ` (клиент ставит `CLIENT_HELLO` до сигнала); сигнал
+        // без заявки (толчок Multi, откатившийся клиент) поглощён -- ждём
+        // дальше.
+        if self.waits.harvest(waker)[OP] && self.server.hello_pending() {
+            return Poll::Ready(self.server.complete_handshake());
+        }
+        let Some(events) = self.server.events.as_ref() else {
+            return Poll::Ready(Err(ANONYMOUS));
+        };
+        match self
+            .waits
+            .ensure_handle(OP, events.connect_req.as_handle(), waker)
+        {
+            Ok(()) => Poll::Pending,
+            Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    /// Снять ожидание; потреблённый, но не разобранный `CONNECT_REQ` --
+    /// вернуть (заявку тогда примет следующее ожидание).
+    fn finish(&mut self) {
+        let event = self.server.events.as_ref().map(|e| &e.connect_req);
+        self.waits.clear(event, None);
+    }
+}
+
+impl Future for AcceptFuture<'_> {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let result = this.step(cx.waker());
+        if result.is_ready() {
+            this.finish();
+        }
+        result
+    }
+}
+
+impl Drop for AcceptFuture<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
 impl Drop for SharedServer {
     fn drop(&mut self) {
         let control = self.view.control_block();
@@ -1027,7 +1199,7 @@ mod tests {
         let name = unique("STRAYOR");
         let mut server = SharedServer::start(&name).unwrap();
         let waiter = std::thread::spawn(move || {
-            let wake = crate::win::EventHandle::create_unnamed(false).unwrap();
+            let wake = EventHandle::create_unnamed(false).unwrap();
             let result = server.wait_for_client_or(wake.as_handle(), Some(Duration::from_secs(2)));
             (result, server)
         });

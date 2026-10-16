@@ -1,8 +1,12 @@
+use std::future::Future;
 use std::marker::PhantomData;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
+use crate::asynch::{Endpoint, OP, RecvFuture, SendFuture, WaitSet};
 use crate::constants::{HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -11,7 +15,7 @@ use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, WriteOutcome};
 use crate::shared::SharedView;
-use crate::win::{Mapping, ProcessWatch, wait_any};
+use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
 
 #[cfg(test)]
 thread_local! {
@@ -244,6 +248,108 @@ impl SharedClient {
         announce_pid: bool,
         mut interrupt: Option<Interrupt<'_>>,
     ) -> Result<Self> {
+        let hello = Hello::post(namespace, name, announce_pid)?;
+        let waited = match hello.events.connect_req.set() {
+            Ok(()) => wait_ack(
+                &hello.view,
+                &hello.events,
+                hello.generation_before,
+                timeout,
+                interrupt.as_mut(),
+            ),
+            Err(err) => AckWait::Abandoned(err),
+        };
+        // Отзыв проиграл CAS сервера -- рукопожатие состоялось: продолжаем
+        // как подключённые (сервер ждёт нас; если уже отключил -- worker
+        // увидит `DISCONNECT` и дочитает кольцо).
+        if let AckWait::Abandoned(err) = waited
+            && !hello.withdraw()
+        {
+            return Err(err);
+        }
+        Ok(hello.finish())
+    }
+
+    /// Подключиться к каналу `name` асинхронно (0.10; рукопожатие -- как у
+    /// [`SharedClient::connect`], ревизия 2): future выставляет заявку
+    /// (`CLIENT_HELLO` + `C2S_CONNECT_REQ`) при первом опросе и ждёт
+    /// `S2C_CONNECT` в реакторе IOCP; подключение засчитывается по смене
+    /// `generation`, устаревший сигнал поглощается.
+    ///
+    /// Таймаута нет -- он у исполнителя. Брошенный future отзывает заявку
+    /// так же, как синхронный таймаут: CAS `CLIENT_HELLO -> IDLE` и откат
+    /// PID/заголовков. Если сервер успел зафиксировать рукопожатие (его CAS
+    /// выиграл), клиент уходит штатно, как `Drop` подключённого: `IDLE`,
+    /// затем `DISCONNECT` -- сервер не остаётся «подключённым» к никому.
+    /// Всё это -- атомарные операции и `NtSetEvent`, `Drop` не блокируется.
+    ///
+    /// Ошибки открытия -- как у `connect` (канала нет --
+    /// `WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`).
+    ///
+    /// ```ignore
+    /// let client = tokio::time::timeout(
+    ///     Duration::from_secs(5),
+    ///     xshm::SharedClient::connect_async("MyChannel"),
+    /// )
+    /// .await??;
+    /// ```
+    pub fn connect_async(name: &str) -> impl Future<Output = Result<Self>> + Send + 'static {
+        ConnectFuture {
+            name: name.to_owned(),
+            hello: None,
+            started: false,
+            waits: WaitSet::default(),
+        }
+    }
+
+    /// Принять сообщение сервера асинхронно (0.10; семантика --
+    /// `SharedServer::recv_async`): отключение сервера -- `Err(NotConnected)`,
+    /// смерть его процесса -- `Err(PeerDied)`, обе -- после дочитанного
+    /// кольца, затем клиент отмечен неподключённым.
+    pub fn recv_async<'a>(
+        &'a mut self,
+        buf: &'a mut Vec<u8>,
+    ) -> impl Future<Output = Result<usize>> + Send + 'a {
+        RecvFuture::new(self, buf)
+    }
+
+    /// Отправить сообщение серверу асинхронно без перезаписи (0.10;
+    /// семантика -- `SharedServer::send_async`).
+    pub fn send_async<'a>(
+        &'a mut self,
+        data: &'a [u8],
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        SendFuture::new(self, data)
+    }
+}
+
+/// Выставленная заявка клиента (`CLIENT_HELLO`), ответа сервера ещё нет:
+/// общая часть синхронного и асинхронного подключения.
+struct Hello {
+    view: SharedView,
+    events: SharedEvents,
+    /// `generation` до заявки: по его смене узнаём, что сервер принял нас.
+    generation_before: u32,
+    /// Последним: view указывает в эту память.
+    mapping: Mapping,
+}
+
+// SAFETY: как у `SharedClient` -- владеющий `Mapping` (view указывает в его
+// память и переезжает вместе с ним) плюс атомарные операции в разделяемой
+// памяти; привязки к потоку нет.
+unsafe impl Send for Hello {}
+
+impl std::fmt::Debug for Hello {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hello")
+            .field("generation_before", &self.generation_before)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Hello {
+    /// Открыть канал и выставить заявку (без сигнала `CONNECT_REQ`).
+    fn post(namespace: Option<&PrivateNamespace>, name: &str, announce_pid: bool) -> Result<Self> {
         let mapping = Mapping::open(ObjectPath::mapping(namespace, name))?;
         // SAFETY: отображение длиной `mapping.size()` живёт, пока жив
         // `mapping`, а он переезжает в возвращаемую структуру вместе с view;
@@ -286,24 +392,35 @@ impl SharedClient {
             .handshake_state
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
 
-        let waited = match events.connect_req.set() {
-            Ok(()) => wait_ack(
-                &view,
-                &events,
-                generation_before,
-                timeout,
-                interrupt.as_mut(),
-            ),
-            Err(err) => AckWait::Abandoned(err),
-        };
-        // Отзыв проиграл CAS сервера -- рукопожатие состоялось: продолжаем
-        // как подключённые (сервер ждёт нас; если уже отключил -- worker
-        // увидит `DISCONNECT` и дочитает кольцо).
-        if let AckWait::Abandoned(err) = waited
-            && !withdraw_hello(&view, generation_before)
-        {
-            return Err(err);
-        }
+        Ok(Self {
+            view,
+            events,
+            generation_before,
+            mapping,
+        })
+    }
+
+    /// Сервер принял именно нашу заявку: `generation` сменился.
+    fn accepted(&self) -> bool {
+        self.view.control_block().generation.load(Ordering::Acquire) != self.generation_before
+    }
+
+    /// Отозвать заявку (`withdraw_hello`): `true` -- поздно, рукопожатие
+    /// состоялось (продолжать как подключённые).
+    fn withdraw(&self) -> bool {
+        withdraw_hello(&self.view, self.generation_before)
+    }
+
+    /// Рукопожатие состоялось: подключённый клиент.
+    fn finish(self) -> SharedClient {
+        let Self {
+            view,
+            events,
+            generation_before: _,
+            mapping,
+        } = self;
+        let control = view.control_block();
+        let (header_a, header_b) = view.headers();
 
         // PID сервера (0 -- сервер старой версии: наблюдения нет, как в 0.7).
         let peer = ProcessWatch::open_peer(
@@ -324,7 +441,7 @@ impl SharedClient {
         let ring_tx = view.ring_b();
         let ring_rx = view.ring_a();
 
-        Ok(Self {
+        SharedClient {
             view,
             events,
             ring_tx,
@@ -334,9 +451,140 @@ impl SharedClient {
             generation,
             _mapping: mapping,
             _not_sync: PhantomData,
-        })
+        }
+    }
+}
+
+/// Future `connect_async`: заявка при первом опросе, ожидание
+/// `S2C_CONNECT` в реакторе, откат заявки в `Drop`.
+struct ConnectFuture {
+    name: String,
+    /// Выставленная заявка (до подтверждения или отказа).
+    hello: Option<Hello>,
+    /// Первый опрос уже был (заявка выставлялась).
+    started: bool,
+    waits: WaitSet,
+}
+
+impl ConnectFuture {
+    fn step(&mut self, waker: &Waker) -> Poll<Result<SharedClient>> {
+        if !self.started {
+            self.started = true;
+            let hello = match Hello::post(None, &self.name, true) {
+                Ok(hello) => hello,
+                Err(err) => return Poll::Ready(Err(err)),
+            };
+            if let Err(err) = hello.events.connect_req.set() {
+                // Как синхронный путь: отзыв, проигравший CAS сервера, --
+                // всё же подключение.
+                return Poll::Ready(if hello.withdraw() {
+                    Ok(hello.finish())
+                } else {
+                    Err(err)
+                });
+            }
+            self.hello = Some(hello);
+        }
+        let Some(hello) = self.hello.as_ref() else {
+            // Повторный опрос завершённого future.
+            return Poll::Ready(Err(ShmError::NotReady));
+        };
+        // Как `wait_ack`: подтверждение -- только `S2C_CONNECT` со сменой
+        // `generation`; сигнал без смены -- устаревший, поглощён.
+        if self.waits.harvest(waker)[OP] && hello.accepted() {
+            return match self.hello.take() {
+                Some(hello) => Poll::Ready(Ok(hello.finish())),
+                None => Poll::Ready(Err(ShmError::NotReady)),
+            };
+        }
+        match self
+            .waits
+            .ensure_handle(OP, hello.events.connect_ack.as_handle(), waker)
+        {
+            Ok(()) => Poll::Pending,
+            Err(err) => {
+                // Ждать нельзя -- заявку отзываем, как при ошибке ожидания.
+                Poll::Ready(match self.hello.take() {
+                    Some(hello) if hello.withdraw() => Ok(hello.finish()),
+                    _ => Err(err),
+                })
+            }
+        }
+    }
+}
+
+impl Future for ConnectFuture {
+    type Output = Result<SharedClient>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.get_mut().step(cx.waker())
+    }
+}
+
+impl Drop for ConnectFuture {
+    fn drop(&mut self) {
+        // `S2C_CONNECT` не возвращаем: заявка отзывается, а следующий клиент
+        // всё равно сбрасывает событие до своей заявки.
+        self.waits.clear(None, None);
+        // Заявка без ответа -- откат, как у синхронного таймаута. Отзыв
+        // опоздал (CAS сервера выиграл) -- мы подключены, но владельца нет:
+        // уходим штатно через `Drop` клиента (CAS `SERVER_READY -> IDLE`,
+        // затем `DISCONNECT`), а не оставляем серверу сессию без клиента.
+        if let Some(hello) = self.hello.take()
+            && hello.withdraw()
+        {
+            drop(hello.finish());
+        }
+    }
+}
+
+impl Endpoint for SharedClient {
+    fn ensure_connected(&self) -> Result<()> {
+        Self::ensure_connected(self)
     }
 
+    fn channel_events(&self) -> Option<&SharedEvents> {
+        Some(&self.events)
+    }
+
+    fn rx_data(events: &SharedEvents) -> &EventHandle {
+        &events.s2c.data
+    }
+
+    fn tx_space(events: &SharedEvents) -> &EventHandle {
+        &events.c2s.space
+    }
+
+    fn rx(&self) -> &RingBuffer {
+        &self.ring_rx
+    }
+
+    fn tx(&self) -> &RingBuffer {
+        &self.ring_tx
+    }
+
+    fn peer_process(&self) -> Option<BorrowedHandle<'_>> {
+        self.peer_wait_handle()
+    }
+
+    fn peer_left(&self) -> bool {
+        self.server_left()
+    }
+
+    fn receive(&self, buf: &mut Vec<u8>) -> Result<usize> {
+        self.receive_from_server(buf)
+    }
+
+    fn try_send(&self, data: &[u8]) -> Result<()> {
+        self.try_send_to_server(data).map(drop)
+    }
+
+    fn mark_gone(&mut self) {
+        self.mark_disconnected();
+    }
+}
+
+impl SharedClient {
     /// Сессия всё ещё наша: `generation` не сменился (ревизия 2). Сменился
     /// -- сервер уже провёл рукопожатие с другим клиентом этого канала/слота
     /// (а наш `DISCONNECT` мог быть сброшен его `complete_handshake`).

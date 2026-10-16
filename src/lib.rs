@@ -1,5 +1,6 @@
 // Политика линтов -- в `[lints]` секции Cargo.toml (см. манифест).
 
+mod asynch;
 mod client;
 mod constants;
 mod error;
@@ -11,7 +12,7 @@ mod naming;
     not(test),
     expect(
         dead_code,
-        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
+        reason = "слой `CompletionPort` реактора ждёт потребителя: Multi (T17)"
     )
 )]
 mod reactor;

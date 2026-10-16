@@ -597,6 +597,62 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 The layout is unchanged: the wake-up request lives in a previously reserved
 `RingHeader` word, so `SHARED_VERSION` stays the same and 0.7.0 peers interoperate.
 
+### Async API (0.10)
+
+`SharedServer` and `SharedClient` have executor-agnostic async methods built
+only on `core::task` — xshm does not depend on tokio or any other runtime.
+Waiting on kernel objects is done by one process-wide IOCP reactor thread,
+not a thread per channel, and an idle future is never polled again until a
+signal arrives.
+
+| Server | Client | Waits for |
+|--------|--------|-----------|
+| `accept_async()` | `SharedClient::connect_async(name)` | handshake (same protocol as `wait_for_client`/`connect`) |
+| `recv_async(&mut buf)` | `recv_async(&mut buf)` | a message (`Ok(len)`) |
+| `send_async(data)` | `send_async(data)` | free space, then writes **without overwrite** |
+
+- Peer disconnected → `Err(NotConnected)`, peer process died →
+  `Err(PeerDied)`; `recv_async` reports them only after the ring is drained,
+  then marks the endpoint disconnected (the server can `accept_async` again).
+- No built-in timeouts: drop the future (e.g. `tokio::time::timeout`).
+  Dropping is safe at any point — registrations are cancelled, a consumed
+  signal is given back, and a dropped `connect_async` withdraws its
+  `CLIENT_HELLO` (or leaves gracefully if the server has already accepted it).
+- Methods take `&mut self`, so the futures are `Send` (`tokio::spawn` works).
+  Receiving and sending on one endpoint *concurrently* needs a split: wrap it
+  in a `Mutex`, or let one task own it and feed it through a channel.
+- Anonymous servers (no events) return `Err(InvalidConfig)`.
+
+```rust,ignore
+// Example with tokio (not a dependency of xshm).
+use std::time::Duration;
+use xshm::{SharedClient, SharedServer};
+
+#[tokio::main]
+async fn main() -> xshm::Result<()> {
+    let mut server = SharedServer::start("MyAsyncChannel")?;
+    let client_task = tokio::spawn(async {
+        let mut client = SharedClient::connect_async("MyAsyncChannel").await?;
+        client.send_async(b"ping").await?;
+        let mut buf = Vec::new();
+        let len = client.recv_async(&mut buf).await?;
+        assert_eq!(&buf[..len], b"pong");
+        xshm::Result::Ok(())
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), server.accept_async())
+        .await
+        .map_err(|_| xshm::ShmError::Timeout)??;
+    let mut buf = Vec::new();
+    let len = server.recv_async(&mut buf).await?;
+    assert_eq!(&buf[..len], b"ping");
+    server.send_async(b"pong").await?;
+
+    client_task.await.expect("client task")?;
+    Ok(())
+}
+```
+
 ### Peer liveness
 
 Graceful disconnects are signalled by the `DISCONNECT` event, but a crashed or

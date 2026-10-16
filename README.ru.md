@@ -603,6 +603,63 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 Layout не менялся: заявка на пробуждение живёт в бывшем зарезервированном слове
 `RingHeader`, поэтому `SHARED_VERSION` прежний и пиры 0.7.0 совместимы.
 
+### Async API (0.10)
+
+У `SharedServer` и `SharedClient` есть async-методы, не привязанные к
+исполнителю: только `core::task`, xshm не зависит ни от tokio, ни от другого
+runtime. Объекты ядра ждёт один поток реактора IOCP на процесс, а не поток на
+канал; ожидающий future не опрашивается, пока не придёт сигнал.
+
+| Сервер | Клиент | Чего ждёт |
+|--------|--------|-----------|
+| `accept_async()` | `SharedClient::connect_async(name)` | рукопожатия (протокол тот же, что у `wait_for_client`/`connect`) |
+| `recv_async(&mut buf)` | `recv_async(&mut buf)` | сообщения (`Ok(len)`) |
+| `send_async(data)` | `send_async(data)` | места, затем пишет **без перезаписи** |
+
+- Пир отключился — `Err(NotConnected)`, процесс пира умер —
+  `Err(PeerDied)`; `recv_async` сообщает их только после дочитанного кольца
+  и затем отмечает сторону неподключённой (сервер может снова
+  `accept_async`).
+- Встроенных таймаутов нет: future бросают (например,
+  `tokio::time::timeout`). Бросать можно в любой момент — регистрации
+  снимаются, потреблённый сигнал возвращается событию, брошенный
+  `connect_async` отзывает `CLIENT_HELLO` (или уходит штатно, если сервер
+  уже принял заявку).
+- Методы берут `&mut self`, поэтому future — `Send` (`tokio::spawn`
+  работает). *Одновременные* приём и отправка одной стороны требуют
+  разделения: `Mutex` или задача-владелец, которой команды идут через канал.
+- Anonymous-сервер (без событий) — `Err(InvalidConfig)`.
+
+```rust,ignore
+// Пример с tokio (xshm от него не зависит).
+use std::time::Duration;
+use xshm::{SharedClient, SharedServer};
+
+#[tokio::main]
+async fn main() -> xshm::Result<()> {
+    let mut server = SharedServer::start("MyAsyncChannel")?;
+    let client_task = tokio::spawn(async {
+        let mut client = SharedClient::connect_async("MyAsyncChannel").await?;
+        client.send_async(b"ping").await?;
+        let mut buf = Vec::new();
+        let len = client.recv_async(&mut buf).await?;
+        assert_eq!(&buf[..len], b"pong");
+        xshm::Result::Ok(())
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), server.accept_async())
+        .await
+        .map_err(|_| xshm::ShmError::Timeout)??;
+    let mut buf = Vec::new();
+    let len = server.recv_async(&mut buf).await?;
+    assert_eq!(&buf[..len], b"ping");
+    server.send_async(b"pong").await?;
+
+    client_task.await.expect("client task")?;
+    Ok(())
+}
+```
+
 ### Живость пира
 
 Штатное отключение сигналится событием `DISCONNECT`, но упавший или убитый

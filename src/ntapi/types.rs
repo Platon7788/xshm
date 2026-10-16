@@ -336,13 +336,6 @@ pub const SEC_FILE: ULONG = 0x0080_0000;
 
 /// Полный доступ к порту завершения ввода-вывода
 /// (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "реактор (T15) пока без потребителей: async API (T16), Multi (T17)"
-    )
-)]
 pub const IO_COMPLETION_ALL_ACCESS: ACCESS_MASK = 0x001F_0003;
 /// Общее право «всё» (маска ACE политики безопасности; так же создают
 /// пакеты ожидания завершения).
