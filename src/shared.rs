@@ -352,5 +352,20 @@ mod tests {
             .store(layout.c2s_offset() as u32, Ordering::Relaxed);
         block.c2s.capacity.store(4000, Ordering::Relaxed);
         assert_eq!(attach(&m, len).unwrap_err(), ShmError::Corrupted);
+        // 0.10 (PAD): `max_message_size` больше `capacity / 2 - 8` -- кадр с
+        // наихудшим PAD не поместился бы в пустое кольцо.
+        let cap = layout.client_to_server.capacity;
+        block.c2s.capacity.store(cap as u32, Ordering::Relaxed);
+        block
+            .c2s
+            .max_message_size
+            .store((cap / 2 - 7) as u32, Ordering::Relaxed);
+        assert_eq!(attach(&m, len).unwrap_err(), ShmError::Corrupted);
+        // Ровно на границе -- принимается.
+        block
+            .c2s
+            .max_message_size
+            .store((cap / 2 - 8) as u32, Ordering::Relaxed);
+        assert!(attach(&m, len).is_ok());
     }
 }

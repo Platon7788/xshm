@@ -206,3 +206,44 @@ fn auto_delivers_without_copy_roundtrip() {
     assert_eq!(adjacent, 0, "копирующая доставка отдала срез из кольца");
     assert!(same > 0, "буфер копии не переиспользуется");
 }
+
+/// `send_with`/`receive_with` (`&mut self`) на `SharedServer`/`SharedClient`:
+/// заполнение на месте и приём срезом в обе стороны, в том числе кадры,
+/// которым нужен PAD у границы кольца 4 КиБ.
+#[test]
+fn shared_send_with_and_receive_with_roundtrip() {
+    use xshm::{ChannelConfig, SharedClient, SharedServer};
+    let name = unique_name("SHARED");
+    let layout = ChannelLayout::symmetric(RingConfig::new(4096));
+    let mut server = SharedServer::start_with(&name, &ChannelConfig::new(layout)).unwrap();
+    let client_name = name;
+    let client_thread =
+        thread::spawn(move || SharedClient::connect(&client_name, Duration::from_secs(5)));
+    server
+        .wait_for_client(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut client = client_thread.join().unwrap().unwrap();
+
+    // Лимит кольца 4 КиБ -- 2040 байт (capacity / 2 - 8): длины 1..=2040.
+    for seq in 0..200u32 {
+        let len = 1 + (seq as usize * 37) % 2040;
+        let fill = seq as u8;
+        server.send_with(len, |buf| buf.fill(fill)).unwrap();
+        // SAFETY: писатель -- этот же поток (`send_with` без перезаписи),
+        // во время `f` кольцо никто не трогает.
+        let got = unsafe { client.receive_with(<[u8]>::to_vec) }.unwrap();
+        assert_eq!(got, vec![fill; len], "сервер -> клиент, {seq}");
+
+        client.send_with(len, |buf| buf.fill(!fill)).unwrap();
+        // SAFETY: см. выше.
+        let got = unsafe { server.receive_with(<[u8]>::to_vec) }.unwrap();
+        assert_eq!(got, vec![!fill; len], "клиент -> сервер, {seq}");
+    }
+    // SAFETY: см. выше.
+    let empty = unsafe { client.receive_with(|_| ()) };
+    assert_eq!(empty, Err(ShmError::QueueEmpty));
+    assert_eq!(
+        server.send_with(2041, |_| unreachable!("слишком длинное")),
+        Err(ShmError::MessageTooLarge)
+    );
+}

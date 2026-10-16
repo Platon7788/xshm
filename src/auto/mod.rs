@@ -163,7 +163,10 @@ impl Delivery {
     /// разделяемой памяти (иначе -- гонка данных и TOCTOU в обработчике,
     /// см. `SharedServer::receive_with`). Выполнено, когда пир -- доверенный
     /// честный xshm, пишущий в эту сторону без перезаписи (`try_send`,
-    /// не `send`). Перезапись, всё же замеченная после `on_message`, даёт
+    /// не `send`). **Пир, отправляющий в это направление обычным `send`
+    /// (overwrite-oldest, а не `try_send`/lossless), контракт нарушает**:
+    /// его вытеснение может затереть кадр во время `on_message`. Перезапись,
+    /// всё же замеченная после `on_message`, даёт
     /// `on_error(Overrun)` -- это защита в глубину, а не разрешение.
     /// `on_message` держит кадр в кольце: долгий обработчик задерживает
     /// освобождение места для писателя.
@@ -186,7 +189,8 @@ impl AutoOptions {
     /// # Safety
     /// Контракт [`Delivery::zero_copy`]: пока выполняется `on_message`, пир
     /// не изменяет байты сообщения (доверенный честный пир xshm, пишущий
-    /// без перезаписи).
+    /// без перезаписи). Пир, который шлёт в это направление обычным `send`
+    /// (overwrite-oldest), а не `try_send`/lossless, контракт НАРУШАЕТ.
     #[must_use]
     pub const unsafe fn zero_copy_delivery(mut self) -> Self {
         // SAFETY: контракт `Delivery::zero_copy` -- контракт этой функции.
@@ -906,6 +910,10 @@ impl AutoServer {
     /// очереди. Если `free_space().fits(n)`, то `try_send` payload-а длины
     /// `n` будет принят и записан в кольцо без ожидания читателя (при одном
     /// отправляющем потоке). Вне подключения -- `FreeSpace::ZERO`.
+    ///
+    /// Это оценка, а не гарантия: при нескольких параллельных отправителях
+    /// она может устареть или (поля снимка читаются раздельно) кратко
+    /// завысить место.
     #[must_use]
     pub fn free_space(&self) -> FreeSpace {
         self.endpoint.free_space()
@@ -1166,7 +1174,8 @@ impl AutoClient {
     }
 
     /// Консервативная оценка места под новое сообщение в направлении
-    /// Client -> Server (см. `AutoServer::free_space`).
+    /// Client -> Server (см. `AutoServer::free_space`). Оценка: при
+    /// параллельных отправителях может устареть.
     #[must_use]
     pub fn free_space(&self) -> FreeSpace {
         self.endpoint.free_space()
@@ -1431,10 +1440,14 @@ where
     };
     for _ in 0..batch.max(1) {
         let received = if delivery.zero_copy {
-            // SAFETY: `Delivery::zero_copy` создаётся только через `unsafe`
-            // (`AutoOptions::zero_copy_delivery`/`Delivery::zero_copy`), и его
-            // контракт -- ровно контракт `receive_with`: пир не меняет кадр,
-            // пока идёт `on_message`.
+            // SAFETY: (1) неизменность кадра: `Delivery::zero_copy`
+            // создаётся только через `unsafe` (`AutoOptions::zero_copy_delivery`
+            // /`Delivery::zero_copy`), его контракт -- пир не меняет кадр, пока
+            // идёт `on_message`. (2) единственный читатель: `SharedServer`/
+            // `SharedClient` worker создаёт сам и не отдаёт из своего потока;
+            // публичного приёма у Auto нет, а `send`/`try_send` пользователя
+            // только кладут в очередь (`Outbox`) -- в кольцо пишет и читает
+            // его один этот worker, последовательно, не изнутри `on_message`.
             unsafe { endpoint.read_with(deliver) }
         } else {
             endpoint.read(buffer).map(|len| deliver(&buffer[..len]))
@@ -1493,10 +1506,11 @@ trait SendEndpoint {
 
 trait ReceiveEndpoint {
     fn read(&self, buffer: &mut Vec<u8>) -> Result<usize>;
-    /// Zero-copy чтение (`receive_with`).
+    /// Zero-copy чтение (`receive_with_shared`).
     ///
     /// # Safety
-    /// Контракт `RingBuffer::read_with`: пир не меняет кадр, пока идёт `f`.
+    /// Контракт `RingBuffer::read_with`: пир не меняет кадр, пока идёт `f`,
+    /// и никакого другого чтения этого направления во время `f`.
     unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T>;
 }
 
@@ -1523,8 +1537,8 @@ impl ReceiveEndpoint for SharedServer {
         self.receive_from_client(buffer)
     }
     unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
-        // SAFETY: контракт `receive_with` -- контракт этой функции.
-        unsafe { self.receive_with(f) }
+        // SAFETY: контракт `receive_with_shared` -- контракт этой функции.
+        unsafe { self.receive_with_shared(f) }
     }
 }
 
@@ -1551,8 +1565,8 @@ impl ReceiveEndpoint for SharedClient {
         self.receive_from_server(buffer)
     }
     unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
-        // SAFETY: контракт `receive_with` -- контракт этой функции.
-        unsafe { self.receive_with(f) }
+        // SAFETY: контракт `receive_with_shared` -- контракт этой функции.
+        unsafe { self.receive_with_shared(f) }
     }
 }
 

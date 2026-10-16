@@ -421,7 +421,7 @@ fn recv_c2s(server: &SharedServer, buf: &mut Vec<u8>, spin: SpinPolicy) -> Bench
 /// `--zero-copy`: принять одно сообщение от сервера срезом прямо из кольца
 /// и сверить его (длина и номер -- как у `check`), ожидая его в ядре.
 fn recv_s2c_zero_copy(
-    client: &SharedClient,
+    client: &mut SharedClient,
     size: usize,
     expected: u64,
     spin: SpinPolicy,
@@ -430,6 +430,7 @@ fn recv_s2c_zero_copy(
         // SAFETY: писатель кольца S2C -- поток этого же процесса (честный
         // xshm, доверенный) и пишет только `try_send_to_client` без
         // перезаписи: пока выполняется замыкание, кадр никто не меняет.
+        // Второго читателя нет по типу (`&mut SharedClient`).
         let got = unsafe {
             client.receive_with(|data| {
                 check(data, data.len(), size, expected, "клиент")?;
@@ -522,14 +523,16 @@ fn run_throughput(name: &str, config: &ChannelConfig, plan: &Plan) -> BenchResul
         zero_copy,
     } = *plan;
     let (warmed_tx, warmed_rx) = mpsc::channel::<()>();
-    let (server, client) =
-        connect_pair(name, config, move |client| -> BenchResult<Vec<Instant>> {
+    let (server, client) = connect_pair(
+        name,
+        config,
+        move |mut client| -> BenchResult<Vec<Instant>> {
             let mut buf = Vec::with_capacity(size);
             let mut expected = 0u64;
             let mut ends = Vec::with_capacity(runs);
             let mut receive = |expected: u64| -> BenchResult<()> {
                 if zero_copy {
-                    return recv_s2c_zero_copy(&client, size, expected, spin);
+                    return recv_s2c_zero_copy(&mut client, size, expected, spin);
                 }
                 let len = recv_s2c(&client, &mut buf, spin)?;
                 check(&buf, len, size, expected, "клиент")?;
@@ -550,7 +553,8 @@ fn run_throughput(name: &str, config: &ChannelConfig, plan: &Plan) -> BenchResul
                 ends.push(Instant::now());
             }
             Ok(ends)
-        })?;
+        },
+    )?;
 
     let mut payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
     let mut starts = Vec::with_capacity(runs);

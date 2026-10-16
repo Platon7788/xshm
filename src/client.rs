@@ -382,9 +382,25 @@ impl SharedClient {
     /// Отправка серверу без перезаписи с заполнением на месте (zero-copy,
     /// 0.10; семантика -- `SharedServer::send_with`): `f` заполняет `len`
     /// байт payload прямо в кольце Client -> Server.
-    pub fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
+    ///
+    /// `&mut self`: ни вложенной отправки из `f`, ни другого потока, пока
+    /// работает `f` (иначе вторая запись получила бы ту же область кольца):
+    ///
+    /// ```compile_fail,E0502
+    /// fn nested(client: &mut xshm::SharedClient) {
+    ///     let _ = client.send_with(16, |buf| {
+    ///         let _ = client.try_send_to_server(b"nested-message!!");
+    ///         buf.fill(b'O');
+    ///     });
+    /// }
+    /// ```
+    pub fn send_with(&mut self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
         self.ensure_connected()?;
-        let result = self.ring_tx.write_with(len, f)?;
+        // SAFETY: `&mut self` -- этот клиент (единственный писатель кольца
+        // Client -> Server по рукопожатию: сервер подключает одного клиента)
+        // на время `f` не используется больше никем: ни вложенной записи из
+        // `f`, ни другого потока.
+        let result = unsafe { self.ring_tx.write_with(len, f) }?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();
         }
@@ -465,7 +481,33 @@ impl SharedClient {
     /// xshm, пишущий это направление без перезаписи (`try_send_to_client`,
     /// `send_with`, `wait_for_space`; не `send_to_client`). Для
     /// недоверенного сервера -- `receive_from_server`.
-    pub unsafe fn receive_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+    ///
+    /// Второго чтения этого направления во время `f` не бывает по типу
+    /// (`&mut self`); вложенный приём не компилируется:
+    ///
+    /// ```compile_fail,E0502
+    /// fn nested(client: &mut xshm::SharedClient) {
+    ///     let mut buf = Vec::new();
+    ///     // SAFETY: (пример не компилируется)
+    ///     let _ = unsafe {
+    ///         client.receive_with(|_data| client.receive_from_server(&mut buf))
+    ///     };
+    /// }
+    /// ```
+    pub unsafe fn receive_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        // SAFETY: неизменность кадра -- контракт этой функции (`# Safety`);
+        // единственность читателя на время `f` даёт `&mut self`.
+        unsafe { self.receive_with_shared(f) }
+    }
+
+    /// `receive_with` по `&self` -- для worker-а Auto, который держит
+    /// клиента один (клиент не выходит из его потока).
+    ///
+    /// # Safety
+    /// Контракт `receive_with` и, сверх него, контракт единственного
+    /// читателя `RingBuffer::read_with`: никакого другого чтения кольца
+    /// Server -> Client, пока выполняется `f`.
+    pub(crate) unsafe fn receive_with_shared<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
         self.ensure_connected()?;
         // SAFETY: контракт `read_with` -- контракт этой функции (`# Safety`).
         let result = unsafe { self.ring_rx.read_with(f) };

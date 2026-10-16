@@ -573,9 +573,27 @@ impl SharedServer {
     /// Срез -- неопубликованная часть разделяемой памяти: недоверенный
     /// клиент, нарушая протокол, может менять эти байты во время `f` --
     /// пострадает только сообщение, которое получит он сам.
-    pub fn send_with(&self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
+    ///
+    /// `&mut self`: пока работает `f`, этот сервер больше никто не трогает --
+    /// ни вложенная отправка из `f` (она получила бы ту же область кольца, и
+    /// одно из сообщений пропало бы), ни другой поток. Это проверяет
+    /// компилятор:
+    ///
+    /// ```compile_fail,E0502
+    /// fn nested(server: &mut xshm::SharedServer) {
+    ///     let _ = server.send_with(16, |buf| {
+    ///         let _ = server.try_send_to_client(b"nested-message!!");
+    ///         buf.fill(b'O');
+    ///     });
+    /// }
+    /// ```
+    pub fn send_with(&mut self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
         self.ensure_connected()?;
-        let result = self.ring_tx.write_with(len, f)?;
+        // SAFETY: `&mut self` -- этот сервер (единственный писатель кольца
+        // Server -> Client в процессе: секцию создаёт он сам, без
+        // `OBJ_OPENIF`) на время `f` не используется больше никем: ни
+        // вложенной записи из `f`, ни другого потока.
+        let result = unsafe { self.ring_tx.write_with(len, f) }?;
         if let Some(ref events) = self.events
             && result.was_empty
         {
@@ -680,7 +698,34 @@ impl SharedServer {
     /// без перезаписи (`try_send_to_server`, `send_with`, `wait_for_space`;
     /// не `send_to_server`). Для недоверенного клиента --
     /// `receive_from_client` (копия с проверкой после копирования).
-    pub unsafe fn receive_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+    ///
+    /// Второго чтения этого направления во время `f` (вложенного или из
+    /// другого потока) не бывает по типу: `&mut self`. Вложенный приём не
+    /// компилируется:
+    ///
+    /// ```compile_fail,E0502
+    /// fn nested(server: &mut xshm::SharedServer) {
+    ///     let mut buf = Vec::new();
+    ///     // SAFETY: (пример не компилируется)
+    ///     let _ = unsafe {
+    ///         server.receive_with(|_data| server.receive_from_client(&mut buf))
+    ///     };
+    /// }
+    /// ```
+    pub unsafe fn receive_with<R>(&mut self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        // SAFETY: неизменность кадра -- контракт этой функции (`# Safety`);
+        // единственность читателя на время `f` даёт `&mut self`.
+        unsafe { self.receive_with_shared(f) }
+    }
+
+    /// `receive_with` по `&self` -- для worker-а Auto, который держит
+    /// сервер один (сервер не выходит из его потока).
+    ///
+    /// # Safety
+    /// Контракт `receive_with` и, сверх него, контракт единственного
+    /// читателя `RingBuffer::read_with`: никакого другого чтения кольца
+    /// Client -> Server, пока выполняется `f`.
+    pub(crate) unsafe fn receive_with_shared<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
         self.ensure_connected()?;
         // SAFETY: контракт `read_with` -- контракт этой функции (`# Safety`).
         let result = unsafe { self.ring_rx.read_with(f) };
