@@ -233,6 +233,18 @@ impl SharedClient {
     /// `ControlBlock::slot_claim`), внешняя сериализация не нужна. Повтор --
     /// на стороне вызывающего (`AutoClient` повторяет сам через
     /// `reconnect_delay`).
+    ///
+    /// Сервер, зафиксировавший рукопожатие и умерший раньше, чем клиент
+    /// открыл его процесс (решение X): отзыв заявки проигран, сессия
+    /// состоялась -- `connect` возвращает `Ok`, `is_peer_alive()` сразу
+    /// `Some(false)`, а первое ожидание (`poll_server`, `recv_async`,
+    /// `wait_for_space`) дочитывает кольцо (прощание сервера не теряется) и
+    /// отвечает `Err(PeerDied)`. Остаток: PID сервера в сегменте занят живым
+    /// процессом с другим временем создания, а заявку засчитал его
+    /// `S2C_CONNECT`, -- неотличимо от живого сервера с испорченным временем
+    /// (`peer_tests::corrupted_server_start_hi_is_not_a_live_server`):
+    /// подключение без наблюдения процесса, границу задаёт таймаут
+    /// вызывающего.
     pub fn connect(name: &str, timeout: Duration) -> Result<Self> {
         Self::connect_impl(None, name, timeout, true, ClaimMode::Take, None)
     }
@@ -371,12 +383,11 @@ impl SharedClient {
         // Отзыв проиграл CAS сервера -- рукопожатие состоялось: продолжаем
         // как подключённые (сервер ждёт нас; если уже отключил -- worker
         // увидит `DISCONNECT` и дочитает кольцо).
-        if let AckWait::Abandoned(err) = waited
-            && !hello.withdraw()
-        {
-            return Err(err);
+        match waited {
+            AckWait::Accepted => Ok(hello.finish()),
+            AckWait::Abandoned(err) if hello.withdraw() => Ok(hello.finish_lost(&err)),
+            AckWait::Abandoned(err) => Err(err),
         }
-        Ok(hello.finish())
     }
 
     /// Подключиться к каналу `name` асинхронно (0.10; рукопожатие -- как у
@@ -873,6 +884,22 @@ impl Hello {
 
     /// Рукопожатие состоялось (шаг A): подключённый клиент.
     pub(crate) fn finish(self) -> SharedClient {
+        self.finish_with(false)
+    }
+
+    /// Заявка брошена с ошибкой `err`, но отзыв проигран -- сервер успел
+    /// зафиксировать рукопожатие: подключены. Брошена как `PeerDied` --
+    /// значит, этот путь уже счёл сервер умершим (синхронный --
+    /// `server_exited`, async -- более широкое `server_gone`, в том числе PID,
+    /// занятый процессом с другим временем создания): подключение получает
+    /// наблюдение «уже завершился» (решение X, M1 ревью T11b).
+    pub(crate) fn finish_lost(self, err: &ShmError) -> SharedClient {
+        self.finish_with(*err == ShmError::PeerDied)
+    }
+
+    /// Шаг A. `server_dead` -- сервер признан умершим до открытия его
+    /// процесса.
+    fn finish_with(self, server_dead: bool) -> SharedClient {
         let Self {
             view,
             events,
@@ -881,23 +908,27 @@ impl Hello {
             owns_claim,
             server: peer,
             server_gone: _,
-            server_exited,
+            server_exited: _,
             mapping,
         } = self;
         let control = view.control_block();
-        // Решение X: сервер подтверждённо завершился ещё до открытия его
-        // процесса, а отзыв заявки проигран (он успел зафиксировать
-        // рукопожатие) -- подключены, но наблюдать некого. Вариант «connect
-        // отвечает `PeerDied`» отброшен: сессия зафиксирована, в кольце может
-        // лежать прощание сервера, и после фиксации смерть пира везде
-        // сообщается ПОСЛЕ дочитывания (`poll_*`, worker-ы Auto/Multi). Поэтому
-        // -- наблюдение «уже завершился» (всегда сигнально): первое же
-        // ожидание видит смерть, данные дочитываются, затем `PeerDied`. Не
-        // удалось создать событие (нехватка ресурсов) -- без наблюдения, как
-        // до исправления.
+        // Решение X: сервер признан умершим ещё до открытия его процесса, а
+        // отзыв заявки проигран (он успел зафиксировать рукопожатие) --
+        // подключены, но наблюдать некого. Вариант «connect отвечает
+        // `PeerDied`» отброшен: сессия зафиксирована, в кольце может лежать
+        // прощание сервера, и после фиксации смерть пира везде сообщается
+        // ПОСЛЕ дочитывания (`poll_*`, `recv_async`, worker-ы Auto/Multi).
+        // Поэтому -- наблюдение «уже завершился» (всегда сигнально): первое
+        // же ожидание видит смерть, данные дочитываются, затем `PeerDied`.
+        // Не удалось создать событие (нехватка ресурсов) -- без наблюдения,
+        // как до исправления. Решение принимает путь, бросивший заявку, а не
+        // `finish` по признакам: живой сервер с испорченным временем в
+        // сегменте (`server_gone` без `server_exited`), чью заявку синхронный
+        // путь принял по `S2C_CONNECT`, наблюдения не получает и работает
+        // (`peer_tests::corrupted_server_start_hi_is_not_a_live_server`).
         let peer = match peer {
             Some(peer) => Some(peer),
-            None if server_exited => {
+            None if server_dead => {
                 ProcessWatch::exited(control.server_pid.load(Ordering::Acquire)).ok()
             }
             None => None,
@@ -1077,7 +1108,7 @@ impl Future for ConnectFuture {
             Step::Abandon(hello, err) => {
                 this.release();
                 Poll::Ready(if hello.withdraw() {
-                    Ok(hello.finish())
+                    Ok(hello.finish_lost(&err))
                 } else {
                     Err(err)
                 })
@@ -1536,9 +1567,19 @@ impl Drop for SharedClient {
     /// `client_pid` не трогаем: наш PID сервер уже забрал (S6), а следующий
     /// клиент мог записать туда свой. `generation` сменился -- сессия уже не
     /// наша (сервер отключил нас, claim отнят, канал у следующего клиента):
-    /// ни состояния, ни заголовков, ни `DISCONNECT`. Пока claim держим,
-    /// новой сессии нет (I3), поэтому сверка и записи не разделены чужим
-    /// рукопожатием. Отключён (`mark_disconnected`: сервер ушёл сам) --
+    /// ни состояния, ни заголовков, ни `DISCONNECT`. Пока claim наш, новой
+    /// сессии нет (I3) -- кроме одного случая (M5 ревью T11b): живого
+    /// клиента сессии, закрытой сервером, сервер лишает claim-а по
+    /// `RESERVE_TIMEOUT` (`observe_idle_claim`), и следующий клиент может
+    /// пройти рукопожатие между нашей сверкой и CAS. Окно сужено: claim
+    /// сверяется прямо перед CAS, а `generation` -- ещё раз после удачного
+    /// CAS (сменился -- заголовков и `DISCONNECT` чужой сессии не трогаем).
+    /// Закрыть окно до конца нельзя без атомарности «поколение + состояние»
+    /// (разные слова): остаток -- поток, вытесненный между сверкой и CAS
+    /// дольше `RESERVE_TIMEOUT` и рукопожатия следующего клиента, --
+    /// граница решения G (INTEROP §h п. 11); тогда `client_state` новой
+    /// сессии один раз становится `IDLE` без сигнала, и её сервер разберёт
+    /// это как уход клиента на ближайшем пробуждении. Отключён (`mark_disconnected`: сервер ушёл сам) --
     /// ответный `DISCONNECT` не сигналим, только освобождаем claim.
     ///
     /// T11b: сервер закрыл сессию сам, а клиент этого ещё не разобрал
@@ -1547,11 +1588,12 @@ impl Drop for SharedClient {
     /// сигналим: сессии, которую он закрыл бы, уже нет, а сигнал остался бы
     /// взведённым для следующей сессии канала (INTEROP §d.2 шаг 7).
     fn drop(&mut self) {
+        let control = self.view.control_block();
         if self.connected
             && self.is_session_current()
-            && self
-                .view
-                .control_block()
+            && (self.claim == CLAIM_FREE
+                || control.slot_claim.load(Ordering::Acquire) == self.claim)
+            && control
                 .client_state
                 .compare_exchange(
                     HANDSHAKE_SERVER_READY,
@@ -1560,6 +1602,7 @@ impl Drop for SharedClient {
                     Ordering::Acquire,
                 )
                 .is_ok()
+            && self.is_session_current()
         {
             let (header_a, header_b) = self.view.headers();
             header_a
@@ -2818,25 +2861,27 @@ mod exited_server_tests {
     use crate::server::SharedServer;
     use crate::test_support::dead_process;
 
-    #[test]
-    fn committed_then_dead_server_is_reported_after_drain() {
-        let name = format!("CLI_EXITED_{}", std::process::id());
+    /// Канал, чей сервер в сегменте -- процесс `(pid, start)`.
+    fn forged_server(tag: &str, (pid, start): (u32, u64)) -> (String, SharedServer) {
+        let name = format!("CLI_EXITED_{tag}_{}", std::process::id());
         let server = SharedServer::start(&name).unwrap();
-        let (pid, start) = dead_process();
-        {
-            let control = server.view().control_block();
-            control.server_start_lo.store(
-                u32::try_from(start & 0xFFFF_FFFF).unwrap(),
-                Ordering::Release,
-            );
-            control
-                .server_start_hi
-                .store(u32::try_from(start >> 32).unwrap(), Ordering::Release);
-            control.server_pid.store(pid, Ordering::Release);
-        }
+        let control = server.view().control_block();
+        control.server_start_lo.store(
+            u32::try_from(start & 0xFFFF_FFFF).unwrap(),
+            Ordering::Release,
+        );
+        control
+            .server_start_hi
+            .store(u32::try_from(start >> 32).unwrap(), Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+        (name, server)
+    }
+
+    /// Хук после заявки: «сервер» пишет прощание, публикует сессию (S3) и
+    /// фиксирует заявку (S5) -- и умирает (больше ничего не делает).
+    fn commit_and_die_after_hello() {
         AFTER_HELLO.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(|view: &SharedView| {
-                // «Сервер»: прощальный кадр, S3 и фиксация S5 -- и смерть.
                 view.ring_a().write_message(b"farewell").unwrap();
                 let control = view.control_block();
                 control.generation.fetch_add(1, Ordering::AcqRel);
@@ -2854,6 +2899,42 @@ mod exited_server_tests {
                     .unwrap();
             }));
         });
+    }
+
+    /// Минимальный исполнитель: опрос с паузой (регистрации реактора живут
+    /// между опросами, waker не нужен).
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+            assert!(Instant::now() < deadline, "future не завершился за 5 с");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// `recv_async`: прощание дочитано, затем `PeerDied` -- без вечного
+    /// ожидания (M8 ревью T11b: регистрация на всегда сигнальном
+    /// наблюдении срабатывает один раз, без цикла).
+    fn assert_async_drain_then_peer_died(client: &mut SharedClient) {
+        let started = Instant::now();
+        let mut buffer = Vec::new();
+        let len = block_on(client.recv_async(&mut buffer)).unwrap();
+        assert_eq!(&buffer[..len], b"farewell", "прощание дочитано");
+        assert_eq!(
+            block_on(client.recv_async(&mut buffer)),
+            Err(ShmError::PeerDied)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn committed_then_dead_server_is_reported_after_drain() {
+        let (name, server) = forged_server("SYNC", dead_process());
+        commit_and_die_after_hello();
         let mut client = SharedClient::connect(&name, Duration::from_secs(2))
             .expect("отзыв проигран -- подключён");
         assert_eq!(
@@ -2874,6 +2955,39 @@ mod exited_server_tests {
             started.elapsed() < Duration::from_secs(1),
             "без ожидания таймаута"
         );
+        drop(client);
+        drop(server);
+    }
+
+    /// M8: тот же исход синхронного `connect`, потребитель -- `recv_async`.
+    #[test]
+    fn committed_then_dead_server_is_reported_to_recv_async() {
+        let (name, server) = forged_server("SYNC_ASYNC", dead_process());
+        commit_and_die_after_hello();
+        let mut client = SharedClient::connect(&name, Duration::from_secs(2))
+            .expect("отзыв проигран -- подключён");
+        assert_async_drain_then_peer_died(&mut client);
+        drop(client);
+        drop(server);
+    }
+
+    /// M1 ревью T11b: `connect_async` бросает заявку по широкому
+    /// `server_gone` -- PID сервера занят живым процессом с другим временем
+    /// создания (сервер умер, PID переиспользован). Отзыв проигран -- клиент
+    /// подключён и тоже получает наблюдение «уже завершился»: `recv_async`
+    /// дочитывает и сообщает `PeerDied`, а не ждёт вечно.
+    #[test]
+    fn async_gone_server_with_lost_withdraw_is_reported_after_drain() {
+        let reused = (
+            std::process::id(),
+            crate::win::current_process_start_time() ^ 0x5A5A,
+        );
+        let (name, server) = forged_server("ASYNC_GONE", reused);
+        commit_and_die_after_hello();
+        let mut client =
+            block_on(SharedClient::connect_async(&name)).expect("отзыв проигран -- подключён");
+        assert_eq!(client.is_peer_alive(), Some(false));
+        assert_async_drain_then_peer_died(&mut client);
         drop(client);
         drop(server);
     }
@@ -2933,5 +3047,47 @@ mod stale_leave_tests {
             .unwrap();
         drop(client.join().unwrap().unwrap());
         assert!(disconnect_fired(&server), "штатный уход");
+    }
+}
+
+#[cfg(test)]
+mod reclaimed_leave_tests {
+    //! M5 ревью T11b: claim «не заметившего» клиента отнят (и, возможно,
+    //! уже взят следующим), а `generation` ещё прежний -- уход не трогает
+    //! состояние и не сигналит `DISCONNECT`.
+
+    use super::*;
+    use crate::server::SharedServer;
+
+    #[test]
+    fn leave_after_claim_was_taken_writes_nothing() {
+        let name = format!("CLI_RECLAIMED_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let client =
+            { std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5))) };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = client.join().unwrap().unwrap();
+        let control = server.view().control_block();
+        // Claim отнят и взят следующим клиентом (его рукопожатие ещё не
+        // опубликовало новое поколение).
+        control.slot_claim.store(0x0BAD_C1A1, Ordering::Release);
+        drop(client);
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_SERVER_READY,
+            "уход тронул состояние чужого claim-а"
+        );
+        assert!(
+            !server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "уход взвёл DISCONNECT"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0x0BAD_C1A1);
     }
 }

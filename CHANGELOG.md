@@ -231,6 +231,9 @@
   было только внутренним (`disconnect_local`) — синхронному серверу
   приходилось ронять канал целиком. Тест
   `server::disconnect_tests::disconnect_kicks_client_and_accepts_next`.
+  Rustdoc (M4 ревью T11b): живой клиент, не заметивший разрыва, держит
+  claim до отъёма по `RESERVE_TIMEOUT` от первого толчка; непрочитанное
+  клиент → сервер сбрасывает S3 следующей сессии; anonymous — без сигнала.
 
 - **Маяк присутствия у каждого сервера** (надёжность, 17.10.2026, Task 11;
   INTEROP **R19**, «Изменения 0.10» п. 34). Каждый именованный сервер
@@ -1068,7 +1071,15 @@
   возвращает `Ok`, потому что сессия зафиксирована. Тест
   `client::exited_server_tests::committed_then_dead_server_is_reported_after_drain`
   (хук `AFTER_HELLO`: «сервер» фиксирует и умирает до открытия его
-  процесса). Пир-невидимо.
+  процесса). Пир-невидимо. Fix round (ревью T11b): наблюдение «уже
+  завершился» назначает путь, бросивший заявку как `PeerDied` (у
+  `connect_async` — и по широкому `server_gone`: PID сервера занят живым
+  процессом с другим временем; M1), а не `finish` по признакам — живой
+  сервер с испорченным временем в сегменте по-прежнему подключается без
+  наблюдения. Тесты `exited_server_tests::{committed_then_dead_server_is_reported_to_recv_async,
+  async_gone_server_with_lost_withdraw_is_reported_after_drain}` (M8, M1).
+  Rustdoc `SharedClient::connect` описывает исход (`Ok`, затем `PeerDied`
+  после дочитывания) и остаток синхронного пути.
 
 - **Minor** (n1 ревью Task 11) `discovery_fallback` короче 1 мс (не только
   ноль) превращал ожидание обнаружения почти в опрос — тысячи попыток в
@@ -1084,7 +1095,7 @@
   следующий перебор начинается со следующего слота и идёт по кругу
   (`claim_free_slot(.., start)`), после подключения — снова с нуля. Тесты
   `multi::tests::{failed_handshake_moves_to_next_slot,
-  claim_scan_wraps_around}`. INTEROP §i.1.
+  claim_scan_wraps_around}`. INTEROP §i.1, «Изменения 0.10» п. 36.
 
 - **Minor** (T11b) Клиент регистрации Dispatch (`lobby_register`), увидевший
   штатный уход лобби (`DISCONNECT` при закрытой сессии) или смерть его
@@ -1092,7 +1103,10 @@
   `IDLE`), но `DISCONNECT` всё равно взводился — поздний сигнал доставался
   следующему клиенту лобби. Теперь — только снятие claim-а (INTEROP §d.2
   шаг 7; так же клиент xipc). Тест
-  `dispatch::tests::lobby_client_leaves_without_disconnect_after_server_left`.
+  `dispatch::tests::lobby_client_leaves_without_disconnect_after_server_died`
+  (смерть лобби без изменения состояния — пункт в изоляции) и
+  `lobby_client_after_server_disconnect_sends_no_disconnect` (сторожит
+  вместе с уходом `SharedClient` ниже). INTEROP «Изменения 0.10» п. 35.
 
 - **Minor** (T11b) Устаревший `DISCONNECT` от `Drop` `SharedClient`: сервер
   закрыл сессию сам (`disconnect`, `Drop` сервера — `client_state` уже
@@ -1101,8 +1115,14 @@
   сигнал оставался для следующей сессии канала. Теперь уход сигналит
   `DISCONNECT` только при удачном CAS (сессия была открыта и с точки зрения
   сервера); claim снимается, как прежде. Пир-видимо: INTEROP R15, §d.2
-  шаг 7, «Изменения 0.10» п. 6 (нативному клиенту — ЖЕЛАТЕЛЬНО так же). Тест
+  шаг 7, «Изменения 0.10» п. 35 (нативному клиенту — ЖЕЛАТЕЛЬНО: старое
+  поведение безвредно, S4 следующей сессии сбрасывает `DISCONNECT`). Тест
   `client::stale_leave_tests::drop_after_server_closed_session_sends_no_disconnect`.
+  Fix round (M5 ревью T11b): claim сверяется прямо перед CAS, `generation`
+  — ещё раз после удачного CAS (окно «claim живого задержавшегося отнят по
+  `RESERVE_TIMEOUT`, следующий клиент прошёл рукопожатие» сужено, остаток
+  — граница решения G, INTEROP §h п. 11); тест
+  `client::reclaimed_leave_tests::leave_after_claim_was_taken_writes_nothing`.
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

@@ -1992,8 +1992,12 @@ mod tests {
     /// T11b (INTEROP §d.2 шаг 7): лобби закрыло сессию, не ответив, --
     /// клиент регистрации уходит, только сняв claim, без ответного
     /// `DISCONNECT` (поздний сигнал достался бы следующему клиенту лобби).
+    /// Сторожит пункты 5 и 6 T11b вместе: сервер уже `IDLE`, поэтому и без
+    /// отметки `lobby_register` CAS ухода не проходит и сигнала нет (M6
+    /// ревью). Отдельно пункт 6 сторожит
+    /// `lobby_client_leaves_without_disconnect_after_server_died`.
     #[test]
-    fn lobby_client_leaves_without_disconnect_after_server_left() {
+    fn lobby_client_after_server_disconnect_sends_no_disconnect() {
         let name = format!("TEST_DISPATCH_LEFT_{}", std::process::id());
         let mut lobby = SharedServer::start(&name).unwrap();
         let client = {
@@ -2022,6 +2026,64 @@ mod tests {
                 .control_block()
                 .slot_claim
                 .load(Ordering::Acquire),
+            CLAIM_FREE,
+            "claim снят"
+        );
+    }
+
+    /// T11b п. 6 в изоляции (M6 ревью): процесс лобби умер, не тронув
+    /// состояние (`client_state` -- всё ещё `SERVER_READY`): CAS ухода
+    /// прошёл бы, и без отметки `lobby_register` клиент взвёл бы
+    /// `DISCONNECT` закрытой (смертью) сессии. С отметкой -- только claim.
+    #[test]
+    fn lobby_client_leaves_without_disconnect_after_server_died() {
+        let name = format!("TEST_DISPATCH_DIED_{}", std::process::id());
+        let mut child = crate::test_support::LiveChild::spawn();
+        let mut lobby = SharedServer::start(&name).unwrap();
+        {
+            // Процесс «сервера» в сегменте -- дочерний: его смерть клиент
+            // увидит по наблюдению процесса.
+            let control = lobby.view().control_block();
+            control.server_start_lo.store(
+                u32::try_from(child.start & 0xFFFF_FFFF).unwrap(),
+                Ordering::Release,
+            );
+            control
+                .server_start_hi
+                .store(u32::try_from(child.start >> 32).unwrap(), Ordering::Release);
+            control.server_pid.store(child.pid, Ordering::Release);
+        }
+        let client = {
+            thread::spawn(move || {
+                let options = DispatchClientOptions {
+                    response_timeout: Duration::from_secs(5),
+                    ..DispatchClientOptions::default()
+                };
+                let registration = ClientRegistration::new(std::process::id(), 1, "died");
+                lobby_register(&name, &registration, &options, &mut Vec::new())
+            })
+        };
+        lobby.wait_for_client(Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(lobby.poll_client(Some(Duration::from_secs(5))), Ok(true));
+        child.kill();
+        assert_eq!(client.join().unwrap().err(), Some(ShmError::PeerDied));
+        let control = lobby.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            crate::constants::HANDSHAKE_SERVER_READY,
+            "уход клиента после смерти сервера не трогает состояние"
+        );
+        assert!(
+            !lobby
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "клиент взвёл DISCONNECT умершему серверу"
+        );
+        assert_eq!(
+            control.slot_claim.load(Ordering::Acquire),
             CLAIM_FREE,
             "claim снят"
         );
