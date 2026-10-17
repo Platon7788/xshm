@@ -51,6 +51,15 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Тесты (решение AB): одноразовый хук ухода L между сверкой
+    /// `generation` и CAS -- играет роль сервера, отнявшего claim «не
+    /// заметившего» клиента и принявшего следующего.
+    pub(crate) static BEFORE_LEAVE_CAS: std::cell::RefCell<Option<HelloHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Время создания текущего процесса, заявляемое в `client_start_*`.
 fn announced_start_time() -> u64 {
     #[cfg(test)]
@@ -1558,52 +1567,44 @@ impl SharedClient {
     }
 }
 
+impl SharedClient {
+    /// CAS ухода L: пара `(client_state, slot_claim)` -- `(SERVER_READY, T)`
+    /// -> `(IDLE, T)` одним 64-битным CAS (решение AB,
+    /// `ControlBlock::leave_session`).
+    fn leave_cas(&self) -> bool {
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_LEAVE_CAS.with(|hook| hook.borrow_mut().take()) {
+            hook(&self.view);
+        }
+        self.view.control_block().leave_session(self.claim)
+    }
+}
+
 impl Drop for SharedClient {
     /// Уход L (ревизия 3, INTEROP R15): записи состояния -- только пока
-    /// сессия наша (`generation == G`), освобождение claim -- последним.
+    /// сессия наша, освобождение claim -- последним.
     ///
-    /// R14: сначала своё состояние -> `IDLE` (CAS `SERVER_READY -> IDLE`,
-    /// не затирает `CLIENT_HELLO` следующего клиента), потом `DISCONNECT`.
+    /// R14: сначала своё состояние -> `IDLE`, потом `DISCONNECT`.
     /// `client_pid` не трогаем: наш PID сервер уже забрал (S6), а следующий
     /// клиент мог записать туда свой. `generation` сменился -- сессия уже не
-    /// наша (сервер отключил нас, claim отнят, канал у следующего клиента):
-    /// ни состояния, ни заголовков, ни `DISCONNECT`. Пока claim наш, новой
-    /// сессии нет (I3) -- кроме одного случая (M5 ревью T11b): живого
-    /// клиента сессии, закрытой сервером, сервер лишает claim-а по
-    /// `RESERVE_TIMEOUT` (`observe_idle_claim`), и следующий клиент может
-    /// пройти рукопожатие между нашей сверкой и CAS. Окно сужено: claim
-    /// сверяется прямо перед CAS, а `generation` -- ещё раз после удачного
-    /// CAS (сменился -- заголовков и `DISCONNECT` чужой сессии не трогаем).
-    /// Закрыть окно до конца нельзя без атомарности «поколение + состояние»
-    /// (разные слова): остаток -- поток, вытесненный между сверкой и CAS
-    /// дольше `RESERVE_TIMEOUT` и рукопожатия следующего клиента, --
-    /// граница решения G (INTEROP §h п. 11); тогда `client_state` новой
-    /// сессии один раз становится `IDLE` без сигнала, и её сервер разберёт
-    /// это как уход клиента на ближайшем пробуждении. Отключён (`mark_disconnected`: сервер ушёл сам) --
-    /// ответный `DISCONNECT` не сигналим, только освобождаем claim.
+    /// наша: ни состояния, ни заголовков, ни `DISCONNECT`.
     ///
-    /// T11b: сервер закрыл сессию сам, а клиент этого ещё не разобрал
-    /// (`disconnect`/`Drop` сервера перевели `client_state` в `IDLE`,
-    /// `generation` прежний) -- CAS не проходит, и `DISCONNECT` тоже не
-    /// сигналим: сессии, которую он закрыл бы, уже нет, а сигнал остался бы
-    /// взведённым для следующей сессии канала (INTEROP §d.2 шаг 7).
+    /// Решение AB: переход состояния -- ОДИН 64-битный CAS пары
+    /// `(client_state, slot_claim)`: `(SERVER_READY, T) -> (IDLE, T)`
+    /// (`ControlBlock::leave_session`). Сверка `generation` сама по себе не
+    /// защищала: живого «не заметившего» клиента сессии, закрытой сервером,
+    /// сервер лишает claim-а по `RESERVE_TIMEOUT` (`observe_idle_claim`), и
+    /// следующий клиент мог пройти рукопожатие между нашей сверкой и
+    /// 32-битным CAS `client_state` -- тот снимал бы ЧУЖУЮ сессию. CAS пары
+    /// проходит, только пока claim -- наш токен `T`; у следующей сессии claim
+    /// другой (токены уникальны), поэтому её он не трогает ни при каком
+    /// вытеснении потока. `NotConnected`-уход сервера (T11b: `disconnect`/
+    /// `Drop` сервера уже перевели `client_state` в `IDLE`) CAS тоже не
+    /// проходит -- `DISCONNECT` не сигналим: сессии, которую он закрыл бы,
+    /// уже нет, а сигнал остался бы для следующей (INTEROP §d.2 шаг 7).
+    /// Отключён (`mark_disconnected`: сервер ушёл сам) -- только claim.
     fn drop(&mut self) {
-        let control = self.view.control_block();
-        if self.connected
-            && self.is_session_current()
-            && (self.claim == CLAIM_FREE
-                || control.slot_claim.load(Ordering::Acquire) == self.claim)
-            && control
-                .client_state
-                .compare_exchange(
-                    HANDSHAKE_SERVER_READY,
-                    HANDSHAKE_IDLE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            && self.is_session_current()
-        {
+        if self.connected && self.is_session_current() && self.leave_cas() {
             let (header_a, header_b) = self.view.headers();
             header_a
                 .handshake_state
@@ -3089,5 +3090,66 @@ mod reclaimed_leave_tests {
             "уход взвёл DISCONNECT"
         );
         assert_eq!(control.slot_claim.load(Ordering::Acquire), 0x0BAD_C1A1);
+    }
+
+    /// Решение AB: поток уходящего клиента вытеснен между сверкой
+    /// `generation` и CAS -- за это время сервер отнял его claim (по
+    /// `RESERVE_TIMEOUT`) и зафиксировал сессию следующего клиента B. CAS
+    /// пары `(client_state, slot_claim)` не проходит (claim уже B), и сессия
+    /// B остаётся нетронутой: ни `IDLE`, ни `DISCONNECT`. С 32-битным CAS
+    /// одного `client_state` уход снял бы сессию B.
+    #[test]
+    fn leave_racing_reclaim_and_next_commit_spares_new_session() {
+        const B_TOKEN: u32 = 0x0BAD_B0B0;
+        let name = format!("CLI_RACE_LEAVE_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let client =
+            { std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5))) };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = client.join().unwrap().unwrap();
+        // Сигнал сервера отсутствует -- проверяем ровно сигнал ухода.
+        assert!(
+            !server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap()
+        );
+        BEFORE_LEAVE_CAS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|view: &SharedView| {
+                // Сверка `generation` уже пройдена. «Сервер»: отключил
+                // клиента, отнял claim, принял B (S3 -- новое поколение, S5 --
+                // фиксация заявки B).
+                let control = view.control_block();
+                control
+                    .client_state
+                    .store(HANDSHAKE_IDLE, Ordering::Release);
+                control.slot_claim.store(B_TOKEN, Ordering::Release);
+                control.generation.fetch_add(1, Ordering::AcqRel);
+                control
+                    .client_state
+                    .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+            }));
+        });
+        drop(client);
+        let control = server.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_SERVER_READY,
+            "уход снял сессию следующего клиента"
+        );
+        assert!(
+            !server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "уход взвёл DISCONNECT в сессии следующего клиента"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), B_TOKEN);
     }
 }

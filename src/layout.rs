@@ -18,7 +18,7 @@
 //! версию формата.
 
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::constants::*;
 use crate::error::{Result, ShmError};
@@ -315,6 +315,11 @@ const _: () = {
     assert!(offset_of!(ControlBlock, server_state) == 12);
     assert!(offset_of!(ControlBlock, client_state) == 16);
     assert!(offset_of!(ControlBlock, slot_claim) == 20);
+    // Пара `(client_state, slot_claim)` -- одно выровненное 8-байтовое слово
+    // (уход L, решение AB): смещение 16 кратно 8, поля подряд.
+    assert!(offset_of!(ControlBlock, client_state).is_multiple_of(8));
+    assert!(offset_of!(ControlBlock, slot_claim) == offset_of!(ControlBlock, client_state) + 4);
+    assert!(align_of::<ControlBlock>() >= align_of::<AtomicU64>());
     assert!(offset_of!(ControlBlock, slot_owner_pid) == 24);
     assert!(offset_of!(ControlBlock, server_pid) == 28);
     assert!(offset_of!(ControlBlock, client_pid) == 32);
@@ -369,6 +374,63 @@ impl ControlBlock {
             self.client_start_lo.load(Ordering::Acquire),
             self.client_start_hi.load(Ordering::Acquire),
         )
+    }
+
+    /// Уход клиента из своей сессии (уход L, решение AB): ОДНИМ атомарным
+    /// CAS пары `(client_state, slot_claim)`: `(SERVER_READY, claim)` ->
+    /// `(IDLE, claim)`. Проходит, только пока сессия открыта для сервера И
+    /// claim всё ещё наш: следующая сессия держит другой claim (токены
+    /// уникальны, `claim_token`), поэтому уход «не заметившего» клиента,
+    /// чей claim сервер отнял по `RESERVE_TIMEOUT`, её не тронет, даже если
+    /// поток клиента вытеснен между сверкой `generation` и этим CAS. 32-битный
+    /// CAS одного `client_state` такой гарантии не давал (два слова --
+    /// поколение и состояние -- не сравниваются вместе). Формат памяти не
+    /// меняется: те же два поля, смещения 16 и 20. `true` -- CAS прошёл
+    /// (сигналить `DISCONNECT`); `claim` -- токен клиента сессии
+    /// (`CLAIM_FREE` у клиента без claim -- тогда сравнивается и он).
+    ///
+    /// **Доступ разного размера.** Пир (другой процесс, сервер Rust или C)
+    /// обращается к этим полям 4-байтовыми атомарными операциями. На x86
+    /// (крейт только для x86/x86_64, TSO) `lock cmpxchg` (x86_64) /
+    /// `lock cmpxchg8b` (i686) над выровненным 8-байтовым словом атомарен
+    /// относительно любых `lock`-операций и обычных выровненных
+    /// записей/чтений меньшего размера в том же слове (Intel SDM т. 3A
+    /// §9.1.1-9.1.2: выровненные обращения атомарны, `lock` -- исключительное
+    /// владение строкой кэша; 8 байт на смещении, кратном 8, -- одна строка).
+    /// Модель памяти Rust гонки атомарных обращений разного размера к ОДНОЙ
+    /// ячейке не определяет -- поэтому важно, кто здесь «гонится» в смысле
+    /// абстрактной машины: это отображение секции принадлежит одной стороне
+    /// (`SharedClient`, `&mut self` в `Drop`), другие обращения к нему в
+    /// этом процессе ей предшествуют (тот же поток), а пиры -- другой
+    /// процесс или другое отображение той же секции (сервер в том же
+    /// процессе отображает свой view по другому адресу) -- вне абстрактной
+    /// машины этого отображения, как и все остальные общие с пиром атомарные
+    /// поля крейта: их согласованность обеспечивает аппаратура. Поэтому
+    /// `AtomicU64::from_ptr` здесь допустим, и он предпочтительнее
+    /// встроенного ассемблера: компилируется ровно в `lock cmpxchg` /
+    /// `lock cmpxchg8b`, а `cmpxchg8b` вручную требует `ebx`, который на
+    /// i686 зарезервирован LLVM как операнд `asm!` (обход через `xchg` --
+    /// лишний риск без выигрыша в гарантиях).
+    pub(crate) fn leave_session(&self, claim: u32) -> bool {
+        let pair_ptr = (&raw const self.client_state).cast::<u64>().cast_mut();
+        // SAFETY: `pair_ptr` указывает на `client_state` (смещение 16) --
+        // начало выровненной на 8 пары `(client_state, slot_claim)` внутри
+        // `ControlBlock` (`const`-утверждения выше: смещение кратно 8, поля
+        // подряд, выравнивание блока >= `align_of::<AtomicU64>()`); память
+        // живёт, пока жив `self` (ссылка `AtomicU64` -- не дольше вызова).
+        // Обращения разного размера: см. документацию метода -- в этом
+        // процессе к этому отображению параллельно не обращается никто,
+        // пиры вне абстрактной машины, атомарность -- гарантия x86.
+        let pair = unsafe { AtomicU64::from_ptr(pair_ptr) };
+        // Little-endian (только x86): `client_state` -- младшие 32 бита.
+        let pack = |state: u32| u64::from(state) | (u64::from(claim) << 32);
+        pair.compare_exchange(
+            pack(HANDSHAKE_SERVER_READY),
+            pack(HANDSHAKE_IDLE),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
     }
 
     /// Клиент Multi: заявить время своего процесса после захвата слота.

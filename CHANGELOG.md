@@ -1124,6 +1124,24 @@
   — граница решения G, INTEROP §h п. 11); тест
   `client::reclaimed_leave_tests::leave_after_claim_was_taken_writes_nothing`.
 
+- **Minor** (решение AB, M5 ревью T11b) Гонка ухода L закрыта: сверка
+  `generation` и 32-битный CAS `client_state: SERVER_READY → IDLE` — два
+  шага, и если между ними сервер отнял claim «не заметившего» клиента (по
+  `RESERVE_TIMEOUT`) и зафиксировал сессию следующего, CAS снимал чужую
+  сессию. Теперь уход — один 64-битный CAS пары `(client_state,
+  slot_claim)`: `(SERVER_READY, T) → (IDLE, T)` (`ControlBlock::leave_session`,
+  `AtomicU64::from_ptr` над смещением 16; на x86 — `lock cmpxchg` /
+  `lock cmpxchg8b`, атомарно относительно 4-байтовых операций пира); у
+  следующей сессии claim другой, и её уход не трогает при любом
+  вытеснении. Формат памяти не меняется. Заменяет сужение окна из
+  предыдущего пункта (сверка claim-а до CAS и `generation` после). Модель
+  рукопожатия: поздний уход «забытого» клиента — многошаговый L (≈2,0 млн
+  состояний), с 32-битным CAS перебор находит нарушение I5. Тест
+  `client::reclaimed_leave_tests::leave_racing_reclaim_and_next_commit_spares_new_session`
+  (хук `BEFORE_LEAVE_CAS` между сверкой и CAS; с 32-битным CAS — падает).
+  INTEROP R15, §d.2 шаг 7, §h п. 11, «Изменения 0.10» п. 37 (нативному
+  клиенту — ЖЕЛАТЕЛЬНО).
+
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
 - Пул пакетов ожидания реактора. `Reactor::register` создавал объект ядра
