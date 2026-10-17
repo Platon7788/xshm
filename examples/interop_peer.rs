@@ -26,7 +26,8 @@
 //! `delay=<мс>` (500), `busy=1` (клиент повторяет и `AlreadyConnected`),
 //! `count=<k>` (клиентов `multi-client`, 1), `ends=<k>` (отключений до
 //! конца сценария Multi), `kick=<слот>` (`multi-server`), `frames=<k>` (10),
-//! `hold=<мс>` (0).
+//! `release=<имя>` (маяк `<имя>_beacon`, которого `multi-client mode=ping`
+//! ждёт перед остановкой; без него -- `hold=<мс>`, 0).
 //!
 //! Сценарии (`server-*` -- `SharedServer`, ждёт клиента после `READY`;
 //! `client-*` -- `SharedClient`, повторяет подключение, пока канала нет):
@@ -40,7 +41,8 @@
 //!   `mode=recv`: эти 3 кадра от пира и его `Graceful`;
 //! - `*-die` -- 2 кадра длины 7, `INFO sent=2`, выход с кодом 9 без ухода
 //!   (`process::exit`, без деструкторов);
-//!   `*-expect-death` -- 2 кадра от пира и `reason=PeerDied`;
+//!   `*-expect-death` -- 2 кадра от пира и `reason=PeerDied` (клиент
+//!   сначала шлёт кадр-готовность длины 1);
 //! - `*-hold` -- держать сессию до ухода пира;
 //! - `client-expect-busy` -- подключение обязано дать `AlreadyConnected`;
 //!   `client-expect-err expect=<вариант>` -- ошибку `expect`;
@@ -57,6 +59,9 @@
 //!   `INFO err=<вариант>` (`Space` -- место появилось, `Timeout` -- нет);
 //! - `client-hello-die` -- рукопожатие в потоке, через 500 мс (`INFO
 //!   hello=1`) выход с кодом 9: заявка `CLIENT_HELLO` умершего остаётся;
+//! - `client-ping` -- клиент сам ведёт эхо: `n` кадров по генератору, на
+//!   каждый -- ответ XOR пира (`server-sessions`, эхо-сервер C), затем
+//!   `INFO pinged=<n>` и уход (Drop: `IDLE`, `DISCONNECT`, claim последним);
 //! - `multi-server n=<слотов> ends=<k> [kick=<слот>]` -- `MultiServer`, эхо
 //!   XOR `0x5A`, `INFO connect=<слот>`, `INFO disconnect=<слот>:<причина>`;
 //!   `kick` -- `disconnect_client` после первого кадра слота; конец -- `k`
@@ -66,7 +71,8 @@
 //!   `INFO slot=<слот>`, `INFO reason=<причина>`; `echo` -- ответ XOR на
 //!   кадры сервера, конец -- `ends` отключений (по умолчанию `count`);
 //!   `ping` -- `frames` кадров длины 16 от каждого и их эхо (`INFO
-//!   pinged=<k>`), затем `hold` мс в сессии и остановка.
+//!   pinged=<k>`), затем сессии держатся до взвода маяка `release` (или
+//!   `hold` мс) и остановка.
 //!
 //! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
 //! перед `INFO sent=`.
@@ -87,9 +93,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{
-    AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelConfig, ChannelKind, ChannelLayout,
-    DisconnectReason, MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler,
-    MultiOptions, MultiServer, RingConfig, SharedClient, SharedServer, ShmError,
+    AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ChannelConfig, ChannelKind,
+    ChannelLayout, DisconnectReason, MultiClient, MultiClientHandler, MultiClientOptions,
+    MultiHandler, MultiOptions, MultiServer, RingConfig, SharedClient, SharedServer, ShmError,
 };
 
 /// Жёсткий самотаймаут пира: оркестратор не должен ждать зависший пир.
@@ -218,6 +224,7 @@ struct Args {
     kick: Option<u32>,
     frames: u32,
     hold: u64,
+    release: String,
 }
 
 /// `<ёмкость>:<сообщений>:<макс. размер>`.
@@ -252,6 +259,7 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
         kick: None,
         frames: 10,
         hold: 0,
+        release: String::new(),
     };
     for pair in pairs {
         let (key, value) = pair
@@ -274,6 +282,7 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
             "kick" => args.kick = Some(value.parse().map_err(|_| bad())?),
             "frames" => args.frames = value.parse().map_err(|_| bad())?,
             "hold" => args.hold = value.parse().map_err(|_| bad())?,
+            "release" => value.clone_into(&mut args.release),
             _ => return Err(format!("unknown key {key}")),
         }
     }
@@ -631,6 +640,17 @@ fn expect_death(side: &mut Side) -> Result<(), String> {
     expect_end(got, DisconnectReason::PeerDied, 2)
 }
 
+/// Клиент ждёт смерти сервера: сначала кадр-готовность (1 байт) -- к этому
+/// моменту `connect` вернулся и процесс сервера уже наблюдается. Сервер,
+/// умерший раньше шага A, клиент не наблюдал бы (`ProcessWatch::open_peer`
+/// отбрасывает завершившийся процесс): умирающий сервер C ждёт этот кадр.
+fn client_expect_death(name: &str) -> Result<(), String> {
+    let mut side = Side::connect(name)?;
+    side.send(&[0x01])
+        .map_err(|e| format!("ready: {}", err_name(&e)))?;
+    expect_death(&mut side)
+}
+
 /// Держать сессию до ухода пира (кадры игнорируются).
 fn hold(side: &mut Side) -> Result<(), String> {
     until_gone(side, |_, _, _| Ok(())).map(drop)
@@ -710,6 +730,38 @@ fn fill_wait(side: &Side, args: &Args) -> Result<(), String> {
     } else {
         Err(format!("expected {}", args.expect))
     }
+}
+
+/// Клиент сам ведёт эхо: `n` кадров по генератору (`seed`, `size`), на
+/// каждый -- ответ XOR пира, усечённый до предела направления ответа; затем
+/// уход (Drop). Подключение без повтора `AlreadyConnected`: claim
+/// предыдущего клиента канала обязан быть уже снят.
+fn client_ping(name: &str, args: &Args) -> Result<(), String> {
+    let mut side = Side::connect(name)?;
+    let rx_max = match &side {
+        Side::Client(c) => c.layout().server_to_client.max_message_size,
+        Side::Server(_) => return Err("side".to_owned()),
+    };
+    let mut lengths = payload::Lengths::new(args.seed, args.size.unwrap_or(65_535));
+    let mut buf = Vec::new();
+    for k in 0..args.n {
+        let frame = payload::frame(k, lengths.next_len());
+        side.send(&frame)
+            .map_err(|e| format!("send {k}: {}", err_name(&e)))?;
+        let len = match side.recv(&mut buf) {
+            Ok(len) => len,
+            Err(Ended::Gone(r)) => return Err(format!("gone at {k}: {}", reason_name(r))),
+            Err(Ended::Failed(e)) => return Err(format!("recv {k}: {}", err_name(&e))),
+        };
+        let reply = buf.get(..len).ok_or("bad length")?;
+        let want = xor_reply(&frame, rx_max);
+        if reply != want.as_slice() {
+            return Err(format!("echo {k}: wrong"));
+        }
+    }
+    out(&format!("INFO pinged={}", args.n));
+    drop(side);
+    Ok(())
 }
 
 /// Клиент, умерший со стоящей заявкой: рукопожатие в потоке (сервер не
@@ -931,7 +983,19 @@ fn multi_client(name: &str, args: &Args) -> Result<(), String> {
     }
     if ping {
         out(&format!("INFO pinged={}", args.count));
-        thread::sleep(Duration::from_millis(args.hold));
+        if args.release.is_empty() {
+            thread::sleep(Duration::from_millis(args.hold));
+        } else {
+            // Сессии держатся, пока оркестратор не взведёт маяк: без
+            // зависимости от времени.
+            let beacon =
+                Beacon::open(&args.release).map_err(|e| format!("release: {}", err_name(&e)))?;
+            match beacon.wait(Some(SELF_TIMEOUT)) {
+                Ok(true) => {}
+                Ok(false) => return Err("release: timeout".to_owned()),
+                Err(e) => return Err(format!("release: {}", err_name(&e))),
+            }
+        }
     }
     for client in &clients {
         client.stop();
@@ -1078,7 +1142,7 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "server-die" => die(&Side::serve(name, args.layout)?),
         "client-die" => die(&Side::connect(name)?),
         "server-expect-death" => expect_death(&mut Side::serve(name, args.layout)?),
-        "client-expect-death" => expect_death(&mut Side::connect(name)?),
+        "client-expect-death" => client_expect_death(name),
         "server-hold" => hold(&mut Side::serve(name, args.layout)?),
         "client-hold" => hold(&mut Side::connect(name)?),
         "client-expect-busy" => client_expect_err(name, "AlreadyConnected"),
@@ -1091,6 +1155,7 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "server-fill-wait" => fill_wait(&Side::serve(name, args.layout)?, args),
         "client-fill-wait" => fill_wait(&Side::connect(name)?, args),
         "client-hello-die" => client_hello_die(name),
+        "client-ping" => client_ping(name, args),
         "multi-server" => multi_server(name, args),
         "multi-client" => multi_client(name, args),
         other => Err(format!("unknown scenario {other}")),
