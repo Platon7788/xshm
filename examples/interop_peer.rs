@@ -27,7 +27,9 @@
 //! `count=<k>` (клиентов `multi-client`, 1), `ends=<k>` (отключений до
 //! конца сценария Multi), `kick=<слот>` (`multi-server`), `frames=<k>` (10),
 //! `release=<имя>` (маяк `<имя>_beacon`, которого `multi-client mode=ping`
-//! ждёт перед остановкой; без него -- `hold=<мс>`, 0).
+//! ждёт перед остановкой; без него -- `hold=<мс>`, 0), `max_clients=<k>`
+//! (`dispatch-server`, 64), `name=<s>` (имя регистрации `dispatch-client`,
+//! `rust`).
 //!
 //! Сценарии (`server-*` -- `SharedServer`, ждёт клиента после `READY`;
 //! `client-*` -- `SharedClient`, повторяет подключение, пока канала нет):
@@ -73,7 +75,18 @@
 //!   кадры сервера, конец -- `ends` отключений (по умолчанию `count`);
 //!   `ping` -- `frames` кадров длины 16 от каждого и их эхо (`INFO
 //!   pinged=<k>`), затем сессии держатся до взвода маяка `release` (или
-//!   `hold` мс) и остановка.
+//!   `hold` мс) и остановка;
+//! - `dispatch-server max_clients=<k> ends=<e>` -- `DispatchServer` (лобби
+//!   `DEFAULT_LOBBY_LAYOUT`), эхо XOR `0x5A`, `INFO connect=<id>:<имя>:<pid>`,
+//!   `INFO disconnect=<id>:<причина>`, `INFO err=<вариант>` (`on_error`,
+//!   например отказ по `max_clients`); конец -- `e` отключений (1);
+//! - `dispatch-client name=<s> count=<k> mode=ping|echo` -- `k` экземпляров
+//!   `DispatchClient`, регистрирующихся одновременно; `INFO channel=<id>:<канал>`;
+//!   `ping` -- `frames` кадров длины 16 от каждого и их эхо (`INFO
+//!   pinged=<k>`), затем уход; `echo` -- ответ XOR на кадры сервера до
+//!   `ends` разрывов (`INFO reason=`); `expect=<вариант>` -- регистрация
+//!   обязана провалиться этой ошибкой (`INFO err=`; отказ лобби --
+//!   `HandshakeFailed`).
 //!
 //! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
 //! перед `INFO sent=`.
@@ -95,8 +108,10 @@ use std::time::{Duration, Instant};
 
 use xshm::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ChannelConfig, ChannelKind,
-    ChannelLayout, DisconnectReason, MultiClient, MultiClientHandler, MultiClientOptions,
-    MultiHandler, MultiOptions, MultiServer, RingConfig, SharedClient, SharedServer, ShmError,
+    ChannelLayout, ClientRegistration, DisconnectReason, DispatchClient, DispatchClientHandler,
+    DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer, MultiClient,
+    MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer, RingConfig,
+    SharedClient, SharedServer, ShmError,
 };
 
 /// Жёсткий самотаймаут пира: оркестратор не должен ждать зависший пир.
@@ -226,6 +241,8 @@ struct Args {
     frames: u32,
     hold: u64,
     release: String,
+    max_clients: usize,
+    cname: String,
 }
 
 /// `<ёмкость>:<сообщений>:<макс. размер>`.
@@ -261,6 +278,8 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
         frames: 10,
         hold: 0,
         release: String::new(),
+        max_clients: DispatchOptions::default().max_clients,
+        cname: "rust".to_owned(),
     };
     for pair in pairs {
         let (key, value) = pair
@@ -284,6 +303,8 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
             "frames" => args.frames = value.parse().map_err(|_| bad())?,
             "hold" => args.hold = value.parse().map_err(|_| bad())?,
             "release" => value.clone_into(&mut args.release),
+            "max_clients" => args.max_clients = value.parse().map_err(|_| bad())?,
+            "name" => value.clone_into(&mut args.cname),
             _ => return Err(format!("unknown key {key}")),
         }
     }
@@ -1011,6 +1032,253 @@ fn multi_client(name: &str, args: &Args) -> Result<(), String> {
 }
 
 // ============================================================================
+// Сценарии Dispatch (DispatchServer / DispatchClient)
+// ============================================================================
+
+/// Обработчик `DispatchServer`: печать подключений, отключений и ошибок,
+/// эхо XOR `0x5A` на кадры клиента.
+struct DispatchEcho {
+    server: OnceLock<Weak<DispatchServer>>,
+    max: usize,
+    ended: mpsc::Sender<()>,
+}
+
+impl DispatchHandler for DispatchEcho {
+    fn on_client_connect(&self, client_id: u32, info: &ClientRegistration) {
+        out(&format!(
+            "INFO connect={client_id}:{}:{}",
+            info.name, info.pid
+        ));
+    }
+
+    fn on_client_disconnect(&self, client_id: u32) {
+        self.on_client_disconnect_reason(client_id, DisconnectReason::Graceful);
+    }
+
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        out(&format!(
+            "INFO disconnect={client_id}:{}",
+            reason_name(reason)
+        ));
+        let _ = self.ended.send(());
+    }
+
+    fn on_message(&self, client_id: u32, data: &[u8]) {
+        if let Some(server) = self.server.get().and_then(Weak::upgrade)
+            && let Err(e) = server.send_to(client_id, &xor_reply(data, self.max))
+        {
+            out(&format!("INFO err={}", err_name(&e)));
+        }
+    }
+
+    fn on_error(&self, _client_id: Option<u32>, err: ShmError) {
+        out(&format!("INFO err={}", err_name(&err)));
+    }
+}
+
+/// `DispatchServer` с лобби по умолчанию (16 КиБ) и `max_clients`; эхо до
+/// `ends` отключений клиентов (по умолчанию 1).
+fn dispatch_server(name: &str, args: &Args) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let options = DispatchOptions {
+        max_clients: args.max_clients,
+        ..DispatchOptions::default()
+    };
+    let handler = Arc::new(DispatchEcho {
+        server: OnceLock::new(),
+        max: options.channel_layout.server_to_client.max_message_size,
+        ended: tx,
+    });
+    let dyn_handler: Arc<dyn DispatchHandler> = handler.clone();
+    let server = DispatchServer::start(name, dyn_handler, options)
+        .map_err(|e| format!("start: {}", err_name(&e)))?;
+    drop(handler.server.set(Arc::downgrade(&server)));
+    out("READY");
+    for _ in 0..args.ends.unwrap_or(1) {
+        rx.recv().map_err(|_| "handler gone".to_owned())?;
+    }
+    server.stop();
+    Ok(())
+}
+
+/// Событие клиента Dispatch для `main`.
+enum DispatchEvent {
+    /// Экземпляр `i` поднял свой канал.
+    Connected(usize),
+    /// Экземпляр получил эхо всех своих кадров (`ping`).
+    Pinged,
+    /// Канал экземпляра разорван.
+    Ended,
+}
+
+/// Обработчик одного `DispatchClient`: `echo` -- ответ XOR на кадры
+/// сервера; `ping` -- сверка эха своих кадров.
+struct DispatchClientEcho {
+    index: usize,
+    client: OnceLock<Weak<DispatchClient>>,
+    ping: bool,
+    frames: u32,
+    replies: std::sync::atomic::AtomicU32,
+    events: mpsc::Sender<DispatchEvent>,
+}
+
+impl DispatchClientHandler for DispatchClientEcho {
+    fn on_connect(&self, client_id: u32, channel_name: &str) {
+        out(&format!("INFO channel={client_id}:{channel_name}"));
+        let _ = self.events.send(DispatchEvent::Connected(self.index));
+    }
+
+    fn on_disconnect(&self) {}
+
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        out(&format!("INFO reason={}", reason_name(reason)));
+        let _ = self.events.send(DispatchEvent::Ended);
+    }
+
+    fn on_message(&self, data: &[u8]) {
+        if self.ping {
+            let k = self
+                .replies
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let want: Vec<u8> = payload::frame(k, PING_LEN)
+                .iter()
+                .map(|b| b ^ 0x5A)
+                .collect();
+            if data != want.as_slice() {
+                out(&format!("INFO err=echo{k}"));
+            } else if k + 1 == self.frames {
+                let _ = self.events.send(DispatchEvent::Pinged);
+            }
+            return;
+        }
+        if let Some(client) = self.client.get().and_then(Weak::upgrade)
+            && let Err(e) = client.send(&xor_reply(data, data.len()))
+        {
+            out(&format!("INFO err={}", err_name(&e)));
+        }
+    }
+
+    fn on_error(&self, err: ShmError) {
+        out(&format!("INFO err={}", err_name(&err)));
+    }
+}
+
+/// Как регистрируется экземпляр клиента Dispatch.
+#[derive(Clone)]
+struct DispatchPlan {
+    cname: String,
+    frames: u32,
+    ping: bool,
+}
+
+/// Один `DispatchClient` (регистрация `ClientRegistration` своего PID).
+fn dispatch_connect(
+    lobby: &str,
+    plan: DispatchPlan,
+    index: usize,
+    events: mpsc::Sender<DispatchEvent>,
+) -> Result<Arc<DispatchClient>, ShmError> {
+    let handler = Arc::new(DispatchClientEcho {
+        index,
+        client: OnceLock::new(),
+        ping: plan.ping,
+        frames: plan.frames,
+        replies: std::sync::atomic::AtomicU32::new(0),
+        events,
+    });
+    let dyn_handler: Arc<dyn DispatchClientHandler> = handler.clone();
+    let registration = ClientRegistration::new(std::process::id(), 1, plan.cname);
+    let client = Arc::new(DispatchClient::connect(
+        lobby,
+        registration,
+        dyn_handler,
+        DispatchClientOptions::default(),
+    )?);
+    drop(handler.client.set(Arc::downgrade(&client)));
+    Ok(client)
+}
+
+/// `count` экземпляров `DispatchClient`, регистрирующихся одновременно (по
+/// потоку на экземпляр). `ping` (по умолчанию): `frames` кадров длины 16 от
+/// каждого после подъёма канала и их эхо (`INFO pinged=<k>`), затем уход;
+/// `echo`: ответ XOR на кадры сервера до `ends` разрывов. `expect=<вариант>`
+/// -- регистрация обязана провалиться этой ошибкой (`INFO err=`; отказ
+/// сервера -- `HandshakeFailed`).
+fn dispatch_client(lobby: &str, args: &Args) -> Result<(), String> {
+    let ping = match args.mode.as_str() {
+        "" | "ping" => true,
+        "echo" => false,
+        other => return Err(format!("mode {other}")),
+    };
+    let plan = DispatchPlan {
+        cname: args.cname.clone(),
+        frames: args.frames,
+        ping,
+    };
+    let (tx, rx) = mpsc::channel();
+    if !args.expect.is_empty() {
+        return match dispatch_connect(lobby, plan, 0, tx) {
+            Ok(_) => Err("registered".to_owned()),
+            Err(e) => {
+                out(&format!("INFO err={}", err_name(&e)));
+                if err_name(&e) == args.expect {
+                    Ok(())
+                } else {
+                    Err(format!("expected {}", args.expect))
+                }
+            }
+        };
+    }
+    let count = args.count as usize;
+    let threads: Vec<_> = (0..count)
+        .map(|index| {
+            let (lobby, plan, events) = (lobby.to_owned(), plan.clone(), tx.clone());
+            thread::spawn(move || dispatch_connect(&lobby, plan, index, events))
+        })
+        .collect();
+    drop(tx);
+    let mut clients = Vec::with_capacity(count);
+    for handle in threads {
+        let client = handle
+            .join()
+            .map_err(|_| "client thread panicked".to_owned())?
+            .map_err(|e| format!("connect: {}", err_name(&e)))?;
+        clients.push(client);
+    }
+    let want = if ping {
+        count
+    } else {
+        args.ends.map_or(count, |e| e as usize)
+    };
+    let (mut connected, mut seen) = (0, 0);
+    while connected < count || seen < want {
+        match rx.recv().map_err(|_| "handler gone".to_owned())? {
+            DispatchEvent::Connected(i) => {
+                connected += 1;
+                if ping && let Some(client) = clients.get(i) {
+                    for k in 0..args.frames {
+                        client
+                            .send(&payload::frame(k, PING_LEN))
+                            .map_err(|e| format!("ping {k}: {}", err_name(&e)))?;
+                    }
+                }
+            }
+            DispatchEvent::Pinged if ping => seen += 1,
+            DispatchEvent::Ended if !ping => seen += 1,
+            DispatchEvent::Ended => return Err("disconnected before the echo".to_owned()),
+            DispatchEvent::Pinged => {}
+        }
+    }
+    if ping {
+        out(&format!("INFO pinged={count}"));
+    }
+    for client in &clients {
+        client.stop();
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Сценарии Auto (AutoServer / AutoClient)
 // ============================================================================
 
@@ -1165,6 +1433,8 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "client-ping" => client_ping(name, args),
         "multi-server" => multi_server(name, args),
         "multi-client" => multi_client(name, args),
+        "dispatch-server" => dispatch_server(name, args),
+        "dispatch-client" => dispatch_client(name, args),
         other => Err(format!("unknown scenario {other}")),
     }
 }
