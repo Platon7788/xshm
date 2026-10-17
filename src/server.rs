@@ -36,6 +36,8 @@ pub(crate) enum HandshakePoint {
     AfterCommit,
     /// S2: заявка признана заявкой умершего, перед перепроверкой claim и CAS.
     BeforeDeadWithdraw,
+    /// S2: CAS `CLIENT_HELLO -> IDLE` удался, claim умершего ещё не снят.
+    AfterDeadWithdraw,
 }
 
 /// Тесты: хук рукопожатия -- получает отображение сервера.
@@ -689,6 +691,24 @@ impl SharedServer {
         if holder_dead
             && (claim == CLAIM_FREE || control.slot_claim.load(Ordering::Acquire) == claim)
         {
+            // Fix round 2: самоописание и заголовки умершего обнуляются ДО
+            // CAS, который делает `IDLE` видимым. После CAS (claim умершего
+            // ещё стоит) клиент лобби с брошенным мьютексом вправе
+            // перехватить claim и записать своё самоописание (C2/C5) --
+            // обнуление после CAS затёрло бы его, и его сессия осталась бы
+            // без наблюдения. До CAS писать сюда некому: заявка умершего
+            // стоит (C6 и перехват невозможны), claim по перепроверке -- его
+            // (I3), сам он мёртв. CAS не удался (заявки уже нет) -- обнулены
+            // всё равно только поля умершего.
+            control.client_pid.store(0, Ordering::Release);
+            control.announce_client_start(0);
+            let (header_a, header_b) = self.view.headers();
+            header_a
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+            header_b
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
             if control
                 .client_state
                 .compare_exchange(
@@ -699,15 +719,8 @@ impl SharedServer {
                 )
                 .is_ok()
             {
-                control.client_pid.store(0, Ordering::Release);
-                control.announce_client_start(0);
-                let (header_a, header_b) = self.view.headers();
-                header_a
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
-                header_b
-                    .handshake_state
-                    .store(HANDSHAKE_IDLE, Ordering::Release);
+                #[cfg(test)]
+                handshake_hook(&self.view, HandshakePoint::AfterDeadWithdraw);
                 // Claim -- последним: пока он стоит, новой заявки нет.
                 if claim != CLAIM_FREE {
                     let _ = control.slot_claim.compare_exchange(
@@ -1727,6 +1740,48 @@ mod handshake_tests {
             AckWait::Accepted
         ));
         let client = a.finish();
+        assert_eq!(server.session_claim(), client.claim());
+    }
+
+    /// Fix round 2: окно S2 между CAS `HELLO -> IDLE` и снятием claim-а
+    /// умершего. Клиент лобби с брошенным мьютексом видит `IDLE` и
+    /// перехватывает claim (`TakeOverAbandoned`), записывая своё
+    /// самоописание; сервер не должен его затереть -- обнуление полей
+    /// умершего идёт ДО CAS. Затем сервер принимает перехватившего и
+    /// наблюдает его процесс.
+    #[test]
+    fn dead_hello_withdrawal_does_not_clobber_takeover() {
+        let name = unique("DEADTAKEOVER");
+        let mut server = SharedServer::start(&name).unwrap();
+        let dead = dead_process();
+        post_foreign_hello(&server, dead, dead);
+        let slot: Rc<RefCell<Option<Hello>>> = Rc::default();
+        let (n_slot, n_name) = (slot.clone(), name);
+        set_hook(HandshakePoint::AfterDeadWithdraw, move |_| {
+            let n = Hello::post(None, &n_name, true, ClaimMode::TakeOverAbandoned).unwrap();
+            *n_slot.borrow_mut() = Some(n);
+        });
+        assert_eq!(server.complete_handshake(), Err(ShmError::HandshakeFailed));
+        let n = slot.borrow_mut().take().expect("перехват не состоялся");
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), n.claim());
+        assert_eq!(
+            control.client_pid.load(Ordering::Acquire),
+            std::process::id(),
+            "самоописание перехватившего затёрто"
+        );
+        assert_ne!(control.client_start_time(), 0);
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_CLIENT_HELLO
+        );
+        assert_eq!(server.complete_handshake(), Ok(()));
+        assert_eq!(server.peer_pid(), Some(std::process::id()));
+        assert!(matches!(
+            n.wait_ack(Duration::from_secs(1), None),
+            AckWait::Accepted
+        ));
+        let client = n.finish();
         assert_eq!(server.session_claim(), client.claim());
     }
 

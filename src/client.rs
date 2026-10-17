@@ -578,6 +578,12 @@ impl Hello {
         Ok(hello)
     }
 
+    /// Тесты: токен claim-а заявки.
+    #[cfg(test)]
+    pub(crate) const fn claim(&self) -> u32 {
+        self.claim
+    }
+
     /// Сигнал `S2C_CONNECT` -- ответ на эту заявку (C10).
     fn accepted(&self) -> bool {
         accepted_on_signal(&self.view, self.generation_before)

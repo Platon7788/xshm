@@ -939,7 +939,8 @@ fn run_storm(tag: &str, mode: StormMode) {
     const CLIENTS: u64 = 8;
     const SEED: u64 = 0x5EED_0018_5708_0001;
     const HANG: Duration = Duration::from_secs(5);
-    /// Общий предел шторма с повтором (в debug -- около 60 с с запасом).
+    /// Общий предел шторма (с большим запасом: шторм с повтором в debug
+    /// занимает около 2,4–2,7 с, без повтора -- меньше 1 с).
     const OVERALL: Duration = Duration::from_secs(120);
     let name = unique(tag);
     let probe = Arc::new(StormProbe::default());

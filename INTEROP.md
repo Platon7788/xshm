@@ -701,7 +701,11 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    Перехват при стоящем `HELLO` затёр бы в C2/C5 самоописание и
    `slot_owner_pid` умершего, после чего S2 его заявку уже не снял бы, а
    сервер зафиксировал бы ненаблюдаемую сессию мёртвого клиента до
-   `lobby_timeout`. Без перехвата лобби отказывает до дедлайна протухшего
+   `lobby_timeout`. `IDLE` при ещё стоящем claim умершего бывает и в окне S2
+   (сервер снял заявку, claim ещё не снят): перехват там допустим, потому что
+   сервер ОБЯЗАН обнулить самоописание умершего **до** CAS `CLIENT_HELLO →
+   IDLE` (шаг 4, S2) — после CAS он полей не трогает, и записанное
+   перехватившим в C2/C5 не затирается. Без перехвата лобби отказывает до дедлайна протухшего
    захвата (`RESERVE_TIMEOUT` = 10 с, длиннее `lobby_timeout`).
 3a. **Клиент** (`SharedClient::connect_impl` → `Hello::post`,
    `src/client.rs`; ревизия 3 — R15, R18; `T` — свой токен, §i.1) строго по
@@ -773,10 +777,13 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
      могли устареть — прежний клиент отозвал заявку, освободил claim и умер,
      а живой следующий уже поставил свою. Claim сменился — S2 пропустить,
      рукопожатие идёт дальше (S3–S7, S6 наблюдает процесс нового клиента).
-     Claim прежний (пока он стоит, новой заявки нет) → `CAS client_state:
-     CLIENT_HELLO → IDLE`; удался — `client_pid = 0`, `client_start = 0`,
-     заголовки `IDLE`, затем при `T ≠ 0` `CAS slot_claim: T → 0`. Итог —
-     `HandshakeFailed` **без** смены `generation` и без `S2C_CONNECT`;
+     Claim прежний (пока он стоит, новой заявки нет) → `client_pid = 0`,
+     `client_start = 0`, заголовки `IDLE` — **до** CAS (fix round 2: после
+     CAS, пока claim умершего ещё стоит, его вправе перехватить клиент лобби
+     с брошенным мьютексом, шаг 3, и обнуление после CAS затёрло бы его
+     самоописание) → `CAS client_state: CLIENT_HELLO → IDLE` → удался — при
+     `T ≠ 0` `CAS slot_claim: T → 0`. Итог — `HandshakeFailed` **без** смены
+     `generation` и без `S2C_CONNECT`;
    - **S3:** сброс обоих заголовков колец с `new = generation + 1` →
      `generation = new` (Release) → `handshake_state = SERVER_READY` в
      заголовки → `server_state = SERVER_READY` (Release);
@@ -1249,7 +1256,8 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
     withdraw_hello_loses_only_to_a_committed_handshake, takeover_only_from_idle}`;
     сервер — `server::handshake_tests::{inflight_aba_accepts_by_ready,
     fast_leaver_disconnect_not_eaten, dead_hello_withdrawn_before_commit,
-    dead_hello_withdrawal_rechecks_claim, dead_hello_of_other_pid_not_withdrawn,
+    dead_hello_withdrawal_rechecks_claim, dead_hello_withdrawal_does_not_clobber_takeover,
+    dead_hello_of_other_pid_not_withdrawn,
     stale_claim_reclaimed_on_nudge_only}`;
     совместимость — `peer_tests::{legacy_client_without_claim_connects,
     client_with_forged_start_time_is_reported_dead}`; Auto/Dispatch/Multi —
@@ -1735,13 +1743,13 @@ R1–R17), §g (фактический прогон).
 | 28.3 | C10: принятие | `S2C_CONNECT` при `generation != g0` | `S2C_CONNECT` при `client_state == SERVER_READY` или `IDLE` и `generation != g0`; при `CLIENT_HELLO` — устаревший при любом `generation` | §d.2 шаг 3a п. 10 |
 | 28.4 | W: отзыв | CAS не удался и `generation != g0` — подключён | CAS не удался: наблюдён `SERVER_READY` — подключён; `IDLE` и `generation != g0` — подключён; иначе откат; откат — затем `CAS T → 0` | §d.2 шаг 3a п. 11 |
 | 28.5 | L: уход клиента | `CAS SERVER_READY → IDLE` и `DISCONNECT` всегда | только при `generation == G` (иначе — ничего); затем всегда `CAS T → 0` **последним** | §d.2 шаг 7, §e.2 п. 5 |
-| 28.6 | S2: заявка умершего | фиксировалась (сессия с мёртвым клиентом) | процесс не открылся, `pid == slot_owner_pid` и подтверждённо ушёл по `client_start` и `owner_start`, а перед CAS `slot_claim` всё ещё `T` (иначе S2 пропускается) — `CAS HELLO → IDLE`, откат полей, `CAS T → 0`, `HandshakeFailed` без `generation` и `S2C_CONNECT` | §d.2 шаг 4 |
+| 28.6 | S2: заявка умершего | фиксировалась (сессия с мёртвым клиентом) | процесс не открылся, `pid == slot_owner_pid` и подтверждённо ушёл по `client_start` и `owner_start`, а перед CAS `slot_claim` всё ещё `T` (иначе S2 пропускается) — обнулить самоописание и заголовки, затем `CAS HELLO → IDLE`, `CAS T → 0`, `HandshakeFailed` без `generation` и `S2C_CONNECT` | §d.2 шаг 4 |
 | 28.7 | S4: сброс `DISCONNECT` | после фиксации, перед `S2C_CONNECT` | **до** фиксации | §d.2 шаг 4, §e.2 п. 4 |
 | 28.8 | S1/S6: самоописание клиента | `swap(client_pid, 0)` и `swap(client_start, 0)` до публикации `generation` | S1 — чтение без потребления; S6 — потребление CAS-ом и claim сессии, только застав владельца в сессии (`client_state == SERVER_READY`), с возвратом при сменившемся claim; иная зафиксированная заявка (ABA) — наблюдать её процесс | §c.1, §d.2 шаг 4 |
 | 28.9 | `mark_disconnected` | состояние `IDLE`, claim не трогался (single-client claim не было) | после сброса состояния: handle процесса клиента сигнален (подтверждённая смерть) — `CAS <claim сессии> → 0`; штатный уход и отключение сервером claim не трогают | R18 |
 | 28.10 | Протухший захват single-client | — | на `CONNECT_REQ` без `HELLO` у неподключённого сервера: первое наблюдение token; не раньше `RESERVE_TIMEOUT` (10 с) от него и без `HELLO` — `CAS token → 0`; без таймера | §i.3, §e.5 |
 | 28.11 | Токен claim-а | Multi: `RandomState` на вызов, внутри процесса мог повториться (2⁻³² на пару) | общий генератор `fmix32(seed + n)` (уникален в процессе) | §i.1 |
-| 28.12 | Лобби: мьютекс достался брошенным | — | ЖЕЛАТЕЛЬНО перехватить claim умершего держателя: `CAS c → T` после проигранного `CAS 0 → T`, только при `client_state == IDLE` (стоящую заявку/сессию умершего разбирает сервер) | §d.2 шаг 3 |
+| 28.12 | Лобби: мьютекс достался брошенным | — | ЖЕЛАТЕЛЬНО перехватить claim умершего держателя: `CAS c → T` после проигранного `CAS 0 → T`, только при `client_state == IDLE` (стоящую заявку/сессию умершего разбирает сервер); сервер в S2 обнуляет самоописание умершего **до** CAS `HELLO → IDLE`, поэтому перехват в окне «заявка снята, claim ещё стоит» безопасен | §d.2 шаги 3–4 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации
