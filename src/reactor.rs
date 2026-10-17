@@ -52,13 +52,46 @@
 //! или `Drop` возможно **не более одного** уже начатого пробуждения --
 //! контракт `Waker` допускает ложные пробуждения. Ждать его в `Drop` нельзя:
 //! `Drop` из самого `Waker` на потоке `xsr` зависал бы навсегда.
+//!
+//! # Пул пакетов
+//!
+//! Пакет ожидания -- объект ядра. Создавать его на каждую регистрацию
+//! (`recv_async`/`send_async` регистрируются на каждом `Pending`) -- лишние
+//! системные вызовы и, главное, лишний режим отказа посреди живой сессии:
+//! под давлением ресурсов (`STATUS_INSUFFICIENT_RESOURCES`, квота handle-ов)
+//! `NtCreateWaitCompletionPacket` отказывает, хотя само ожидание возможно.
+//! Поэтому снятые пакеты возвращаются в пул таблицы и переиспользуются:
+//! в установившемся режиме регистрация не создаёт объектов ядра, отказ
+//! создания возможен только при росте числа одновременных регистраций.
+//!
+//! В пул попадает только **заведомо простаивающий** пакет -- не привязанный
+//! и не стоящий в очереди порта:
+//! - извлечённый реактором из порта и доставленный (`process`);
+//! - снятый отменой с «чистым» кодом (`WaitPacket::cancel_for_reuse`):
+//!   `STATUS_SUCCESS` (ожидание снято до сигнала), `STATUS_PENDING` ->
+//!   `STATUS_SUCCESS` (вынут из очереди), `STATUS_CANCELLED` (уже извлечён
+//!   из порта -- в том числе реактором, который ещё не дошёл до таблицы);
+//! - не привязавшийся (отказ `NtAssociateWaitCompletionPacket`).
+//!
+//! Любой иной код отмены (невозможен при живом дескрипторе) -- пакет
+//! закрывается, а не переиспользуется. Завершение, уже извлечённое
+//! реактором, но ещё не обработанное, несёт ключ прежней регистрации
+//! (индекс слота, старое поколение): переиспользованный пакет привязан с
+//! новым ключом, и это завершение отбрасывается как устаревшее (тест
+//! `pooled_packet_is_clean_after_every_outcome`). В порт реактора пишет
+//! только ядро по привязкам: чужих `NtSetIoCompletion` с живым ключом нет,
+//! поэтому завершение с живым ключом -- всегда завершение пакета этой
+//! записи. Пул ограничен [`POOL_LIMIT`]: сверх предела пакеты закрываются,
+//! удерживаемые handle-ы ограничены. Закрытие и пробуждение -- вне
+//! блокировки таблицы; пакеты пачки возвращаются в пул за тот же захват
+//! блокировки, в котором снимаются записи.
 
 use std::mem::MaybeUninit;
 use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 #[cfg(test)]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::task::Waker;
 use std::thread;
@@ -84,6 +117,11 @@ const BATCH_LEN: usize = BATCH as usize;
 /// возможен только при негодном handle порта, а порт живёт до конца
 /// процесса, -- страховка от горячего цикла, а не рабочий путь.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Максимум простаивающих пакетов ожидания в пуле реактора (см. «Пул
+/// пакетов»): ограничивает удерживаемые handle-ы; сверх предела снятые
+/// пакеты закрываются.
+const POOL_LIMIT: usize = 64;
 
 // ============================================================================
 // Порт завершения
@@ -358,27 +396,46 @@ impl WaitPacket {
     /// FALSE` различает «не сработало» / «сработало, в очереди» / «уже
     /// извлечено»; во втором случае `TRUE` вынимает пакет из очереди.
     pub(crate) fn cancel(&self) -> CancelOutcome {
-        match self.cancel_raw(false) {
-            STATUS_SUCCESS => CancelOutcome::NotFired,
-            STATUS_PENDING => match self.cancel_raw(true) {
-                // Между шагами пакет успел извлечь владелец порта.
-                STATUS_CANCELLED => CancelOutcome::AlreadyDelivered,
-                // `STATUS_SUCCESS`: вынут из очереди. Иной код невозможен
-                // при живом дескрипторе -- считаем сигнал потреблённым,
-                // а доставку несостоявшейся: недоставленный пакет придёт
-                // и будет отброшен по ключу.
-                _ => CancelOutcome::FiredNotDelivered,
-            },
-            // `STATUS_CANCELLED` (уже извлечён / не привязывался); иной код
-            // невозможен при живом дескрипторе.
-            _ => CancelOutcome::AlreadyDelivered,
-        }
+        self.cancel_for_reuse().0
+    }
+
+    /// [`cancel`](Self::cancel) и признак «пакет чист»: `true` -- после
+    /// отмены пакет не привязан и не стоит в очереди порта, его можно
+    /// привязать снова (пул реактора, привязка Multi). `false` -- код
+    /// отмены неожиданный: пакет закрывают, а не переиспользуют.
+    pub(crate) fn cancel_for_reuse(&self) -> (CancelOutcome, bool) {
+        classify_cancel(self.cancel_raw(false), || self.cancel_raw(true))
     }
 
     /// Один вызов `NtCancelWaitCompletionPacket`.
     fn cancel_raw(&self, remove_signaled: bool) -> NTSTATUS {
         // SAFETY: дескриптор пакета жив, пока жив `self`.
         unsafe { NtCancelWaitCompletionPacket(self.handle.raw(), u8::from(remove_signaled)) }
+    }
+}
+
+/// Коды двухшаговой отмены -> (исход, пакет чист). `second` -- второй шаг
+/// (`RemoveSignaledPacket = TRUE`), вызывается только после
+/// `STATUS_PENDING` первого.
+fn classify_cancel(first: NTSTATUS, second: impl FnOnce() -> NTSTATUS) -> (CancelOutcome, bool) {
+    match first {
+        // Ожидание снято до сигнала.
+        STATUS_SUCCESS => (CancelOutcome::NotFired, true),
+        STATUS_PENDING => match second() {
+            // Вынут из очереди.
+            STATUS_SUCCESS => (CancelOutcome::FiredNotDelivered, true),
+            // Между шагами пакет успел извлечь владелец порта.
+            STATUS_CANCELLED => (CancelOutcome::AlreadyDelivered, true),
+            // Иной код невозможен при живом дескрипторе: сигнал считаем
+            // потреблённым, доставку несостоявшейся (недоставленный пакет
+            // придёт и будет отброшен по ключу), а пакет -- «грязным».
+            _ => (CancelOutcome::FiredNotDelivered, false),
+        },
+        // Уже извлечён / не привязывался.
+        STATUS_CANCELLED => (CancelOutcome::AlreadyDelivered, true),
+        // Иной код невозможен при живом дескрипторе; состояние пакета
+        // неизвестно -- не переиспользовать.
+        _ => (CancelOutcome::AlreadyDelivered, false),
     }
 }
 
@@ -408,14 +465,48 @@ struct Slot {
     entry: Option<Entry>,
 }
 
-/// Таблица регистраций: слоты + список свободных.
+/// Таблица регистраций: слоты + список свободных + пул простаивающих
+/// пакетов (см. «Пул пакетов»).
 #[derive(Debug, Default)]
 struct Table {
     slots: Vec<Slot>,
     free: Vec<usize>,
+    /// Не привязанные и не стоящие в очереди порта пакеты, не больше
+    /// [`POOL_LIMIT`].
+    pool: Vec<WaitPacket>,
+}
+
+/// Снятое потоком реактора за пачку -- разбирается вне блокировки.
+#[derive(Debug, Default)]
+struct Spent {
+    /// Кого будить.
+    wakers: Vec<Waker>,
+    /// Пакеты сверх [`POOL_LIMIT`] -- закрыть.
+    closing: Vec<WaitPacket>,
+}
+
+impl Spent {
+    /// Пустой разбор под пачку `BATCH_LEN`.
+    fn with_batch_capacity() -> Self {
+        Self {
+            wakers: Vec::with_capacity(BATCH_LEN),
+            closing: Vec::with_capacity(BATCH_LEN),
+        }
+    }
 }
 
 impl Table {
+    /// Вернуть простаивающий пакет в пул; сверх [`POOL_LIMIT`] -- пакет
+    /// возвращается вызывающему, чтобы тот закрыл его вне блокировки.
+    fn recycle(&mut self, packet: WaitPacket) -> Option<WaitPacket> {
+        if self.pool.len() < POOL_LIMIT {
+            self.pool.push(packet);
+            None
+        } else {
+            Some(packet)
+        }
+    }
+
     /// Живая запись слота `index` поколения `generation`.
     fn entry_mut(&mut self, index: usize, generation: usize) -> Option<&mut Entry> {
         let slot = self.slots.get_mut(index)?;
@@ -456,6 +547,13 @@ pub(crate) struct Reactor {
     /// Отброшенные устаревшие пакеты (слот снят или переиспользован).
     #[cfg(test)]
     stale: AtomicU64,
+    /// Созданные `register`-ом пакеты (доказательство пула).
+    #[cfg(test)]
+    packets_created: AtomicU64,
+    /// Инъекция отказа создания пакета (`register`) -- у своего
+    /// экземпляра, чтобы не задевать параллельные тесты.
+    #[cfg(test)]
+    fail_create: AtomicBool,
 }
 
 /// Общий реактор процесса.
@@ -487,6 +585,10 @@ impl Reactor {
             table: Mutex::new(Table::default()),
             #[cfg(test)]
             stale: AtomicU64::new(0),
+            #[cfg(test)]
+            packets_created: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_create: AtomicBool::new(false),
         })
     }
 
@@ -531,11 +633,25 @@ impl Reactor {
     /// потребляет (в т.ч. уже взведённого -- тогда `waker` будится сразу,
     /// ровно один раз). Закрытый или негодный `handle` -- `Err`
     /// (`WindowsError`, контекст `NtAssociateWaitCompletionPacket`).
+    ///
+    /// Пакет берётся из пула (см. «Пул пакетов»); пул пуст -- создаётся.
+    /// Отказ создания (`NtCreateWaitCompletionPacket`) -- `Err`, таблица и
+    /// сигнал объекта не тронуты.
     pub(crate) fn register(&'static self, handle: isize, waker: Waker) -> Result<Registration> {
-        // Пакет создаём вне блокировки; привязываем -- под ней: пакет может
-        // прийти сразу, и поток реактора обязан найти запись в таблице.
-        let mut packet = WaitPacket::new()?;
+        // Пакет из пула -- под блокировкой; новый создаём вне её. Привязка
+        // -- под блокировкой: пакет может прийти сразу, и поток реактора
+        // обязан найти запись в таблице.
         let mut table = self.table.lock_clean();
+        let pooled = table.pool.pop();
+        let mut packet = match pooled {
+            Some(packet) => packet,
+            None => {
+                drop(table);
+                let packet = self.new_packet()?;
+                table = self.table.lock_clean();
+                packet
+            }
+        };
         let index = table.free.pop().unwrap_or(table.slots.len());
         if index == table.slots.len() {
             table.slots.push(Slot::default());
@@ -548,9 +664,11 @@ impl Reactor {
             .arm(&mut packet, raw_handle(handle), index, generation)
         {
             // Привязки не было -- пакета с этим ключом в порту нет,
-            // поколение менять незачем.
+            // поколение менять незачем; непривязанный пакет чист -- в пул.
             table.free.push(index);
+            let overflow = table.recycle(packet);
             drop(table);
+            drop(overflow);
             return Err(err);
         }
         table.slots[index].entry = Some(Entry { waker, packet });
@@ -562,27 +680,53 @@ impl Reactor {
         })
     }
 
+    /// Новый пакет для регистрации (в тестах -- со счётчиком и инъекцией
+    /// отказа).
+    fn new_packet(&self) -> Result<WaitPacket> {
+        #[cfg(test)]
+        {
+            /// `STATUS_INSUFFICIENT_RESOURCES` -- типичный отказ под давлением.
+            const INJECTED: NTSTATUS = 0xC000_009A_u32.cast_signed();
+            // Relaxed: тестовые флаг и статистика, ничего не публикуют.
+            if self.fail_create.load(Ordering::Relaxed) {
+                return Err(status_to_error(INJECTED, "NtCreateWaitCompletionPacket"));
+            }
+            self.packets_created.fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(test))]
+        let _ = self;
+        WaitPacket::new()
+    }
+
     /// Цикл потока реактора: бесконечное ожидание порта и обработка пачек.
     fn run(&self) {
         let mut batch = Vec::with_capacity(BATCH_LEN);
-        let mut fired = Vec::with_capacity(BATCH_LEN);
+        let mut spent = Spent::with_batch_capacity();
         loop {
             if self.port.wait_batch(&mut batch, None).is_err() {
                 thread::sleep(ERROR_BACKOFF);
                 continue;
             }
-            self.process(&batch, &mut fired);
+            self.process(&batch, &mut spent);
         }
     }
 
-    /// Пачка пакетов -> записи из таблицы (под блокировкой) -> пробуждение
+    /// Пачка пакетов -> записи из таблицы и возврат их пакетов в пул (за
+    /// один захват блокировки) -> пробуждение и закрытие лишних пакетов
     /// (без неё).
-    fn process(&self, batch: &[Completion], fired: &mut Vec<Entry>) {
+    fn process(&self, batch: &[Completion], spent: &mut Spent) {
         {
             let mut table = self.table.lock_clean();
             for completion in batch {
                 match table.take(completion.key, completion.tag) {
-                    Some(entry) => fired.push(entry),
+                    Some(Entry { waker, packet }) => {
+                        spent.wakers.push(waker);
+                        // Завершение с живым ключом -- пакет этой записи
+                        // извлечён из порта: он не привязан и не в очереди.
+                        if let Some(packet) = table.recycle(packet) {
+                            spent.closing.push(packet);
+                        }
+                    }
                     // Устаревший пакет: регистрация уже снята (и, возможно,
                     // слот занят новой) -- отбрасываем.
                     #[cfg(test)]
@@ -595,12 +739,25 @@ impl Reactor {
                 }
             }
         }
-        for Entry { waker, packet } in fired.drain(..) {
+        for waker in spent.wakers.drain(..) {
             // Паника чужого `Waker` не должна убить общий поток.
             drop(catch_unwind(AssertUnwindSafe(|| waker.wake())));
-            // Пакет извлечён -- отмена в `Drop` ничего не найдёт.
-            drop(packet);
         }
+        // Пакеты извлечены -- отмена в `Drop` ничего не найдёт, остаётся
+        // закрыть дескриптор.
+        spent.closing.clear();
+    }
+
+    /// Сколько пакетов создано `register`-ом.
+    #[cfg(test)]
+    fn packets_created(&self) -> u64 {
+        self.packets_created.load(Ordering::Relaxed)
+    }
+
+    /// Сколько пакетов простаивает в пуле.
+    #[cfg(test)]
+    fn pooled(&self) -> usize {
+        self.table.lock_clean().pool.len()
     }
 
     /// Сколько устаревших пакетов отброшено.
@@ -687,14 +844,24 @@ impl Registration {
         // Запись снята нами -- реактор её не найдёт и не разбудит. Пакет,
         // извлечённый им до снятия (`AlreadyDelivered` на уровне пакета),
         // будет отброшен как устаревший: сигнал потреблён, не доставлен.
-        let outcome = match packet.cancel() {
+        let (outcome, clean) = packet.cancel_for_reuse();
+        let outcome = match outcome {
             CancelOutcome::NotFired => CancelOutcome::NotFired,
             CancelOutcome::FiredNotDelivered | CancelOutcome::AlreadyDelivered => {
                 CancelOutcome::FiredNotDelivered
             }
         };
-        // Закрытие пакета и `Drop` `Waker` (код пользователя) -- вне блокировки.
-        drop(packet);
+        // Чистый пакет (не привязан, не в очереди порта; завершение,
+        // извлечённое реактором до снятия записи, несёт старое поколение и
+        // будет отброшено) -- в пул. «Грязный» и лишний сверх предела --
+        // закрыть. Закрытие и `Drop` `Waker` (код пользователя) -- вне
+        // блокировки.
+        let closing = if clean {
+            self.reactor.table.lock_clean().recycle(packet)
+        } else {
+            Some(packet)
+        };
+        drop(closing);
         drop(waker);
         outcome
     }
@@ -1179,12 +1346,12 @@ mod tests {
     /// Один оборот цикла реактора вручную.
     fn turn(reactor: &Reactor) -> usize {
         let mut batch = Vec::new();
-        let mut fired = Vec::new();
+        let mut spent = Spent::default();
         let count = reactor
             .port
             .wait_batch(&mut batch, Some(Duration::from_millis(100)))
             .unwrap();
-        reactor.process(&batch, &mut fired);
+        reactor.process(&batch, &mut spent);
         count
     }
 
@@ -1243,7 +1410,7 @@ mod tests {
             1
         );
         assert_eq!(registration.cancel(), CancelOutcome::FiredNotDelivered);
-        reactor.process(&batch, &mut Vec::new());
+        reactor.process(&batch, &mut Spent::default());
         assert_eq!(reactor.stale_completions(), 1);
         assert_eq!(counter.get(), 0);
     }
@@ -1292,5 +1459,237 @@ mod tests {
                 "событие взведено до отмены"
             );
         }
+    }
+
+    /// Оборот без ожидания: только то, что уже стоит в порту.
+    fn turn_quick(reactor: &Reactor) -> usize {
+        let mut batch = Vec::new();
+        let count = reactor
+            .port
+            .wait_batch(&mut batch, Some(Duration::ZERO))
+            .unwrap();
+        reactor.process(&batch, &mut Spent::default());
+        count
+    }
+
+    /// Пул: в установившемся режиме регистрации не создают пакетов --
+    /// ни после отмены, ни после штатного срабатывания.
+    #[test]
+    fn registrations_reuse_pooled_packets() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        for _ in 0..1000 {
+            let registration = reactor
+                .register(event.raw_handle(), counter.waker())
+                .unwrap();
+            assert_eq!(registration.cancel(), CancelOutcome::NotFired);
+        }
+        assert_eq!(reactor.packets_created(), 1);
+        for round in 1..=1000 {
+            let registration = reactor
+                .register(event.raw_handle(), counter.waker())
+                .unwrap();
+            event.set().unwrap();
+            assert_eq!(turn(reactor), 1);
+            assert_eq!(counter.get(), round, "ровно одно пробуждение");
+            assert!(registration.is_fired());
+            drop(registration);
+        }
+        assert_eq!(turn_quick(reactor), 0, "лишних пакетов в порту нет");
+        assert_eq!(counter.get(), 1000);
+        assert_eq!(reactor.packets_created(), 1);
+        assert_eq!(reactor.stale_completions(), 0);
+    }
+
+    /// Пул ограничен `POOL_LIMIT`: лишние пакеты закрываются -- и при
+    /// отмене, и при пачке срабатываний.
+    #[test]
+    fn pool_is_bounded() {
+        const N: usize = 200;
+        let reactor = manual_reactor();
+        let events: Vec<_> = (0..N)
+            .map(|_| EventHandle::create_unnamed(false).unwrap())
+            .collect();
+        let counter = Counter::new();
+        let register_all = || -> Vec<Registration> {
+            events
+                .iter()
+                .map(|event| {
+                    reactor
+                        .register(event.raw_handle(), counter.waker())
+                        .unwrap()
+                })
+                .collect()
+        };
+        let registrations = register_all();
+        assert_eq!(reactor.packets_created(), 200);
+        for registration in registrations {
+            assert_eq!(registration.cancel(), CancelOutcome::NotFired);
+        }
+        assert_eq!(reactor.pooled(), POOL_LIMIT);
+        assert_eq!(reactor.packets_created(), 200);
+        let registrations = register_all();
+        assert_eq!(reactor.pooled(), 0);
+        assert_eq!(reactor.packets_created(), 400 - POOL_LIMIT as u64);
+        for event in &events {
+            event.set().unwrap();
+        }
+        let mut delivered = 0;
+        while delivered < N {
+            let got = turn(reactor);
+            assert_ne!(got, 0, "доставлено {delivered} из {N}");
+            delivered += got;
+        }
+        assert_eq!(counter.get(), N);
+        assert_eq!(reactor.pooled(), POOL_LIMIT);
+        drop(registrations);
+        assert_eq!(reactor.pooled(), POOL_LIMIT);
+    }
+
+    /// Исход прежней регистрации, после которого её пакет ушёл в пул.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Scenario {
+        /// Отмена до сигнала (`STATUS_SUCCESS`).
+        NotFired,
+        /// Сработала, пакет вынут из очереди отменой (`PENDING` -> `TRUE`).
+        FiredNotDelivered,
+        /// Пакет извлечён реактором до поиска в таблице, отмена сняла
+        /// запись раньше (`STATUS_CANCELLED`): завершение «в полёте».
+        DequeuedBeforeLookup,
+        /// Штатное срабатывание и доставка.
+        Delivered,
+    }
+
+    fn run_scenario(scenario: Scenario) {
+        let reactor = manual_reactor();
+        let first = EventHandle::create_unnamed(false).unwrap();
+        let second = EventHandle::create_unnamed(false).unwrap();
+        let old = Counter::new();
+        let new = Counter::new();
+        let registration = reactor.register(first.raw_handle(), old.waker()).unwrap();
+        let mut in_flight = Vec::new();
+        match scenario {
+            Scenario::NotFired => {
+                assert_eq!(registration.cancel(), CancelOutcome::NotFired);
+            }
+            Scenario::FiredNotDelivered => {
+                first.set().unwrap();
+                assert_eq!(registration.cancel(), CancelOutcome::FiredNotDelivered);
+            }
+            Scenario::DequeuedBeforeLookup => {
+                first.set().unwrap();
+                let got = reactor
+                    .port
+                    .wait_batch(&mut in_flight, Some(DEADLINE))
+                    .unwrap();
+                assert_eq!(got, 1);
+                assert_eq!(registration.cancel(), CancelOutcome::FiredNotDelivered);
+            }
+            Scenario::Delivered => {
+                first.set().unwrap();
+                assert_eq!(turn(reactor), 1);
+                assert_eq!(old.get(), 1);
+                assert_eq!(registration.cancel(), CancelOutcome::AlreadyDelivered);
+            }
+        }
+        assert_eq!(reactor.pooled(), 1, "{scenario:?}: пакет не вернулся в пул");
+        let registration = reactor.register(second.raw_handle(), new.waker()).unwrap();
+        assert_eq!(reactor.pooled(), 0, "{scenario:?}");
+        assert_eq!(
+            reactor.packets_created(),
+            1,
+            "{scenario:?}: пакет не из пула"
+        );
+        // Устаревшее завершение прежней регистрации (тот же слот, старое
+        // поколение) -- отбрасывается, новый waker не будится.
+        reactor.process(&in_flight, &mut Spent::default());
+        // Прежнее событие переиспользованный пакет не будит.
+        first.set().unwrap();
+        assert_eq!(turn_quick(reactor), 0, "{scenario:?}: чужое событие");
+        assert_eq!(new.get(), 0, "{scenario:?}");
+        assert!(!registration.is_fired(), "{scenario:?}");
+        second.set().unwrap();
+        assert_eq!(turn(reactor), 1, "{scenario:?}");
+        assert_eq!(new.get(), 1, "{scenario:?}");
+        assert_eq!(turn_quick(reactor), 0, "{scenario:?}");
+        assert_eq!(new.get(), 1, "{scenario:?}: больше одного пробуждения");
+        let expected_old = usize::from(scenario == Scenario::Delivered);
+        assert_eq!(old.get(), expected_old, "{scenario:?}");
+        let expected_stale = u64::from(scenario == Scenario::DequeuedBeforeLookup);
+        assert_eq!(reactor.stale_completions(), expected_stale, "{scenario:?}");
+    }
+
+    /// Пакет из пула чист после любого исхода прежней регистрации.
+    #[test]
+    fn pooled_packet_is_clean_after_every_outcome() {
+        for scenario in [
+            Scenario::NotFired,
+            Scenario::FiredNotDelivered,
+            Scenario::DequeuedBeforeLookup,
+            Scenario::Delivered,
+        ] {
+            run_scenario(scenario);
+        }
+    }
+
+    /// Прогретый пул переживает отказ создания пакета; пустой -- отказ
+    /// чистый: `Err`, слот таблицы возвращён, чужой сигнал цел.
+    #[test]
+    fn warm_pool_survives_create_failure() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let other = EventHandle::create_unnamed(false).unwrap();
+        let counter = Counter::new();
+        let warm = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        assert_eq!(warm.cancel(), CancelOutcome::NotFired);
+        reactor.fail_create.store(true, Ordering::SeqCst);
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        other.set().unwrap();
+        let failed = reactor.register(other.raw_handle(), counter.waker());
+        assert!(failed.is_err(), "{failed:?}");
+        reactor.fail_create.store(false, Ordering::SeqCst);
+        assert_eq!(reactor.packets_created(), 1);
+        assert_eq!(reactor.table.lock_clean().slots.len(), 1);
+        event.set().unwrap();
+        assert_eq!(turn(reactor), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(registration.is_fired());
+        assert!(other.wait(Some(Duration::ZERO)).unwrap(), "сигнал цел");
+    }
+
+    /// Классификация кодов отмены: «грязный» код -- пакет не в пул.
+    #[test]
+    fn unexpected_cancel_status_is_not_reused() {
+        let invalid = 0xC000_0008_u32.cast_signed();
+        let never = || -> NTSTATUS { unreachable!("второго шага нет") };
+        assert_eq!(
+            classify_cancel(STATUS_SUCCESS, never),
+            (CancelOutcome::NotFired, true)
+        );
+        assert_eq!(
+            classify_cancel(STATUS_CANCELLED, never),
+            (CancelOutcome::AlreadyDelivered, true)
+        );
+        assert_eq!(
+            classify_cancel(invalid, never),
+            (CancelOutcome::AlreadyDelivered, false)
+        );
+        assert_eq!(
+            classify_cancel(STATUS_PENDING, || STATUS_SUCCESS),
+            (CancelOutcome::FiredNotDelivered, true)
+        );
+        assert_eq!(
+            classify_cancel(STATUS_PENDING, || STATUS_CANCELLED),
+            (CancelOutcome::AlreadyDelivered, true)
+        );
+        assert_eq!(
+            classify_cancel(STATUS_PENDING, || invalid),
+            (CancelOutcome::FiredNotDelivered, false)
+        );
     }
 }
