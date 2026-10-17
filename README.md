@@ -750,7 +750,7 @@ signal arrives.
 
 | Server | Client | Waits for |
 |--------|--------|-----------|
-| `accept_async()` | `SharedClient::connect_async(name)` | handshake (same protocol as `wait_for_client`/`connect`) |
+| `accept_async()` | `SharedClient::connect_async(name)` / `connect_async_in(Arc<PrivateNamespace>, name)` | handshake (same protocol as `wait_for_client`/`connect`/`connect_in`) |
 | `recv_async(&mut buf)` | `recv_async(&mut buf)` | a message (`Ok(len)`) |
 | `send_async(data)` | `send_async(data)` | free space, then writes **without overwrite** |
 

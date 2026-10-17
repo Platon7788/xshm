@@ -2,8 +2,11 @@
 //! общего `\BaseNamedObjects` -- найти и занять их может только процесс с
 //! той же границей (тот же пользователь).
 
+use std::future::Future;
+use std::pin::pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, mpsc};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::Duration;
 
@@ -354,4 +357,130 @@ fn beacon_in_namespace_is_separate_from_shared_one() {
     assert!(!outside.is_raised().unwrap(), "общий маяк -- другой объект");
     inside.lower().unwrap();
     assert!(!peer.is_raised().unwrap());
+}
+
+// ─── async в пространстве имён (Task 3 надёжности, пункты 2 и 10) ───────────
+
+/// `Waker`, будящий поток-владельца.
+struct Unpark(thread::Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+/// Минимальный исполнитель: опрос, пока не готово, сон до `wake`
+/// (`thread::park` без таймаута; ложный возврат `park` безвреден).
+fn block_on<F: Future>(future: F) -> F::Output {
+    let waker = Waker::from(Arc::new(Unpark(thread::current())));
+    let mut cx = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        if let Poll::Ready(value) = future.as_mut().poll(&mut cx) {
+            return value;
+        }
+        thread::park();
+    }
+}
+
+/// Рукопожатие и эхо целиком через async API в частном пространстве:
+/// `accept_async` ждёт на событиях, открытых `start_with` в пространстве,
+/// `connect_async_in` находит канал по той же границе.
+#[test]
+fn async_connect_in_namespace_echo() {
+    let boundary = unique("B_ASYNC");
+    let name = unique("ASYNC");
+    let ns = namespace(&boundary);
+    let mut server =
+        SharedServer::start_with(&name, &ChannelConfig::default().namespace(Arc::clone(&ns)))
+            .unwrap();
+    let server = thread::spawn(move || {
+        block_on(server.accept_async()).unwrap();
+        let mut buffer = Vec::new();
+        let len = block_on(server.recv_async(&mut buffer)).unwrap();
+        block_on(server.send_async(&buffer[..len])).unwrap();
+        server
+    });
+
+    let ns2 = namespace(&boundary);
+    assert!(!ns2.created());
+    let mut client = block_on(SharedClient::connect_async_in(Arc::clone(&ns2), &name)).unwrap();
+    let payload: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+    block_on(client.send_async(&payload)).unwrap();
+    let mut buffer = Vec::new();
+    let len = block_on(client.recv_async(&mut buffer)).unwrap();
+    assert_eq!(&buffer[..len], &payload[..]);
+    let _server = server.join().unwrap();
+}
+
+/// Без пространства (`connect_async`) канал в пространстве не виден.
+#[test]
+fn async_connect_outside_namespace_is_not_found() {
+    let ns = namespace(&unique("B_ASYNC_OUT"));
+    let name = unique("ASYNC_OUT");
+    let _server =
+        SharedServer::start_with(&name, &ChannelConfig::default().namespace(Arc::clone(&ns)))
+            .unwrap();
+    let outside = block_on(SharedClient::connect_async(&name));
+    assert!(is_not_found(&outside), "{outside:?}");
+}
+
+/// Префикс или `\` в имени внутри пространства -- `InvalidConfig` на первом
+/// опросе (как у `connect_in`).
+#[test]
+fn async_connect_in_rejects_prefixed_name() {
+    let ns = namespace(&unique("B_ASYNC_PREFIX"));
+    for name in ["Local\\X", "Global\\X", "\\BaseNamedObjects\\X", ""] {
+        let mut future = pin!(SharedClient::connect_async_in(Arc::clone(&ns), name));
+        let waker = Waker::from(Arc::new(Unpark(thread::current())));
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            matches!(
+                future.as_mut().poll(&mut cx),
+                Poll::Ready(Err(ShmError::InvalidConfig(_)))
+            ),
+            "{name:?}"
+        );
+    }
+}
+
+/// Пункт 10 (решение 12): `Drop` создателя не удаляет пространство. Пока
+/// handle держит пир (`ns_b`), пространство с той же границей -- то же
+/// самое: новый `open_or_create` его открывает (`created() == false`; если
+/// бы `Drop` вызывал `NtDeletePrivateNamespace`, создалось бы другое --
+/// `true`), и канал, поднятый через новый handle, виден через handle пира.
+#[test]
+fn creator_drop_keeps_namespace_for_peers() {
+    let boundary = unique("B_KEEP");
+    let ns_a = namespace(&boundary);
+    assert!(ns_a.created());
+    let ns_b = namespace(&boundary);
+    assert!(!ns_b.created());
+
+    let first = unique("KEEP_A");
+    let server = SharedServer::start_with(
+        &first,
+        &ChannelConfig::default().namespace(Arc::clone(&ns_a)),
+    )
+    .unwrap();
+    drop(server);
+    assert_eq!(Arc::strong_count(&ns_a), 1, "сервер отпустил пространство");
+    drop(ns_a);
+
+    let ns_c = namespace(&boundary);
+    assert!(!ns_c.created(), "пространство пережило Drop создателя");
+    let name = unique("KEEP_C");
+    let mut server = SharedServer::start_with(
+        &name,
+        &ChannelConfig::default().namespace(Arc::clone(&ns_c)),
+    )
+    .unwrap();
+    let client = thread::spawn(move || {
+        SharedClient::connect_in(&ns_b, &name, Duration::from_secs(2)).map(|_client| ())
+    });
+    server
+        .wait_for_client(Some(Duration::from_secs(5)))
+        .unwrap();
+    client.join().unwrap().unwrap();
 }

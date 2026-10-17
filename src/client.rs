@@ -2,6 +2,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
@@ -334,13 +335,30 @@ impl SharedClient {
     /// # Ok::<(), xshm::ShmError>(())
     /// ```
     pub fn connect_async(name: &str) -> impl Future<Output = Result<Self>> + Send + 'static {
-        ConnectFuture {
-            name: name.to_owned(),
-            hello: None,
-            started: false,
-            server: None,
-            waits: WaitSet::default(),
-        }
+        ConnectFuture::new(None, name)
+    }
+
+    /// Подключиться асинхронно к каналу `name` в частном пространстве имён
+    /// `ns` (0.10): то же рукопожатие, ожидание и откат брошенного future,
+    /// что у [`SharedClient::connect_async`]; объекты канала ищутся, как у
+    /// [`SharedClient::connect_in`] (сервер -- `ChannelConfig::namespace` с
+    /// той же границей; его `accept_async` ждёт на событиях, открытых
+    /// `start_with` в пространстве).
+    ///
+    /// `ns` -- по значению (`Arc`), чтобы future оставался `'static`
+    /// (`tokio::spawn`). Future держит пространство до готовности (или до
+    /// `Drop`); дальше подключённый клиент держит открытые объекты канала,
+    /// handle пространства ему не нужен.
+    ///
+    /// Ошибки -- как у [`SharedClient::connect_in`], на первом опросе: имя с
+    /// `Local\`/`Global\`, с `\` или пустое -- `InvalidConfig`; канала в
+    /// пространстве нет -- `WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`;
+    /// канал занят -- `AlreadyConnected`.
+    pub fn connect_async_in(
+        ns: Arc<PrivateNamespace>,
+        name: &str,
+    ) -> impl Future<Output = Result<Self>> + Send + 'static {
+        ConnectFuture::new(Some(ns), name)
     }
 
     /// Принять сообщение сервера асинхронно (0.10; семантика --
@@ -694,9 +712,12 @@ impl Hello {
     }
 }
 
-/// Future `connect_async`: заявка при первом опросе, ожидание
-/// `S2C_CONNECT` в реакторе, откат заявки в `Drop`.
+/// Future `connect_async`/`connect_async_in`: заявка при первом опросе,
+/// ожидание `S2C_CONNECT` в реакторе, откат заявки в `Drop`.
 struct ConnectFuture {
+    /// Частное пространство имён канала (`connect_async_in`); `None` --
+    /// общий `\BaseNamedObjects` (`connect_async`). Держится до готовности.
+    namespace: Option<Arc<PrivateNamespace>>,
     name: String,
     /// Выставленная заявка (до подтверждения или отказа).
     hello: Option<Hello>,
@@ -712,10 +733,22 @@ struct ConnectFuture {
 }
 
 impl ConnectFuture {
+    fn new(namespace: Option<Arc<PrivateNamespace>>, name: &str) -> Self {
+        Self {
+            namespace,
+            name: name.to_owned(),
+            hello: None,
+            started: false,
+            server: None,
+            waits: WaitSet::default(),
+        }
+    }
+
     fn step(&mut self, waker: &Waker) -> Poll<Result<SharedClient>> {
         if !self.started {
             self.started = true;
-            let hello = match Hello::post(None, &self.name, true, ClaimMode::Take) {
+            let posted = Hello::post(self.namespace.as_deref(), &self.name, true, ClaimMode::Take);
+            let hello = match posted {
                 Ok(hello) => hello,
                 Err(err) => return Poll::Ready(Err(err)),
             };
@@ -1376,7 +1409,7 @@ mod tests {
                 let result = server.wait_for_client(Some(Duration::from_secs(5)));
                 (result, server)
             });
-            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
             let racers: Vec<_> = (0..2)
                 .map(|_| {
                     let (barrier, name) = (barrier.clone(), name.clone());
@@ -1580,6 +1613,58 @@ mod tests {
             "claim не взят"
         );
         drop(future);
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
+    }
+
+    /// Task 3 надёжности: `connect_async_in` -- тот же future, что
+    /// `connect_async`: заявка в пространстве при первом опросе, брошенный
+    /// до ответа -- откат и освобождение claim; пространство future держит
+    /// до `Drop` и отпускает.
+    #[test]
+    fn connect_async_in_drop_releases_claim_and_namespace() {
+        use crate::security::ObjectSecurity;
+        use crate::server::ChannelConfig;
+
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+
+        let ns = PrivateNamespace::open_or_create(
+            &unique("ANSDROP_B"),
+            "xshm",
+            &ObjectSecurity::default(),
+        )
+        .unwrap();
+        let name = unique("ANSDROP");
+        let server =
+            SharedServer::start_with(&name, &ChannelConfig::default().namespace(Arc::clone(&ns)))
+                .unwrap();
+        let held = Arc::strong_count(&ns);
+        let control = server.view().control_block();
+        let mut future = Box::pin(SharedClient::connect_async_in(Arc::clone(&ns), &name));
+        assert_send_static(&future);
+        assert_eq!(
+            Arc::strong_count(&ns),
+            held + 1,
+            "future держит пространство"
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        assert_ne!(
+            control.slot_claim.load(Ordering::Acquire),
+            0,
+            "claim в пространстве не взят"
+        );
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_CLIENT_HELLO
+        );
+        drop(future);
+        assert_eq!(
+            Arc::strong_count(&ns),
+            held,
+            "Drop future отпускает пространство"
+        );
         assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
         assert_eq!(control.client_pid.load(Ordering::Acquire), 0);

@@ -117,7 +117,9 @@
   `DispatchClient::lobby_exists_in`. Пространство живёт, пока открыт хоть
   один handle; `Drop` только закрывает handle — `NtDeletePrivateNamespace` не
   вызывается (пиры остались бы в удалённом каталоге, а перезапущенный сервер
-  создал бы другое пространство). Без пространства — поведение прежнее.
+  создал бы другое пространство; закреплено тестом
+  `creator_drop_keeps_namespace_for_peers`). Без пространства — поведение
+  прежнее.
   Пир-видимо: `INTEROP.md` §b.4, §h п. 7–8, «Изменения 0.10» п. 23.
 - **Спин перед ожиданием в ядре** `SpinPolicy { iterations }`
   (`SpinPolicy::NONE` — по умолчанию, спина нет): до `iterations`
@@ -195,6 +197,16 @@
     `Err(PeerDied)` с тем же откатом заявки. Повторно опрашивать future
     после `Ready` нельзя: recv/send выполнили бы ещё одну операцию.
   - Anonymous-сервер (без событий) — `Err(InvalidConfig)`.
+  - `SharedClient::connect_async_in(ns: Arc<PrivateNamespace>, name)`
+    (надёжность, 17.10.2026) — async-подключение к каналу в частном
+    пространстве имён: тот же future, что `connect_async` (заявка,
+    ожидание, откат брошенного), объекты канала — как у `connect_in`;
+    ошибки — как у `connect_in` (имя с префиксом или `\` — `InvalidConfig`
+    на первом опросе). `Arc` по значению — future остаётся `'static`
+    (`tokio::spawn`) и держит пространство до готовности. `accept_async`
+    сервера, поднятого `start_with` в пространстве, работал и раньше —
+    теперь закреплён тестом `async_connect_in_namespace_echo`
+    (`tests/namespace.rs`). Пир-невидимо.
   - Протокол и раскладка не меняются: async API — это те же сигналы и
     переходы, что у синхронных `wait_for_client`/`connect`/`poll_*`/
     `wait_for_space`.

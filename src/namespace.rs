@@ -58,6 +58,20 @@ const STATUS_OBJECT_PATH_NOT_FOUND: i32 = 0xC000_003A_u32.cast_signed();
 /// [`ObjectSecurity::CurrentUserAllowLowIntegrity`] содержит ещё и метку Low,
 /// это другой дескриптор границы -- другое пространство.
 ///
+/// # Время жизни
+///
+/// `Drop` закрывает только свой handle; `NtDeletePrivateNamespace` не
+/// вызывается (и не объявлен в `ntapi/funcs.rs`): удаление создателем
+/// оставило бы пиров с «висящим» каталогом, а перезапущенный сервер создал
+/// бы другое пространство с той же границей. Пространство исчезает с
+/// последним handle в любом процессе. Закреплено тестом
+/// `creator_drop_keeps_namespace_for_peers` (`tests/namespace.rs`).
+///
+/// Async-подключение в пространстве --
+/// [`SharedClient::connect_async_in`](crate::SharedClient::connect_async_in)
+/// (`Arc` по значению: future `'static` и держит пространство до
+/// готовности).
+///
 /// ```no_run
 /// use std::sync::Arc;
 /// use std::time::Duration;
@@ -302,8 +316,9 @@ impl PrivateNamespace {
 
 impl Drop for PrivateNamespace {
     fn drop(&mut self) {
-        // Только закрытие handle (см. модуль: почему без
-        // `NtDeletePrivateNamespace`).
+        // Только закрытие handle: без `NtDeletePrivateNamespace` (см. раздел
+        // «Время жизни» у типа) -- пространство живёт, пока handle держит
+        // любой пир; тест `creator_drop_keeps_namespace_for_peers`.
         // SAFETY: handle получен успешным `NtCreate/OpenPrivateNamespace`,
         // владеет им только `self`, закрывается ровно один раз.
         let _ = unsafe { NtClose(self.handle) };
