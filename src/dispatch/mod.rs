@@ -32,7 +32,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::auto::{AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelKind, map_spawn_error};
-use crate::client::{ClaimMode, SharedClient};
+use crate::client::{ClaimMode, FreeLink, SharedClient};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
 use crate::namespace::PrivateNamespace;
@@ -1792,6 +1792,7 @@ fn lobby_register(
         options.lobby_timeout,
         true,
         claim,
+        FreeLink::Off,
         None,
     )?;
 
@@ -3675,6 +3676,7 @@ mod tests {
             Duration::from_secs(5),
             false,
             ClaimMode::Take,
+            FreeLink::Open,
             None,
         )
         .unwrap();
@@ -3727,6 +3729,7 @@ mod tests {
             Duration::from_secs(5),
             true,
             ClaimMode::Take,
+            FreeLink::Open,
             None,
         );
         crate::client::FORGED_START_TIME.with(|cell| cell.set(None));

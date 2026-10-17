@@ -176,6 +176,13 @@ fn child_entry() {
             linger(forever);
             server.stop();
         }
+        "claim_and_exit" => {
+            // Task 12: держатель, умерший до `CLIENT_HELLO` -- захватить
+            // claim канала (C1, C2: время своего процесса, затем PID) и
+            // выйти, не выставив заявки.
+            claim_as_holder(name);
+            thread::sleep(graceful);
+        }
         other => panic!("unknown child mode {other}"),
     }
 }
@@ -981,6 +988,78 @@ impl Drop for Segment {
     }
 }
 
+/// Смещения `ControlBlock` (INTEROP §c.1): `slot_owner_pid`,
+/// `owner_start_lo`/`owner_start_hi`.
+const SLOT_OWNER_PID: usize = 24;
+const OWNER_START_LO: usize = 52;
+const OWNER_START_HI: usize = 56;
+
+#[cfg_attr(
+    target_arch = "x86",
+    link(
+        name = "kernel32",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
+unsafe extern "system" {
+    fn GetCurrentProcess() -> *mut c_void;
+    fn GetProcessTimes(
+        process: *mut c_void,
+        creation: *mut u64,
+        exit: *mut u64,
+        kernel: *mut u64,
+        user: *mut u64,
+    ) -> i32;
+}
+
+/// Время создания своего процесса (FILETIME, как `CreateTime` NT).
+fn own_start_time() -> u64 {
+    let (mut creation, mut exit, mut kernel, mut user) = (0u64, 0u64, 0u64, 0u64);
+    // SAFETY: без аргументов; возвращает псевдо-handle своего процесса.
+    let process = unsafe { GetCurrentProcess() };
+    // SAFETY: `process` -- псевдо-handle своего процесса; выходные параметры
+    // -- локальные `u64` (FILETIME -- 8 байт, выравнивание `u64` не меньше
+    // нужного).
+    let ok = unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    assert_ne!(ok, 0, "GetProcessTimes");
+    creation
+}
+
+/// Дочерний «держатель»: claim канала `name` своим токеном, затем время
+/// своего процесса и PID владельца (шаги C1, C2), без заявки.
+fn claim_as_holder(name: &str) {
+    let segment = Segment::open(name);
+    let start = own_start_time();
+    let token = 0xC1A1_0000 | (std::process::id() & 0xFFFF);
+    assert!(
+        segment
+            .word(SLOT_CLAIM)
+            .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok(),
+        "канал уже занят"
+    );
+    let [l0, l1, l2, l3, h0, h1, h2, h3] = start.to_le_bytes();
+    segment
+        .word(OWNER_START_LO)
+        .store(u32::from_le_bytes([l0, l1, l2, l3]), Ordering::Release);
+    segment
+        .word(OWNER_START_HI)
+        .store(u32::from_le_bytes([h0, h1, h2, h3]), Ordering::Release);
+    segment
+        .word(SLOT_OWNER_PID)
+        .store(std::process::id(), Ordering::Release);
+}
+
 /// Взвести `C2S_DATA` канала `name`, как это сделал бы писатель-пир.
 fn signal_c2s_data(name: &str) {
     let path = wide(&format!("Local\\{name}_C2S_DATA"));
@@ -1298,5 +1377,92 @@ fn auto_client_reconnects_after_server_crash_without_polling() {
         "подключение через {took:?}"
     );
     drop(client);
+    drop(server);
+}
+
+// ─── Task 12: уведомление «claim освобождён» ────────────────────────────────
+
+/// Момент подключения `AutoClient`.
+#[derive(Default)]
+struct ConnectedAt(Mutex<Option<Instant>>);
+
+impl ConnectedAt {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn get(&self) -> Option<Instant> {
+        *self.0.lock().unwrap()
+    }
+}
+
+impl AutoHandler for ConnectedAt {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_connect(&self) {
+        self.0.lock().unwrap().get_or_insert_with(Instant::now);
+    }
+}
+
+/// Держатель канала -- дочерний процесс в сессии `AutoServer`, `AutoClient`
+/// B ждёт освобождения. Держатель убит -- сервер освобождает claim умершего
+/// (`mark_disconnected`) и уведомляет (R20): B подключён не позже 500 мс
+/// (до Task 12 -- по отступу `BusyBackoff`, до 2 с).
+#[test]
+fn busy_waiter_wakes_on_holder_crash_in_session() {
+    let name = unique_name("FREE_CRASH");
+    let rec = Arc::new(Recorder::default());
+    let server = AutoServer::start(&name, rec.clone(), AutoOptions::default()).unwrap();
+    let mut peer = Peer::spawn("shared_client", &name);
+    wait_until(
+        "держатель подключён",
+        Duration::from_secs(20),
+        || rec.connected.load(Ordering::Acquire),
+    );
+    let b_log = Arc::new(ConnectedAt::default());
+    let b = AutoClient::connect(&name, b_log.clone(), AutoOptions::default()).unwrap();
+    // B успел получить отказ и заснуть; отступ (до Task 12) дошёл до 2 с.
+    thread::sleep(Duration::from_millis(2500));
+    assert!(b_log.get().is_none(), "B подключился к занятому каналу");
+    let t0 = peer.kill();
+    wait_until("B подключён", Duration::from_secs(5), || {
+        b_log.get().is_some()
+    });
+    let took = b_log.get().unwrap() - t0;
+    report("busy waiter after holder crash", took);
+    assert!(took <= BOUND, "{took:?}");
+    drop(b);
+    drop(server);
+}
+
+/// Держатель (дочерний процесс) захватил claim и вышел, не выставив
+/// заявки. Ждущий B просыпается по процессу держателя и толкает сервер,
+/// сервер подтверждает смерть и освобождает claim сразу (R18, быстрый
+/// путь): B подключён не позже 500 мс (до Task 12 -- через
+/// `RESERVE_TIMEOUT` 10 с повторными толчками).
+#[test]
+fn holder_dead_before_hello_reclaimed_on_first_nudge() {
+    let name = unique_name("FREE_NOHELLO");
+    let server = AutoServer::start(&name, Arc::new(Noop), AutoOptions::default()).unwrap();
+    let mut peer = Peer::spawn("claim_and_exit", &name);
+    let segment = Segment::open(&name);
+    wait_until("claim держателя", Duration::from_secs(20), || {
+        segment.claim() != 0
+    });
+    let b_log = Arc::new(ConnectedAt::default());
+    let b = AutoClient::connect(&name, b_log.clone(), AutoOptions::default()).unwrap();
+    let status = peer.wait_exit(Duration::from_secs(20));
+    let t0 = Instant::now();
+    assert!(status.success(), "{status:?}");
+    wait_until("B подключён", Duration::from_secs(15), || {
+        b_log.get().is_some()
+    });
+    let took = b_log.get().unwrap().saturating_duration_since(t0);
+    report("busy waiter after holder died before hello", took);
+    assert!(took <= BOUND, "{took:?}");
+    drop(b);
+    drop(segment);
     drop(server);
 }

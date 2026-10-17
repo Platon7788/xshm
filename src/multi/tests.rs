@@ -959,7 +959,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
         // DISCONNECT, затем снимает свой claim.
         a.mark_disconnected();
         drop(a);
-        release_claim(None, &slot_name, TOKEN_A);
+        release_claim(None, &slot_name, TOKEN_A, None);
 
         assert!(
             try_claim_slot(None, &slot_name, TOKEN_B).unwrap(),
@@ -971,7 +971,7 @@ fn disconnect_client_keeps_claim_until_the_client_leaves() {
         });
         assert!(b.is_session_current());
         drop(b); // штатный уход B: DISCONNECT -> сервер снимает claim CAS-ом
-        release_claim(None, &slot_name, TOKEN_B);
+        release_claim(None, &slot_name, TOKEN_B, None);
         wait_for("B отключён", Duration::from_secs(5), || {
             server.client_count() == 0
         });
@@ -1723,6 +1723,7 @@ fn connect_held(slot_name: &str, token: u32) -> Result<SharedClient> {
         Duration::from_secs(5),
         true,
         ClaimMode::Held(token),
+        FreeLink::Open,
         None,
     )
 }
@@ -2639,10 +2640,10 @@ fn claim_scan_wraps_around() {
         MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
     let (slot, slot_name, token) = claim_free_slot(None, &name, 1).unwrap();
     assert_eq!(slot, 1);
-    release_claim(None, &slot_name, token);
+    release_claim(None, &slot_name, token, None);
     let (slot, slot_name, token) = claim_free_slot(None, &name, 2).unwrap();
     assert_eq!(slot, 0, "за последним слотом -- снова с нуля");
-    release_claim(None, &slot_name, token);
+    release_claim(None, &slot_name, token, None);
     server.stop();
 }
 
@@ -2960,4 +2961,114 @@ fn multi_client_returns_disconnect_of_foreign_session() {
         "DISCONNECT новой сессии съеден старым клиентом"
     );
     drop(server);
+}
+
+/// Task 12 (R20/R21): все слоты заняты -- `MultiClient` B спит на
+/// уведомлении базы (не больше одного пробуждения за секунду, хотя
+/// `retry_delay` -- 10 с и повтор не спас бы); A остановлен -- B подключён
+/// не позже 200 мс (до Task 12 -- только через `retry_delay`).
+#[test]
+fn no_free_slot_waiter_sleeps_and_wakes_on_release() {
+    let name = unique("FREE_WAIT");
+    let server = MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).unwrap();
+    let a_log = Arc::new(ClientRecorder::default());
+    let a = MultiClient::connect(&name, a_log.clone(), MultiClientOptions::default()).unwrap();
+    wait_for("A подключён", Duration::from_secs(5), || {
+        a_log.connects.load(Ordering::Acquire) == 1
+    });
+    let b_log = Arc::new(ClientRecorder::default());
+    let b = MultiClient::connect(
+        &name,
+        b_log.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_secs(10),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(200));
+    let w0 = b.wakeups();
+    thread::sleep(Duration::from_secs(1));
+    let woke = b.wakeups() - w0;
+    assert!(woke <= 1, "пробуждений без свободного слота: {woke}");
+    assert_eq!(b_log.connects.load(Ordering::Acquire), 0);
+
+    let stopped = Instant::now();
+    a.stop();
+    wait_for("B подключён", Duration::from_secs(3), || {
+        b_log.connects.load(Ordering::Acquire) == 1
+    });
+    let took = stopped.elapsed();
+    assert!(took <= Duration::from_millis(200), "{took:?}");
+    drop(b);
+    drop(a);
+    server.stop();
+}
+
+/// Task 12 (R20): протухший захват единственного слота (claim без заявки,
+/// владелец -- живой дочерний процесс) снимает дедлайн диспетчера
+/// (`reserve_timeout` 150 мс) -- с уведомлением базы: ждущий B
+/// (`retry_delay` 10 с) подключён не позже 1 с.
+#[test]
+fn slot_deadline_reclaim_notifies_waiters() {
+    let name = unique("FREE_DEADLINE");
+    let server = MultiServer::start_with(
+        &name,
+        Arc::new(TestHandler::new()),
+        single_slot(1),
+        Duration::from_millis(150),
+    )
+    .unwrap();
+    let owner = crate::test_support::LiveChild::spawn();
+    let mapping = Mapping::open_header(ObjectPath::mapping(None, &format!("{name}_0"))).unwrap();
+    let control = SharedView::peek_control(&mapping).unwrap();
+    control.announce_owner_start(owner.start);
+    control.slot_owner_pid.store(owner.pid, Ordering::Release);
+    control.slot_claim.store(0x5A1E_0001, Ordering::Release);
+
+    let started = Instant::now();
+    let b_log = Arc::new(ClientRecorder::default());
+    let b = MultiClient::connect(
+        &name,
+        b_log.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_secs(10),
+            ..MultiClientOptions::default()
+        },
+    )
+    .unwrap();
+    wait_for("B подключён", Duration::from_secs(3), || {
+        b_log.connects.load(Ordering::Acquire) == 1
+    });
+    let took = started.elapsed();
+    assert!(took <= Duration::from_secs(1), "{took:?}");
+    drop(b);
+    server.stop();
+    drop(owner);
+}
+
+/// Task 12 (R-O): владелец claim-а без заявки подтверждённо умер --
+/// диспетчер снимает claim на первом же толчке (не через
+/// `reserve_timeout`, здесь -- 10 с), ждущий B подключён сразу.
+#[test]
+fn dead_owner_claim_released_on_nudge() {
+    let name = unique("FREE_DEAD_OWNER");
+    let server = MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).unwrap();
+    let (pid, start) = crate::test_support::dead_process();
+    let mapping = Mapping::open_header(ObjectPath::mapping(None, &format!("{name}_0"))).unwrap();
+    let control = SharedView::peek_control(&mapping).unwrap();
+    control.announce_owner_start(start);
+    control.slot_owner_pid.store(pid, Ordering::Release);
+    control.slot_claim.store(0xDEAD_0001, Ordering::Release);
+
+    let started = Instant::now();
+    let b_log = Arc::new(ClientRecorder::default());
+    let b = MultiClient::connect(&name, b_log.clone(), MultiClientOptions::default()).unwrap();
+    wait_for("B подключён", Duration::from_secs(5), || {
+        b_log.connects.load(Ordering::Acquire) == 1
+    });
+    let took = started.elapsed();
+    assert!(took <= Duration::from_millis(500), "{took:?}");
+    drop(b);
+    server.stop();
 }

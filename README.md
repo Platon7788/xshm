@@ -78,6 +78,13 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
   the server (immediately on confirmed death, or `RESERVE_TIMEOUT` after a losing client's
   nudge) — still no idle timers. Proven by an exhaustive model of two clients and a
   server (`handshake_model`, ≈1.9 M states).
+- ✅ **Busy channel without polling** — a client that gets `AlreadyConnected` (or a
+  `MultiClient` with no free slot) sleeps in the kernel on the server's
+  "claim released" event `<name>_free` (`<base>_multi_free` for Multi) and on the holder
+  and server processes, and connects as soon as the holder leaves. Every claim release
+  bumps a generation counter and signals the event only when someone waits — no system
+  call otherwise. `SharedClient::wait_connectable(name, timeout)` waits the same way
+  without connecting (INTEROP R20/R21).
 - ✅ **Dispatch admission** — `DispatchHandler::admit` → `Admission::{Accept,
   AcceptWithLayout, Reject}` runs before a channel is created; `max_clients` (64);
   the lobby protocol is strict (bad length, trailing bytes, invalid UTF-8 → `Corrupted`).
@@ -934,12 +941,19 @@ Clients use it on their own — nothing to write:
   segment and in the beacon state are untrusted: identities without a
   creation time or naming the client itself are ignored, and the segment's
   identity must match the beacon's.
+- A **busy** channel (`AlreadyConnected`; Multi `NoFreeSlot`) is not polled
+  either (0.10, R20/R21): the client sleeps on the "claim released" event
+  `<name>_free` next to the beacon (`<base>_multi_free` for Multi) and on the
+  holder and server processes; the holder's leave, a crashed holder or a
+  stale claim reclaimed by the server wakes it at once. A claim taken without
+  a session is nudged once, plus one re-nudge after `RESERVE_TIMEOUT + 1 s`.
 - `on_error` reports the same error once while it repeats; a different error
   in between makes the next repeat reported again (`AlreadyConnected` /
-  `NoFreeSlot` are still reported on every attempt).
-- The old pause remains for a busy channel, after a `Timeout`, once after a
-  session ends (not after `PeerDied`) and as a fallback when the beacon is
-  unusable (no access, no `SeCreateGlobalPrivilege` for `Global\`).
+  `NoFreeSlot` once per busy episode).
+- The old pause remains after a `Timeout`, once after a session ends (not
+  after `PeerDied`) and as a fallback when the beacon or `<name>_free` is
+  unusable (no access, no `SeCreateGlobalPrivilege` for `Global\`, a server
+  without R20 — then a busy channel backs off up to 2 s as before).
 - A client that starts first creates the beacon with its own policy
   (`AutoOptions::security`, `MultiClientOptions::security`): the first creator
   sets the DACL, so a `Global\` service with `ObjectSecurity::Everyone` needs
@@ -962,6 +976,11 @@ if SharedClient::wait_for_server("MyChannel", Some(Duration::from_secs(30)))? {
 (`wait_for_server_in(&ns, name, timeout)` for a private namespace;
 `wait_for_server_with(name, timeout, &DiscoveryOptions::default().security(..)
 .fallback(..))` to choose the beacon policy and the fallback.)
+
+A busy channel can be awaited without polling, too:
+`SharedClient::wait_connectable(name, timeout)` returns `Ok(true)` once the
+channel's claim was free (it does not take it — a `connect` that loses the
+race gets `AlreadyConnected` and simply waits again).
 
 Native peers acting as a server must follow the same rule (INTEROP R19);
 otherwise a Rust client that started first finds them only through
@@ -1063,7 +1082,7 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **Anonymous servers**: No event handles available (polling mode only, no async API)
 - **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan) — use Dispatch mode if you need more. All slots share one dispatcher thread: a slow `on_message` of one client delays the others
 - **Native peers**: must implement the 0.10 contract — format `0x00020000`, PAD frames and handshake revision 3 ([`INTEROP.md`](INTEROP.md))
-- **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* (no server, no free slot) retries every `reconnect_delay` / `retry_delay`; connected channels never wake while idle. Use `Beacon` for fully event-driven discovery
+- **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* sleeps on the presence beacon (no server) or on the "claim released" event (busy channel, no free slot); `reconnect_delay` / `retry_delay` remain as a one-off pause after a session and as a fallback against peers without the beacon/`_free` objects (R19/R20). A peer that releases a claim without notifying (no R20) keeps Rust waiters asleep until the holder or server process exits
 - **Access control, not authentication**: by default named objects are open only to the creating user and SYSTEM (`ObjectSecurity::CurrentUser`); any process of that same user can still open them, and `ObjectSecurity::Everyone` restores the ≤ 0.9 NULL DACL — do not send secrets
 
 ## Project Structure

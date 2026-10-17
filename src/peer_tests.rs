@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use crate::client::ClaimMode;
+use crate::client::{ClaimMode, FreeLink};
 use crate::{SharedClient, SharedServer, ShmError};
 
 fn unique(tag: &str) -> String {
@@ -43,6 +43,7 @@ fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServ
         Duration::from_secs(5),
         announce_pid,
         ClaimMode::Take,
+        FreeLink::Open,
         None,
     )
     .unwrap();
@@ -143,6 +144,7 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         Duration::from_secs(5),
         false,
         ClaimMode::Take,
+        FreeLink::Open,
         None,
     )
     .unwrap();
@@ -204,6 +206,7 @@ fn client_with_forged_start_time_is_reported_dead() {
         Duration::from_secs(5),
         true,
         ClaimMode::Take,
+        FreeLink::Open,
         None,
     );
     crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
@@ -264,6 +267,7 @@ fn legacy_client_without_claim_connects() {
         Duration::from_secs(5),
         true,
         ClaimMode::Legacy,
+        FreeLink::Open,
         None,
     )
     .unwrap();

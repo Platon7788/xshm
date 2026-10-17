@@ -1,4 +1,5 @@
-//! Маяк присутствия сервера (0.10, Task 11 надёжности; INTEROP R19).
+//! Маяк присутствия сервера (0.10, Task 11 надёжности; INTEROP R19) и
+//! уведомление «claim освобождён» (Task 12; R20/R21).
 //!
 //! Каждый именованный сервер single-client канала (`SharedServer::start*`,
 //! `AutoServer`, лобби Dispatch) держит маяк своего имени -- [`Beacon`]
@@ -45,20 +46,95 @@
 //!
 //! `wake` -- индекс 0 (П1 Task 10): маяк и процесс пира -- объекты, которые
 //! пир может держать взведёнными, а остановку они не заслоняют.
+//!
+//! # Уведомление «claim освобождён» (Task 12, INTEROP R20/R21)
+//!
+//! Занятый канал (`AlreadyConnected`) и база Multi без свободного слота
+//! (`NoFreeSlot`) клиент тоже не опрашивает. Рядом с маяком (тот же
+//! namespace и дескриптор) сервер создаёт событие-уведомление `<имя>_free`
+//! (ручной сброс; база Multi -- `<база>_multi_free`), а в секции
+//! `<имя>_beacon_state` живут `free_gen@20` (только `fetch_add` SeqCst --
+//! `lock xadd`) и `free_waiters@24` (число спящих ждущих, SeqCst). Клиент
+//! объекты только ОТКРЫВАЕТ ([`FreeNotifier::open`]): их нет -- пир без
+//! R20, резерв -- прежние `BusyBackoff`/`retry_delay` (решение R-M).
+//!
+//! **Освобождающий (R20)** -- любой, чей CAS `slot_claim: T -> 0` удался
+//! (единственный путь в крейте -- [`release_claim_notify`]), и сервер при
+//! `raise`/`lower` маяка: `free_gen.fetch_add(1)`, затем `if
+//! free_waiters.load() != 0 { NtSetEvent(_free) }`. Без ждущих -- ни одного
+//! системного вызова; `NtPulseEvent` не используется.
+//!
+//! **Ждущий (R21, [`FreeWaiter`])**: `free_waiters += 1`; круг: `g =
+//! free_gen` -> попытка (дешёвая проверка `slot_claim == 0`, затем полное
+//! подключение/захват) -> удалась -- выход; иначе толчок `CONNECT_REQ` (раз
+//! на захват без сессии) -> `NtResetEvent(_free)` -> `fence(SeqCst)` ->
+//! `free_gen != g` ? `NtSetEvent(_free)` (вернуть сигнал, который мог
+//! стереть наш сброс) и новый круг : сон на `[wake (0), _free (1), процесс
+//! держателя (2), процесс сервера (3)]` без таймаута. Выход -- `free_waiters
+//! -= 1` (`Drop`). Сбрасывает событие только ждущий и только прямо перед
+//! своей перепроверкой.
+//!
+//! **Доказательство «освобождение не теряется»** (все операции над
+//! `free_gen`/`free_waiters` -- SeqCst, одна полная очерёдность S; сброс и
+//! взвод -- системные вызовы, завершённые к следующей операции потока).
+//! Возьмём освобождение R (CAS `T -> 0`, затем инкремент `I_R`, затем
+//! чтение `free_waiters`) и круг ждущего W (чтение `g`, чтение `slot_claim`,
+//! сброс, барьер, перепроверка `P`, сон):
+//! - (а) CAS R раньше чтения `slot_claim` W -- W видит `0` (или уже чужой
+//!   новый захват, у которого будет своё освобождение) и не спит;
+//! - (б) CAS R после чтения `slot_claim`, `I_R` раньше `P` в S -- `P` видит
+//!   новое поколение: W не спит и возвращает сигнал (`NtSetEvent`), который
+//!   его сброс мог стереть у других ждущих;
+//! - (в) `I_R` позже `P` в S -- инкремент `free_waiters` у W (до первого `g`)
+//!   раньше `P`, значит, раньше чтения `free_waiters` у R: R видит `!= 0` и
+//!   взводит событие ПОСЛЕ сброса W (сброс -> барьер -> `P` <S `I_R` ->
+//!   чтение -> `NtSetEvent`), к моменту сна событие взведено.
+//!
+//! Чужой сброс, стерший сигнал R, -- сброс другого ждущего W': либо W'
+//! увидел новое поколение и вернул сигнал (случай (б) для W'), либо его
+//! попытка ПОСЛЕ освобождения R провалилась -- значит, claim уже снова
+//! занят, и спать можно (новое освобождение снова уведомит). Dekker-пара:
+//! освобождающий, прочитавший `free_waiters == 0`, в S раньше инкремента
+//! ждущего -- тогда и `I_R` раньше первого чтения `g`, а CAS R (Release
+//! перед SeqCst-инкрементом) виден чтению `slot_claim` после `g` (Acquire
+//! после SeqCst-чтения, увидевшего `I_R`): ждущий видит освобождение сам.
+//! Упавший ждущий оставляет `free_waiters > 0` -- цена только в лишних
+//! сигналах. Враждебный писатель счётчиков и события может лишь разбудить
+//! ждущих лишний раз (работа на пробуждение O(1)) или не дать им проснуться
+//! до смерти процесса держателя/сервера -- то же, что пир без R20 (INTEROP
+//! §h).
+//!
+//! **Толчки без опроса**: захват без сессии (`server_state !=
+//! SERVER_READY`) ждущий толкает один раз на наблюдённый токен и ставит
+//! разовый повторный толчок через `RESERVE_TIMEOUT + 1 с` (решение R-N) --
+//! сервер отнимает протухший захват на нём; подключённая сессия держателя
+//! ни толчков, ни таймаута не даёт. Подтверждённо умершего держателя без
+//! заявки сервер снимает на первом же толчке (решение R-O). Ждущий Multi
+//! толкает занятые слоты без сессии раз на их набор; повторный толчок ему
+//! не нужен -- протухший снимает дедлайн диспетчера.
 
 use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 use std::time::{Duration, Instant};
 
-use crate::beacon::Beacon;
+use crate::beacon::{Beacon, STATE_FREE_GEN_OFFSET, STATE_FREE_WAITERS_OFFSET};
+use crate::constants::{
+    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
+};
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
+use crate::layout::ControlBlock;
 use crate::namespace::PrivateNamespace;
-use crate::naming::ObjectPath;
-use crate::ntapi::types::STATUS_OBJECT_NAME_NOT_FOUND;
+use crate::naming::{Direction, ObjectPath};
+use crate::ntapi::types::{NOTIFICATION_EVENT, STATUS_OBJECT_NAME_NOT_FOUND};
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
-use crate::win::{Mapping, ProcessWatch, is_announced_process_exited, is_process_gone, wait_any};
+#[cfg(test)]
+use crate::sync_ext::LockExt;
+use crate::win::{
+    EventHandle, Mapping, ProcessWatch, is_announced_process_exited, is_process_gone, wait_any,
+};
 
 /// `NTSTATUS` `STATUS_OBJECT_PATH_NOT_FOUND` (путь в пространстве имён).
 const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
@@ -153,6 +229,10 @@ pub enum PresenceStatus {
 #[derive(Debug)]
 pub(crate) struct ServerPresence {
     beacon: Beacon,
+    /// Уведомитель «claim освобождён» канала (Task 12, R20): `raise` и
+    /// `lower` тоже уведомляют -- ждущий занятого канала заново
+    /// оценивает канал при смене сервера.
+    free: Option<Arc<FreeNotifier>>,
 }
 
 impl ServerPresence {
@@ -162,33 +242,47 @@ impl ServerPresence {
         root: Option<&Arc<PrivateNamespace>>,
         name: &str,
         security: &SecurityAttributes,
+        free: Option<Arc<FreeNotifier>>,
     ) -> Result<Self> {
         Ok(Self {
             beacon: Beacon::open_at(root.map(Arc::as_ref), root.cloned(), name, security)?,
+            free,
         })
     }
 
-    /// Канал опубликован: личность сервера в состояние маяка, затем взвод.
+    /// Канал опубликован: личность сервера в состояние маяка, затем взвод;
+    /// затем уведомление «claim освобождён» (R20).
     pub(crate) fn raise(&self) -> Result<()> {
-        self.beacon.raise()
+        let raised = self.beacon.raise();
+        if let Some(free) = &self.free {
+            free.notify();
+        }
+        raised
     }
 
-    /// Сервер уходит (первым шагом): личность -- в ноль, маяк сброшен.
-    /// Ошибка сброса здесь некуда сообщить (`Drop`); маяк, оставшийся
-    /// взведённым, клиенты гасят сами (`clear_if_stale`, PID 0 после
-    /// обнуления личности).
+    /// Сервер уходит (первым шагом): личность -- в ноль, маяк сброшен,
+    /// затем уведомление «claim освобождён» (R20: ждущий занятого канала
+    /// не спит на сервере, которого больше нет). Ошибка сброса здесь некуда
+    /// сообщить (`Drop`); маяк, оставшийся взведённым, клиенты гасят сами
+    /// (`clear_if_stale`, PID 0 после обнуления личности).
     pub(crate) fn lower(&self) {
         let _ = self.beacon.lower();
+        if let Some(free) = &self.free {
+            free.notify();
+        }
     }
 
     /// Лучшее усилие (решение W(1)): создать и взвести маяк; любая ошибка
     /// -- сервер без маяка и её причина в статусе, старт не отказывает.
+    /// `free` -- уведомитель канала (уже созданный вызывающим, тоже лучшее
+    /// усилие; `None` -- без него).
     pub(crate) fn start(
         root: Option<&Arc<PrivateNamespace>>,
         name: &str,
         security: &SecurityAttributes,
+        free: Option<Arc<FreeNotifier>>,
     ) -> (Option<Self>, PresenceStatus) {
-        match Self::create(root, name, security) {
+        match Self::create(root, name, security, free) {
             Ok(presence) => match presence.raise() {
                 Ok(()) => (Some(presence), PresenceStatus::Active),
                 Err(err) => {
@@ -574,9 +668,7 @@ fn probe(root: Option<&PrivateNamespace>, name: &str) -> Result<()> {
     let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }?;
     let control = view.control_block();
     let server = (
-        control
-            .server_pid
-            .load(std::sync::atomic::Ordering::Acquire),
+        control.server_pid.load(Ordering::Acquire),
         control.server_start_time(),
     );
     SharedEvents::open_in(root, name)?;
@@ -638,6 +730,670 @@ pub(crate) fn wait_for_server(
     }
 }
 
+// ============================================================================
+// Уведомление «claim освобождён» (0.10, Task 12 надёжности; INTEROP R20/R21)
+// ============================================================================
+
+/// Суффикс события «claim освобождён»: `<имя>_free` рядом с маяком
+/// `<имя>_beacon` (тот же namespace и дескриптор; база Multi --
+/// `<база>_multi_free`, как и её маяк).
+const FREE_SUFFIX: &str = "_free";
+
+/// Уведомитель «claim освобождён» канала (R20): событие-уведомление
+/// `<имя>_free` (ручной сброс) и счётчики `free_gen@20`/`free_waiters@24` в
+/// секции состояния маяка `<имя>_beacon_state`.
+///
+/// Создаёт сервер вместе с маяком (лучшее усилие, как маяк: отказ не
+/// отказывает старт), клиент только ОТКРЫВАЕТ: объекта нет -- пир без R20,
+/// ждущий работает по резерву (`BusyBackoff`/`retry_delay`, решение R-M).
+#[derive(Debug)]
+pub(crate) struct FreeNotifier {
+    event: EventHandle,
+    /// Секция состояния маяка: счётчики по смещениям
+    /// `STATE_FREE_GEN_OFFSET`/`STATE_FREE_WAITERS_OFFSET` (не меньше
+    /// страницы -- проверено при открытии).
+    state: Mapping,
+    /// Тесты: сколько раз `notify` взвёл событие (статистика).
+    #[cfg(test)]
+    signals: std::sync::atomic::AtomicU64,
+}
+
+impl FreeNotifier {
+    /// Сервер: создать (или открыть) `<name>_free` и секцию состояния маяка
+    /// `<name>_beacon_state` с дескриптором канала `security`.
+    pub(crate) fn create(
+        root: Option<&PrivateNamespace>,
+        name: &str,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let event = EventHandle::open_or_create_notification(
+            ObjectPath::scoped(root, name, FREE_SUFFIX),
+            security,
+        )?;
+        let state = crate::beacon::open_state_section(root, name, Some(security))?;
+        Ok(Self::assemble(event, state))
+    }
+
+    /// Клиент: открыть существующие `<name>_free` и состояние маяка (не
+    /// создаёт). Нет объекта -- `Err` (пир без R20); событие не
+    /// уведомление (подмена: автосброс будил бы одного ждущего) --
+    /// `Corrupted`.
+    pub(crate) fn open(root: Option<&PrivateNamespace>, name: &str) -> Result<Self> {
+        let event = EventHandle::open(ObjectPath::scoped(root, name, FREE_SUFFIX))?;
+        if event.event_type()? != NOTIFICATION_EVENT {
+            return Err(ShmError::Corrupted);
+        }
+        let state = crate::beacon::open_state_section(root, name, None)?;
+        Ok(Self::assemble(event, state))
+    }
+
+    const fn assemble(event: EventHandle, state: Mapping) -> Self {
+        Self {
+            event,
+            state,
+            #[cfg(test)]
+            signals: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn word(&self, offset: usize) -> Option<&AtomicU32> {
+        crate::beacon::state_word(&self.state, offset)
+    }
+
+    /// Текущее `free_gen` (SeqCst -- часть Dekker-пары с `free_waiters`).
+    pub(crate) fn free_gen(&self) -> u32 {
+        self.word(STATE_FREE_GEN_OFFSET)
+            .map_or(0, |generation| generation.load(Ordering::SeqCst))
+    }
+
+    /// Освобождение (R20): `free_gen += 1`, затем -- только если есть
+    /// ждущие -- `NtSetEvent`. Без ждущих -- ни одного системного вызова.
+    /// `NtPulseEvent` не используется (сигнал, пришедший между сбросом и
+    /// сном ждущего, им терялся бы).
+    pub(crate) fn notify(&self) {
+        let (Some(generation), Some(waiters)) = (
+            self.word(STATE_FREE_GEN_OFFSET),
+            self.word(STATE_FREE_WAITERS_OFFSET),
+        ) else {
+            return;
+        };
+        // SeqCst (Dekker): инкремент поколения упорядочен раньше чтения
+        // `free_waiters`, а у ждущего инкремент `free_waiters` -- раньше
+        // чтения поколения (см. модуль, доказательство R21).
+        generation.fetch_add(1, Ordering::SeqCst);
+        if waiters.load(Ordering::SeqCst) != 0 {
+            #[cfg(test)]
+            // Relaxed: статистика теста.
+            self.signals.fetch_add(1, Ordering::Relaxed);
+            // Отказ `NtSetEvent` здесь некуда сообщить (освобождение уже
+            // состоялось); ждущих разбудит процесс держателя/сервера или
+            // следующее освобождение.
+            let _ = self.event.set();
+        }
+    }
+
+    /// Тесты: сколько раз `notify` взвёл событие.
+    #[cfg(test)]
+    pub(crate) fn signals(&self) -> u64 {
+        self.signals.load(Ordering::Relaxed)
+    }
+
+    /// Тесты: взведено ли событие сейчас.
+    #[cfg(test)]
+    pub(crate) fn is_set(&self) -> bool {
+        self.event.wait(Some(Duration::ZERO)).unwrap_or(false)
+    }
+
+    /// Тесты: текущее `free_waiters`.
+    #[cfg(test)]
+    pub(crate) fn waiters(&self) -> u32 {
+        self.word(STATE_FREE_WAITERS_OFFSET)
+            .map_or(0, |waiters| waiters.load(Ordering::SeqCst))
+    }
+}
+
+/// Освободить claim-слово `word` (CAS `token -> 0`) и уведомить ждущих
+/// (R20). `true` -- освобождено этим вызовом. `token == 0` -- ничего не
+/// освобождается (CAS `0 -> 0` не освобождение).
+pub(crate) fn release_word_notify(
+    word: &AtomicU32,
+    token: u32,
+    notifier: Option<&FreeNotifier>,
+) -> bool {
+    let released = token != CLAIM_FREE
+        && word
+            .compare_exchange(token, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+    if released && let Some(notifier) = notifier {
+        notifier.notify();
+    }
+    released
+}
+
+/// ЕДИНСТВЕННОЕ освобождение `ControlBlock::slot_claim` в крейте (Task 12,
+/// R20): CAS `token -> 0`, при удаче -- уведомление «claim освобождён».
+/// Все пути (откат C6, C8, отзыв W, уход L, `connect_async`, Multi
+/// `release_claim`; сервер -- S2, `mark_disconnected`, `abort_session`,
+/// отъём протухшего захвата, снятие умершего держателя; диспетчер Multi --
+/// дедлайн, уход, смерть, осиротевший слот) идут через него.
+pub(crate) fn release_claim_notify(
+    control: &ControlBlock,
+    token: u32,
+    notifier: Option<&FreeNotifier>,
+) -> bool {
+    release_word_notify(&control.slot_claim, token, notifier)
+}
+
+/// Задержка разового повторного толчка протухшего захвата (решение R-N):
+/// `RESERVE_TIMEOUT + 1 с` от первого толчка этого токена -- к повторному
+/// толчку сервер уже отсчитал свой `RESERVE_TIMEOUT` и отнимает claim.
+/// Тесты подменяют её для канала `name` (`set_renudge_delay`).
+#[cfg(not(test))]
+pub(crate) const fn renudge_delay(_name: &str) -> Duration {
+    RENUDGE_DELAY
+}
+
+/// `RESERVE_TIMEOUT + 1 с` (см. `renudge_delay`).
+const RENUDGE_DELAY: Duration = RESERVE_TIMEOUT.saturating_add(Duration::from_secs(1));
+
+/// Тесты: `renudge_delay` с подменой по имени канала.
+#[cfg(test)]
+pub(crate) fn renudge_delay(name: &str) -> Duration {
+    RENUDGE_OVERRIDE
+        .lock_clean()
+        .iter()
+        .find(|(channel, _)| channel == name)
+        .map_or(RENUDGE_DELAY, |(_, delay)| *delay)
+}
+
+/// Тесты: подмена задержки повторного толчка по имени канала.
+#[cfg(test)]
+static RENUDGE_OVERRIDE: std::sync::Mutex<Vec<(String, Duration)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Тесты: задержка повторного толчка канала `name`.
+#[cfg(test)]
+pub(crate) fn set_renudge_delay(name: &str, delay: Duration) {
+    RENUDGE_OVERRIDE.lock_clean().push((name.to_owned(), delay));
+}
+
+/// Что видит ждущий у занятого канала.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Busy {
+    /// Ключ захвата, который стоит толкнуть (`CONNECT_REQ`): токен claim-а
+    /// канала без сессии (`server_state != SERVER_READY`); Multi -- свёртка
+    /// таких `(слот, токен)`. `0` -- толкать нечего (подключённая сессия:
+    /// ни толчков, ни повторного толчка).
+    pub(crate) key: u64,
+    /// Личность держателя (`slot_owner_pid`, `owner_start`): его смерть --
+    /// повод попытаться снова (single-client; Multi -- `None`).
+    pub(crate) holder: Option<(u32, u64)>,
+    /// Личность сервера из `ControlBlock`: его смерть -- `ServerGone`.
+    pub(crate) server: Option<(u32, u64)>,
+}
+
+/// Исход попытки ждущего.
+pub(crate) enum Attempt<T> {
+    /// Получилось (захват/подключение).
+    Done(T),
+    /// Занято: ждать освобождения.
+    Busy(Busy),
+    /// Другая ошибка -- вызывающему.
+    Failed(ShmError),
+}
+
+/// Чем кончилось [`FreeWaiter::wait_free`].
+#[derive(Debug)]
+pub(crate) enum FreeWait<T> {
+    /// Попытка удалась.
+    Claimed(T),
+    /// Остановка (`running() == false`).
+    Stopped,
+    /// Процесс сервера завершился.
+    ServerGone,
+    /// Истёк дедлайн вызывающего.
+    TimedOut,
+    /// Попытка вернула другую ошибку.
+    Failed(ShmError),
+}
+
+/// Параметры ожидания [`FreeWaiter::wait_free`].
+pub(crate) struct WaitCtl<'a> {
+    /// `wake` вызывающего -- индекс 0 (П1 Task 10).
+    pub(crate) wake: Option<BorrowedHandle<'a>>,
+    /// Работать ли дальше (сверяется на каждом круге и после `wake`).
+    pub(crate) running: &'a dyn Fn() -> bool,
+    /// `wake` без остановки (например, `send`): отчёт вызывающего.
+    pub(crate) on_wake: &'a mut dyn FnMut(),
+    /// Каждый возврат из ожидания в ядре (счётчики пробуждений).
+    pub(crate) wakeup: &'a dyn Fn(),
+    /// Дедлайн вызывающего (`None` -- без таймаута).
+    pub(crate) deadline: Option<Instant>,
+    /// Задержка разового повторного толчка (R-N); `None` -- без него (Multi:
+    /// протухший захват снимает дедлайн диспетчера после первого толчка).
+    pub(crate) renudge: Option<Duration>,
+}
+
+/// Наблюдаемый процесс по личности: открывается один раз на личность.
+#[derive(Debug, Default)]
+struct Watched(Option<((u32, u64), Option<ProcessWatch>)>);
+
+impl Watched {
+    /// Новая личность -- открыть её процесс (только доверенную, решение
+    /// W(2): без времени создания и свой PID не ждём).
+    fn update(&mut self, identity: Option<(u32, u64)>) {
+        match identity.filter(trusted) {
+            None => self.0 = None,
+            Some(identity) => {
+                if self.0.as_ref().map(|(seen, _)| *seen) != Some(identity) {
+                    self.0 = Some((identity, ProcessWatch::open_peer(identity.0, identity.1)));
+                }
+            }
+        }
+    }
+
+    fn handle(&self) -> Option<BorrowedHandle<'_>> {
+        self.0
+            .as_ref()
+            .and_then(|(_, watch)| watch.as_ref())
+            .map(AsHandle::as_handle)
+    }
+
+    /// Процесс завершился: handle сигнален навсегда -- из набора долой
+    /// (иначе каждый круг возвращался бы сразу), личность помним.
+    fn retire(&mut self) {
+        if let Some((_, watch)) = self.0.as_mut() {
+            *watch = None;
+        }
+    }
+}
+
+/// Тесты: точки вмешательства в круг ждущего (детерминированные
+/// интерлинии `free_waiter_interleavings`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FreePoint {
+    /// После чтения `free_gen`, до попытки.
+    Generation,
+    /// После неудачной попытки, до сброса события.
+    Attempted,
+    /// После сброса события, до перепроверки `free_gen`.
+    Reset,
+}
+
+/// Таймер одного ожидания ждущего.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Timer {
+    /// Дедлайн вызывающего.
+    Deadline,
+    /// Разовый повторный толчок (R-N).
+    Renudge,
+}
+
+/// Объект набора ожидания ждущего.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slot {
+    Wake,
+    Free,
+    Holder,
+    Server,
+}
+
+/// Ждущий освобождения claim-а (R21). Пока жив -- учтён в `free_waiters`
+/// (освобождающие сигналят событие); `Drop` -- `free_waiters - 1`.
+pub(crate) struct FreeWaiter {
+    notifier: Arc<FreeNotifier>,
+    /// Ключ захвата, который уже толкнули (`Busy::key`).
+    nudged: Option<u64>,
+    /// Разовый повторный толчок (R-N) этого ключа.
+    renudge_at: Option<Instant>,
+    holder: Watched,
+    server: Watched,
+    #[cfg(test)]
+    hooks: Vec<(FreePoint, Box<dyn FnOnce() + Send>)>,
+    /// Тесты: потолок одного ожидания в ядре (детектор потерянного
+    /// сигнала) и число ожиданий, упёршихся в него.
+    #[cfg(test)]
+    kernel_cap: Option<Duration>,
+    #[cfg(test)]
+    kernel_timeouts: u64,
+}
+
+impl std::fmt::Debug for FreeWaiter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FreeWaiter")
+            .field("nudged", &self.nudged)
+            .field("renudge_at", &self.renudge_at)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FreeWaiter {
+    /// Встать в ждущие: `free_waiters + 1` (SeqCst) -- ДО первого чтения
+    /// `free_gen` (Dekker с освобождающим).
+    pub(crate) fn new(notifier: Arc<FreeNotifier>) -> Self {
+        if let Some(waiters) = notifier.word(STATE_FREE_WAITERS_OFFSET) {
+            waiters.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            notifier,
+            nudged: None,
+            renudge_at: None,
+            holder: Watched::default(),
+            server: Watched::default(),
+            #[cfg(test)]
+            hooks: Vec::new(),
+            #[cfg(test)]
+            kernel_cap: None,
+            #[cfg(test)]
+            kernel_timeouts: 0,
+        }
+    }
+
+    /// Тесты: одноразовый хук в точке `at`.
+    #[cfg(test)]
+    pub(crate) fn hook(&mut self, at: FreePoint, hook: impl FnOnce() + Send + 'static) {
+        self.hooks.push((at, Box::new(hook)));
+    }
+
+    #[cfg(test)]
+    fn run_hook(&mut self, at: FreePoint) {
+        if let Some(index) = self.hooks.iter().position(|(point, _)| *point == at) {
+            let (_, hook) = self.hooks.remove(index);
+            hook();
+        }
+    }
+
+    /// Тесты: потолок одного ожидания в ядре.
+    #[cfg(test)]
+    pub(crate) const fn cap_kernel_wait(&mut self, cap: Duration) {
+        self.kernel_cap = Some(cap);
+    }
+
+    /// Тесты: ожидания, упёршиеся в потолок (потерянный сигнал).
+    #[cfg(test)]
+    pub(crate) const fn kernel_timeouts(&self) -> u64 {
+        self.kernel_timeouts
+    }
+
+    /// Ждать, пока `attempt` не удастся (протокол R21, см. модуль):
+    /// `g = free_gen` -> попытка -> (занято) толчок -> сброс `_free` ->
+    /// барьер -> `free_gen != g`? вернуть сигнал и снова : сон на
+    /// `[wake (0), _free (1), процесс держателя (2), процесс сервера (3)]`.
+    ///
+    /// `nudge` -- толчок `CONNECT_REQ` (раз на ключ `Busy::key`, плюс разовый
+    /// повторный через `ctl.renudge`). Ошибка ОС сброса/взвода/ожидания --
+    /// `Err` (вызывающий уходит в резерв).
+    pub(crate) fn wait_free<T>(
+        &mut self,
+        attempt: &mut dyn FnMut() -> Attempt<T>,
+        nudge: &mut dyn FnMut(),
+        ctl: &mut WaitCtl<'_>,
+    ) -> Result<FreeWait<T>> {
+        loop {
+            if !(ctl.running)() {
+                return Ok(FreeWait::Stopped);
+            }
+            let generation = self.notifier.free_gen();
+            #[cfg(test)]
+            self.run_hook(FreePoint::Generation);
+            let busy = match attempt() {
+                Attempt::Done(value) => return Ok(FreeWait::Claimed(value)),
+                Attempt::Failed(err) => return Ok(FreeWait::Failed(err)),
+                Attempt::Busy(busy) => busy,
+            };
+            self.observe(&busy, nudge, ctl.renudge);
+            #[cfg(test)]
+            self.run_hook(FreePoint::Attempted);
+            // Сбрасывает только ждущий и только перед своей перепроверкой.
+            self.notifier.event.reset()?;
+            #[cfg(test)]
+            self.run_hook(FreePoint::Reset);
+            // Сброс (системный вызов) -- до перечитывания поколения: барьер
+            // запрещает поднять чтение выше сброса (как `clear_after` маяка).
+            fence(Ordering::SeqCst);
+            if self.notifier.free_gen() != generation {
+                // Освобождение после нашей проверки: наш сброс мог стереть
+                // его сигнал -- вернуть (другим ждущим) и попытаться снова.
+                self.notifier.event.set()?;
+                continue;
+            }
+            let now = Instant::now();
+            if ctl.deadline.is_some_and(|at| now >= at) {
+                return Ok(FreeWait::TimedOut);
+            }
+            if let Some(stop) = self.sleep(nudge, ctl, now)? {
+                return Ok(stop);
+            }
+        }
+    }
+
+    /// Учесть занятость: процессы держателя и сервера; толчок -- раз на
+    /// ключ (и разовый повторный через `renudge`); подключённая сессия
+    /// (`key == 0`) -- ни толчков, ни таймаута.
+    fn observe(&mut self, busy: &Busy, nudge: &mut dyn FnMut(), renudge: Option<Duration>) {
+        self.holder.update(busy.holder);
+        self.server.update(busy.server);
+        if busy.key == 0 {
+            self.nudged = None;
+            self.renudge_at = None;
+            return;
+        }
+        if self.nudged != Some(busy.key) {
+            nudge();
+            self.nudged = Some(busy.key);
+            self.renudge_at = renudge.and_then(|delay| Instant::now().checked_add(delay));
+        }
+    }
+
+    /// Одно ожидание набора. `Some(исход)` -- выйти; `None` -- новый круг.
+    fn sleep<T>(
+        &mut self,
+        nudge: &mut dyn FnMut(),
+        ctl: &mut WaitCtl<'_>,
+        now: Instant,
+    ) -> Result<Option<FreeWait<T>>> {
+        // Таймер ожидания: дедлайн вызывающего или разовый повторный толчок
+        // (ближайший; равные -- дедлайн). Истёкшее ожидание засчитывается
+        // ИМЕННО этому таймеру, без повторной сверки `Instant`: ядро может
+        // вернуть таймаут чуть раньше отметки `Instant` (разрешение таймера),
+        // и сверка дала бы лишний короткий сон -- лишнее пробуждение.
+        let timer = match (ctl.deadline, self.renudge_at) {
+            (Some(deadline), Some(renudge)) if renudge < deadline => {
+                Some((renudge, Timer::Renudge))
+            }
+            (Some(deadline), _) => Some((deadline, Timer::Deadline)),
+            (None, Some(renudge)) => Some((renudge, Timer::Renudge)),
+            (None, None) => None,
+        };
+        let timeout = timer.map(|(at, _)| at.saturating_duration_since(now));
+        #[cfg(test)]
+        let (timeout, capped) = match (timeout, self.kernel_cap) {
+            (Some(t), Some(cap)) if cap < t => (Some(cap), true),
+            (None, Some(cap)) => (Some(cap), true),
+            (t, _) => (t, false),
+        };
+        let mut slots: Vec<Slot> = Vec::with_capacity(4);
+        let mut handles: Vec<BorrowedHandle<'_>> = Vec::with_capacity(4);
+        if let Some(wake) = ctl.wake {
+            slots.push(Slot::Wake);
+            handles.push(wake);
+        }
+        slots.push(Slot::Free);
+        handles.push(self.notifier.event.as_handle());
+        if let Some(holder) = self.holder.handle() {
+            slots.push(Slot::Holder);
+            handles.push(holder);
+        }
+        if let Some(server) = self.server.handle() {
+            slots.push(Slot::Server);
+            handles.push(server);
+        }
+        let fired = wait_any(&handles, timeout);
+        (ctl.wakeup)();
+        let mut slot = match fired? {
+            Some(index) => slots.get(index).copied(),
+            None => None,
+        };
+        if slot == Some(Slot::Wake) {
+            if !(ctl.running)() {
+                return Ok(Some(FreeWait::Stopped));
+            }
+            (ctl.on_wake)();
+            // П2 (Task 10): `wake` без остановки (поток `send`) не голодит
+            // остальные объекты -- одно нулевое ожидание без `wake`.
+            slot = wait_any(&handles[1..], Some(Duration::ZERO))?
+                .and_then(|index| slots.get(index + 1).copied());
+            if slot.is_none() {
+                return Ok(None);
+            }
+        }
+        match slot {
+            Some(Slot::Server) => Ok(Some(FreeWait::ServerGone)),
+            Some(Slot::Holder) => {
+                // Держатель умер: снова попытка и толчок того же ключа
+                // (сервер подтвердит смерть и освободит claim сразу, R18).
+                self.holder.retire();
+                self.nudged = None;
+                Ok(None)
+            }
+            Some(Slot::Free | Slot::Wake) => Ok(None),
+            None => {
+                #[cfg(test)]
+                if capped {
+                    // Ожидание упёрлось в тестовый потолок, а не в таймер.
+                    self.kernel_timeouts += 1;
+                    return Ok(None);
+                }
+                match timer.map(|(_, timer)| timer) {
+                    Some(Timer::Renudge) => {
+                        // Разовый: ключ остаётся «толкнутым», новый таймер не
+                        // ставится.
+                        nudge();
+                        self.renudge_at = None;
+                        Ok(None)
+                    }
+                    Some(Timer::Deadline) => Ok(Some(FreeWait::TimedOut)),
+                    // Нулевое ожидание после `wake` (П2) ничего не застало.
+                    None => Ok(None),
+                }
+            }
+        }
+    }
+}
+
+impl Drop for FreeWaiter {
+    fn drop(&mut self) {
+        // Упавший ждущий оставляет счётчик > 0 -- цена только в лишних
+        // сигналах освобождающих.
+        if let Some(waiters) = self.notifier.word(STATE_FREE_WAITERS_OFFSET) {
+            waiters.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Занятость single-client канала по удерживаемому заголовку секции и
+/// толчок `CONNECT_REQ` (ждущие `AutoClient` и `wait_connectable`).
+#[derive(Debug)]
+pub(crate) struct ChannelProbe {
+    mapping: Mapping,
+    connect_req: EventHandle,
+}
+
+impl ChannelProbe {
+    /// Открыть заголовок секции канала `name` и его `C2S_CONNECT_REQ`.
+    pub(crate) fn open(root: Option<&PrivateNamespace>, name: &str) -> Result<Self> {
+        let mapping = Mapping::open_header(ObjectPath::mapping(root, name))?;
+        if SharedView::peek_control(&mapping).is_none() {
+            return Err(ShmError::NotReady);
+        }
+        let connect_req = EventHandle::open_auto_reset(ObjectPath::event(
+            root,
+            name,
+            Direction::ClientToServer,
+            EVENT_CONNECT_REQ_SUFFIX,
+        ))?;
+        Ok(Self {
+            mapping,
+            connect_req,
+        })
+    }
+
+    /// `None` -- claim свободен; иначе -- что видит ждущий.
+    pub(crate) fn busy(&self) -> Result<Option<Busy>> {
+        let control = SharedView::peek_control(&self.mapping).ok_or(ShmError::NotReady)?;
+        let claim = control.slot_claim.load(Ordering::Acquire);
+        if claim == CLAIM_FREE {
+            return Ok(None);
+        }
+        let served = control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
+        let owner = control.slot_owner_pid.load(Ordering::Acquire);
+        let server = control.server_pid.load(Ordering::Acquire);
+        Ok(Some(Busy {
+            key: if served { 0 } else { u64::from(claim) },
+            holder: Some((owner, control.owner_start_time())),
+            server: Some((server, control.server_start_time())),
+        }))
+    }
+
+    /// Толчок сервера (`CONNECT_REQ` без заявки): он назначит отсчёт
+    /// протухшему захвату или сразу снимет claim умершего держателя.
+    pub(crate) fn nudge(&self) {
+        let _ = self.connect_req.set();
+    }
+}
+
+/// `SharedClient::wait_connectable*`: ждать, пока claim канала `name` не
+/// окажется свободным (`Ok(true)`; захват не выполняется), не дольше
+/// `timeout` (`Ok(false)`).
+pub(crate) fn wait_connectable(
+    root: Option<&PrivateNamespace>,
+    name: &str,
+    timeout: Option<Duration>,
+) -> Result<bool> {
+    let deadline = crate::ring::deadline_of(timeout);
+    let probe = ChannelProbe::open(root, name)?;
+    let Ok(notifier) = FreeNotifier::open(root, name) else {
+        // Пир без R20 (или `_free` недоступен): резервная проверка раз в
+        // `PRESENCE_RETRY_DELAY` (решение R-M).
+        loop {
+            if probe.busy()?.is_none() {
+                return Ok(true);
+            }
+            let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            if left.is_some_and(|left| left.is_zero()) {
+                return Ok(false);
+            }
+            std::thread::sleep(
+                min_timeout(Some(PRESENCE_RETRY_DELAY), left).unwrap_or(PRESENCE_RETRY_DELAY),
+            );
+        }
+    };
+    let mut waiter = FreeWaiter::new(Arc::new(notifier));
+    let waited = waiter.wait_free(
+        &mut || match probe.busy() {
+            Ok(None) => Attempt::Done(()),
+            Ok(Some(busy)) => Attempt::Busy(busy),
+            Err(err) => Attempt::Failed(err),
+        },
+        &mut || probe.nudge(),
+        &mut WaitCtl {
+            wake: None,
+            running: &|| true,
+            on_wake: &mut || {},
+            wakeup: &|| {},
+            deadline,
+            renudge: Some(renudge_delay(name)),
+        },
+    )?;
+    match waited {
+        FreeWait::Claimed(()) => Ok(true),
+        FreeWait::TimedOut | FreeWait::Stopped => Ok(false),
+        FreeWait::ServerGone => Err(ShmError::PeerDied),
+        FreeWait::Failed(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! M4 ревью Task 11: исходы `PresenceWatch::wait` по ветвям.
@@ -645,7 +1401,7 @@ mod tests {
     use super::*;
     use crate::test_support::{LiveChild, dead_process};
     use crate::win::EventHandle;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
     fn unique(tag: &str) -> String {
         static NEXT: AtomicU32 = AtomicU32::new(0);
@@ -914,5 +1670,372 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(140));
         assert_eq!(waits() - before, 1, "ожидание маяка в ядре");
+    }
+
+    // ─── Task 12: уведомление «claim освобождён» (R20/R21) ──────────────────
+
+    /// Уведомитель тестового канала (создаёт «сервер»).
+    fn notifier(tag: &str) -> Arc<FreeNotifier> {
+        let name = unique(tag);
+        Arc::new(
+            FreeNotifier::create(
+                None,
+                &name,
+                &ObjectSecurity::default().attributes().unwrap(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Попытка ждущего над claim-словом: свободно -- захват своим
+    /// токеном, иначе «занято» (толкать нечего).
+    fn claim_attempt(word: &AtomicU32, token: u32) -> Attempt<()> {
+        match word.compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Attempt::Done(()),
+            Err(_) => Attempt::Busy(Busy::default()),
+        }
+    }
+
+    /// Ожидание с дедлайном и счётчиком пробуждений.
+    fn wait_once(
+        waiter: &mut FreeWaiter,
+        word: &AtomicU32,
+        token: u32,
+        deadline: Duration,
+        wakeups: &AtomicU32,
+        attempts: &mut dyn FnMut(),
+    ) -> FreeWait<()> {
+        waiter
+            .wait_free(
+                &mut || {
+                    attempts();
+                    claim_attempt(word, token)
+                },
+                &mut || {},
+                &mut WaitCtl {
+                    wake: None,
+                    running: &|| true,
+                    on_wake: &mut || {},
+                    wakeup: &|| {
+                        wakeups.fetch_add(1, Ordering::Relaxed);
+                    },
+                    deadline: Instant::now().checked_add(deadline),
+                    renudge: None,
+                },
+            )
+            .unwrap()
+    }
+
+    const HOLDER: u32 = 0xA000_0001;
+    const WAITER: u32 = 0xB000_0001;
+
+    /// Три интерлинии протокола ждущего (доказательство R21 в модуле):
+    /// (а) освобождение между чтением `free_gen` и проверкой claim-а --
+    /// захват без сна; (б) освобождение между проверкой и сбросом -- сброс
+    /// стёр сигнал, перепроверка видит новое поколение, событие возвращено
+    /// (взведено к следующей попытке), ждущий не спит; (в) освобождение
+    /// после перепроверки -- ждущий спит и просыпается не позже 50 мс.
+    #[test]
+    fn free_waiter_interleavings() {
+        // (а)
+        let free = notifier("IL_A");
+        let word = Arc::new(AtomicU32::new(HOLDER));
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        let (w, f) = (Arc::clone(&word), Arc::clone(&free));
+        waiter.hook(FreePoint::Generation, move || {
+            assert!(release_word_notify(&w, HOLDER, Some(&f)));
+        });
+        let wakeups = AtomicU32::new(0);
+        let waited = wait_once(
+            &mut waiter,
+            &word,
+            WAITER,
+            Duration::from_secs(2),
+            &wakeups,
+            &mut || {},
+        );
+        assert!(matches!(waited, FreeWait::Claimed(())), "{waited:?}");
+        assert_eq!(wakeups.load(Ordering::Relaxed), 0, "(а): спал");
+        drop(waiter);
+
+        // (б)
+        let free = notifier("IL_B");
+        let word = Arc::new(AtomicU32::new(HOLDER));
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        let (w, f) = (Arc::clone(&word), Arc::clone(&free));
+        waiter.hook(FreePoint::Attempted, move || {
+            assert!(release_word_notify(&w, HOLDER, Some(&f)));
+            assert!(f.is_set(), "(б): освобождающий взвёл событие");
+        });
+        let f = Arc::clone(&free);
+        waiter.hook(FreePoint::Reset, move || {
+            assert!(!f.is_set(), "(б): сброс стёр сигнал");
+        });
+        let wakeups = AtomicU32::new(0);
+        let mut calls = 0;
+        let mut set_at_retry = None;
+        let f = Arc::clone(&free);
+        let waited = wait_once(
+            &mut waiter,
+            &word,
+            WAITER,
+            Duration::from_secs(2),
+            &wakeups,
+            &mut || {
+                calls += 1;
+                if calls == 2 {
+                    set_at_retry = Some(f.is_set());
+                }
+            },
+        );
+        assert!(matches!(waited, FreeWait::Claimed(())), "{waited:?}");
+        assert_eq!(calls, 2, "(б): ждущий в цикле -- вторая попытка");
+        assert_eq!(set_at_retry, Some(true), "(б): чужой сигнал возвращён");
+        assert_eq!(wakeups.load(Ordering::Relaxed), 0, "(б): спал");
+        drop(waiter);
+
+        // (в)
+        let free = notifier("IL_C");
+        let word = Arc::new(AtomicU32::new(HOLDER));
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        let (w, f) = (Arc::clone(&word), Arc::clone(&free));
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let at = Instant::now();
+            assert!(release_word_notify(&w, HOLDER, Some(&f)));
+            at
+        });
+        let wakeups = AtomicU32::new(0);
+        let waited = wait_once(
+            &mut waiter,
+            &word,
+            WAITER,
+            Duration::from_secs(5),
+            &wakeups,
+            &mut || {},
+        );
+        let woke = Instant::now();
+        assert!(matches!(waited, FreeWait::Claimed(())), "{waited:?}");
+        let released = releaser.join().unwrap();
+        let took = woke.saturating_duration_since(released);
+        assert!(took <= Duration::from_millis(50), "(в): {took:?}");
+        assert_eq!(wakeups.load(Ordering::Relaxed), 1, "(в): одно пробуждение");
+    }
+
+    /// Без ждущих освобождение -- ни одного системного вызова (`NtSetEvent`
+    /// не зовётся); с одним ждущим -- сигнал на каждое освобождение.
+    #[test]
+    fn release_without_waiters_makes_no_syscall() {
+        let free = notifier("NOSYS");
+        let word = AtomicU32::new(CLAIM_FREE);
+        let before = free.free_gen();
+        for _ in 0..1000 {
+            word.store(HOLDER, Ordering::Release);
+            assert!(release_word_notify(&word, HOLDER, Some(&free)));
+        }
+        assert_eq!(free.waiters(), 0);
+        assert_eq!(free.signals(), 0, "сигналы без ждущих");
+        assert_eq!(free.free_gen().wrapping_sub(before), 1000, "поколение");
+        // Не наш токен -- не освобождение: ни поколения, ни сигнала.
+        word.store(HOLDER, Ordering::Release);
+        assert!(!release_word_notify(&word, WAITER, Some(&free)));
+        assert_eq!(free.free_gen().wrapping_sub(before), 1000);
+
+        let waiter = FreeWaiter::new(Arc::clone(&free));
+        assert_eq!(free.waiters(), 1);
+        for _ in 0..3 {
+            word.store(HOLDER, Ordering::Release);
+            assert!(release_word_notify(&word, HOLDER, Some(&free)));
+        }
+        assert_eq!(free.signals(), 3, "сигналы при ждущем");
+        drop(waiter);
+        assert_eq!(free.waiters(), 0, "Drop ждущего");
+    }
+
+    /// Подержать claim ~20 мкс (спин): ждущие успевают уснуть в ядре, а не
+    /// только крутиться на сменившемся поколении.
+    fn hold() {
+        let until = Instant::now() + Duration::from_micros(20);
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// 4 ждущих потока и 2 держателя гоняют одно claim-слово: 20 000
+    /// циклов «захват -> освобождение» держателей, каждый ждущий захватывает
+    /// `K` раз. Каждое ожидание в ядре ограничено 1 с -- детектор потерянного
+    /// сигнала (держатели освобождают постоянно, а после них -- ждущие друг
+    /// другу): ни одного такого таймаута; все ждущие завершаются не позже
+    /// 2 с после последнего освобождения держателей.
+    #[test]
+    fn free_waiters_never_miss_release_stress() {
+        const HOLDER_CYCLES: u32 = 20_000;
+        const K: u32 = 1_000;
+        let free = notifier("STRESS");
+        let word = Arc::new(AtomicU32::new(CLAIM_FREE));
+        let cycles = Arc::new(AtomicU32::new(0));
+        let holders_done = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let mut threads = Vec::new();
+        for h in 0..2u32 {
+            let (word, free, cycles, done) = (
+                Arc::clone(&word),
+                Arc::clone(&free),
+                Arc::clone(&cycles),
+                Arc::clone(&holders_done),
+            );
+            threads.push(std::thread::spawn(move || {
+                let token = HOLDER + h;
+                while cycles.load(Ordering::Acquire) < HOLDER_CYCLES {
+                    if word
+                        .compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        hold();
+                        assert!(release_word_notify(&word, token, Some(&free)));
+                        cycles.fetch_add(1, Ordering::AcqRel);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                *done.lock().unwrap() = Some(Instant::now());
+                (0u64, 0u32)
+            }));
+        }
+        for w in 0..4u32 {
+            let (word, free) = (Arc::clone(&word), Arc::clone(&free));
+            threads.push(std::thread::spawn(move || {
+                let token = WAITER + w;
+                let mut waiter = FreeWaiter::new(Arc::clone(&free));
+                waiter.cap_kernel_wait(Duration::from_secs(1));
+                let wakeups = AtomicU32::new(0);
+                for _ in 0..K {
+                    let waited = wait_once(
+                        &mut waiter,
+                        &word,
+                        token,
+                        Duration::from_secs(120),
+                        &wakeups,
+                        &mut || {},
+                    );
+                    assert!(matches!(waited, FreeWait::Claimed(())), "{waited:?}");
+                    hold();
+                    assert!(release_word_notify(&word, token, Some(&free)));
+                }
+                (waiter.kernel_timeouts(), wakeups.load(Ordering::Relaxed))
+            }));
+        }
+        let (mut timeouts, mut slept) = (0, 0);
+        for thread in threads {
+            let (t, s) = thread.join().unwrap();
+            timeouts += t;
+            slept += s;
+        }
+        // Тест проверяет путь сна, а не только круги по поколению.
+        assert!(slept >= 100, "ожиданий в ядре: {slept}");
+        let finished = Instant::now();
+        let last_release = holders_done.lock().unwrap().unwrap();
+        assert_eq!(timeouts, 0, "потерянные сигналы (ожидание до потолка 1 с)");
+        let tail = finished.saturating_duration_since(last_release);
+        assert!(tail <= Duration::from_secs(2), "хвост ждущих: {tail:?}");
+        assert_eq!(free.waiters(), 0);
+    }
+
+    /// Поток сигналов `_free` (пир, взводящий событие и поколение без
+    /// конца) не голодит остановку: `wake` -- индекс 0, остановка видна
+    /// не позже 100 мс.
+    #[test]
+    fn free_flood_does_not_starve_stop() {
+        let free = notifier("FLOOD");
+        let word = AtomicU32::new(HOLDER);
+        let running = Arc::new(AtomicBool::new(true));
+        let flooding = Arc::new(AtomicBool::new(true));
+        let flooder = {
+            let (free, flooding) = (Arc::clone(&free), Arc::clone(&flooding));
+            std::thread::spawn(move || {
+                while flooding.load(Ordering::Acquire) {
+                    free.notify();
+                }
+            })
+        };
+        let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let stopper = {
+            let (running, wake) = (Arc::clone(&running), Arc::clone(&wake));
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                running.store(false, Ordering::Release);
+                wake.set().unwrap();
+                Instant::now()
+            })
+        };
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        let waited = waiter
+            .wait_free(
+                &mut || claim_attempt(&word, WAITER),
+                &mut || {},
+                &mut WaitCtl {
+                    wake: Some(wake.as_handle()),
+                    running: &|| running.load(Ordering::Acquire),
+                    on_wake: &mut || {},
+                    wakeup: &|| {},
+                    deadline: Instant::now().checked_add(Duration::from_secs(10)),
+                    renudge: None,
+                },
+            )
+            .unwrap();
+        let returned = Instant::now();
+        flooding.store(false, Ordering::Release);
+        flooder.join().unwrap();
+        let stopped = stopper.join().unwrap();
+        assert!(matches!(waited, FreeWait::Stopped), "{waited:?}");
+        let took = returned.saturating_duration_since(stopped);
+        assert!(took <= Duration::from_millis(100), "{took:?}");
+    }
+
+    /// Разовый повторный толчок (R-N): захват без сессии толкается один
+    /// раз при первом наблюдении и один раз -- через `renudge`; новый
+    /// таймер на тот же ключ не ставится. Подключённая сессия (`key == 0`)
+    /// -- ни одного толчка.
+    #[test]
+    fn stale_claim_is_renudged_once() {
+        let free = notifier("RENUDGE");
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        let nudges = AtomicU32::new(0);
+        let wakeups = AtomicU32::new(0);
+        let run = |waiter: &mut FreeWaiter, key: u64, limit: Duration| {
+            waiter
+                .wait_free::<()>(
+                    &mut || {
+                        Attempt::Busy(Busy {
+                            key,
+                            ..Busy::default()
+                        })
+                    },
+                    &mut || {
+                        nudges.fetch_add(1, Ordering::Relaxed);
+                    },
+                    &mut WaitCtl {
+                        wake: None,
+                        running: &|| true,
+                        on_wake: &mut || {},
+                        wakeup: &|| {
+                            wakeups.fetch_add(1, Ordering::Relaxed);
+                        },
+                        deadline: Instant::now().checked_add(limit),
+                        renudge: Some(Duration::from_millis(100)),
+                    },
+                )
+                .unwrap()
+        };
+        let waited = run(&mut waiter, 7, Duration::from_millis(600));
+        assert!(matches!(waited, FreeWait::TimedOut), "{waited:?}");
+        assert_eq!(nudges.load(Ordering::Relaxed), 2, "толчок + один повторный");
+        // Сон: повторный толчок (100 мс) и дедлайн -- два возврата.
+        assert_eq!(wakeups.load(Ordering::Relaxed), 2);
+
+        let mut waiter = FreeWaiter::new(Arc::clone(&free));
+        nudges.store(0, Ordering::Relaxed);
+        let waited = run(&mut waiter, 0, Duration::from_millis(300));
+        assert!(matches!(waited, FreeWait::TimedOut), "{waited:?}");
+        assert_eq!(nudges.load(Ordering::Relaxed), 0, "сессия -- без толчков");
     }
 }

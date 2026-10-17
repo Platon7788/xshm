@@ -269,6 +269,26 @@
   создатель (решение R-L): служба на `Global\` с `Everyone` требует той же
   политики у клиентов (или старта службы первой).
 
+- **Уведомление «claim освобождён»** (надёжность, 17.10.2026, Task 12;
+  решения J, R-N, R-O; INTEROP **R20**/**R21**, «Изменения 0.10» п. 39).
+  Рядом с маяком присутствия сервер создаёт событие-уведомление
+  `<имя>_free` (база `MultiServer` — `<база>_multi_free`; тот же namespace и
+  дескриптор, лучшее усилие, как маяк), а в `<имя>_beacon_state` — счётчики
+  `free_gen@20` и `free_waiters@24`. Каждое освобождение claim-а
+  (`slot_claim: T -> 0` — откат и отзыв заявки, уход клиента, снятие
+  claim-а умершего, отъём протухшего захвата, дедлайн и уход в Multi) и
+  `raise`/`lower` маяка увеличивают `free_gen` и, только если есть ждущие,
+  взводят `<имя>_free`: без ждущих — ни одного системного вызова. Внутреннее:
+  `presence::{FreeNotifier, FreeWaiter, release_claim_notify,
+  ChannelProbe}` — `release_claim_notify` единственный путь `T -> 0` в
+  крейте.
+- **`SharedClient::wait_connectable(name, timeout)` и
+  `wait_connectable_in(ns, name, timeout)`** -> `Result<bool>`: дождаться,
+  пока канал не станет свободным, не подключаясь (`Ok(true)` — claim был
+  свободен; проигравший гонку `connect` получит `AlreadyConnected` и зовёт
+  снова; `Ok(false)` — таймаут). Сон в ядре на `<имя>_free` и процессах
+  держателя и сервера; сервер без `<имя>_free` — проверка раз в 250 мс.
+
 ### Изменено (несовместимо)
 
 - **`SharedServer::poll_client`/`poll_client_spin` и
@@ -426,6 +446,36 @@
   повторы `on_error` как признак «сервера всё ещё нет», — ждать `on_connect`;
   имена каналов и баз Multi не должны совпадать (`X` и база `X` делят маяк
   `X_beacon`).
+- **Занятый канал и `NoFreeSlot` — без опроса** (надёжность, 17.10.2026,
+  Task 12; INTEROP R20/R21, п. 39). Было: `AutoClient` при
+  `AlreadyConnected` повторял попытку с отступом `BusyBackoff`
+  (`reconnect_delay` -> 2 с, `on_error` на каждой попытке), `MultiClient`
+  при `NoFreeSlot` — раз в `retry_delay` (250 мс) с толчком всех слотов.
+  Стало: `on_error(AlreadyConnected)`/`on_error(NoFreeSlot)` — **раз на
+  эпизод** занятости, затем сон в ядре на `[wake, <имя>_free, процесс
+  держателя, процесс сервера]` (Multi — `[wake, <база>_multi_free, процесс
+  сервера]`) без таймаута; держатель ушёл — подключение сразу (в тестах ≤
+  200 мс). Захват без сессии ждущий толкает (`CONNECT_REQ`) один раз на
+  токен и разово повторно через `RESERVE_TIMEOUT + 1 с` (решение R-N) —
+  сервер отнимает протухший захват на нём; подключённая сессия держателя ни
+  толчков, ни таймаута не даёт. `BusyBackoff`/`retry_delay` остались
+  **резервом**: сервер без `<имя>_free` (пир без R20, подменённый тип
+  события), заголовок канала не открылся, claim свободен, а канал занят
+  клиентом без claim. Пир, освобождающий claim без уведомления (нативный
+  клиент без R20 при Rust-сервере), держит ждущих до смерти процесса
+  держателя/сервера или до следующего освобождения (INTEROP §h п. 12).
+  Тесты: `auto::free_tests::{busy_channel_waiter_sleeps_without_wakeups,
+  busy_waiter_wakes_on_every_release_path}`,
+  `multi::tests::{no_free_slot_waiter_sleeps_and_wakes_on_release,
+  slot_deadline_reclaim_notifies_waiters}`,
+  `presence::tests::{free_waiter_interleavings,
+  free_waiters_never_miss_release_stress,
+  release_without_waiters_makes_no_syscall, free_flood_does_not_starve_stop,
+  stale_claim_is_renudged_once}`, `client::tests::{wait_connectable_returns_on_release,
+  wait_connectable_falls_back_without_free_event}`, `tests/peer_death.rs`
+  `busy_waiter_wakes_on_holder_crash_in_session`; резерв —
+  `auto::claim_tests::already_connected_backs_off` (`<имя>_free` занят
+  автосбросным событием).
 - Dispatch: мьютекс лобби `<лобби>_lock` сервер создаёт **до** секции лобби
   (было — после): лобби взводит маяк присутствия, и разбуженный им клиент
   застаёт мьютекс с политикой сервера. INTEROP §b.2.
@@ -1197,6 +1247,23 @@
   R14 (состояние, потом сигнал) — ОБЯЗАН, иначе любой потребитель Rust
   примет уход за устаревший сигнал; поглощать устаревший `DISCONNECT`
   самому — ЖЕЛАТЕЛЬНО.
+
+- **Important** (Task 12, решение R-O) Claim держателя, умершего до
+  `CLIENT_HELLO` (захватил claim и упал, не выставив заявки), single-client
+  сервер снимал только через `RESERVE_TIMEOUT` (10 с) от первого толчка, и
+  то лишь благодаря повторным толчкам опрашивающих клиентов; Multi — по
+  дедлайну диспетчера. Теперь на толчке (`CONNECT_REQ` без заявки) сервер
+  (single-client `observe_idle_claim`, диспетчер Multi
+  `handle_slot_connect`) при `client_state != CLIENT_HELLO` и
+  подтверждённо умершем владельце (`slot_owner_pid` + `owner_start`,
+  `server::release_if_owner_gone`) снимает claim сразу и уведомляет ждущих.
+  ABA (окно C1–C2 нового держателя, поля владельца ещё прежние): живой
+  держатель теряет claim, его C8 даёт `AlreadyConnected` и повтор — двух
+  писателей нет (C6 — CAS из `IDLE`, отъём только без заявки). Тесты:
+  `tests/peer_death.rs` `holder_dead_before_hello_reclaimed_on_first_nudge`
+  (было 13,4 с, стало ≤ 500 мс), `multi::tests::dead_owner_claim_released_on_nudge`.
+  Пир-видимо: INTEROP R18, §e.5, §i.3, п. 39 (нативному серверу —
+  ЖЕЛАТЕЛЬНО).
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

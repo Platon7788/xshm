@@ -16,6 +16,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
+use crate::presence::{FreeNotifier, release_claim_notify};
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
@@ -156,6 +157,23 @@ pub(crate) enum ClaimMode {
     Legacy,
 }
 
+/// Откуда заявка берёт уведомитель «claim освобождён» (Task 12, R20),
+/// которым уведомляет о каждом своём освобождении claim-а (откат C6, C8,
+/// отзыв W, уход L).
+#[derive(Clone, Debug)]
+pub(crate) enum FreeLink {
+    /// Открыть `<имя>_free` канала на C0 (нет -- пир без R20, без
+    /// уведомления).
+    Open,
+    /// Уже открытый вызывающим (worker `AutoClient`: один на жизнь worker-а;
+    /// `None` -- у канала его нет).
+    Given(Option<Arc<FreeNotifier>>),
+    /// Без уведомления: лобби Dispatch (клиентов сериализует мьютекс лобби
+    /// -- ждущих claim-а нет), выделенный канал Dispatch (без маяка и
+    /// `_free`), `Held` Multi (claim освобождает перебор Multi).
+    Off,
+}
+
 /// Прерывание ожидания `S2C_CONNECT` (ревизия 2): событие своего процесса
 /// (`wake` worker-а) и проверка «пора остановиться». Сработал `wake`, а
 /// `should_stop()` вернул `true` -- заявка отзывается, `connect` возвращает
@@ -217,6 +235,9 @@ pub struct SharedClient {
     /// (`PeerDied` от наблюдения «уже завершился»), чтобы живой сервер с
     /// испорченным временем в сегменте не остался в сессии навсегда.
     leave_on_drop: bool,
+    /// Уведомитель «claim освобождён» (Task 12, R20): освобождение claim-а
+    /// при уходе L -- с уведомлением ждущих.
+    free: Option<Arc<FreeNotifier>>,
     /// Последним: view и кольца указывают в эту память.
     _mapping: Mapping,
     /// Делает тип `!Sync` (0.10, нулевой размер): кольцо -- SPSC, и
@@ -259,8 +280,21 @@ impl SharedClient {
     /// (`peer_tests::corrupted_server_start_hi_is_not_a_live_server`):
     /// подключение без наблюдения процесса, границу задаёт таймаут
     /// вызывающего.
+    ///
+    /// Каждое освобождение claim-а этим клиентом (отзыв заявки, уход) --
+    /// с уведомлением «claim освобождён» (0.10, INTEROP R20): клиент,
+    /// ждущий занятый канал ([`SharedClient::wait_connectable`],
+    /// `AutoClient`), просыпается сразу.
     pub fn connect(name: &str, timeout: Duration) -> Result<Self> {
-        Self::connect_impl(None, name, timeout, true, ClaimMode::Take, None)
+        Self::connect_impl(
+            None,
+            name,
+            timeout,
+            true,
+            ClaimMode::Take,
+            FreeLink::Open,
+            None,
+        )
     }
 
     /// Подключиться к каналу `name` в частном пространстве имён `ns` (0.10;
@@ -272,7 +306,55 @@ impl SharedClient {
     /// Ошибки -- как у [`SharedClient::connect`]; канала в пространстве нет
     /// -- `WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`.
     pub fn connect_in(ns: &PrivateNamespace, name: &str, timeout: Duration) -> Result<Self> {
-        Self::connect_impl(Some(ns), name, timeout, true, ClaimMode::Take, None)
+        Self::connect_impl(
+            Some(ns),
+            name,
+            timeout,
+            true,
+            ClaimMode::Take,
+            FreeLink::Open,
+            None,
+        )
+    }
+
+    /// Дождаться, пока канал `name` не станет свободным (0.10, Task 12,
+    /// INTEROP R21), не подключаясь: `Ok(true)` -- claim канала был свободен
+    /// в какой-то момент (дальше -- [`SharedClient::connect`]; проигравший
+    /// гонку другому клиенту получит `AlreadyConnected` и зовёт снова);
+    /// `Ok(false)` -- истёк `timeout` (`None` -- без ограничения).
+    ///
+    /// Без опроса: ждущий спит в ядре на уведомлении «claim освобождён»
+    /// `<имя>_free`, которое сервер создаёт вместе с маяком присутствия, а
+    /// каждый, кто освобождает claim (клиент -- отзыв и уход, сервер --
+    /// снятие умершего и протухшего захвата), взводит при наличии ждущих
+    /// (R20), -- и на процессах держателя и сервера. Захват без заявки
+    /// (держатель завис или умер до `CLIENT_HELLO`) ждущий толкает сам
+    /// (`CONNECT_REQ`) и один раз повторно через `RESERVE_TIMEOUT + 1 с` --
+    /// сервер снимает протухший захват. Сервер без `_free` (пир без R20) --
+    /// проверка раз в 250 мс (резерв).
+    ///
+    /// # Errors
+    ///
+    /// Канала нет или он не опубликован -- ошибка открытия
+    /// (`WindowsError { code: STATUS_OBJECT_NAME_NOT_FOUND }`, `NotReady`);
+    /// процесс сервера завершился во время ожидания -- `PeerDied`; ошибка
+    /// ОС ожидания.
+    pub fn wait_connectable(name: &str, timeout: Option<Duration>) -> Result<bool> {
+        crate::presence::wait_connectable(None, name, timeout)
+    }
+
+    /// [`SharedClient::wait_connectable`] для канала в частном пространстве
+    /// имён `ns`.
+    ///
+    /// # Errors
+    ///
+    /// Как у [`SharedClient::wait_connectable`].
+    pub fn wait_connectable_in(
+        ns: &PrivateNamespace,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        crate::presence::wait_connectable(Some(ns), name, timeout)
     }
 
     /// Дождаться сервера канала `name` (0.10, INTEROP R19), не подключаясь:
@@ -355,9 +437,10 @@ impl SharedClient {
         name: &str,
         timeout: Duration,
         claim: ClaimMode,
+        free: FreeLink,
         interrupt: Interrupt<'_>,
     ) -> Result<Self> {
-        Self::connect_impl(namespace, name, timeout, true, claim, Some(interrupt))
+        Self::connect_impl(namespace, name, timeout, true, claim, free, Some(interrupt))
     }
 
     /// `announce_pid = false` -- поведение клиента 0.7/0.8.0 без обмена PID
@@ -378,9 +461,10 @@ impl SharedClient {
         timeout: Duration,
         announce_pid: bool,
         claim: ClaimMode,
+        free: FreeLink,
         mut interrupt: Option<Interrupt<'_>>,
     ) -> Result<Self> {
-        let hello = Hello::post(namespace, name, announce_pid, claim)?;
+        let hello = Hello::post(namespace, name, announce_pid, claim, free)?;
         // Сервер подтверждённо завершился ещё до открытия его процесса
         // (решение U): `S2C_CONNECT` никто не пошлёт, а наблюдать нечего --
         // ожидание заняло бы весь таймаут (с `Duration::MAX` -- вечно).
@@ -538,6 +622,9 @@ pub(crate) struct Hello {
     /// открылся (другая сессия без прав): тогда границу задаёт только
     /// таймаут.
     server: Option<ProcessWatch>,
+    /// Уведомитель «claim освобождён» (Task 12, R20): освобождения заявки
+    /// (откат C6, C8, отзыв W) -- с уведомлением; переходит клиенту.
+    free: Option<Arc<FreeNotifier>>,
     /// Сервер подтверждённо ушёл ещё до открытия его процесса
     /// (`is_process_gone`; `open_peer` не наблюдает мёртвый процесс). Им
     /// пользуется `connect_async` (`PeerDied` на первом опросе, Task 18);
@@ -572,15 +659,10 @@ impl std::fmt::Debug for Hello {
     }
 }
 
-/// Освободить свой claim (CAS `token -> CLAIM_FREE`): если он уже не наш
-/// (отъём по дедлайну), -- no-op.
-fn release_claim(view: &SharedView, token: u32) {
-    let _ = view.control_block().slot_claim.compare_exchange(
-        token,
-        CLAIM_FREE,
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+/// Освободить свой claim (CAS `token -> CLAIM_FREE`) с уведомлением ждущих
+/// `free` (Task 12, R20): если он уже не наш (отъём по дедлайну), -- no-op.
+fn release_claim(view: &SharedView, token: u32, free: Option<&FreeNotifier>) {
+    let _ = release_claim_notify(view.control_block(), token, free);
 }
 
 impl Hello {
@@ -592,11 +674,17 @@ impl Hello {
     /// получил толчок `CONNECT_REQ` -- §2.3 дизайна), заявка или сессия
     /// чужого клиента без claim (C6), или claim отняли до сигнала (C8).
     /// `Held`: провал C6 -- `Err(HandshakeFailed)` (Multi повторит захват).
+    ///
+    /// `free` (Task 12, R20) -- уведомитель «claim освобождён», которым
+    /// заявка и клиент уведомляют о своих освобождениях claim-а;
+    /// `FreeLink::Open` -- открыть `<имя>_free` здесь же, на C0 (его нет --
+    /// без уведомления).
     pub(crate) fn post(
         namespace: Option<&PrivateNamespace>,
         name: &str,
         announce_pid: bool,
         claim: ClaimMode,
+        free: FreeLink,
     ) -> Result<Self> {
         // C0: открыть всё, не трогая память (ошибки -- без побочных эффектов).
         let mapping = Mapping::open(ObjectPath::mapping(namespace, name))?;
@@ -606,6 +694,11 @@ impl Hello {
         let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }?;
         let control = view.control_block();
         let events = SharedEvents::open_in(namespace, name)?;
+        let free = match free {
+            FreeLink::Open => FreeNotifier::open(namespace, name).ok().map(Arc::new),
+            FreeLink::Given(free) => free,
+            FreeLink::Off => None,
+        };
 
         // C1-C2: исключительный захват claim-а и владелец.
         let (token, owns_claim) = match claim {
@@ -659,7 +752,7 @@ impl Hello {
         };
         let release = || {
             if owns_claim {
-                release_claim(&view, token);
+                release_claim(&view, token, free.as_deref());
             }
         };
 
@@ -747,6 +840,7 @@ impl Hello {
             claim: token,
             owns_claim,
             server,
+            free,
             server_gone,
             server_exited,
             mapping,
@@ -891,7 +985,7 @@ impl Hello {
             return true;
         }
         if self.owns_claim {
-            release_claim(&self.view, self.claim);
+            release_claim(&self.view, self.claim, self.free.as_deref());
         }
         false
     }
@@ -921,6 +1015,7 @@ impl Hello {
             claim,
             owns_claim,
             server: peer,
+            free,
             server_gone: _,
             server_exited,
             mapping,
@@ -988,6 +1083,7 @@ impl Hello {
             claim,
             owns_claim,
             leave_on_drop: inferred_death,
+            free,
             _mapping: mapping,
             _not_sync: PhantomData,
         }
@@ -1044,7 +1140,13 @@ impl ConnectFuture {
     fn step(&mut self, waker: &Waker) -> Step {
         if !self.started {
             self.started = true;
-            let posted = Hello::post(self.namespace.as_deref(), &self.name, true, ClaimMode::Take);
+            let posted = Hello::post(
+                self.namespace.as_deref(),
+                &self.name,
+                true,
+                ClaimMode::Take,
+                FreeLink::Open,
+            );
             let hello = match posted {
                 Ok(hello) => hello,
                 Err(err) => return Step::Failed(err),
@@ -1646,8 +1748,9 @@ impl Drop for SharedClient {
             let _ = self.events.disconnect.set();
         }
         self.connected = false;
+        // Task 12 (R20): claim -- последним, с уведомлением ждущих.
         if self.owns_claim {
-            release_claim(&self.view, self.claim);
+            release_claim(&self.view, self.claim, self.free.as_deref());
         }
     }
 }
@@ -1784,7 +1887,7 @@ mod tests {
         let server = SharedServer::start(&name).unwrap();
         let control = server.view().control_block();
         let req = &server.events().unwrap().connect_req;
-        let holder = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        let holder = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         let before = claim_fields(control);
         assert!(
             !req.wait(Some(Duration::ZERO)).unwrap(),
@@ -2162,7 +2265,14 @@ mod tests {
                 .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
         }
         let before = claim_fields(server.view().control_block());
-        let err = Hello::post(None, &name, true, ClaimMode::TakeOverAbandoned).unwrap_err();
+        let err = Hello::post(
+            None,
+            &name,
+            true,
+            ClaimMode::TakeOverAbandoned,
+            FreeLink::Open,
+        )
+        .unwrap_err();
         assert_eq!(err, ShmError::AlreadyConnected);
         assert_eq!(claim_fields(server.view().control_block()), before);
         // Толчок разбудил сервер, S2 снял заявку умершего D и его claim.
@@ -2176,7 +2286,14 @@ mod tests {
 
         // Claim D без заявки -- перехватывается.
         control.slot_claim.store(T_D, Ordering::Release);
-        let hello = Hello::post(None, &name, true, ClaimMode::TakeOverAbandoned).unwrap();
+        let hello = Hello::post(
+            None,
+            &name,
+            true,
+            ClaimMode::TakeOverAbandoned,
+            FreeLink::Open,
+        )
+        .unwrap();
         assert_eq!(control.slot_claim.load(Ordering::Acquire), hello.claim);
         assert!(!hello.withdraw());
         assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
@@ -2188,7 +2305,7 @@ mod tests {
     fn connect_async_loser_already_connected() {
         let name = unique("ALOSER");
         let server = SharedServer::start(&name).unwrap();
-        let holder = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        let holder = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         let mut future = std::pin::pin!(SharedClient::connect_async(&name));
         let mut cx = Context::from_waker(Waker::noop());
         match future.as_mut().poll(&mut cx) {
@@ -2325,7 +2442,7 @@ mod tests {
     /// его. Иначе `wait_ack` -- `Timeout` при уже зафиксированной сервером
     /// сессии.
     fn next_client_gets_ack(server: &mut SharedServer, name: &str) {
-        let hello = Hello::post(None, name, true, ClaimMode::Take).unwrap();
+        let hello = Hello::post(None, name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         std::thread::scope(|s| {
             let accepting = s.spawn(|| server.wait_for_client(Some(Duration::from_secs(5))));
             hello.events.connect_req.set().unwrap();
@@ -2568,6 +2685,7 @@ mod tests {
             name,
             timeout,
             ClaimMode::Take,
+            FreeLink::Open,
             Interrupt {
                 wake: wake.as_handle(),
                 should_stop: &mut should_stop,
@@ -2652,6 +2770,7 @@ mod tests {
             &name,
             Duration::from_secs(5),
             ClaimMode::Take,
+            FreeLink::Open,
             Interrupt {
                 wake: wake.as_handle(),
                 should_stop: &mut should_stop,
@@ -2815,6 +2934,82 @@ mod tests {
         assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+    }
+
+    /// Task 12 (R21): `wait_connectable` спит, пока канал занят, и
+    /// возвращает `true` сразу после освобождения claim-а (здесь -- отзыв
+    /// заявки A, уведомление R20); claim он не берёт. Занят до конца
+    /// таймаута -- `false`; канала нет -- ошибка открытия.
+    #[test]
+    fn wait_connectable_returns_on_release() {
+        let name = format!("XSHM_WAIT_CONNECTABLE_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let a = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+
+        let started = Instant::now();
+        assert_eq!(
+            SharedClient::wait_connectable(&name, Some(Duration::from_millis(200))),
+            Ok(false),
+            "занят -- таймаут"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(190));
+
+        let waiter_name = name.clone();
+        let waiter = std::thread::spawn(move || {
+            let result = SharedClient::wait_connectable(&waiter_name, Some(Duration::from_secs(5)));
+            (result, Instant::now())
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        let released = Instant::now();
+        assert!(!a.withdraw(), "отзыв удался");
+        let (result, returned) = waiter.join().unwrap();
+        assert_eq!(result, Ok(true));
+        let took = returned.saturating_duration_since(released);
+        assert!(took <= Duration::from_millis(100), "{took:?}");
+        let control = server.view().control_block();
+        assert_eq!(
+            control.slot_claim.load(Ordering::Acquire),
+            CLAIM_FREE,
+            "ждущий claim не берёт"
+        );
+        drop(a);
+        assert_eq!(
+            SharedClient::wait_connectable(&name, Some(Duration::ZERO)),
+            Ok(true),
+            "свободен"
+        );
+        drop(server);
+        assert!(SharedClient::wait_connectable(&name, Some(Duration::ZERO)).is_err());
+    }
+
+    /// Task 12 (резерв R-M): канал без уведомителя (`<имя>_free` занят
+    /// автосбросным событием -- как пир без R20) -- `wait_connectable`
+    /// проверяет раз в 250 мс и всё равно дожидается освобождения.
+    #[test]
+    fn wait_connectable_falls_back_without_free_event() {
+        let name = format!("XSHM_WAIT_CONNECTABLE_FB_{}", std::process::id());
+        let _squatter = EventHandle::create(
+            ObjectPath::scoped(None, &name, "_free"),
+            &crate::ObjectSecurity::default().attributes().unwrap(),
+        )
+        .unwrap();
+        let server = SharedServer::start(&name).unwrap();
+        assert!(
+            FreeNotifier::open(None, &name).is_err(),
+            "подменённый _free"
+        );
+        let a = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        let waiter = std::thread::spawn(move || {
+            SharedClient::wait_connectable(&name, Some(Duration::from_secs(5)))
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let released = Instant::now();
+        assert!(!a.withdraw());
+        assert_eq!(waiter.join().unwrap(), Ok(true));
+        let took = released.elapsed();
+        assert!(took <= Duration::from_millis(600), "{took:?}");
+        drop(a);
+        drop(server);
     }
 }
 

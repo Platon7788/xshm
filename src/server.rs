@@ -17,7 +17,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::presence::{Presence, ServerPresence};
+use crate::presence::{FreeNotifier, Presence, ServerPresence, release_claim_notify};
 use crate::ring::{
     DisconnectWatch, DrainBound, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome,
     deadline_of, spin_until,
@@ -172,18 +172,43 @@ pub(crate) type Lingering = (ProcessWatch, u32);
 /// Без ABA: токены уникальны в процессе (`claim_token`), новый держатель
 /// мог взять claim только после его освобождения (тогда CAS не совпадёт), а
 /// живой процесс не бывает «умершим» -- сигнальный handle окончателен.
+///
+/// Task 12: освобождение -- через `release_claim_notify` (R20, уведомление
+/// ждущих `free`).
 pub(crate) fn release_if_holder_dead(
     control: &crate::layout::ControlBlock,
     watch: &ProcessWatch,
     token: u32,
+    free: Option<&FreeNotifier>,
 ) -> bool {
     token != CLAIM_FREE
         && watch.has_exited()
         && control.slot_owner_pid.load(Ordering::Acquire) == watch.pid()
-        && control
-            .slot_claim
-            .compare_exchange(token, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+        && release_claim_notify(control, token, free)
+}
+
+/// Быстрый путь толчка (Task 12, решение R-O, INTEROP R18): claim без
+/// заявки (`client_state != CLIENT_HELLO`), а его владелец
+/// (`slot_owner_pid` + `owner_start`) подтверждённо умер -- освободить сразу,
+/// без `RESERVE_TIMEOUT`, и уведомить ждущих. `true` -- освобождён.
+///
+/// ABA (окно C1-C2 нового держателя): claim уже его, а поля владельца ещё
+/// прежнего, умершего, -- живой держатель теряет claim. Двух писателей это
+/// не даёт: его C6 -- CAS из `IDLE` (заявки нет -- отъём только без
+/// `HELLO`), а C8 видит чужой claim и отвечает `AlreadyConnected`
+/// (вызывающий повторяет).
+pub(crate) fn release_if_owner_gone(
+    control: &crate::layout::ControlBlock,
+    free: Option<&FreeNotifier>,
+) -> bool {
+    let claim = control.slot_claim.load(Ordering::Acquire);
+    if claim == CLAIM_FREE || control.client_state.load(Ordering::Acquire) == HANDSHAKE_CLIENT_HELLO
+    {
+        return false;
+    }
+    let owner = control.slot_owner_pid.load(Ordering::Acquire);
+    claim_holder_gone(control, owner, control.owner_start_time())
+        && release_claim_notify(control, claim, free)
 }
 
 /// Протухший захват single-client канала (ревизия 3, §2.3 дизайна, R18):
@@ -201,18 +226,27 @@ pub(crate) fn release_if_holder_dead(
 /// умер и claim всё ещё его -- снять сразу (`release_if_holder_dead`), не
 /// дожидаясь `reserve`; claim уже не его токен (клиент ушёл сам, L) --
 /// наблюдение больше не нужно.
+///
+/// Task 12 (решение R-O): владелец claim-а без заявки подтверждённо умер --
+/// claim снимается на этом же толчке (`release_if_owner_gone`), без
+/// `reserve`. Все освобождения -- с уведомлением `free` (R20).
 fn observe_idle_claim(
     view: &SharedView,
     seen: &mut Option<(u32, Instant)>,
     lingering: &mut Option<Lingering>,
     reserve: Duration,
+    free: Option<&FreeNotifier>,
 ) {
     let control = view.control_block();
     if let Some((watch, token)) = lingering.as_ref()
         && (control.slot_claim.load(Ordering::Acquire) != *token
-            || release_if_holder_dead(control, watch, *token))
+            || release_if_holder_dead(control, watch, *token, free))
     {
         *lingering = None;
+    }
+    if release_if_owner_gone(control, free) {
+        *seen = None;
+        return;
     }
     let claim = control.slot_claim.load(Ordering::Acquire);
     if claim == CLAIM_FREE {
@@ -226,12 +260,7 @@ fn observe_idle_claim(
                 && control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO
             {
                 // CAS: если claim успел смениться, это уже другой захват.
-                let _ = control.slot_claim.compare_exchange(
-                    claim,
-                    CLAIM_FREE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                let _ = release_claim_notify(control, claim, free);
                 *seen = None;
             }
         }
@@ -377,6 +406,10 @@ pub struct SharedServer {
     presence: Option<ServerPresence>,
     /// Состояние маяка присутствия (`presence()`, решение W(1)).
     presence_status: crate::PresenceStatus,
+    /// Уведомитель «claim освобождён» (Task 12, R20): `<имя>_free` рядом с
+    /// маяком; слот Multi -- уведомитель базы. `None` -- anonymous,
+    /// выделенный канал Dispatch, отказ создания (лучшее усилие).
+    free: Option<Arc<FreeNotifier>>,
     /// Тесты: пробуждения ожиданий `wait_for_client*` (включая внутренние
     /// повторы после `CONNECT_REQ` без заявки).
     #[cfg(test)]
@@ -480,11 +513,23 @@ impl SharedServer {
             // занятый или недоступный маяк старт не отказывает -- сервер
             // работает без него (`presence()`), клиенты находят его резервной
             // проверкой `discovery_fallback`.
-            let (beacon, status) = ServerPresence::start(namespace, name, security);
+            // Task 12 (R20): уведомитель «claim освобождён» -- рядом с
+            // маяком, тоже лучшее усилие (отказ -- ждущие клиенты работают
+            // по резерву `BusyBackoff`).
+            server.free = FreeNotifier::create(root, name, security)
+                .ok()
+                .map(Arc::new);
+            let (beacon, status) =
+                ServerPresence::start(namespace, name, security, server.free.clone());
             server.presence = beacon;
             server.presence_status = status;
         }
         Ok(server)
+    }
+
+    /// Слот Multi (Task 12): уведомитель «claim освобождён» базы.
+    pub(crate) fn set_free_notifier(&mut self, free: Option<Arc<FreeNotifier>>) {
+        self.free = free;
     }
 
     /// Маяк присутствия этого сервера (0.10, INTEROP R19): `Active` -- взведён;
@@ -564,6 +609,7 @@ impl SharedServer {
             reserve_timeout: crate::constants::RESERVE_TIMEOUT,
             presence: None,
             presence_status: crate::PresenceStatus::Disabled,
+            free: None,
             #[cfg(test)]
             wait_wakeups: Arc::default(),
             _namespace: None,
@@ -619,6 +665,7 @@ impl SharedServer {
                     &mut self.claim_seen,
                     &mut self.lingering,
                     self.reserve_timeout,
+                    self.free.as_deref(),
                 );
             }
         }
@@ -783,6 +830,7 @@ impl SharedServer {
                     &mut self.claim_seen,
                     &mut self.lingering,
                     self.reserve_timeout,
+                    self.free.as_deref(),
                 );
             }
             #[cfg(test)]
@@ -919,14 +967,8 @@ impl SharedServer {
                 #[cfg(test)]
                 handshake_hook(&self.view, HandshakePoint::AfterDeadWithdraw);
                 // Claim -- последним: пока он стоит, новой заявки нет.
-                if claim != CLAIM_FREE {
-                    let _ = control.slot_claim.compare_exchange(
-                        claim,
-                        CLAIM_FREE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
-                }
+                // Task 12: с уведомлением ждущих (R20).
+                let _ = release_claim_notify(control, claim, self.free.as_deref());
             }
             return Err(ShmError::HandshakeFailed);
         }
@@ -1077,14 +1119,8 @@ impl SharedServer {
         header_b
             .handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
-        if claim != CLAIM_FREE {
-            let _ = control.slot_claim.compare_exchange(
-                claim,
-                CLAIM_FREE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
+        // Task 12: с уведомлением ждущих (R20).
+        let _ = release_claim_notify(control, claim, self.free.as_deref());
         if let Some(events) = &self.events {
             let _ = events.disconnect.set();
         }
@@ -1193,12 +1229,8 @@ impl SharedServer {
             return;
         }
         if self.exclusive && peer.has_exited() {
-            let _ = control.slot_claim.compare_exchange(
-                session_claim,
-                CLAIM_FREE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+            // Task 12: с уведомлением ждущих (R20).
+            let _ = release_claim_notify(control, session_claim, self.free.as_deref());
             return;
         }
         // Task 7: клиент жив (или это слот Multi), а claim всё ещё его --
@@ -1290,6 +1322,7 @@ impl SharedServer {
                 &mut self.claim_seen,
                 &mut self.lingering,
                 self.reserve_timeout,
+                self.free.as_deref(),
             );
         }
     }
@@ -1950,7 +1983,7 @@ mod handshake_tests {
 
     // ─── Ревизия 3 (Task 22) ────────────────────────────────────────────────
 
-    use crate::client::{AckWait, ClaimMode, Hello};
+    use crate::client::{AckWait, ClaimMode, FreeLink, Hello};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1974,14 +2007,14 @@ mod handshake_tests {
             let forged = crate::win::current_process_start_time().wrapping_add(1);
             crate::client::FORGED_START_TIME.with(|cell| cell.set(Some(forged)));
         }
-        let p = Hello::post(None, &name, true, ClaimMode::Take);
+        let p = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open);
         crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
         let p = p.unwrap();
         let slot: Rc<RefCell<Option<Hello>>> = Rc::default();
         let (a_slot, a_name) = (slot.clone(), name);
         set_hook(HandshakePoint::BeforeCommit, move |_| {
             assert!(!p.withdraw(), "P отозвал заявку");
-            let a = Hello::post(None, &a_name, true, ClaimMode::Take).unwrap();
+            let a = Hello::post(None, &a_name, true, ClaimMode::Take, FreeLink::Open).unwrap();
             *a_slot.borrow_mut() = Some(a);
         });
         server.complete_handshake().unwrap();
@@ -2014,7 +2047,7 @@ mod handshake_tests {
     fn fast_leaver_disconnect_not_eaten() {
         let name = unique("FASTLEAVE");
         let mut server = SharedServer::start(&name).unwrap();
-        let hello = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         set_hook(HandshakePoint::AfterCommit, move |_| {
             assert!(hello.withdraw(), "отзыв обязан проиграть фиксации");
             drop(hello.finish());
@@ -2043,7 +2076,7 @@ mod handshake_tests {
     fn failed_connect_ack_closes_the_session() {
         let name = unique("ACKFAIL");
         let mut server = SharedServer::start(&name).unwrap();
-        let hello = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         FAIL_CONNECT_ACK.with(|fail| fail.set(true));
         assert!(matches!(
             server.complete_handshake(),
@@ -2078,7 +2111,7 @@ mod handshake_tests {
         drop(client);
         assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
         // Следующий клиент подключается.
-        let next = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        let next = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         server.complete_handshake().unwrap();
         assert!(matches!(
             next.wait_ack(Duration::from_secs(1), None),
@@ -2152,7 +2185,7 @@ mod handshake_tests {
             control.announce_client_start(0);
             control.slot_claim.store(CLAIM_FREE, Ordering::Release);
             // Живой A захватил канал и поставил заявку.
-            let a = Hello::post(None, &a_name, true, ClaimMode::Take).unwrap();
+            let a = Hello::post(None, &a_name, true, ClaimMode::Take, FreeLink::Open).unwrap();
             *a_slot.borrow_mut() = Some(a);
         });
         assert_eq!(server.complete_handshake(), Ok(()), "заявка живого A снята");
@@ -2181,7 +2214,14 @@ mod handshake_tests {
         let slot: Rc<RefCell<Option<Hello>>> = Rc::default();
         let (n_slot, n_name) = (slot.clone(), name);
         set_hook(HandshakePoint::AfterDeadWithdraw, move |_| {
-            let n = Hello::post(None, &n_name, true, ClaimMode::TakeOverAbandoned).unwrap();
+            let n = Hello::post(
+                None,
+                &n_name,
+                true,
+                ClaimMode::TakeOverAbandoned,
+                FreeLink::Open,
+            )
+            .unwrap();
             *n_slot.borrow_mut() = Some(n);
         });
         assert_eq!(server.complete_handshake(), Err(ShmError::HandshakeFailed));

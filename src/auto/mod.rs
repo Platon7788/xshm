@@ -5,12 +5,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crate::client::{ClaimMode, Interrupt, SharedClient};
+use crate::client::{ClaimMode, FreeLink, Interrupt, SharedClient};
 use crate::constants::{FRAME_ALIGN, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
-use crate::presence::{self, Failure, Presence, PresenceWait, PresenceWatch, Reported};
+use crate::presence::{
+    self, Attempt, ChannelProbe, Failure, FreeNotifier, FreeWait, FreeWaiter, Presence,
+    PresenceWait, PresenceWatch, Reported, WaitCtl,
+};
 use crate::ring::{self, FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -89,11 +92,14 @@ pub trait AutoHandler: Send + Sync + 'static {
     /// повтор сообщается снова), а
     /// следующая попытка -- по событию (см. `AutoOptions::reconnect_delay`).
     /// `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал занят другим
-    /// клиентом -- о каждой попытке, повтор с растущим отступом: пауза
-    /// удваивается от `reconnect_delay` до 2 с (`BUSY_RECONNECT_CAP`;
-    /// больший `reconnect_delay` -- без роста), любой другой исход попытки
-    /// её сбрасывает. Выделенный канал Dispatch не повторяет:
-    /// `AlreadyConnected` там -- канал занят чужим.
+    /// клиентом -- один раз на эпизод, затем (Task 12, INTEROP R21) сон в
+    /// ядре на уведомлении «claim освобождён» `<имя>_free` и процессах
+    /// держателя и сервера, без опроса: держатель ушёл -- подключение сразу.
+    /// Канал без `_free` (пир без R20) -- резерв: о каждой попытке, повтор с
+    /// растущим отступом (пауза удваивается от `reconnect_delay` до 2 с,
+    /// `BUSY_RECONNECT_CAP`; больший `reconnect_delay` -- без роста), любой
+    /// другой исход попытки её сбрасывает. Выделенный канал Dispatch не
+    /// повторяет: `AlreadyConnected` там -- канал занят чужим.
     fn on_error(&self, _err: ShmError) {}
 }
 
@@ -107,9 +113,17 @@ pub struct AutoOptions {
     /// корректности; оставлено для диагностики).
     pub poll_timeout: Option<Duration>,
     /// Пауза между попытками переподключения `AutoClient` (`AutoServer` не
-    /// использует). Канал занят другим клиентом (`AlreadyConnected`) --
-    /// пауза удваивается с каждой неудачей до 2 с (или остаётся этой, если
-    /// она больше); первый повтор -- через `reconnect_delay`.
+    /// использует).
+    ///
+    /// 0.10 (Task 12, INTEROP R20/R21): **канал занят** другим клиентом
+    /// (`AlreadyConnected`) -- клиент не повторяет, а спит в ядре на
+    /// уведомлении «claim освобождён» `<имя>_free` (его создаёт сервер
+    /// вместе с маяком, а взводит каждый, кто освобождает claim) и на
+    /// процессах держателя и сервера; захват без сессии он толкает сам
+    /// (`CONNECT_REQ`) и один раз повторно через `RESERVE_TIMEOUT + 1 с`.
+    /// Резерв (сервер без `_free`, пир без R20): пауза удваивается с каждой
+    /// неудачей до 2 с (или остаётся этой, если она больше); первый повтор
+    /// -- через `reconnect_delay`.
     ///
     /// 0.10 (Task 11, INTEROP R19): **сервера нет** (секции или событий нет,
     /// сегмент не опубликован, процесс сервера завершился) -- клиент НЕ
@@ -120,8 +134,8 @@ pub struct AutoOptions {
     /// и спит дальше. **Сервер есть, но подключиться нельзя** (другой формат
     /// памяти, порча, отказ в доступе) -- клиент спит до выхода процесса
     /// этого сервера. Пауза `reconnect_delay` остаётся: разовая после конца
-    /// сессии (после смерти сервера -- без неё), при занятом канале и как
-    /// резерв (решение R-M) -- сервер не ответил за `connect_timeout`, маяк
+    /// сессии (после смерти сервера -- без неё), при занятом канале без
+    /// `_free` и как резерв (решение R-M) -- сервер не ответил за `connect_timeout`, маяк
     /// недоступен (нет прав или привилегии `Global\`), процесс сервера не
     /// открылся.
     pub reconnect_delay: Duration,
@@ -1535,6 +1549,119 @@ impl BusyBackoff {
     }
 }
 
+/// Чем кончилось ожидание занятого канала (`Worker::await_free`).
+enum FreeOutcome {
+    /// Подключились.
+    Connected(Box<SharedClient>),
+    /// Попытка вернула другую ошибку -- разобрать её как обычную.
+    Failed(ShmError),
+    /// Новый круг worker-а (сервер ушёл, страховочный таймаут, резерв).
+    Retry,
+    /// Остановка.
+    Stop,
+}
+
+impl Worker {
+    /// Уведомитель «claim освобождён» канала `name` (открыть, если ещё не
+    /// открыт; нет -- `None`, следующий вызов пробует снова).
+    fn free_notifier(
+        &self,
+        name: &str,
+        free: &mut Option<Arc<FreeNotifier>>,
+    ) -> Option<Arc<FreeNotifier>> {
+        if free.is_none() {
+            *free = FreeNotifier::open(self.options.namespace.as_deref(), name)
+                .ok()
+                .map(Arc::new);
+        }
+        free.clone()
+    }
+
+    /// Канал занят (Task 12, INTEROP R21): ждать освобождения claim-а на
+    /// `[wake (0), <имя>_free (1), процесс держателя (2), процесс сервера
+    /// (3)]` без таймаута (страховка -- `poll_timeout`), попытка -- сначала
+    /// дешёвая проверка `slot_claim == 0` по удерживаемому заголовку, затем
+    /// подключение. Захват без сессии толкается один раз (и один повторный
+    /// толчок через `RESERVE_TIMEOUT + 1 с`, решение R-N). Нет `_free`
+    /// (пир без R20) или заголовок не открылся -- прежний отступ
+    /// `BusyBackoff` (резерв).
+    fn await_free(
+        &self,
+        name: &str,
+        free: &mut Option<Arc<FreeNotifier>>,
+        backoff: &mut BusyBackoff,
+    ) -> FreeOutcome {
+        let namespace = self.options.namespace.as_deref();
+        let busy_pause = |backoff: &mut BusyBackoff| {
+            let delay = backoff.next(true, self.options.reconnect_delay);
+            if self.pause(delay) {
+                FreeOutcome::Retry
+            } else {
+                FreeOutcome::Stop
+            }
+        };
+        let Some(notifier) = self.free_notifier(name, free) else {
+            return busy_pause(backoff);
+        };
+        let Ok(probe) = ChannelProbe::open(namespace, name) else {
+            return busy_pause(backoff);
+        };
+        let mut waiter = FreeWaiter::new(Arc::clone(&notifier));
+        let mut should_stop = || !self.running();
+        let mut attempt = || {
+            match probe.busy() {
+                Ok(Some(busy)) => return Attempt::Busy(busy),
+                Ok(None) => {}
+                Err(err) => return Attempt::Failed(err),
+            }
+            #[cfg(test)]
+            self.stats.attempts.fetch_add(1, Ordering::Relaxed);
+            let connected = SharedClient::connect_interruptible(
+                namespace,
+                name,
+                self.options.connect_timeout,
+                ClaimMode::Take,
+                FreeLink::Given(Some(Arc::clone(&notifier))),
+                Interrupt {
+                    wake: self.wake.as_handle(),
+                    should_stop: &mut should_stop,
+                },
+            );
+            match connected {
+                Ok(client) => Attempt::Done(client),
+                // Проиграли гонку другому клиенту -- снова ждать. Claim
+                // свободен, а канал занят (заявка или сессия клиента без
+                // claim, C6) -- уведомление этого не покажет: резерв.
+                Err(ShmError::AlreadyConnected) => match probe.busy() {
+                    Ok(Some(busy)) => Attempt::Busy(busy),
+                    _ => Attempt::Failed(ShmError::AlreadyConnected),
+                },
+                Err(err) => Attempt::Failed(err),
+            }
+        };
+        let waited = waiter.wait_free(
+            &mut attempt,
+            &mut || probe.nudge(),
+            &mut WaitCtl {
+                wake: Some(self.wake.as_handle()),
+                running: &|| self.running(),
+                on_wake: &mut || self.report_evicted(),
+                wakeup: &|| self.stats.wake(),
+                deadline: ring::deadline_of(self.options.poll_timeout),
+                renudge: Some(presence::renudge_delay(name)),
+            },
+        );
+        match waited {
+            Ok(FreeWait::Claimed(client)) => FreeOutcome::Connected(Box::new(client)),
+            Ok(FreeWait::Stopped) => FreeOutcome::Stop,
+            Ok(FreeWait::ServerGone | FreeWait::TimedOut) if self.running() => FreeOutcome::Retry,
+            Ok(FreeWait::ServerGone | FreeWait::TimedOut) => FreeOutcome::Stop,
+            Ok(FreeWait::Failed(ShmError::AlreadyConnected)) | Err(_) => busy_pause(backoff),
+            Ok(FreeWait::Failed(err)) => FreeOutcome::Failed(err),
+        }
+    }
+}
+
 /// Тесты (Task 6 надёжности): точка прохода worker-а клиента Auto, где
 /// срабатывает одноразовый хук канала (`WORKER_HOOKS`).
 #[cfg(test)]
@@ -1579,72 +1706,95 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
     // Маяк присутствия сервера (Task 11): открывается при первой нужде,
     // один раз на жизнь worker-а.
     let mut presence: Option<PresenceWatch> = None;
+    // Уведомитель «claim освобождён» канала (Task 12): открывается при
+    // первой нужде; пока его нет (сервер без R20) -- пробуется снова.
+    let mut free: Option<Arc<FreeNotifier>> = None;
     let mut reported = Reported::default();
 
-    while worker.running() {
+    'session: while worker.running() {
         // Ревизия 2: ожидание `S2C_CONNECT` прерывается `wake` -- `stop`/Drop
         // не ждут `connect_timeout`; `send` ожидание не прерывает.
         let mut should_stop = || !worker.running();
         #[cfg(test)]
         worker.stats.attempts.fetch_add(1, Ordering::Relaxed);
-        let connected = SharedClient::connect_interruptible(
+        // Task 12 (R20): свои освобождения claim-а (отзыв, уход) -- с
+        // уведомлением ждущих. Выделенный канал Dispatch -- без `_free`.
+        let link = if dedicated {
+            FreeLink::Off
+        } else {
+            FreeLink::Given(worker.free_notifier(name, &mut free))
+        };
+        let mut connected = SharedClient::connect_interruptible(
             worker.options.namespace.as_deref(),
             name,
             worker.options.connect_timeout,
             // Ревизия 3: канал Auto (и выделенный канал Dispatch) -- свой
-            // захват claim; занят -- `AlreadyConnected`, повтор с
-            // отступом `BusyBackoff` (выделенный -- без повтора).
+            // захват claim; занят -- `AlreadyConnected`, сон на уведомлении
+            // «claim освобождён» (Task 12; выделенный -- без повтора).
             ClaimMode::Take,
+            link,
             Interrupt {
                 wake: worker.wake.as_handle(),
                 should_stop: &mut should_stop,
             },
         );
-        let mut client = match connected {
-            Ok(client) => client,
-            Err(_) if !worker.running() => break,
-            Err(err) if dedicated => {
+        let mut client = loop {
+            let err = match connected {
+                Ok(client) => break client,
+                Err(err) => err,
+            };
+            if !worker.running() {
+                break 'session;
+            }
+            if dedicated {
                 // Выделенный канал не поднялся -- повторять не к чему
                 // (сервер его уже снёс или не дождался нас).
                 worker.handler.on_error(err);
                 worker.notify_disconnect(DisconnectReason::Error);
-                break;
+                break 'session;
             }
-            Err(err) => {
-                // Task 11 (R19): сервера нет или он отверг нас -- сон в ядре
-                // на маяке присутствия / процессе сервера (не дольше
-                // `discovery_fallback`), одинаковая ошибка подряд -- один раз.
-                if let Some(failure) =
-                    presence::classify(&err, worker.options.namespace.as_deref(), Some(name))
-                {
-                    busy_backoff.reset();
-                    worker.report_once(&mut reported, err);
-                    worker.report_evicted();
-                    if !worker.await_server(name, failure, &mut presence, &mut reported) {
-                        break;
-                    }
-                    continue;
-                }
-                // Канал занят (`AlreadyConnected`, до Task 12) -- о каждой
-                // попытке, отступ растёт (final review M4). Таймаут ответа
-                // сервера и прочее -- прежняя пауза `reconnect_delay`
-                // (решение R-M), одинаковая ошибка подряд -- один раз.
-                let busy = err == ShmError::AlreadyConnected;
-                if busy {
-                    reported.note(&err);
-                    worker.handler.on_error(err);
-                } else {
-                    worker.report_once(&mut reported, err);
-                }
+            // Task 11 (R19): сервера нет или он отверг нас -- сон в ядре на
+            // маяке присутствия / процессе сервера (не дольше
+            // `discovery_fallback`), одинаковая ошибка подряд -- один раз.
+            if let Some(failure) =
+                presence::classify(&err, worker.options.namespace.as_deref(), Some(name))
+            {
+                busy_backoff.reset();
+                worker.report_once(&mut reported, err);
                 worker.report_evicted();
-                // Отступ перед новой попыткой; остановка прерывает его сразу
-                // (событие `wake`), без сна-циклов.
-                let delay = busy_backoff.next(busy, worker.options.reconnect_delay);
-                if !worker.pause(delay) {
-                    break;
+                if !worker.await_server(name, failure, &mut presence, &mut reported) {
+                    break 'session;
                 }
-                continue;
+                continue 'session;
             }
+            if err == ShmError::AlreadyConnected {
+                // Канал занят -- о каждом эпизоде (final review M4), затем
+                // Task 12 (R21): сон на уведомлении «claim освобождён», а
+                // не повтор с отступом. Без `_free` (пир без R20) -- прежний
+                // отступ `BusyBackoff` (резерв, решение R-M).
+                reported.note(&err);
+                worker.handler.on_error(err);
+                worker.report_evicted();
+                match worker.await_free(name, &mut free, &mut busy_backoff) {
+                    FreeOutcome::Connected(client) => break *client,
+                    FreeOutcome::Failed(err) => {
+                        connected = Err(err);
+                        continue;
+                    }
+                    FreeOutcome::Retry => continue 'session,
+                    FreeOutcome::Stop => break 'session,
+                }
+            }
+            // Таймаут ответа сервера и прочее -- прежняя пауза
+            // `reconnect_delay` (решение R-M), одинаковая ошибка подряд --
+            // один раз. Остановка прерывает паузу сразу (событие `wake`).
+            worker.report_once(&mut reported, err);
+            worker.report_evicted();
+            let delay = busy_backoff.next(false, worker.options.reconnect_delay);
+            if !worker.pause(delay) {
+                break 'session;
+            }
+            continue 'session;
         };
         busy_backoff.reset();
         reported.clear();
@@ -3061,9 +3211,19 @@ mod claim_tests {
     /// Final review M4: проигравший `AutoClient` повторяет с растущим
     /// отступом (удвоение от `reconnect_delay` до `BUSY_RECONNECT_CAP`), а
     /// не каждые `reconnect_delay` бесконечно.
+    ///
+    /// Task 12: это резерв -- канал без уведомления «claim освобождён»
+    /// (пир без R20). Здесь `<имя>_free` заранее занят автосбросным
+    /// событием: сервер работает без уведомителя (лучшее усилие), клиент
+    /// его отвергает (не уведомление) -- прежний отступ.
     #[test]
     fn already_connected_backs_off() {
         let name = unique("BACKOFF");
+        let squatter = EventHandle::create(
+            ObjectPath::scoped(None, &name, "_free"),
+            &ObjectSecurity::default().attributes().unwrap(),
+        )
+        .unwrap();
         let server =
             AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
         let holder = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
@@ -3089,11 +3249,13 @@ mod claim_tests {
         drop(client);
         drop(holder);
         drop(server);
+        drop(squatter);
     }
 
     /// §7.1 п. 13: канал занят `SharedClient` -- `AutoClient` получает
     /// `on_error(AlreadyConnected)` и повторяет через `reconnect_delay`;
-    /// держатель ушёл -- подключение в пределах двух интервалов.
+    /// держатель ушёл -- подключение в пределах двух интервалов. Task 12:
+    /// не повтор, а уведомление «claim освобождён» -- тем более в срок.
     #[test]
     fn auto_client_retries_after_already_connected() {
         let name = unique("RETRY");
@@ -4091,5 +4253,246 @@ mod stale_disconnect_tests {
         assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
         drop(client);
         drop(server);
+    }
+}
+
+#[cfg(test)]
+mod free_tests {
+    //! Task 12 надёжности (R20/R21): занятый канал -- клиент спит на
+    //! уведомлении «claim освобождён», а не повторяет с отступом.
+
+    use super::*;
+    use std::time::Instant;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "AUTO_FREE_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !cond() {
+            assert!(Instant::now() < deadline, "таймаут: {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[derive(Default)]
+    struct Log {
+        connected: AtomicBool,
+        connected_at: Mutex<Option<Instant>>,
+        errors: Mutex<Vec<ShmError>>,
+    }
+
+    impl AutoHandler for Log {
+        fn on_connect(&self) {
+            *self.connected_at.lock().unwrap() = Some(Instant::now());
+            self.connected.store(true, Ordering::Release);
+        }
+        fn on_error(&self, err: ShmError) {
+            self.errors.lock().unwrap().push(err);
+        }
+    }
+
+    impl Log {
+        fn errors(&self) -> Vec<ShmError> {
+            self.errors.lock().unwrap().clone()
+        }
+        fn connected_at(&self) -> Option<Instant> {
+            *self.connected_at.lock().unwrap()
+        }
+    }
+
+    /// Канал занят `SharedClient` A: `AutoClient` B (опции по умолчанию)
+    /// получает один `AlreadyConnected` и спит -- не больше одного
+    /// пробуждения за секунду (до Task 12: повторы с отступом, ошибка на
+    /// каждом). A ушёл -- B подключён не позже 200 мс.
+    #[test]
+    fn busy_channel_waiter_sleeps_without_wakeups() {
+        let name = unique("SLEEP");
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        let holder = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        wait_until("AlreadyConnected", Duration::from_secs(3), || {
+            !log.errors().is_empty()
+        });
+        thread::sleep(Duration::from_millis(100));
+        let w0 = client.wakeups();
+        thread::sleep(Duration::from_secs(1));
+        let woke = client.wakeups() - w0;
+        assert!(woke <= 1, "пробуждений при занятом канале: {woke}");
+        assert_eq!(log.errors(), [ShmError::AlreadyConnected]);
+
+        let left = Instant::now();
+        drop(holder);
+        wait_until(
+            "подключение после ухода",
+            Duration::from_secs(3),
+            || log.connected.load(Ordering::Acquire),
+        );
+        let took = log.connected_at().unwrap() - left;
+        assert!(took <= Duration::from_millis(200), "{took:?}");
+        drop(client);
+        drop(server);
+    }
+
+    /// `free_gen` канала `name` (уведомитель «сервера»).
+    fn free_gen(name: &str) -> u32 {
+        FreeNotifier::open(None, name).unwrap().free_gen()
+    }
+
+    /// `AutoClient` B ждёт занятый канал: стартует, получает
+    /// `AlreadyConnected` и засыпает.
+    fn busy_waiter(name: &str) -> (AutoClient, Arc<Log>) {
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(name, log.clone(), AutoOptions::default()).unwrap();
+        wait_until("AlreadyConnected", Duration::from_secs(3), || {
+            !log.errors().is_empty()
+        });
+        thread::sleep(Duration::from_millis(100));
+        assert!(!log.connected.load(Ordering::Acquire));
+        (client, log)
+    }
+
+    /// Ждущий B просыпается на КАЖДОМ пути освобождения claim-а (R20) и
+    /// подключается не позже 500 мс; `free_gen` вырос ровно на число
+    /// освобождений:
+    /// - отзыв A (заявка без ответа: сервер -- `SharedServer`, не принимает);
+    /// - уход L подключённого A;
+    /// - `disconnect_local` сервера (claim не освобождает), затем L A;
+    /// - отъём протухшего захвата (claim без `HELLO` с живым владельцем,
+    ///   `reserve_timeout` 150 мс, повторный толчок ждущего -- 300 мс).
+    #[test]
+    fn busy_waiter_wakes_on_every_release_path() {
+        // Отзыв W.
+        {
+            let name = unique("PATH_W");
+            let mut server = SharedServer::start(&name).unwrap();
+            let a_name = name.clone();
+            let a = thread::spawn(move || {
+                SharedClient::connect(&a_name, Duration::from_secs(2)).map(|_| ())
+            });
+            let mapping =
+                win::Mapping::open_header(crate::naming::ObjectPath::mapping(None, &name)).unwrap();
+            let control = crate::shared::SharedView::peek_control(&mapping).unwrap();
+            wait_until("заявка A", Duration::from_secs(3), || {
+                control.slot_claim.load(Ordering::Acquire) != 0
+            });
+            let (b, b_log) = busy_waiter(&name);
+            let g0 = free_gen(&name);
+            assert_eq!(a.join().unwrap(), Err(ShmError::Timeout));
+            let released = Instant::now();
+            server
+                .wait_for_client(Some(Duration::from_secs(3)))
+                .unwrap();
+            wait_until("B подключён (W)", Duration::from_secs(3), || {
+                b_log.connected.load(Ordering::Acquire)
+            });
+            let took = b_log
+                .connected_at()
+                .unwrap()
+                .saturating_duration_since(released);
+            assert!(took <= Duration::from_millis(500), "W: {took:?}");
+            assert_eq!(free_gen(&name).wrapping_sub(g0), 1, "W: освобождений");
+            drop(b);
+            drop(server);
+        }
+        // Уход L.
+        {
+            let name = unique("PATH_L");
+            let server =
+                AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+            let a = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+            let (b, b_log) = busy_waiter(&name);
+            let g0 = free_gen(&name);
+            let released = Instant::now();
+            drop(a);
+            wait_until("B подключён (L)", Duration::from_secs(3), || {
+                b_log.connected.load(Ordering::Acquire)
+            });
+            let took = b_log.connected_at().unwrap() - released;
+            assert!(took <= Duration::from_millis(500), "L: {took:?}");
+            assert_eq!(free_gen(&name).wrapping_sub(g0), 1, "L: освобождений");
+            drop(b);
+            drop(server);
+        }
+        // `disconnect_local` сервера, затем L клиента.
+        {
+            let name = unique("PATH_DL");
+            let mut server = SharedServer::start(&name).unwrap();
+            let a_name = name.clone();
+            let a = thread::spawn(move || {
+                SharedClient::connect(&a_name, Duration::from_secs(5)).unwrap()
+            });
+            server
+                .wait_for_client(Some(Duration::from_secs(5)))
+                .unwrap();
+            let a = a.join().unwrap();
+            let (b, b_log) = busy_waiter(&name);
+            let g0 = free_gen(&name);
+            server.disconnect_local();
+            thread::sleep(Duration::from_millis(200));
+            assert!(!b_log.connected.load(Ordering::Acquire), "claim ещё у A");
+            assert_eq!(free_gen(&name), g0, "сервер claim не освобождал");
+            let released = Instant::now();
+            drop(a);
+            server
+                .wait_for_client(Some(Duration::from_secs(3)))
+                .unwrap();
+            wait_until("B подключён (DL)", Duration::from_secs(3), || {
+                b_log.connected.load(Ordering::Acquire)
+            });
+            let took = b_log.connected_at().unwrap() - released;
+            assert!(took <= Duration::from_millis(500), "DL: {took:?}");
+            assert_eq!(free_gen(&name).wrapping_sub(g0), 1, "DL: освобождений");
+            drop(b);
+            drop(server);
+        }
+        // Отъём протухшего захвата.
+        {
+            let name = unique("PATH_STALE");
+            presence::set_renudge_delay(&name, Duration::from_millis(300));
+            let mut server = SharedServer::start(&name).unwrap();
+            server.set_reserve_timeout(Duration::from_millis(150));
+            let owner = crate::test_support::LiveChild::spawn();
+            {
+                let control = server.view().control_block();
+                control.announce_owner_start(owner.start);
+                control.slot_owner_pid.store(owner.pid, Ordering::Release);
+                control.slot_claim.store(0x5A1E_C1A1, Ordering::Release);
+            }
+            let g0 = free_gen(&name);
+            let started = Instant::now();
+            let log = Arc::new(Log::default());
+            let b = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+            // Сервер принимает (и разбирает толчки) в своём потоке.
+            let acceptor = thread::spawn(move || {
+                server
+                    .wait_for_client(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+            });
+            let server = acceptor.join().unwrap();
+            wait_until(
+                "B подключён (отъём)",
+                Duration::from_secs(3),
+                || log.connected.load(Ordering::Acquire),
+            );
+            let took = log.connected_at().unwrap() - started;
+            // Повторный толчок -- через 300 мс, отъём на нём; затем
+            // подключение не позже 500 мс.
+            assert!(took <= Duration::from_millis(800), "отъём: {took:?}");
+            assert_eq!(log.errors(), [ShmError::AlreadyConnected]);
+            assert_eq!(free_gen(&name).wrapping_sub(g0), 1, "отъём: освобождений");
+            drop(b);
+            drop(server);
+            drop(owner);
+        }
     }
 }

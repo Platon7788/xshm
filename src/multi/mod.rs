@@ -79,7 +79,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::auto::{join_unless_self, map_spawn_error};
-use crate::client::{ClaimMode, Interrupt, SharedClient};
+use crate::client::{ClaimMode, FreeLink, Interrupt, SharedClient};
 use crate::constants::{
     CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, MAX_RING_CAPACITY,
     MIN_MESSAGE_SIZE, RESERVE_SAFETY_MARGIN, RESERVE_TIMEOUT, SLOT_ID_NO_SLOT,
@@ -90,15 +90,16 @@ use crate::namespace::PrivateNamespace;
 use crate::naming::{Direction, ObjectPath};
 use crate::ntapi::STATUS_SUCCESS;
 use crate::presence::{
-    self, Failure, Presence, PresenceStatus, PresenceWait, PresenceWatch, Reported, ServerPresence,
-    multi_beacon_name,
+    self, Attempt, Busy, Failure, FreeNotifier, FreeWait, FreeWaiter, Presence, PresenceStatus,
+    PresenceWait, PresenceWatch, Reported, ServerPresence, WaitCtl, multi_beacon_name,
+    release_claim_notify,
 };
 use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
 use crate::ring::{
     DrainBound, FreeSpace, SpinPolicy, UnreadProbe, rest_after_stale_disconnect, spin_until,
 };
 use crate::security::ObjectSecurity;
-use crate::server::{Lingering, SharedServer, release_if_holder_dead};
+use crate::server::{Lingering, SharedServer, release_if_holder_dead, release_if_owner_gone};
 use crate::shared::SharedView;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker, panic_error};
 use crate::wait_delay_or;
@@ -316,14 +317,20 @@ pub struct MultiClientOptions {
     /// 0.10 (Task 11, INTEROP R19): **сервера нет** (ни одного слота, или
     /// процесс сервера завершился) -- клиент не опрашивает раз в
     /// `retry_delay`, а спит в ядре на маяке присутствия базы
-    /// `<база>_multi_beacon` и подключается сразу, как сервер его взведёт. Пауза
-    /// `retry_delay` остаётся: после конца сессии (разово), при занятых
-    /// или чужих слотах (`NoFreeSlot`/`AccessDenied`, до уведомления
-    /// «claim освобождён») и как резерв (решение R-M) -- маяк недоступен
-    /// (нет прав, нет привилегии `Global\`), процесс сервера не открылся,
-    /// подключение к слоту не удалось. Одинаковую ошибку вне подключения
-    /// ПОДРЯД `on_error` сообщает один раз (кроме `NoFreeSlot` -- о каждой
-    /// попытке); другая ошибка между ними -- и повтор сообщается снова.
+    /// `<база>_multi_beacon` и подключается сразу, как сервер его взведёт.
+    ///
+    /// 0.10 (Task 12, INTEROP R20/R21): **все слоты заняты** (`NoFreeSlot`,
+    /// сообщается раз на эпизод) -- тоже без опроса: сон в ядре на
+    /// уведомлении «claim освобождён» базы `<база>_multi_free` и процессе
+    /// сервера; освободился любой слот -- захват сразу.
+    ///
+    /// Пауза `retry_delay` остаётся: после конца сессии (разово), при чужих
+    /// слотах (`AccessDenied`) и как резерв (решение R-M) -- маяк или
+    /// `_free` недоступны (нет прав, нет привилегии `Global\`, сервер без
+    /// R20), процесс сервера не открылся, подключение к слоту не удалось.
+    /// Одинаковую ошибку вне подключения ПОДРЯД `on_error` сообщает один
+    /// раз (кроме `NoFreeSlot` -- о каждом эпизоде); другая ошибка между
+    /// ними -- и повтор сообщается снова.
     pub retry_delay: Duration,
     /// Резервная проверка обнаружения сервера (0.10, решение W(3); см.
     /// `AutoOptions::discovery_fallback`): пока сервера нет и клиент спит на
@@ -574,7 +581,9 @@ impl std::fmt::Debug for MultiServer {
 
 mod core_type {
     use super::{Arc, AtomicBool, AtomicU64, ClientSlot, CompletionPort, Duration, JoinHandle};
-    use super::{MultiHandler, MultiOptions, Mutex, PresenceStatus, RwLock, ServerPresence};
+    use super::{
+        FreeNotifier, MultiHandler, MultiOptions, Mutex, PresenceStatus, RwLock, ServerPresence,
+    };
 
     /// Состояние сервера, общее для ручки `MultiServer` и потока-диспетчера.
     /// Вне крейта тип не именуем: его методы доступны через `Deref` ручки.
@@ -618,6 +627,11 @@ mod core_type {
         pub(in crate::multi) presence: Mutex<Option<ServerPresence>>,
         /// Состояние маяка базы (`presence()`, решение W(1)).
         pub(in crate::multi) presence_status: Mutex<PresenceStatus>,
+        /// Уведомитель «claim освобождён» базы `<база>_multi_free` (Task 12,
+        /// R20): общий для всех слотов (у их `SharedServer` -- тот же).
+        /// `None` -- не создан (лучшее усилие): клиенты ждут по резерву
+        /// `retry_delay`.
+        pub(in crate::multi) free: Option<Arc<FreeNotifier>>,
         /// Сколько ближайших привязок провалить (тест повтора привязки).
         #[cfg(test)]
         pub(in crate::multi) fail_arms: std::sync::atomic::AtomicU32,
@@ -652,6 +666,16 @@ impl MultiServer {
         let mut slots = Vec::with_capacity(options.max_clients as usize);
         // Дескриптор -- один на все слоты (токен процесса читается один раз).
         let security = options.security.attributes()?;
+        // Task 12 (R20): уведомитель «claim освобождён» базы -- до слотов
+        // (их освобождения уведомляют его с первого рукопожатия); лучшее
+        // усилие, как маяк.
+        let free = FreeNotifier::create(
+            options.namespace.as_deref(),
+            &multi_beacon_name(base_name),
+            &security,
+        )
+        .ok()
+        .map(Arc::new);
         for slot_id in 0..options.max_clients {
             // Каждый слот публикует число слотов -- подсказка для диагностики,
             // перебор клиента им не ограничивается.
@@ -664,6 +688,8 @@ impl MultiServer {
                 // Маяк -- один на базу (ниже), не на слот (R19).
                 Presence::Off,
             )?;
+            let mut server = server;
+            server.set_free_notifier(free.clone());
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
 
@@ -685,6 +711,7 @@ impl MultiServer {
             wake_lost: AtomicBool::new(false),
             presence: Mutex::new(None),
             presence_status: Mutex::new(PresenceStatus::Disabled),
+            free: free.clone(),
             #[cfg(test)]
             fail_arms: AtomicU32::new(0),
         });
@@ -716,6 +743,7 @@ impl MultiServer {
             server.options.namespace.as_ref(),
             &multi_beacon_name(base_name),
             &security,
+            free,
         );
         *server.presence.lock_clean() = beacon;
         *server.presence_status.lock_clean() = status;
@@ -1060,7 +1088,12 @@ impl MultiCore {
             // слота сверит вызывающий (`Sweep::relinquished`).
             if let Some((watch, token)) = slot.lingering.as_ref()
                 && (claim != *token
-                    || release_if_holder_dead(slot.server.view().control_block(), watch, *token))
+                    || release_if_holder_dead(
+                        slot.server.view().control_block(),
+                        watch,
+                        *token,
+                        self.free.as_deref(),
+                    ))
             {
                 slot.retire_lingering();
                 sweep.relinquished.push(slot.id);
@@ -1072,12 +1105,12 @@ impl MultiCore {
             };
             if now >= due {
                 // CAS: если за это время claim сменился, это уже другой захват.
-                let _ = slot
-                    .server
-                    .view()
-                    .control_block()
-                    .slot_claim
-                    .compare_exchange(claim, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire);
+                // Task 12: с уведомлением ждущих базы (R20).
+                let _ = release_claim_notify(
+                    slot.server.view().control_block(),
+                    claim,
+                    self.free.as_deref(),
+                );
                 slot.claim_seen = None;
             } else {
                 sweep.deadline(due);
@@ -1167,6 +1200,15 @@ impl MultiCore {
                 if let Some(lingering) = slot.server.take_lingering() {
                     slot.retire_lingering();
                     slot.lingering = Some(lingering);
+                }
+                // Task 12 (решение R-O): толчок без заявки, а владелец
+                // claim-а подтверждённо умер -- claim снимается сразу (не
+                // через `reserve_timeout`), ждущие базы уведомлены.
+                if matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected) {
+                    let _ = release_if_owner_gone(
+                        slot.server.view().control_block(),
+                        self.free.as_deref(),
+                    );
                 }
                 drop(slot);
                 drop(slots);
@@ -1300,18 +1342,13 @@ impl MultiCore {
                 // снимает claim сам сразу после `DISCONNECT` (R13), и новый
                 // клиент мог уже захватить слот, пока мы дочитывали кольцо --
                 // безусловный store отнял бы у него захват. Клиент старой
-                // версии, не снявший claim, освобождается этим CAS.
-                let _ = slot
-                    .server
-                    .view()
-                    .control_block()
-                    .slot_claim
-                    .compare_exchange(
-                        session_claim,
-                        CLAIM_FREE,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    );
+                // версии, не снявший claim, освобождается этим CAS (Task 12:
+                // с уведомлением ждущих базы, R20).
+                let _ = release_claim_notify(
+                    slot.server.view().control_block(),
+                    session_claim,
+                    self.free.as_deref(),
+                );
             }
             was
         };
@@ -1344,8 +1381,12 @@ impl MultiCore {
                 if let Some((watch, token)) = slot.lingering.as_ref()
                     && watch.has_exited()
                 {
-                    let _ =
-                        release_if_holder_dead(slot.server.view().control_block(), watch, *token);
+                    let _ = release_if_holder_dead(
+                        slot.server.view().control_block(),
+                        watch,
+                        *token,
+                        self.free.as_deref(),
+                    );
                     slot.retire_lingering();
                 }
                 return;
@@ -1354,12 +1395,7 @@ impl MultiCore {
             let claim = control.slot_claim.load(Ordering::Acquire);
             let owner = control.slot_owner_pid.load(Ordering::Acquire);
             if claim != CLAIM_FREE && slot.watched_pid() == Some(owner) {
-                let _ = control.slot_claim.compare_exchange(
-                    claim,
-                    CLAIM_FREE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                );
+                let _ = release_claim_notify(control, claim, self.free.as_deref());
             }
             // Handle процесса обязан уйти из привязок в любом случае:
             // он сигнален навсегда и иначе будил бы диспетчер без конца.
@@ -1404,16 +1440,17 @@ impl MultiCore {
                 return; // уже обработан (например явным disconnect-событием)
             }
 
-            let claim_field = &slot.server.view().control_block().slot_claim;
-            if claim_field
-                .compare_exchange(
-                    expected_claim,
-                    CLAIM_FREE,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
+            // Task 12: снятие -- через `release_claim_notify` (R20);
+            // ожидаемый `CLAIM_FREE` (брошенное рукопожатие) -- проверка
+            // «всё ещё свободен», а не освобождение (CAS `0 -> 0` был ей
+            // равносилен).
+            let control = slot.server.view().control_block();
+            let unchanged = if expected_claim == CLAIM_FREE {
+                control.slot_claim.load(Ordering::Acquire) == CLAIM_FREE
+            } else {
+                release_claim_notify(control, expected_claim, self.free.as_deref())
+            };
+            if !unchanged {
                 return; // claim изменился — состояние слота уже не то, что при детекции
             }
 
@@ -2471,6 +2508,7 @@ fn client_worker(
         options,
         shared,
         presence: None,
+        free: None,
         reported: Reported::default(),
     };
 
@@ -2478,43 +2516,54 @@ fn client_worker(
     // следующий за неудачным (T11b, как клиент C), иначе -- с нуля.
     let mut next_slot = 0;
 
-    while running.load(Ordering::Acquire) {
+    'session: while running.load(Ordering::Acquire) {
         report_evicted(outbox, handler);
         // Шаг 1: атомарно захватываем свободный слот (без централизованного lobby).
-        let (slot_id, slot_name, token) = match claim_free_slot(namespace, base_name, next_slot) {
-            Ok(v) => v,
-            Err(err) => {
-                // Возможно, слот держит захват упавшего клиента: толкаем
-                // сервер, чтобы он назначил дедлайн его освобождения. И при
-                // `AccessDenied`: слот, занятый захватчиком с запрещающим
-                // DACL (`B_N` создан заранее), не должен отключать толчок
-                // остальных слотов.
-                if matches!(err, ShmError::NoFreeSlot | ShmError::AccessDenied) {
-                    nudge_stale_claims(namespace, base_name);
+        let mut claimed = claim_free_slot(namespace, base_name, next_slot);
+        let (slot_id, slot_name, token) = loop {
+            let err = match claimed {
+                Ok(v) => break v,
+                Err(err) => err,
+            };
+            // Task 11 (R19): ни одного слота -- сервера нет, сон на маяке
+            // базы.
+            if err == ShmError::NotConnected {
+                waiter.report_once(err);
+                if !waiter.await_server(Failure::Absent) {
+                    break 'session;
                 }
-                // Task 11 (R19): ни одного слота -- сервера нет, сон на
-                // маяке базы. Все слоты заняты (`NoFreeSlot`, о каждой
-                // попытке) или часть слотов чужие (`AccessDenied`: итог
-                // перебора, где остальные слоты могли быть просто заняты, --
-                // ждать выхода сервера нельзя) -- прежняя пауза
-                // `retry_delay` (до Task 12).
-                let go_on = if err == ShmError::NotConnected {
-                    waiter.report_once(err);
-                    waiter.await_server(Failure::Absent)
-                } else {
-                    if err == ShmError::NoFreeSlot {
-                        waiter.reported.note(&err);
-                        handler.on_error(err);
-                    } else {
-                        waiter.report_once(err);
-                    }
-                    waiter.pause()
-                };
-                if !go_on {
-                    break;
-                }
-                continue;
+                continue 'session;
             }
+            // Task 12 (R20/R21): все слоты заняты (`NoFreeSlot`, о каждом
+            // эпизоде) -- сон на уведомлении «claim освобождён» базы, а не
+            // повтор раз в `retry_delay`; толчок занятых слотов -- раз на
+            // набор их захватов (сервер назначит дедлайн протухшему).
+            if err == ShmError::NoFreeSlot {
+                waiter.reported.note(&err);
+                handler.on_error(err);
+                match waiter.await_free(next_slot) {
+                    SlotWait::Claimed(v) => break v,
+                    SlotWait::Failed(err) => {
+                        claimed = Err(err);
+                        continue;
+                    }
+                    SlotWait::Retry => continue 'session,
+                    SlotWait::Stop => break 'session,
+                }
+            }
+            // Часть слотов чужие (`AccessDenied`: итог перебора, где
+            // остальные слоты могли быть просто заняты, -- ждать выхода
+            // сервера нельзя): толчок (слот, занятый захватчиком с
+            // запрещающим DACL, не отключает толчок остальных) и прежняя
+            // пауза `retry_delay`.
+            if err == ShmError::AccessDenied {
+                nudge_stale_claims(namespace, base_name);
+            }
+            waiter.report_once(err);
+            if !waiter.pause() {
+                break 'session;
+            }
+            continue 'session;
         };
 
         // Шаг 2: подключаемся к захваченному слоту обычным handshake.
@@ -2528,6 +2577,9 @@ fn client_worker(
             // Ревизия 3: claim слота уже наш (`try_claim_slot`) -- рукопожатие
             // его не берёт и не освобождает (снимает `release_claim` ниже).
             ClaimMode::Held(token),
+            // Held: claim освобождает перебор (`release_claim` с уведомлением
+            // базы), заявке уведомитель не нужен.
+            FreeLink::Off,
             Interrupt {
                 wake: wake.as_handle(),
                 should_stop: &mut should_stop,
@@ -2536,13 +2588,13 @@ fn client_worker(
         let mut client = match connected {
             Ok(c) => c,
             Err(_) if !running.load(Ordering::Acquire) => {
-                release_claim(namespace, &slot_name, token);
+                release_claim(namespace, &slot_name, token, waiter.free().as_deref());
                 break;
             }
             Err(err) => {
                 // Не подключились — освобождаем захваченный слот (best-effort;
                 // иначе сервер вернёт его в оборот по RESERVE_TIMEOUT).
-                release_claim(namespace, &slot_name, token);
+                release_claim(namespace, &slot_name, token, waiter.free().as_deref());
                 // Следующая попытка -- со следующего слота (T11b): слот, чьё
                 // рукопожатие не удаётся (испорчен, сервер его не обслуживает),
                 // не держит клиента, пока остальные свободны.
@@ -2715,7 +2767,8 @@ fn client_worker(
         // Слот освободился у нас — снимаем claim (best-effort), чтобы он сразу
         // вернулся в оборот. CAS token->FREE сработает, только если claim ещё наш
         // (если сервер уже отнял слот по таймауту/force-disconnect — это no-op).
-        release_claim(namespace, &slot_name, token);
+        // Task 12: с уведомлением ждущих базы (R20).
+        release_claim(namespace, &slot_name, token, waiter.free().as_deref());
 
         // Пауза после конца сессии -- разовая реакция (клиент, отключённый
         // `disconnect_client`, не возвращается мгновенно). Сервер умер --
@@ -2736,11 +2789,97 @@ struct AbsenceWaiter<'a> {
     shared: &'a ClientShared,
     /// Маяк базы: открывается при первой нужде, один раз на жизнь worker-а.
     presence: Option<PresenceWatch>,
+    /// Уведомитель «claim освобождён» базы (Task 12): открывается при
+    /// первой нужде (освобождение своего claim-а, ожидание свободного
+    /// слота); пока его нет (сервер без R20) -- пробуется снова.
+    free: Option<Arc<FreeNotifier>>,
     /// Ошибки эпизода вне подключения, о которых уже сообщено.
     reported: Reported,
 }
 
+/// Чем кончилось ожидание свободного слота (`AbsenceWaiter::await_free`).
+enum SlotWait {
+    /// Слот захвачен: `(слот, имя, токен)`.
+    Claimed((u32, String, u32)),
+    /// Новый круг worker-а (сервер ушёл, страховочный таймаут, резерв).
+    Retry,
+    /// Перебор вернул другую ошибку -- разобрать её.
+    Failed(ShmError),
+    /// Остановка.
+    Stop,
+}
+
 impl AbsenceWaiter<'_> {
+    /// Уведомитель базы (открыть, если ещё не открыт).
+    fn free(&mut self) -> Option<Arc<FreeNotifier>> {
+        if self.free.is_none() {
+            self.free = FreeNotifier::open(
+                self.options.namespace.as_deref(),
+                &multi_beacon_name(self.base_name),
+            )
+            .ok()
+            .map(Arc::new);
+        }
+        self.free.clone()
+    }
+
+    /// Все слоты заняты (Task 12, R21): ждать освобождения claim-а любого
+    /// слота базы на `[wake, <база>_multi_free, процесс сервера]` без
+    /// таймаута (страховка -- `poll_timeout`). Попытка -- перебор
+    /// `claim_free_slot` с `start`; толчок занятых слотов без сессии --
+    /// раз на набор их захватов (протухший снимает дедлайн диспетчера,
+    /// повторный толчок не нужен). Сервер без `_free` (пир без R20) --
+    /// прежний резерв: толчок и пауза `retry_delay`.
+    fn await_free(&mut self, start: u32) -> SlotWait {
+        let namespace = self.options.namespace.as_deref();
+        let base_name = self.base_name;
+        let Some(notifier) = self.free() else {
+            nudge_stale_claims(namespace, base_name);
+            return if self.pause() {
+                SlotWait::Retry
+            } else {
+                SlotWait::Stop
+            };
+        };
+        let mut free_waiter = FreeWaiter::new(notifier);
+        let shared = self.shared;
+        let handler = self.handler;
+        let waited = free_waiter.wait_free(
+            &mut || match claim_free_slot(namespace, base_name, start) {
+                Ok(claimed) => Attempt::Done(claimed),
+                Err(ShmError::NoFreeSlot) => Attempt::Busy(unserved_claims(namespace, base_name)),
+                Err(err) => Attempt::Failed(err),
+            },
+            &mut || nudge_stale_claims(namespace, base_name),
+            &mut WaitCtl {
+                wake: Some(shared.wake.as_handle()),
+                running: &|| shared.running.load(Ordering::Acquire),
+                on_wake: &mut || report_evicted(&shared.outbox, handler),
+                wakeup: &|| {
+                    shared.wakeups.fetch_add(1, Ordering::AcqRel);
+                },
+                deadline: crate::ring::deadline_of(self.options.poll_timeout),
+                renudge: None,
+            },
+        );
+        match waited {
+            Ok(FreeWait::Claimed(claimed)) => SlotWait::Claimed(claimed),
+            Ok(FreeWait::Stopped) => SlotWait::Stop,
+            Ok(FreeWait::ServerGone | FreeWait::TimedOut) if self.running() => SlotWait::Retry,
+            Ok(FreeWait::ServerGone | FreeWait::TimedOut) => SlotWait::Stop,
+            Ok(FreeWait::Failed(err)) => SlotWait::Failed(err),
+            // Ошибка ОС события: резерв (решение R-M).
+            Err(err) => {
+                self.report_presence(err);
+                if self.pause() {
+                    SlotWait::Retry
+                } else {
+                    SlotWait::Stop
+                }
+            }
+        }
+    }
+
     fn running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
     }
@@ -2882,17 +3021,60 @@ fn try_claim_slot(
     // mapping размапится здесь; захваченный claim остаётся в shared memory.
 }
 
-/// Снять собственный claim со слота (CAS token -> FREE), если он всё ещё наш.
-fn release_claim(namespace: Option<&PrivateNamespace>, slot_name: &str, token: u32) {
+/// Снять собственный claim со слота (CAS token -> FREE), если он всё ещё
+/// наш; Task 12 -- с уведомлением ждущих базы `free` (R20).
+fn release_claim(
+    namespace: Option<&PrivateNamespace>,
+    slot_name: &str,
+    token: u32,
+    free: Option<&FreeNotifier>,
+) {
     if let Ok(mapping) = Mapping::open_header(ObjectPath::mapping(namespace, slot_name))
         && let Some(control) = SharedView::peek_control(&mapping)
     {
-        let _ = control.slot_claim.compare_exchange(
-            token,
-            CLAIM_FREE,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let _ = release_claim_notify(control, token, free);
+    }
+}
+
+/// Занятость базы для ждущего Multi (Task 12): ключ -- свёртка `(слот,
+/// токен)` занятых слотов без сессии (`server_state != SERVER_READY`; `0`
+/// -- таких нет, толкать нечего), личность сервера -- из слота 0. Перебор
+/// -- как в `nudge_stale_claims`.
+fn unserved_claims(namespace: Option<&PrivateNamespace>, base_name: &str) -> Busy {
+    // FNV-1a: ключ только сравнивается на равенство (толкать ли снова).
+    let mut key: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut any = false;
+    let mut server = None;
+    for slot_id in 0..MAX_MULTI_CLIENTS {
+        let slot_name = format!("{base_name}_{slot_id}");
+        let mapping = match Mapping::open_header(ObjectPath::mapping(namespace, &slot_name)) {
+            Ok(mapping) => mapping,
+            Err(ShmError::AccessDenied) => continue,
+            Err(_) => break,
+        };
+        let Some(control) = SharedView::peek_control(&mapping) else {
+            continue;
+        };
+        if server.is_none() {
+            server = Some((
+                control.server_pid.load(Ordering::Acquire),
+                control.server_start_time(),
+            ));
+        }
+        let claim = control.slot_claim.load(Ordering::Acquire);
+        if claim != CLAIM_FREE
+            && control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
+        {
+            any = true;
+            for byte in slot_id.to_le_bytes().into_iter().chain(claim.to_le_bytes()) {
+                key = (key ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+            }
+        }
+    }
+    Busy {
+        key: if any { key.max(1) } else { 0 },
+        holder: None,
+        server,
     }
 }
 

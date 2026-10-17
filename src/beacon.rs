@@ -86,7 +86,7 @@ pub fn wait_any(objects: &[&dyn Waitable], timeout: Option<Duration>) -> Result<
 }
 
 /// Размер секции состояния маяка (одна страница).
-const STATE_SIZE: usize = 4096;
+pub(crate) const STATE_SIZE: usize = 4096;
 /// `magic` состояния маяка: `'XBCN'` (байты `58 42 43 4E`, `u32` LE).
 const STATE_MAGIC: u32 = 0x4E43_4258;
 /// Смещения полей состояния (`u32` LE, атомарно).
@@ -95,6 +95,12 @@ const STATE_GENERATION_OFFSET: usize = 4;
 const STATE_SERVER_PID_OFFSET: usize = 8;
 const STATE_SERVER_START_LO_OFFSET: usize = 12;
 const STATE_SERVER_START_HI_OFFSET: usize = 16;
+/// 0.10, Task 12 (INTEROP R20/R21): поколение освобождений claim-а канала
+/// (`free_gen`, только `fetch_add` SeqCst / `lock xadd`) и число спящих
+/// ждущих (`free_waiters`). Пишет их `presence::FreeNotifier`, `magic` не
+/// требуется: это счётчики, а не личность сервера.
+pub(crate) const STATE_FREE_GEN_OFFSET: usize = 20;
+pub(crate) const STATE_FREE_WAITERS_OFFSET: usize = 24;
 
 /// Маяк сервера (см. модуль).
 #[derive(Debug)]
@@ -147,22 +153,59 @@ const fn state_fallback(error: &ShmError) -> bool {
     }
 }
 
-/// Открыть секцию состояния: сначала существующую (открытие не требует
-/// `SeCreateGlobalPrivilege`), и только если её нет -- создать с
-/// дескриптором `security` (тот же, что у события маяка).
+/// Секция состояния маяка `name`: сначала существующая (открытие не
+/// требует `SeCreateGlobalPrivilege`), и только если её нет и задан
+/// `security` -- создать с ним (тот же дескриптор, что у события маяка).
+/// Меньше страницы -- `Corrupted`. Общая для маяка и уведомления «claim
+/// освобождён» (`presence::FreeNotifier`, Task 12).
+pub(crate) fn open_state_section(
+    namespace: Option<&PrivateNamespace>,
+    name: &str,
+    security: Option<&SecurityAttributes>,
+) -> Result<Mapping> {
+    match Mapping::open(beacon_state_path(namespace, name)) {
+        Ok(mapping) if mapping.size() >= STATE_SIZE => Ok(mapping),
+        Ok(_) => Err(ShmError::Corrupted),
+        Err(ShmError::WindowsError { code, .. }) if code == STATUS_OBJECT_NAME_NOT_FOUND => {
+            match security {
+                Some(security) => Mapping::open_or_create(
+                    beacon_state_path(namespace, name),
+                    STATE_SIZE,
+                    security,
+                ),
+                None => Err(ShmError::WindowsError {
+                    code,
+                    context: "NtOpenSection(beacon state)",
+                }),
+            }
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Слово секции состояния `state` по смещению `offset`; `None` -- смещение
+/// не кратно 4 или вне отображения.
+pub(crate) fn state_word(state: &Mapping, offset: usize) -> Option<&AtomicU32> {
+    if !offset.is_multiple_of(4) || offset.checked_add(4)? > state.size() {
+        return None;
+    }
+    let ptr = state.as_ptr().wrapping_add(offset).cast::<u32>();
+    // SAFETY: `ptr` -- внутри отображения (`offset + 4 <= size`) и выровнен
+    // на 4 (view выровнен на страницу, `offset` кратно 4); отображение живёт,
+    // пока жив `state`, то есть дольше возвращаемой ссылки (она заимствует
+    // `state`). Доступ к памяти, общей с другими процессами, -- только
+    // атомарный.
+    Some(unsafe { AtomicU32::from_ptr(ptr) })
+}
+
+/// Открыть секцию состояния: сначала существующую, и только если её нет --
+/// создать с дескриптором `security` (`open_state_section`).
 fn open_state(
     namespace: Option<&PrivateNamespace>,
     name: &str,
     security: &SecurityAttributes,
 ) -> Result<BeaconState> {
-    let attempt = match Mapping::open(beacon_state_path(namespace, name)) {
-        Ok(mapping) if mapping.size() >= STATE_SIZE => Ok(mapping),
-        Ok(_) => Err(ShmError::Corrupted),
-        Err(ShmError::WindowsError { code, .. }) if code == STATUS_OBJECT_NAME_NOT_FOUND => {
-            Mapping::open_or_create(beacon_state_path(namespace, name), STATE_SIZE, security)
-        }
-        Err(other) => Err(other),
-    };
+    let attempt = open_state_section(namespace, name, Some(security));
     match attempt {
         Ok(mapping) => Ok(BeaconState::Shared(mapping)),
         Err(error) if state_fallback(&error) => Ok(BeaconState::Legacy),
@@ -187,7 +230,10 @@ fn beacon_path<'a>(namespace: Option<&'a PrivateNamespace>, base: &str) -> Objec
 }
 
 /// Секция состояния маяка `<base>_beacon_state` (там же, где событие).
-fn beacon_state_path<'a>(namespace: Option<&'a PrivateNamespace>, base: &str) -> ObjectPath<'a> {
+pub(crate) fn beacon_state_path<'a>(
+    namespace: Option<&'a PrivateNamespace>,
+    base: &str,
+) -> ObjectPath<'a> {
     ObjectPath::scoped(namespace, base, "_beacon_state")
 }
 
@@ -451,16 +497,7 @@ impl Beacon {
         let BeaconState::Shared(state) = &self.state else {
             return None;
         };
-        if !offset.is_multiple_of(4) || offset.checked_add(4)? > state.size() {
-            return None;
-        }
-        let ptr = state.as_ptr().wrapping_add(offset).cast::<u32>();
-        // SAFETY: `ptr` -- внутри отображения (`offset + 4 <= size`) и
-        // выровнен на 4 (view выровнен на страницу, `offset` кратно 4);
-        // отображение живёт, пока жив `self.state`, то есть дольше
-        // возвращаемой ссылки (она заимствует `self`). Доступ к памяти,
-        // общей с другими процессами, -- только атомарный.
-        Some(unsafe { AtomicU32::from_ptr(ptr) })
+        state_word(state, offset)
     }
 
     /// Поле доверенного состояния (`magic` верный), иначе `None`.
