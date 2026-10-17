@@ -3387,6 +3387,43 @@ mod tests {
         server.stop();
     }
 
+    /// T11c (решение AD): устаревший `DISCONNECT` выделенного канала (обе
+    /// стороны в сессии) -- не уход ни для worker-а сервера канала, ни для
+    /// клиента (оба -- worker-ы Auto): канал жив, обмен идёт в обе стороны;
+    /// настоящий уход клиента сервер по-прежнему видит. Сигналов несколько
+    /// -- событие одно на обе стороны, разбирает их то одна, то другая.
+    #[test]
+    fn dedicated_channel_survives_stale_disconnect() {
+        let (server, server_handler, client, client_handler, channel) = dispatch_pair("STALE_DISC");
+        let events = crate::events::SharedEvents::open(&channel).unwrap();
+        for _ in 0..20 {
+            events.disconnect.set().unwrap();
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(50));
+        assert!(client.is_connected(), "клиент закрыл канал");
+        assert!(client_handler.connected.load(Ordering::Acquire));
+        assert_eq!(server.client_count(), 1, "сервер закрыл канал");
+        assert_eq!(server_handler.disconnects.load(Ordering::Acquire), 0);
+
+        server.send_to(client.client_id(), b"after-stale").unwrap();
+        client.send(b"reply").unwrap();
+        wait_for(
+            "обмен после сигналов",
+            Duration::from_secs(3),
+            || {
+                client_handler.messages.load(Ordering::Acquire) == 1
+                    && server_handler.messages.load(Ordering::Acquire) == 1
+            },
+        );
+
+        drop(client);
+        wait_for("уход клиента", Duration::from_secs(3), || {
+            server_handler.disconnects.load(Ordering::Acquire) == 1
+        });
+        server.stop();
+    }
+
     /// Ревизия 2, дефект 6: `stop()` из колбэка обработчика не блокируется
     /// (раньше: поток лобби join-ил worker канала, ждущий в `stop()`, --
     /// взаимная блокировка). Остановка отложенная; `stop()` из чужого потока

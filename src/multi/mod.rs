@@ -94,7 +94,9 @@ use crate::presence::{
     multi_beacon_name,
 };
 use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
-use crate::ring::{DrainBound, FreeSpace, SpinPolicy, UnreadProbe, spin_until};
+use crate::ring::{
+    DrainBound, FreeSpace, SpinPolicy, UnreadProbe, rest_after_stale_disconnect, spin_until,
+};
 use crate::security::ObjectSecurity;
 use crate::server::{Lingering, SharedServer, release_if_holder_dead};
 use crate::shared::SharedView;
@@ -1266,6 +1268,18 @@ impl MultiCore {
                 if let Some(events) = slot.server.events() {
                     let _ = events.disconnect.set();
                 }
+                return;
+            }
+            if !slot.server.client_left() {
+                // T11c (решение AD): клиент в сессии (`client_state ==
+                // SERVER_READY`) -- сигнал устаревший (окно между CAS ухода
+                // прежнего клиента и его сигналом, пир 0.9, посторонний
+                // процесс). Поглощён: возвращать некому -- сервер сигналит,
+                // только закрыв слот (`connected == false` под этой же
+                // блокировкой, ветка выше), а клиент -- только уходя
+                // (состояние до сигнала, R14). Привязку `DISCONNECT`
+                // вызывающий `reconcile` поставит снова; работа на сигнал
+                // -- O(1), остальные объекты слота -- свои пакеты порта.
                 return;
             }
         }
@@ -2621,9 +2635,32 @@ fn client_worker(
                 options.poll_timeout
             };
 
+            // Тесты (T11c): «противник» -- `DISCONNECT` к каждому ожиданию.
+            #[cfg(test)]
+            crate::server::adversary_resignal(client.view(), &client_events.disconnect);
             let result = win::wait_any(&handles[..count], timeout);
             shared.wakeups.fetch_add(1, Ordering::AcqRel);
+            // T11c (решение AD): `DISCONNECT` -- уход, только если сервер
+            // покинул НАШУ сессию (`server_left`: `server_state` или
+            // `generation`). Иначе сигнал устаревший: поглощён (возвращать
+            // некому -- сервер сигналит, только уйдя), остальные объекты
+            // набора -- нулевым ожиданием (поток таких сигналов не скрывает
+            // смерть сервера; данные, очередь и остановку проход и так
+            // решает по состоянию).
+            let result = match result {
+                Ok(Some(0)) if !client.server_left() => {
+                    rest_after_stale_disconnect(&handles[..count])
+                }
+                other => other,
+            };
             match result {
+                Ok(Some(0)) if !client.is_session_current() => {
+                    // Сессия уже чужая: сигнал (автосброс) -- для нового
+                    // клиента слота, возвращаем (как DATA ниже и клиент
+                    // Auto); уходим без дочитывания чужого кольца.
+                    let _ = client_events.disconnect.set();
+                    break Some(DisconnectReason::Graceful);
+                }
                 Ok(Some(0)) => {
                     // Штатное отключение сервера: его последние сообщения
                     // доставляем ДО колбэка.

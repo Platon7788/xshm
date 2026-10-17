@@ -1224,13 +1224,21 @@ impl SharedClient {
     /// Сессия всё ещё наша: `generation` не сменился (ревизия 2). Сменился
     /// -- сервер уже провёл рукопожатие с другим клиентом этого канала/слота
     /// (а наш `DISCONNECT` мог быть сброшен его `complete_handshake`).
+    /// Тесты: проекция сегмента канала (метка «противника» T10/T11c).
+    #[cfg(test)]
+    pub(crate) const fn view(&self) -> &SharedView {
+        &self.view
+    }
+
     pub(crate) fn is_session_current(&self) -> bool {
         self.view.control_block().generation.load(Ordering::Acquire) == self.generation
     }
 
     /// Сервер закрыл нашу сессию: `server_state` уже не `SERVER_READY` или
     /// `generation` сменился. Отличает свежий `DISCONNECT` от устаревшего
-    /// (0.10: ожидание ответа лобби Dispatch).
+    /// -- одно правило для всех потребителей стороны клиента
+    /// (`poll_server`, `wait_for_space`, async, ответ лобби Dispatch,
+    /// worker-ы Auto и Multi; T11c, решение AD).
     pub(crate) fn server_left(&self) -> bool {
         self.view
             .control_block()
@@ -1416,8 +1424,10 @@ impl SharedClient {
         spin: SpinPolicy,
     ) -> Result<bool> {
         self.ensure_writable()?;
-        let control = self.view.control_block();
-        let peer_left = || control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY;
+        // T11c: то же правило ухода, что у остальных потребителей
+        // (`server_left`, с `generation`; до T11c здесь сверялось только
+        // `server_state`).
+        let peer_left = || self.server_left();
         let disconnect = DisconnectWatch {
             event: &self.events.disconnect,
             peer_left: &peer_left,
@@ -3215,5 +3225,102 @@ mod reclaimed_leave_tests {
             "уход взвёл DISCONNECT в сессии следующего клиента"
         );
         assert_eq!(control.slot_claim.load(Ordering::Acquire), B_TOKEN);
+    }
+}
+
+#[cfg(test)]
+mod stale_disconnect_tests {
+    //! T11c (решение AD): синхронные ожидания (`poll_*`, `wait_for_space`)
+    //! принимают `DISCONNECT` за уход только при ушедшем пире -- по тем же
+    //! предикатам, что worker-ы и async (`client_left`/`server_left`).
+
+    use super::*;
+    use crate::server::SharedServer;
+    use std::time::Instant;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "CLI_STALE_DISC_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn accept(mut server: SharedServer, name: &str) -> (SharedServer, SharedClient) {
+        let waiter = std::thread::spawn(move || {
+            server
+                .wait_for_client(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+        });
+        let client = SharedClient::connect(name, Duration::from_secs(5)).unwrap();
+        (waiter.join().unwrap(), client)
+    }
+
+    /// `poll_client`/`poll_server`: устаревший сигнал поглощается (событие
+    /// не возвращено, ожидание дошло до таймаута), сессия жива; настоящий
+    /// уход сервера -- `NotConnected`.
+    #[test]
+    fn sync_poll_absorbs_stale_disconnect() {
+        let name = unique("POLL");
+        let (mut server, mut client) = accept(SharedServer::start(&name).unwrap(), &name);
+        let events = SharedEvents::open(&name).unwrap();
+
+        events.disconnect.set().unwrap();
+        assert_eq!(
+            server.poll_client(Some(Duration::from_millis(100))),
+            Ok(false)
+        );
+        assert!(
+            !events.disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "устаревший сигнал возвращён событию"
+        );
+        events.disconnect.set().unwrap();
+        assert_eq!(
+            client.poll_server(Some(Duration::from_millis(100))),
+            Ok(false)
+        );
+        assert!(server.is_connected() && client.is_connected());
+
+        server.disconnect().unwrap();
+        assert_eq!(
+            client.poll_server(Some(Duration::from_secs(2))),
+            Err(ShmError::NotConnected)
+        );
+    }
+
+    /// `wait_for_space` клиента: сервер сменил сессию (`generation`), не
+    /// выходя из `SERVER_READY` (принял другого клиента), и `DISCONNECT`
+    /// пришёл -- это уход для нашей сессии: `NotConnected` сразу, как у
+    /// остальных потребителей (`server_left`). До T11c здесь сверялось
+    /// только `server_state`, и ожидание тянулось до таймаута.
+    #[test]
+    fn client_wait_for_space_sees_foreign_session() {
+        let name = unique("SPACE_GEN");
+        let config = crate::server::ChannelConfig::new(ChannelLayout::symmetric(
+            crate::layout::RingConfig::new(4096),
+        ));
+        let (server, client) = accept(SharedServer::start_with(&name, &config).unwrap(), &name);
+        let payload = [1u8; 1000];
+        while client.try_send_to_server(&payload).is_ok() {}
+        let events = SharedEvents::open(&name).unwrap();
+        let switcher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // Сессия сменилась до сигнала (как S3 следующего рукопожатия).
+            server
+                .view()
+                .control_block()
+                .generation
+                .fetch_add(1, Ordering::AcqRel);
+            events.disconnect.set().unwrap();
+            server
+        });
+        let started = Instant::now();
+        let result = client.wait_for_space(payload.len(), Some(Duration::from_secs(3)));
+        let elapsed = started.elapsed();
+        drop(switcher.join().unwrap());
+        assert_eq!(result, Err(ShmError::NotConnected));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
     }
 }

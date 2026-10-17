@@ -1615,8 +1615,13 @@ impl SharedServer {
 
     /// Клиент закрыл сессию: `client_state` уже не `SERVER_READY` (уход L
     /// ставит `IDLE` до `DISCONNECT`, R14). Отличает свежий `DISCONNECT`
-    /// от устаревшего.
-    fn client_left(&self) -> bool {
+    /// от устаревшего -- одно правило для всех потребителей стороны
+    /// сервера (`poll_client`, `wait_for_space`, async, worker Auto,
+    /// диспетчер Multi; T11c, решение AD). `generation` сверять не нужно:
+    /// его меняет только сам сервер (S3), а `client_state ==
+    /// SERVER_READY` при открытой сессии сервера ставит только его же
+    /// фиксация S5 -- значит, клиент ЭТОЙ сессии ещё в ней.
+    pub(crate) fn client_left(&self) -> bool {
         self.view
             .control_block()
             .client_state

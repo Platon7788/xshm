@@ -710,3 +710,108 @@ fn accept_async_under_flood_accepts() {
     assert!(client.unwrap().is_connected() && server.is_connected());
     assert!(elapsed <= Duration::from_millis(500), "{elapsed:?}");
 }
+
+// ─── T11c: устаревший DISCONNECT -- не уход ────────────────────────────────
+
+/// Взвести `DISCONNECT` канала `name` через второй handle (сторона канала
+/// заимствована future-ом).
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+fn stale_disconnect(name: &str) {
+    xshm::events::SharedEvents::open(name)
+        .unwrap()
+        .disconnect
+        .set()
+        .unwrap();
+}
+
+/// T11c (решение AD): ожидающий `recv_async` сервера, разбуженный
+/// устаревшим `DISCONNECT` (клиент в сессии), поглощает его и остаётся
+/// `Pending`; данные клиента потом доставляются, а настоящий уход клиента
+/// -- `Err(NotConnected)`.
+#[test]
+fn async_server_recv_absorbs_stale_disconnect() {
+    let name = unique_name("STALEDISC_S");
+    let (mut server, client) = connected_pair(&name, &ChannelConfig::default());
+    let (state, waker) = unpark_waker();
+    let mut buf = Vec::new();
+    {
+        let mut future = pin!(server.recv_async(&mut buf));
+        assert!(poll_once(future.as_mut(), &waker).is_pending());
+        stale_disconnect(&name);
+        wait_until("DISCONNECT разбудил future", || {
+            state.wakes.load(Ordering::SeqCst) >= 1
+        });
+        assert!(
+            poll_once(future.as_mut(), &waker).is_pending(),
+            "устаревший DISCONNECT завершил приём"
+        );
+        client.try_send_to_server(b"after-stale").unwrap();
+        let (result, _) = drive(future.as_mut(), &waker);
+        assert_eq!(result, Ok(11));
+    }
+    assert_eq!(&buf[..11], b"after-stale");
+    drop(client); // IDLE -> DISCONNECT
+    assert_eq!(
+        block_on(server.recv_async(&mut buf)),
+        Err(ShmError::NotConnected)
+    );
+}
+
+/// То же у клиента (`server_state == SERVER_READY`, `generation`
+/// прежний): `recv_async` клиента поглощает устаревший сигнал; уход
+/// сервера (`disconnect`) -- `Err(NotConnected)`.
+#[test]
+fn async_client_recv_absorbs_stale_disconnect() {
+    let name = unique_name("STALEDISC_C");
+    let (mut server, mut client) = connected_pair(&name, &ChannelConfig::default());
+    let (state, waker) = unpark_waker();
+    let mut buf = Vec::new();
+    {
+        let mut future = pin!(client.recv_async(&mut buf));
+        assert!(poll_once(future.as_mut(), &waker).is_pending());
+        stale_disconnect(&name);
+        wait_until("DISCONNECT разбудил future", || {
+            state.wakes.load(Ordering::SeqCst) >= 1
+        });
+        assert!(
+            poll_once(future.as_mut(), &waker).is_pending(),
+            "устаревший DISCONNECT завершил приём"
+        );
+        server.try_send_to_client(b"after-stale").unwrap();
+        let (result, _) = drive(future.as_mut(), &waker);
+        assert_eq!(result, Ok(11));
+    }
+    server.disconnect().unwrap();
+    assert_eq!(
+        block_on(client.recv_async(&mut buf)),
+        Err(ShmError::NotConnected)
+    );
+}
+
+/// Ожидающий места `send_async` поглощает устаревший `DISCONNECT` и
+/// завершается, когда читатель освобождает место.
+#[test]
+fn async_send_absorbs_stale_disconnect() {
+    let name = unique_name("STALEDISC_SEND");
+    let config = ChannelConfig::default().layout(ChannelLayout::symmetric(RingConfig::new(4096)));
+    let (mut server, client) = connected_pair(&name, &config);
+    let payload = [3u8; 1000];
+    fill_to_client(&server, &payload);
+    let (state, waker) = unpark_waker();
+    let mut future = pin!(server.send_async(&payload));
+    assert!(poll_once(future.as_mut(), &waker).is_pending(), "места нет");
+    stale_disconnect(&name);
+    wait_until("DISCONNECT разбудил future", || {
+        state.wakes.load(Ordering::SeqCst) >= 1
+    });
+    assert!(
+        poll_once(future.as_mut(), &waker).is_pending(),
+        "устаревший DISCONNECT завершил отправку"
+    );
+    let mut buf = Vec::new();
+    client.receive_from_server(&mut buf).unwrap();
+    assert_eq!(drive(future.as_mut(), &waker).0, Ok(()));
+}

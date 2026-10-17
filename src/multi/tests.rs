@@ -1506,6 +1506,14 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
                 written += 1;
             }
             let prefilled = written;
+            // Уход по R14 (состояние, потом сигнал): с T11c `DISCONNECT`
+            // при `client_state == SERVER_READY` -- устаревший, не уход.
+            // Писать враждебный клиент продолжает и после.
+            client
+                .view()
+                .control_block()
+                .client_state
+                .store(crate::constants::HANDSHAKE_IDLE, Ordering::Release);
             client.events().disconnect.set().unwrap();
             ready_tx.send((Instant::now(), prefilled)).unwrap();
             while flooding.load(Ordering::Acquire) {
@@ -1873,6 +1881,12 @@ fn panic_while_draining_keeps_reason_and_releases_claim() {
     for seq in 0..3u32 {
         client.try_send_to_server(&seq.to_le_bytes()).unwrap();
     }
+    // Уход по R14: состояние, потом сигнал (T11c: иначе сигнал устаревший).
+    client
+        .view()
+        .control_block()
+        .client_state
+        .store(crate::constants::HANDSHAKE_IDLE, Ordering::Release);
     client.events().disconnect.set().unwrap();
     journal.panic_slot.store(0, Ordering::Release);
 
@@ -2630,4 +2644,269 @@ fn claim_scan_wraps_around() {
     assert_eq!(slot, 0, "за последним слотом -- снова с нуля");
     release_claim(None, &slot_name, token);
     server.stop();
+}
+
+// ─── T11c (решение AD): устаревший DISCONNECT -- не уход ──────────────────
+
+/// Диспетчер: устаревший `DISCONNECT` подключённого слота (клиент в
+/// сессии, `client_state == SERVER_READY`) поглощается -- слот подключён,
+/// колбэка отключения нет, обмен идёт; настоящий уход клиента (`Drop`:
+/// `IDLE`, затем `DISCONNECT`) -- `Graceful`. До исправления любой
+/// `DISCONNECT` подключённого слота закрывал сессию.
+#[test]
+fn dispatcher_keeps_slot_on_stale_disconnect() {
+    let name = unique("STALE_DISC_SRV");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(&name, journal.clone(), single_slot(1)).expect("start");
+    let slot_name = format!("{name}_0");
+    assert!(try_claim_slot(None, &slot_name, 0xBAD0_00C1).unwrap());
+    let client = connect_held(&slot_name, 0xBAD0_00C1).unwrap();
+    wait_for(
+        "слот подключён",
+        Duration::from_secs(5),
+        || server.is_client_connected(0),
+    );
+
+    let w0 = server.wakeups();
+    client.events().disconnect.set().unwrap();
+    wait_for(
+        "диспетчер разобрал сигнал",
+        Duration::from_secs(2),
+        || server.wakeups() > w0,
+    );
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        journal.disconnect_of(0).is_none(),
+        "устаревший DISCONNECT закрыл слот"
+    );
+    assert!(server.is_client_connected(0));
+
+    // Привязка `DISCONNECT` поставлена снова: обмен идёт, настоящий уход
+    // замечен.
+    client.try_send_to_server(&7u32.to_le_bytes()).unwrap();
+    wait_for("доставка", Duration::from_secs(2), || {
+        journal.count(0) == 1
+    });
+    drop(client);
+    wait_for("уход клиента", Duration::from_secs(2), || {
+        journal.disconnect_of(0).is_some()
+    });
+    assert_eq!(
+        journal.disconnect_of(0).map(|(reason, _)| reason),
+        Some(DisconnectReason::Graceful)
+    );
+    assert!(journal.errors.lock().unwrap().is_empty());
+    server.stop();
+}
+
+/// Worker `MultiClient`: устаревший `DISCONNECT` (сервер слота в сессии,
+/// `generation` прежний) поглощается -- клиент подключён, обмен идёт;
+/// настоящее отключение сервером (`disconnect_client`) -- `Graceful`.
+/// Сигнал взводится, пока его не разберёт сам клиент (`wakeups`):
+/// событие одно на обе стороны, и часть сигналов разбирает диспетчер --
+/// для него они тоже устаревшие.
+#[test]
+fn multi_client_keeps_session_on_stale_disconnect() {
+    let name = unique("STALE_DISC_CLI");
+    let handler = Arc::new(TestHandler::new());
+    let server = MultiServer::start(&name, handler.clone(), single_slot(1)).expect("start");
+    let recorder = Arc::new(ClientRecorder::default());
+    let client =
+        MultiClient::connect(&name, recorder.clone(), MultiClientOptions::default()).unwrap();
+    wait_for("подключение", Duration::from_secs(5), || {
+        client.is_connected() && server.is_client_connected(0)
+    });
+
+    let disconnect = crate::events::SharedEvents::open(&format!("{name}_0"))
+        .unwrap()
+        .disconnect;
+    let w0 = client.wakeups();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while client.wakeups() == w0 {
+        assert!(Instant::now() < deadline, "клиент не разобрал сигнал");
+        disconnect.set().unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        recorder.reasons.lock().unwrap().is_empty(),
+        "устаревший DISCONNECT закрыл сессию клиента"
+    );
+    assert!(client.is_connected());
+    assert!(server.is_client_connected(0));
+    assert_eq!(handler.disconnects.load(Ordering::Acquire), 0);
+
+    server.send_to(0, b"after-stale").unwrap();
+    wait_for(
+        "доставка клиенту",
+        Duration::from_secs(2),
+        || recorder.messages.load(Ordering::Acquire) == 1,
+    );
+    client.send(b"reply").unwrap();
+    wait_for(
+        "доставка серверу",
+        Duration::from_secs(2),
+        || handler.messages.load(Ordering::Acquire) == 1,
+    );
+
+    server.disconnect_client(0).unwrap();
+    wait_for(
+        "отключение сервером",
+        Duration::from_secs(2),
+        || !recorder.reasons.lock().unwrap().is_empty(),
+    );
+    assert_eq!(
+        recorder.reasons.lock().unwrap().first(),
+        Some(&DisconnectReason::Graceful)
+    );
+    client.stop();
+    server.stop();
+}
+
+/// Поток устаревших `DISCONNECT` («противник», `ADVERSARY_MARK`: сигнал
+/// взведён к каждому ожиданию worker-а) не скрывает от `MultiClient`
+/// смерть сервера: процесс стоит в наборе после `DISCONNECT` и
+/// проверяется нулевым ожиданием на каждом поглощённом сигнале --
+/// `PeerDied` за ≤ 1 с. Личность сервера слота -- дочерний процесс.
+/// Слот 0 держит синхронный `SharedServer` (протокол слота тот же): он
+/// `DISCONNECT` не ждёт, и сигнал «противника» не достаётся диспетчеру.
+#[test]
+fn multi_client_sees_server_death_under_stale_disconnect_flood() {
+    let name = unique("STALE_DISC_DEATH");
+    let mut server = SharedServer::start(&format!("{name}_0")).expect("start");
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "pause"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let start = ProcessWatch::open(pid).unwrap().start_time().unwrap();
+    let (lo, hi) = crate::layout::split_time(start);
+    {
+        let control = server.view().control_block();
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+    }
+    let recorder = Arc::new(ClientRecorder::default());
+    let client =
+        MultiClient::connect(&name, recorder.clone(), MultiClientOptions::default()).unwrap();
+    server
+        .wait_for_client(Some(Duration::from_secs(5)))
+        .expect("рукопожатие слота");
+    wait_for("подключение", Duration::from_secs(5), || {
+        client.is_connected()
+    });
+    server
+        .view()
+        .control_block()
+        .slot_count
+        .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+    let run = Arc::new(AtomicBool::new(true));
+    let attacker = flood_events(
+        vec![
+            crate::events::SharedEvents::open(&format!("{name}_0"))
+                .unwrap()
+                .disconnect,
+        ],
+        run.clone(),
+    );
+    thread::sleep(Duration::from_millis(50));
+    assert!(
+        recorder.reasons.lock().unwrap().is_empty(),
+        "сессия закрыта: {:?}",
+        recorder.reasons.lock().unwrap()
+    );
+
+    let started = Instant::now();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    wait_for(
+        "смерть сервера под потоком",
+        Duration::from_secs(3),
+        || !recorder.reasons.lock().unwrap().is_empty(),
+    );
+    let elapsed = started.elapsed();
+    run.store(false, Ordering::Release);
+    attacker.join().unwrap();
+    assert_eq!(
+        recorder.reasons.lock().unwrap().first(),
+        Some(&DisconnectReason::PeerDied)
+    );
+    assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
+    client.stop();
+    drop(server);
+}
+
+/// Поток устаревших `DISCONNECT` подключённого слота не голодит
+/// диспетчер: каждый сигнал -- одно завершение порта и сверка одного
+/// слота (O(1)), привязки остальных объектов -- свои пакеты в той же
+/// очереди. Слот остаётся подключённым, его данные доставляются, другой
+/// клиент подключается, `stop()` возвращается сразу.
+#[test]
+fn stale_disconnect_flood_does_not_starve_dispatcher() {
+    let name = unique("STALE_DISC_FLOOD");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(&name, journal.clone(), single_slot(2)).expect("start");
+    let slot_name = format!("{name}_0");
+    assert!(try_claim_slot(None, &slot_name, 0xBAD0_00C2).unwrap());
+    let client = connect_held(&slot_name, 0xBAD0_00C2).unwrap();
+    wait_for(
+        "слот подключён",
+        Duration::from_secs(5),
+        || server.is_client_connected(0),
+    );
+    let run = Arc::new(AtomicBool::new(true));
+    let attacker = flood_events(
+        vec![
+            crate::events::SharedEvents::open(&slot_name)
+                .unwrap()
+                .disconnect,
+        ],
+        run.clone(),
+    );
+    thread::sleep(Duration::from_millis(50));
+    // Relaxed: тестовая статистика.
+    let (v0, w0) = (server.slot_visits.load(Ordering::Relaxed), server.wakeups());
+
+    for i in 0..50u32 {
+        client.try_send_to_server(&i.to_le_bytes()).unwrap();
+        thread::sleep(Duration::from_millis(2));
+    }
+    wait_for(
+        "доставка под потоком",
+        Duration::from_secs(3),
+        || journal.count(0) == 50,
+    );
+    let newcomer = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "новый клиент под потоком",
+        Duration::from_secs(5),
+        || newcomer.is_connected() && newcomer.slot_id() == 1,
+    );
+    assert!(server.is_client_connected(0));
+    assert!(journal.disconnect_of(0).is_none(), "слот закрыт потоком");
+
+    let visits = server.slot_visits.load(Ordering::Relaxed) - v0;
+    let wakeups = server.wakeups() - w0;
+    assert!(wakeups >= 10, "поток не дошёл до диспетчера: {wakeups}");
+    assert!(
+        visits <= 3 * wakeups,
+        "сверок слотов {visits} на {wakeups} пробуждений"
+    );
+
+    let started = Instant::now();
+    server.stop();
+    let stopped_in = started.elapsed();
+    run.store(false, Ordering::Release);
+    attacker.join().unwrap();
+    assert!(stopped_in <= Duration::from_millis(300), "{stopped_in:?}");
+    drop(newcomer);
+    drop(client);
 }

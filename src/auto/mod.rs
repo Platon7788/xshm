@@ -11,7 +11,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
 use crate::presence::{self, Failure, Presence, PresenceWait, PresenceWatch, Reported};
-use crate::ring::{FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
+use crate::ring::{self, FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
 use crate::sync_ext::{LockExt, join_worker};
@@ -807,7 +807,7 @@ impl Worker {
         presence: &mut Option<PresenceWatch>,
         reported: &mut Reported,
     ) -> bool {
-        let deadline = crate::ring::deadline_of(presence::min_timeout(
+        let deadline = ring::deadline_of(presence::min_timeout(
             self.options.poll_timeout,
             self.options.discovery_fallback,
         ));
@@ -987,11 +987,26 @@ impl Worker {
         buffer: &mut Vec<u8>,
     ) -> Option<DisconnectReason> {
         match result {
-            Ok(Some(DISCONNECT_INDEX)) => {
+            Ok(Some(DISCONNECT_INDEX)) if endpoint.peer_left() => {
                 // Штатное отключение: всё, что пир успел записать (например,
                 // прощальное сообщение), доставляем ДО `on_disconnect`.
+                // Пир, уходя, ставит своё состояние ДО сигнала (R14), так
+                // что прочитанное здесь состояние публикует и его данные.
+                // Сигнал не возвращаем: сторона -- его единственный
+                // потребитель, а ушедший пир его уже не ждёт.
                 self.drain_remaining(endpoint, buffer);
                 Some(DisconnectReason::Graceful)
+            }
+            Ok(Some(DISCONNECT_INDEX)) => {
+                // T11c (решение AD): пир в сессии -- сигнал устаревший
+                // (окно между CAS ухода прежнего клиента и его сигналом,
+                // пир 0.9, посторонний процесс). Поглощён, сессия живёт;
+                // остальные объекты набора -- нулевым ожиданием (поток
+                // таких сигналов на индексе 0 не скрывает `SPACE` и смерть
+                // пира). Исход нулевого ожидания -- никогда не
+                // `DISCONNECT`, так что повтор разбора не рекурсивен.
+                let rest = ring::rest_after_stale_disconnect(set.handles());
+                self.handle_wait(endpoint, set, space, rest, buffer)
             }
             Ok(Some(DATA_INDEX)) => {
                 // Данные прочитаем на следующем проходе. SPACE (автосброс,
@@ -1278,6 +1293,10 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
                 server.peer_wait_handle(),
                 worker.wake.as_handle(),
             );
+            // Тесты (T11c): «противник, всегда выигрывающий гонку» --
+            // `DISCONNECT` взведён к каждому ожиданию.
+            #[cfg(test)]
+            crate::server::adversary_resignal(server.view(), &events.disconnect);
             let result = win::wait_any(set.handles(), timeout);
             worker.stats.wake();
             worker.handle_wait(server, &set, space, result, &mut buffer)
@@ -1312,6 +1331,10 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
 /// Индексы событий канала в наборе ожидания worker-а. NT при одновременном
 /// сигнале возвращает наименьший индекс: штатный DISCONNECT и данные имеют
 /// приоритет над «процесс пира завершился», а тот -- над `wake`.
+/// `DISCONNECT` -- уход, только если пир покинул сессию (T11c); устаревший
+/// поглощается, и остальные объекты проверяются нулевым ожиданием
+/// (`ring::rest_after_stale_disconnect`) -- поток таких сигналов на
+/// индексе 0 ничего не скрывает.
 const DISCONNECT_INDEX: usize = 0;
 const DATA_INDEX: usize = 1;
 const SPACE_INDEX: usize = 2;
@@ -1690,6 +1713,9 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 client.peer_wait_handle(),
                 worker.wake.as_handle(),
             );
+            // Тесты (T11c): «противник» -- `DISCONNECT` к каждому ожиданию.
+            #[cfg(test)]
+            crate::server::adversary_resignal(client.view(), &client_events.disconnect);
             let result = win::wait_any(set.handles(), timeout);
             worker.stats.wake();
             if !client.is_session_current() {
@@ -1926,6 +1952,10 @@ trait ReceiveEndpoint {
     /// Контракт `RingBuffer::read_with`: пир не меняет кадр, пока идёт `f`,
     /// и никакого другого чтения этого направления во время `f`.
     unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T>;
+    /// Пир покинул сессию этой стороны: `DISCONNECT` -- свежий, а не
+    /// устаревший (T11c; `SharedServer::client_left`,
+    /// `SharedClient::server_left`).
+    fn peer_left(&self) -> bool;
 }
 
 impl SendEndpoint for SharedServer {
@@ -1954,6 +1984,9 @@ impl ReceiveEndpoint for SharedServer {
         // SAFETY: контракт `receive_with_shared` -- контракт этой функции.
         unsafe { self.receive_with_shared(f) }
     }
+    fn peer_left(&self) -> bool {
+        self.client_left()
+    }
 }
 
 impl SendEndpoint for SharedClient {
@@ -1981,6 +2014,9 @@ impl ReceiveEndpoint for SharedClient {
     unsafe fn read_with<T>(&self, f: impl FnOnce(&[u8]) -> T) -> Result<T> {
         // SAFETY: контракт `receive_with_shared` -- контракт этой функции.
         unsafe { self.receive_with_shared(f) }
+    }
+    fn peer_left(&self) -> bool {
+        self.server_left()
     }
 }
 
@@ -3718,5 +3754,340 @@ mod presence_tests {
         fn on_connect(&self, _slot_id: u32) {}
         fn on_disconnect(&self) {}
         fn on_message(&self, _data: &[u8]) {}
+    }
+}
+
+#[cfg(test)]
+mod stale_disconnect_tests {
+    //! T11c надёжности (решение AD): `DISCONNECT` у подключённого worker-а
+    //! -- уход, только если пир действительно покинул ЭТУ сессию (сервер:
+    //! `client_state != SERVER_READY`; клиент: `server_state !=
+    //! SERVER_READY` или `generation != G`). Устаревший сигнал (окно между
+    //! CAS ухода и сигналом прежнего клиента, пир 0.9, посторонний
+    //! процесс) поглощается -- сессия живёт; поток таких сигналов не
+    //! голодит остальные объекты набора и остановку.
+
+    use super::*;
+    use crate::events::SharedEvents;
+    use crate::layout::RingConfig;
+    use crate::win::ProcessWatch;
+    use std::time::Instant;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "AUTO_STALE_DISC_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !cond() {
+            assert!(Instant::now() < deadline, "таймаут: {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[derive(Default)]
+    struct Log {
+        connected: AtomicBool,
+        messages: AtomicU32,
+        spaces: AtomicU32,
+        reasons: Mutex<Vec<DisconnectReason>>,
+        errors: Mutex<Vec<ShmError>>,
+    }
+
+    impl Log {
+        fn reasons(&self) -> Vec<DisconnectReason> {
+            self.reasons.lock().unwrap().clone()
+        }
+    }
+
+    impl AutoHandler for Log {
+        fn on_connect(&self) {
+            self.connected.store(true, Ordering::Release);
+        }
+        fn on_disconnect_reason(&self, reason: DisconnectReason) {
+            self.connected.store(false, Ordering::Release);
+            self.reasons.lock().unwrap().push(reason);
+        }
+        fn on_message(&self, _direction: ChannelKind, _payload: &[u8]) {
+            self.messages.fetch_add(1, Ordering::AcqRel);
+        }
+        fn on_space_available(&self, _direction: ChannelKind) {
+            self.spaces.fetch_add(1, Ordering::AcqRel);
+        }
+        fn on_error(&self, err: ShmError) {
+            self.errors.lock().unwrap().push(err);
+        }
+    }
+
+    /// Поток-атакующий: взводит `event` без пауз, пока `run` истинно.
+    fn flood(event: Arc<EventHandle>, run: Arc<AtomicBool>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            while run.load(Ordering::Acquire) {
+                let _ = event.set();
+            }
+        })
+    }
+
+    /// Сервер: устаревший `DISCONNECT` (клиент в сессии, `client_state ==
+    /// SERVER_READY`) worker разбирает и поглощает -- ни колбэка
+    /// отключения, ни сброса состояния; обмен идёт дальше в обе стороны, а
+    /// настоящий уход клиента (`Drop`: `IDLE`, затем `DISCONNECT`) --
+    /// по-прежнему `Graceful`. До исправления любой `DISCONNECT` закрывал
+    /// живую сессию.
+    #[test]
+    fn server_keeps_session_on_stale_disconnect() {
+        let name = unique("SRV");
+        let log = Arc::new(Log::default());
+        let server = AutoServer::start(&name, log.clone(), AutoOptions::default()).unwrap();
+        let mut client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        let w0 = server.wakeups();
+        client.events().disconnect.set().unwrap();
+        wait_until(
+            "worker разобрал сигнал",
+            Duration::from_secs(2),
+            || server.wakeups() > w0,
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            log.reasons().is_empty(),
+            "устаревший DISCONNECT закрыл сессию"
+        );
+        assert!(log.connected.load(Ordering::Acquire));
+        assert!(
+            !client.server_left(),
+            "сервер ушёл из сессии по устаревшему сигналу"
+        );
+
+        // Сессия жива в обе стороны.
+        client.send_to_server(b"after-stale").unwrap();
+        wait_until(
+            "доставка серверу",
+            Duration::from_secs(2),
+            || log.messages.load(Ordering::Acquire) == 1,
+        );
+        server.send(b"reply").unwrap();
+        assert_eq!(client.poll_server(Some(Duration::from_secs(2))), Ok(true));
+
+        // Настоящий уход -- `Graceful`.
+        drop(client);
+        wait_until("уход клиента", Duration::from_secs(2), || {
+            !log.reasons().is_empty()
+        });
+        assert_eq!(log.reasons(), [DisconnectReason::Graceful]);
+        assert!(log.errors.lock().unwrap().is_empty());
+        server.stop();
+    }
+
+    /// Клиент: устаревший `DISCONNECT` (сервер в сессии, `server_state ==
+    /// SERVER_READY`, `generation` прежний) worker поглощает; обмен идёт
+    /// дальше, а настоящий уход сервера (`disconnect`) -- `Graceful`.
+    #[test]
+    fn client_keeps_session_on_stale_disconnect() {
+        let name = unique("CLI");
+        let mut server = SharedServer::start(&name).unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        let w0 = client.wakeups();
+        server.events().unwrap().disconnect.set().unwrap();
+        wait_until(
+            "worker разобрал сигнал",
+            Duration::from_secs(2),
+            || client.wakeups() > w0,
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            log.reasons().is_empty(),
+            "устаревший DISCONNECT закрыл сессию"
+        );
+        let control = server.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            crate::constants::HANDSHAKE_SERVER_READY,
+            "клиент ушёл из сессии по устаревшему сигналу"
+        );
+
+        server.send_to_client(b"after-stale").unwrap();
+        wait_until(
+            "доставка клиенту",
+            Duration::from_secs(2),
+            || log.messages.load(Ordering::Acquire) == 1,
+        );
+        client.send(b"reply").unwrap();
+        assert_eq!(server.poll_client(Some(Duration::from_secs(2))), Ok(true));
+
+        server.disconnect().unwrap();
+        wait_until("уход сервера", Duration::from_secs(2), || {
+            !log.reasons().is_empty()
+        });
+        assert_eq!(log.reasons(), [DisconnectReason::Graceful]);
+        drop(client);
+        drop(server);
+    }
+
+    /// Поток устаревших `DISCONNECT` (индекс 0 набора) на живой сессии
+    /// сервера не голодит ничего: данные клиента доставляются, отправка
+    /// идёт, `SPACE` (индекс 2) доходит до `on_space_available` -- его
+    /// видит нулевое ожидание остальных объектов набора после каждого
+    /// поглощённого сигнала; `stop()` возвращается сразу. Сессия всё это
+    /// время жива. Атакующий без пауз и «противник, всегда выигрывающий
+    /// гонку» (`ADVERSARY_MARK`: `DISCONNECT` взведён к каждому ожиданию).
+    #[test]
+    fn stale_disconnect_flood_starves_nothing_on_server() {
+        const TOTAL: u32 = 200;
+        let name = unique("FLOOD_SRV");
+        let log = Arc::new(Log::default());
+        let server = AutoServer::start(
+            &name,
+            log.clone(),
+            AutoOptions {
+                layout: ChannelLayout::symmetric(RingConfig::new(4096)),
+                ..AutoOptions::default()
+            },
+        )
+        .unwrap();
+        let mut client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+        client
+            .view()
+            .control_block()
+            .slot_count
+            .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        let run = Arc::new(AtomicBool::new(true));
+        let attacker = flood(
+            Arc::new(SharedEvents::open(&name).unwrap().disconnect),
+            run.clone(),
+        );
+        thread::sleep(Duration::from_millis(50));
+
+        // Данные клиента.
+        for i in 0..50u32 {
+            client.try_send_to_server(&i.to_le_bytes()).unwrap();
+        }
+        wait_until(
+            "доставка под потоком",
+            Duration::from_secs(3),
+            || log.messages.load(Ordering::Acquire) == 50,
+        );
+
+        // Отправка без потерь больше кольца: worker ждёт места (`SPACE`).
+        for i in 0..TOTAL {
+            server
+                .try_send(&[u8::try_from(i % 251).unwrap(); 64])
+                .unwrap();
+        }
+        let mut buf = Vec::new();
+        let mut received = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while received < TOTAL {
+            assert!(Instant::now() < deadline, "получено {received} из {TOTAL}");
+            match client.receive_from_server(&mut buf) {
+                Ok(_) => received += 1,
+                Err(ShmError::QueueEmpty) => {
+                    let _ = client.poll_server(Some(Duration::from_millis(50)));
+                }
+                Err(err) => panic!("{err:?}"),
+            }
+        }
+        wait_until(
+            "on_space_available под потоком",
+            Duration::from_secs(2),
+            || log.spaces.load(Ordering::Acquire) > 0,
+        );
+        assert!(
+            log.reasons().is_empty(),
+            "сессия закрыта: {:?}",
+            log.reasons()
+        );
+
+        let started = Instant::now();
+        server.stop();
+        let stopped_in = started.elapsed();
+        run.store(false, Ordering::Release);
+        attacker.join().unwrap();
+        assert!(stopped_in <= Duration::from_millis(300), "{stopped_in:?}");
+        assert!(log.errors.lock().unwrap().is_empty());
+        drop(client);
+    }
+
+    /// Поток устаревших `DISCONNECT` не скрывает смерть сервера (процесс
+    /// стоит в наборе после `DISCONNECT`): клиент видит `PeerDied` за
+    /// ≤ 1 с. Личность сервера -- дочерний процесс (`cmd /C pause`).
+    #[test]
+    fn stale_disconnect_flood_does_not_hide_server_death() {
+        let name = unique("FLOOD_DEATH");
+        let mut server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = ProcessWatch::open(pid).unwrap().start_time().unwrap();
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+        // Атакующий и «противник» (`DISCONNECT` к каждому ожиданию).
+        server
+            .view()
+            .control_block()
+            .slot_count
+            .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        let run = Arc::new(AtomicBool::new(true));
+        let attacker = flood(
+            Arc::new(SharedEvents::open(&name).unwrap().disconnect),
+            run.clone(),
+        );
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            log.reasons().is_empty(),
+            "сессия закрыта: {:?}",
+            log.reasons()
+        );
+
+        let started = Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        wait_until(
+            "смерть сервера под потоком",
+            Duration::from_secs(3),
+            || !log.reasons().is_empty(),
+        );
+        let elapsed = started.elapsed();
+        run.store(false, Ordering::Release);
+        attacker.join().unwrap();
+        assert_eq!(log.reasons().first(), Some(&DisconnectReason::PeerDied));
+        assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
+        drop(client);
+        drop(server);
     }
 }

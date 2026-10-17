@@ -34,7 +34,7 @@
 //! зависание, панику или выход за пределы кольца.
 
 use std::marker::PhantomData;
-use std::os::windows::io::AsHandle;
+use std::os::windows::io::{AsHandle, BorrowedHandle};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering, compiler_fence, fence};
 use std::time::{Duration, Instant};
@@ -205,6 +205,25 @@ pub(crate) struct DrainBound {
 pub(crate) struct DisconnectWatch<'a> {
     pub event: &'a EventHandle,
     pub peer_left: &'a dyn Fn() -> bool,
+}
+
+/// Подключённый worker (Auto, `MultiClient`; T11c, решение AD) поглотил
+/// устаревший `DISCONNECT` -- индекс 0 своего набора: пир в сессии
+/// (`SharedServer::client_left`/`SharedClient::server_left` -- `false`).
+/// Возвращать сигнал некому: сторона его единственный потребитель, а пир
+/// сигналит только уходя (сначала состояние, потом сигнал -- R14), так
+/// что сигнал при живой сессии не адресован никому.
+///
+/// Остальные объекты набора (`handles[1..]`: данные, место, процесс пира,
+/// `wake`) проверяются одним ожиданием с нулевым таймаутом (П1/П2 §e.1):
+/// поток устаревших сигналов на индексе 0 иначе скрывал бы их -- смерть
+/// пира и `SPACE` без такой проверки не видны вовсе, данные и остановку
+/// worker и так решает по состоянию на каждом проходе. Цена сигнала --
+/// O(1): одно чтение состояния и один системный вызов без сна. Индекс --
+/// в полном наборе (`handles`), `Ok(None)` -- ничего не взведено.
+pub(crate) fn rest_after_stale_disconnect(handles: &[BorrowedHandle<'_>]) -> Result<Option<usize>> {
+    let rest = handles.get(1..).unwrap_or_default();
+    Ok(wait_any(rest, Some(Duration::ZERO))?.map(|index| index + 1))
 }
 
 /// Результат записи в кольцо.

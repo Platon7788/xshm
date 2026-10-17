@@ -1150,6 +1150,54 @@
   INTEROP R15, §d.2 шаг 7, §h п. 11, «Изменения 0.10» п. 37 (нативному
   клиенту — ЖЕЛАТЕЛЬНО).
 
+- **Important** (T11c, решение AD) Устаревший `DISCONNECT` закрывал живую
+  сессию у worker-ов: Auto-сервер и Auto-клиент (`Worker::handle_wait`,
+  значит, и выделенные каналы Dispatch), диспетчер `MultiServer`
+  (`handle_slot_disconnect`) и `MultiClient` считали **любой** сигнал
+  `DISCONNECT` штатным уходом пира. Сигнал при живой сессии возможен:
+  окно между удачным CAS ухода прежнего клиента и его сигналом (допущение
+  A1', п. 37), пир 0.9 или чужой реализации, посторонний процесс того же
+  пользователя. Теперь `DISCONNECT` — уход, только если пир покинул ЭТУ
+  сессию: сервер — `client_state != SERVER_READY`
+  (`SharedServer::client_left`; `generation` меняет только сам сервер),
+  клиент — `server_state != SERVER_READY` или `generation != G`
+  (`SharedClient::server_left`). Те же два предиката — у всех
+  потребителей (синхронные `poll_*`/`wait_for_space`, async
+  `recv_async`/`send_async`, ответ лобби уже следовали правилу; клиентский
+  `wait_for_space` сверял только `server_state` — теперь и `generation`).
+  Устаревший сигнал поглощается (возвращать некому: пир сигналит, только
+  уйдя, R14), сессия живёт; worker-ы Auto и `MultiClient` после него
+  проверяют остальные объекты набора одним нулевым ожиданием
+  (`ring::rest_after_stale_disconnect`): поток таких сигналов на индексе 0
+  не скрывает `SPACE` и смерть пира, данные и остановку проход решает по
+  состоянию — работа на сигнал O(1). Диспетчер Multi — одно завершение
+  порта и сверка одного слота, привязка `DISCONNECT` ставится снова.
+  `MultiClient`, разбуженный `DISCONNECT` чужой сессии (`generation`
+  сменился), возвращает сигнал новому клиенту слота (как `DATA` и клиент
+  Auto). Настоящий уход — по-прежнему `Graceful` с дочитыванием кольца.
+  Тесты: `auto::stale_disconnect_tests::{server_keeps_session_on_stale_disconnect,
+  client_keeps_session_on_stale_disconnect,
+  stale_disconnect_flood_starves_nothing_on_server,
+  stale_disconnect_flood_does_not_hide_server_death}`,
+  `multi::tests::{dispatcher_keeps_slot_on_stale_disconnect,
+  multi_client_keeps_session_on_stale_disconnect,
+  multi_client_sees_server_death_under_stale_disconnect_flood,
+  stale_disconnect_flood_does_not_starve_dispatcher}`,
+  `dispatch::tests::dedicated_channel_survives_stale_disconnect`,
+  `client::stale_disconnect_tests::{sync_poll_absorbs_stale_disconnect,
+  client_wait_for_space_sees_foreign_session}`, `tests/async.rs`
+  `async_{server_recv,client_recv,send}_absorbs_stale_disconnect`; потоки —
+  атакующий без пауз и «противник» `ADVERSARY_MARK` (сигнал к каждому
+  ожиданию); без нулевого ожидания тесты потока падают. Тесты,
+  моделировавшие уход одним сигналом без смены состояния
+  (`hostile_disconnect_flood_does_not_stall_dispatcher`,
+  `panic_while_draining_keeps_reason_and_releases_claim`), теперь уходят
+  по R14. Пир-видимо: INTEROP §e.1, §e.2 п. 5, §e.4 (R14), §i.2, §i.4,
+  §i.6, «Изменения 0.10» п. 37 и **п. 38**. Нативному пиру: сигналить по
+  R14 (состояние, потом сигнал) — ОБЯЗАН, иначе любой потребитель Rust
+  примет уход за устаревший сигнал; поглощать устаревший `DISCONNECT`
+  самому — ЖЕЛАТЕЛЬНО.
+
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
 - Пул пакетов ожидания реактора. `Reactor::register` создавал объект ядра
