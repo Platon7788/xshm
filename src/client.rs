@@ -240,15 +240,22 @@ impl SharedClient {
     /// `Ok(true)` -- секция канала опубликована, все 7 событий на месте и
     /// процесс сервера не завершился (дальше -- [`SharedClient::connect`]);
     /// `Ok(false)` -- истёк `timeout` (`None` -- ждать без ограничения).
+    /// Параметры по умолчанию ([`DiscoveryOptions::default`](crate::DiscoveryOptions)),
+    /// свои -- [`SharedClient::wait_for_server_with`].
     ///
     /// Без опроса: пока сервера нет, вызов спит в ядре на маяке присутствия
     /// `<имя>_beacon`, который каждый именованный сервер взводит после
-    /// публикации канала (клиент создаёт маяк сам, если пришёл первым, --
-    /// политика по умолчанию, `ObjectSecurity::CurrentUser`; DACL задаёт
-    /// первый создатель). Маяк, оставленный упавшим сервером, гасится
-    /// (`Beacon::clear_if_stale`), и ожидание продолжается. Маяк недоступен
-    /// (нет прав, нет привилегии `Global\`) -- резервная проверка раз в
-    /// 250 мс.
+    /// публикации канала. Существующий маяк открывается по DACL создателя;
+    /// если ожидающий пришёл первым, он создаёт маяк с политикой
+    /// `DiscoveryOptions::security` (по умолчанию `CurrentUser`) -- DACL
+    /// задаёт первый создатель, поэтому при сервере другого пользователя
+    /// (служба на `Global\`) задайте ту же политику, что у канала сервера.
+    /// Маяк, оставленный упавшим сервером, гасится
+    /// (`Beacon::clear_if_stale`), и ожидание продолжается. Резервная
+    /// проверка канала -- не реже `DiscoveryOptions::fallback` (по
+    /// умолчанию 10 с): сервер без маяка (пир без R19, маяк занят заранее)
+    /// всё равно находится. Маяк недоступен (нет прав, нет привилегии
+    /// `Global\`) -- проверка раз в 250 мс.
     ///
     /// # Errors
     ///
@@ -256,7 +263,7 @@ impl SharedClient {
     /// (`VersionMismatch`, `Corrupted`, `AccessDenied`, `InvalidConfig`),
     /// ошибка ОС ожидания.
     pub fn wait_for_server(name: &str, timeout: Option<Duration>) -> Result<bool> {
-        crate::presence::wait_for_server(None, name, timeout)
+        Self::wait_for_server_with(name, timeout, &crate::DiscoveryOptions::default())
     }
 
     /// [`SharedClient::wait_for_server`] для канала в частном пространстве
@@ -271,7 +278,29 @@ impl SharedClient {
         name: &str,
         timeout: Option<Duration>,
     ) -> Result<bool> {
-        crate::presence::wait_for_server(Some(ns), name, timeout)
+        crate::presence::wait_for_server(
+            Some(ns),
+            name,
+            timeout,
+            &crate::DiscoveryOptions::default(),
+        )
+    }
+
+    /// [`SharedClient::wait_for_server`] с параметрами `options`: политика
+    /// маяка, если его создаёт ожидающий, резервная проверка
+    /// (`fallback`, `None` -- только события) и частное пространство имён.
+    ///
+    /// # Errors
+    ///
+    /// Как у [`SharedClient::wait_for_server`]; некорректный
+    /// `ObjectSecurity::Descriptor` -- маяк не открывается, работает
+    /// резервная проверка.
+    pub fn wait_for_server_with(
+        name: &str,
+        timeout: Option<Duration>,
+        options: &crate::DiscoveryOptions,
+    ) -> Result<bool> {
+        crate::presence::wait_for_server(options.namespace.as_deref(), name, timeout, options)
     }
 
     /// Раскладка канала, выбранная сервером.

@@ -62,6 +62,7 @@ pub use dispatch::{
 pub use error::{DisconnectReason, Result, ShmError};
 pub use events::EventHandles;
 pub use layout::{ChannelLayout, RingConfig, max_payload_for};
+pub use presence::{DEFAULT_DISCOVERY_FALLBACK, DiscoveryOptions, PresenceStatus};
 
 /// Ёмкость кольца раскладки по умолчанию (до 0.10 -- единственная).
 #[deprecated(

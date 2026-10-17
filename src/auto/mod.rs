@@ -84,8 +84,9 @@ pub trait AutoHandler: Send + Sync + 'static {
     /// — `try_send`, получивший `QueueFull`, стоит повторить.
     fn on_space_available(&self, _direction: ChannelKind) {}
     /// Ошибка worker-а. Клиент (`AutoClient::connect`): неудачная попытка
-    /// подключения приходит сюда (0.10, Task 11: одна и та же ошибка --
-    /// один раз за эпизод вне подключения, кроме `AlreadyConnected`), а
+    /// подключения приходит сюда (0.10, Task 11: одинаковая ошибка подряд --
+    /// один раз, кроме `AlreadyConnected`; другая ошибка между ними -- и
+    /// повтор сообщается снова), а
     /// следующая попытка -- по событию (см. `AutoOptions::reconnect_delay`).
     /// `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал занят другим
     /// клиентом -- о каждой попытке, повтор с растущим отступом: пауза
@@ -124,6 +125,17 @@ pub struct AutoOptions {
     /// недоступен (нет прав или привилегии `Global\`), процесс сервера не
     /// открылся.
     pub reconnect_delay: Duration,
+    /// Резервная проверка обнаружения сервера `AutoClient` (0.10, решение
+    /// W(3); `AutoServer` не использует): пока сервер не найден и клиент
+    /// спит на маяке присутствия или процессе сервера, он всё равно делает
+    /// попытку не реже этого интервала. Защищает от маяка, занятого заранее
+    /// и никогда не взводимого, от сервера без маяка (пир без R19, сервер,
+    /// которому не удалось создать маяк, -- `PresenceStatus::Unavailable`)
+    /// и от подменённой личности сервера в состоянии маяка. Подключённый
+    /// клиент по нему не просыпается. По умолчанию --
+    /// `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с: не больше 0,1 пробуждения в
+    /// секунду, пока сервера нет); `None` -- только события.
+    pub discovery_fallback: Option<Duration>,
     /// Сколько `AutoClient` ждёт ответа сервера на одну попытку
     /// подключения (`AutoServer` не использует).
     pub connect_timeout: Duration,
@@ -241,6 +253,7 @@ impl Default for AutoOptions {
         Self {
             poll_timeout: None,
             reconnect_delay: Duration::from_millis(250),
+            discovery_fallback: Some(presence::DEFAULT_DISCOVERY_FALLBACK),
             connect_timeout: Duration::from_secs(2),
             max_send_queue: 256,
             recv_batch: 32,
@@ -737,10 +750,17 @@ impl Worker {
         self.running.load(Ordering::Acquire)
     }
 
-    /// `on_error` -- если в этом эпизоде вне подключения о такой ошибке
-    /// ещё не сообщали (Task 11).
+    /// `on_error` -- если это не повтор предыдущей ошибки вне подключения
+    /// (Task 11, M1: одинаковая ошибка подряд -- один раз).
     fn report_once(&self, reported: &mut Reported, err: ShmError) {
         if reported.first(&err) {
+            self.handler.on_error(err);
+        }
+    }
+
+    /// `on_error` для ошибки маяка присутствия (свой ряд повторов).
+    fn report_presence(&self, reported: &mut Reported, err: ShmError) {
+        if reported.presence_first(&err) {
             self.handler.on_error(err);
         }
     }
@@ -753,6 +773,17 @@ impl Worker {
         go_on
     }
 
+    /// Резерв (решение R-M): ждать нечего -- пауза `reconnect_delay`, но не
+    /// дольше резервной проверки `discovery_fallback` (W(3) ограничивает
+    /// каждое ожидание обнаружения). `false` -- остановка.
+    fn degraded_pause(&self) -> bool {
+        let delay = presence::min_timeout(
+            Some(self.options.reconnect_delay),
+            self.options.discovery_fallback,
+        );
+        self.pause(delay.unwrap_or(self.options.reconnect_delay))
+    }
+
     /// Клиент вне подключения после неудачи `failure` (Task 11, R19): сон в
     /// ядре на маяке присутствия канала `name` или на процессе сервера
     /// (`presence::PresenceWatch::wait`), без опроса. `wake` -- индекс 0:
@@ -760,7 +791,8 @@ impl Worker {
     /// Ждать нечего (маяк недоступен -- нет прав или привилегии `Global\`,
     /// процесс сервера не открылся, состояние маяка испорчено) -- резерв:
     /// пауза `reconnect_delay` (решение R-M), ошибка маяка -- один раз.
-    /// `false` -- остановка.
+    /// Сон -- не дольше `discovery_fallback` от входа (решение W(3); `send`
+    /// дедлайн не продлевает), затем попытка. `false` -- остановка.
     fn await_server(
         &self,
         name: &str,
@@ -768,9 +800,17 @@ impl Worker {
         presence: &mut Option<PresenceWatch>,
         reported: &mut Reported,
     ) -> bool {
+        let deadline = crate::ring::deadline_of(presence::min_timeout(
+            self.options.poll_timeout,
+            self.options.discovery_fallback,
+        ));
         loop {
             if !self.running() {
                 return false;
+            }
+            let left = deadline.map(|at| at.saturating_duration_since(std::time::Instant::now()));
+            if left.is_some_and(|left| left.is_zero()) {
+                return true;
             }
             if presence.is_none() {
                 match PresenceWatch::open(
@@ -781,29 +821,26 @@ impl Worker {
                 ) {
                     Ok(watch) => *presence = Some(watch),
                     Err(err) => {
-                        self.report_once(reported, err);
-                        return self.pause(self.options.reconnect_delay);
+                        self.report_presence(reported, err);
+                        return self.degraded_pause();
                     }
                 }
             }
             let Some(watch) = presence.as_mut() else {
-                return self.pause(self.options.reconnect_delay);
+                return self.degraded_pause();
             };
-            let waited = watch.wait(
-                failure,
-                Some(self.wake.as_handle()),
-                self.options.poll_timeout,
-                &|| self.stats.wake(),
-            );
+            let waited = watch.wait(failure, Some(self.wake.as_handle()), left, &|| {
+                self.stats.wake();
+            });
             match waited {
                 Ok(PresenceWait::Retry | PresenceWait::TimedOut) => return self.running(),
                 Ok(PresenceWait::Woken) => self.report_evicted(),
                 Ok(PresenceWait::Unavailable) => {
-                    return self.pause(self.options.reconnect_delay);
+                    return self.degraded_pause();
                 }
                 Err(err) => {
-                    self.report_once(reported, err);
-                    return self.pause(self.options.reconnect_delay);
+                    self.report_presence(reported, err);
+                    return self.degraded_pause();
                 }
             }
         }
@@ -991,6 +1028,8 @@ impl ChannelKind {
 pub struct AutoServer {
     endpoint: Endpoint,
     layout: ChannelLayout,
+    /// Маяк присутствия канала на момент старта (решение W(1)).
+    presence: crate::PresenceStatus,
 }
 
 impl AutoServer {
@@ -1021,6 +1060,7 @@ impl AutoServer {
             presence,
         )?;
         let layout = *server.layout();
+        let status = server.presence();
         let endpoint = Endpoint::spawn(
             handler,
             options,
@@ -1029,13 +1069,26 @@ impl AutoServer {
             Some(layout),
             move |worker| server_worker(&mut server, worker),
         )?;
-        Ok(Self { endpoint, layout })
+        Ok(Self {
+            endpoint,
+            layout,
+            presence: status,
+        })
     }
 
     /// Раскладка канала.
     #[must_use]
     pub const fn layout(&self) -> &ChannelLayout {
         &self.layout
+    }
+
+    /// Маяк присутствия канала (0.10, INTEROP R19; см.
+    /// `SharedServer::presence`): `Unavailable` -- сервер работает без
+    /// маяка, `AutoClient`-ы находят его резервной проверкой
+    /// `AutoOptions::discovery_fallback`.
+    #[must_use]
+    pub fn presence(&self) -> crate::PresenceStatus {
+        self.presence.clone()
     }
 
     /// Асинхронная отправка с политикой overwrite-oldest: при переполнении
@@ -1520,8 +1573,8 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             }
             Err(err) => {
                 // Task 11 (R19): сервера нет или он отверг нас -- сон в ядре
-                // на маяке присутствия / процессе сервера, о каждой ошибке --
-                // один раз за эпизод.
+                // на маяке присутствия / процессе сервера (не дольше
+                // `discovery_fallback`), одинаковая ошибка подряд -- один раз.
                 if let Some(failure) =
                     presence::classify(&err, worker.options.namespace.as_deref(), Some(name))
                 {
@@ -1536,9 +1589,10 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 // Канал занят (`AlreadyConnected`, до Task 12) -- о каждой
                 // попытке, отступ растёт (final review M4). Таймаут ответа
                 // сервера и прочее -- прежняя пауза `reconnect_delay`
-                // (решение R-M), ошибка -- один раз за эпизод.
+                // (решение R-M), одинаковая ошибка подряд -- один раз.
                 let busy = err == ShmError::AlreadyConnected;
                 if busy {
+                    reported.note(&err);
                     worker.handler.on_error(err);
                 } else {
                     worker.report_once(&mut reported, err);
@@ -3191,8 +3245,10 @@ mod presence_tests {
     }
 
     /// Под именем -- сервер другого формата памяти: клиент сообщает
-    /// `VersionMismatch` один раз и спит до выхода процесса этого сервера
-    /// (PID и время -- из `ControlBlock`), а не повторяет раз в 250 мс.
+    /// `VersionMismatch` один раз и спит до выхода процесса этого сервера,
+    /// а не повторяет раз в 250 мс. Личность (PID и время) -- из
+    /// `ControlBlock`, сверенная с состоянием маяка (решение W(2)): обе
+    /// указывают на дочерний процесс.
     #[test]
     fn incompatible_server_waits_for_its_exit() {
         let name = unique("VERSION");
@@ -3208,6 +3264,10 @@ mod presence_tests {
             .server_start_hi
             .store(u32::from_le_bytes([h0, h1, h2, h3]), Ordering::Release);
         control.server_pid.store(child.pid, Ordering::Release);
+        // Маяк сервера -- с той же личностью (иначе W(2): расхождение, не
+        // верим ни одной -- только резервная проверка).
+        let beacon = Beacon::open(&name).unwrap();
+        beacon.raise_as(child.pid, child.start).unwrap();
 
         let log = Arc::new(Log::default());
         let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
@@ -3242,5 +3302,219 @@ mod presence_tests {
         assert_eq!(log.errors().len(), 1, "{:?}", log.errors());
         drop(client);
         drop(server);
+        drop(beacon);
+    }
+
+    /// Опции с короткой резервной проверкой (W(3)) и длинной паузой: всё,
+    /// что найдено быстрее паузы, найдено событием или резервом.
+    fn fallback_options(fallback: Duration) -> AutoOptions {
+        AutoOptions {
+            reconnect_delay: Duration::from_secs(10),
+            discovery_fallback: Some(fallback),
+            ..AutoOptions::default()
+        }
+    }
+
+    /// Подключение не позже `limit` после `started`.
+    fn assert_connected_within(log: &Log, started: Instant, limit: Duration) {
+        wait_until("подключение", Duration::from_secs(15), || {
+            log.connected.load(Ordering::Acquire)
+        });
+        let took = log.connected_at.lock().unwrap().unwrap() - started;
+        assert!(took <= limit, "подключение через {took:?}");
+    }
+
+    /// W(2): сервер, отвергнувший клиента, -- этот же процесс (свой PID в
+    /// `ControlBlock`): клиент не ждёт выхода самого себя, а находит
+    /// исправленный сервер резервной проверкой.
+    #[test]
+    fn refusal_by_own_process_is_rechecked_by_fallback() {
+        let name = unique("OWNPID");
+        let server = SharedServer::start(&name).unwrap();
+        server
+            .view()
+            .control_block()
+            .version
+            .store(0x0001_0000, Ordering::Release);
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(
+            &name,
+            log.clone(),
+            fallback_options(Duration::from_millis(200)),
+        )
+        .unwrap();
+        wait_until("VersionMismatch", Duration::from_secs(2), || {
+            version_errors(&log) == 1
+        });
+        drop(server);
+        let started = Instant::now();
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        assert_connected_within(&log, started, Duration::from_millis(700));
+        drop(client);
+        drop(server);
+    }
+
+    /// W(2): маяк взведён с подменённой личностью (живой процесс того же
+    /// пользователя, время 0 -- «любой процесс с этим PID»): клиент не спит
+    /// на этом процессе вечно -- реальный сервер найден в пределах резервной
+    /// проверки, пробуждений -- не больше одного на её интервал.
+    #[test]
+    fn spoofed_beacon_identity_does_not_block_discovery() {
+        let name = unique("SPOOF");
+        let child = LiveChild::spawn();
+        let spoof = Beacon::open(&name).unwrap();
+        spoof.raise_as(child.pid, 0).unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(
+            &name,
+            log.clone(),
+            fallback_options(Duration::from_millis(300)),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let w0 = client.wakeups();
+        thread::sleep(Duration::from_secs(1));
+        let woke = client.wakeups() - w0;
+        assert!(woke <= 5, "пробуждений при подменённой личности: {woke}");
+        let started = Instant::now();
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        assert_connected_within(&log, started, Duration::from_millis(700));
+        drop(client);
+        drop(server);
+        drop(spoof);
+    }
+
+    /// W(3): сервер без маяка (маяк не создан) -- клиент, стартовавший
+    /// раньше, находит его резервной проверкой, а не спит на маяке вечно.
+    #[test]
+    fn server_without_beacon_is_found_by_fallback() {
+        let name = unique("NOBEACON");
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(
+            &name,
+            log.clone(),
+            fallback_options(Duration::from_millis(200)),
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let server = AutoServer::start_with_presence(
+            &name,
+            Arc::new(Log::default()),
+            AutoOptions::default(),
+            Presence::Off,
+        )
+        .unwrap();
+        assert_eq!(server.presence(), crate::PresenceStatus::Disabled);
+        assert_connected_within(&log, started, Duration::from_millis(600));
+        drop(client);
+        drop(server);
+    }
+
+    /// W(1): маяк занят заранее событием другого типа -- старт сервера
+    /// (single-client, Auto, Multi) не отказывает, `presence()` сообщает
+    /// причину, клиент всё равно подключается.
+    #[test]
+    fn squatted_beacon_does_not_fail_start() {
+        use crate::naming::ObjectPath;
+        let sec = ObjectSecurity::default().attributes().unwrap();
+        let squat = |base: &str| {
+            EventHandle::create(ObjectPath::scoped(None, base, "_beacon"), &sec).unwrap()
+        };
+        let mismatch = |status: crate::PresenceStatus| {
+            matches!(
+                status,
+                crate::PresenceStatus::Unavailable(ShmError::WindowsError {
+                    code: 0xC000_0024,
+                    ..
+                })
+            )
+        };
+
+        let name = unique("SQUAT");
+        let _squatter = squat(&name);
+        let shared = SharedServer::start(&name).unwrap();
+        assert!(mismatch(shared.presence()), "{:?}", shared.presence());
+        drop(shared);
+
+        let log = Arc::new(Log::default());
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        assert!(mismatch(server.presence()), "{:?}", server.presence());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        wait_until(
+            "подключение без маяка",
+            Duration::from_secs(5),
+            || log.connected.load(Ordering::Acquire),
+        );
+        drop(client);
+        drop(server);
+
+        struct QuietMulti;
+        impl crate::multi::MultiHandler for QuietMulti {
+            fn on_client_connect(&self, _client_id: u32) {}
+            fn on_client_disconnect(&self, _client_id: u32) {}
+            fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+        }
+        let base = unique("SQUAT_MULTI");
+        let _multi_squatter = squat(&presence::multi_beacon_name(&base));
+        let multi = crate::multi::MultiServer::start(
+            &base,
+            Arc::new(QuietMulti),
+            crate::multi::MultiOptions {
+                max_clients: 1,
+                ..crate::multi::MultiOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(mismatch(multi.presence()), "{:?}", multi.presence());
+        multi.stop();
+    }
+
+    /// M1: одинаковая ошибка подряд -- один раз, но второй «зависший»
+    /// сервер после промежуточной ошибки сообщается снова.
+    #[test]
+    fn different_hung_servers_are_each_reported() {
+        let name = unique("HUNG");
+        let log = Arc::new(Log::default());
+        let timeouts = |log: &Log| {
+            log.errors()
+                .iter()
+                .filter(|e| **e == ShmError::Timeout)
+                .count()
+        };
+        let first = SharedServer::start(&name).unwrap();
+        let client = AutoClient::connect(
+            &name,
+            log.clone(),
+            AutoOptions {
+                connect_timeout: Duration::from_millis(100),
+                reconnect_delay: Duration::from_millis(20),
+                ..AutoOptions::default()
+            },
+        )
+        .unwrap();
+        wait_until("Timeout первого", Duration::from_secs(5), || {
+            timeouts(&log) == 1
+        });
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            timeouts(&log),
+            1,
+            "повтор подряд сообщён: {:?}",
+            log.errors()
+        );
+        drop(first);
+        thread::sleep(Duration::from_millis(300));
+        let second = SharedServer::start(&name).unwrap();
+        wait_until("Timeout второго", Duration::from_secs(5), || {
+            timeouts(&log) == 2
+        });
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(timeouts(&log), 2, "{:?}", log.errors());
+        drop(client);
+        drop(second);
     }
 }

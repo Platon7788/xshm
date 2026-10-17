@@ -16,7 +16,7 @@
 //!
 //! **0.10 (INTEROP R19)**: маяк своего имени держит САМ каждый именованный
 //! сервер — `SharedServer::start*`, `AutoServer`, лобби `DispatchServer` и
-//! база `MultiServer` (`<база>_beacon`, не слоты), в том же пространстве
+//! база `MultiServer` (`<база>_multi_beacon`, не слоты), в том же пространстве
 //! имён и с той же политикой, что канал; `AutoClient`/`MultiClient` и
 //! [`SharedClient::wait_for_server`](crate::SharedClient::wait_for_server)
 //! ждут на нём появления сервера без опроса. Ручной `raise` приложения

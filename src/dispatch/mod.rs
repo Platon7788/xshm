@@ -487,6 +487,8 @@ mod core_type {
         /// мьютекса задавал он, а не первый пришедший клиент. Сервер его не
         /// захватывает.
         pub(in crate::dispatch) _lobby_lock: NamedMutex,
+        /// Маяк присутствия текущего лобби (`presence()`, решение W(1)).
+        pub(in crate::dispatch) presence_status: Mutex<crate::PresenceStatus>,
     }
 }
 use core_type::DispatchCore;
@@ -503,8 +505,10 @@ impl DispatchServer {
     /// остановки лобби; приложению взводить его больше не нужно (прежний
     /// ручной [`Beacon::raise`](crate::Beacon::raise) безвреден: взвод
     /// идемпотентен). Выделенные каналы клиентов маяка не имеют: их клиент
-    /// подключается один раз, по имени из ответа лобби. Маяк уже занят
-    /// объектом другого типа или с чужим DACL -- ошибка `start`.
+    /// подключается один раз, по имени из ответа лобби. Маяк -- лучшее
+    /// усилие (решение W(1)): занят объектом другого типа или с чужим DACL
+    /// -- лобби всё равно стартует, без маяка (`presence()` --
+    /// `PresenceStatus::Unavailable`).
     ///
     /// # Errors
     ///
@@ -561,6 +565,7 @@ impl DispatchServer {
             channel_prefix,
             lobby_wakeups: std::sync::atomic::AtomicU64::new(0),
             _lobby_lock: lobby_lock,
+            presence_status: Mutex::new(lobby.presence()),
         });
 
         let lobby_core = Arc::clone(&core);
@@ -590,6 +595,16 @@ impl DispatchServer {
 }
 
 impl DispatchCore {
+    /// Маяк присутствия лобби `<лобби>_beacon` (0.10, INTEROP R19; см.
+    /// `SharedServer::presence`): `Unavailable` -- лобби работает без
+    /// маяка (занят объектом другого типа, DACL маяка, созданного клиентом
+    /// другого пользователя, не включает сервер): клиенты, ждущие маяк,
+    /// находят лобби только своей резервной проверкой.
+    #[must_use]
+    pub fn presence(&self) -> crate::PresenceStatus {
+        self.presence_status.lock_clean().clone()
+    }
+
     /// Отправляет сообщение конкретному клиенту.
     pub fn send_to(&self, client_id: u32, data: &[u8]) -> Result<()> {
         let clients = self.clients.read_clean();
@@ -868,7 +883,10 @@ impl DispatchCore {
                         Presence::On,
                     )
                 }) {
-                    Ok(s) => s,
+                    Ok(s) => {
+                        *self.presence_status.lock_clean() = s.presence();
+                        s
+                    }
                     Err(err) => {
                         self.handler.on_error(None, err);
                         if !wait_delay_or(&self.running, &self.stop_event, LOBBY_RETRY_DELAY) {

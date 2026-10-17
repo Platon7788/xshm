@@ -90,7 +90,8 @@ use crate::namespace::PrivateNamespace;
 use crate::naming::{Direction, ObjectPath};
 use crate::ntapi::STATUS_SUCCESS;
 use crate::presence::{
-    self, Failure, Presence, PresenceWait, PresenceWatch, Reported, ServerPresence,
+    self, Failure, Presence, PresenceStatus, PresenceWait, PresenceWatch, Reported, ServerPresence,
+    multi_beacon_name,
 };
 use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
 use crate::ring::{DrainBound, FreeSpace, SpinPolicy, UnreadProbe, spin_until};
@@ -313,15 +314,21 @@ pub struct MultiClientOptions {
     /// 0.10 (Task 11, INTEROP R19): **сервера нет** (ни одного слота, или
     /// процесс сервера завершился) -- клиент не опрашивает раз в
     /// `retry_delay`, а спит в ядре на маяке присутствия базы
-    /// `<база>_beacon` и подключается сразу, как сервер его взведёт. Пауза
+    /// `<база>_multi_beacon` и подключается сразу, как сервер его взведёт. Пауза
     /// `retry_delay` остаётся: после конца сессии (разово), при занятых
     /// или чужих слотах (`NoFreeSlot`/`AccessDenied`, до уведомления
     /// «claim освобождён») и как резерв (решение R-M) -- маяк недоступен
     /// (нет прав, нет привилегии `Global\`), процесс сервера не открылся,
-    /// подключение к слоту не удалось. Об одной и той же ошибке вне
-    /// подключения `on_error` сообщает один раз за эпизод (кроме
-    /// `NoFreeSlot` -- о каждой попытке).
+    /// подключение к слоту не удалось. Одинаковую ошибку вне подключения
+    /// ПОДРЯД `on_error` сообщает один раз (кроме `NoFreeSlot` -- о каждой
+    /// попытке); другая ошибка между ними -- и повтор сообщается снова.
     pub retry_delay: Duration,
+    /// Резервная проверка обнаружения сервера (0.10, решение W(3); см.
+    /// `AutoOptions::discovery_fallback`): пока сервера нет и клиент спит на
+    /// маяке базы или процессе сервера, попытка захвата -- не реже этого
+    /// интервала. Подключённый клиент по нему не просыпается. По умолчанию
+    /// -- `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с); `None` -- только события.
+    pub discovery_fallback: Option<Duration>,
     /// Количество сообщений за один цикл
     pub recv_batch: usize,
     /// Максимум неотправленных сообщений во внутренней очереди перед сбросом
@@ -332,7 +339,7 @@ pub struct MultiClientOptions {
     /// `MultiOptions::namespace`). `None` (по умолчанию) -- общий
     /// `\BaseNamedObjects`.
     pub namespace: Option<Arc<PrivateNamespace>>,
-    /// Политика объектов маяка присутствия базы `<база>_beacon`, если их
+    /// Политика объектов маяка присутствия базы `<база>_multi_beacon`, если их
     /// создаёт клиент (0.10, Task 11; клиент стартовал раньше сервера). DACL
     /// маяка задаёт тот, кто создал его первым (решение R-L): служба на
     /// `Global\` с `ObjectSecurity::Everyone` требует той же политики у
@@ -359,6 +366,7 @@ impl Default for MultiClientOptions {
             slot_timeout: Duration::from_secs(5),
             poll_timeout: None,
             retry_delay: Duration::from_millis(250),
+            discovery_fallback: Some(presence::DEFAULT_DISCOVERY_FALLBACK),
             recv_batch: 32,
             max_send_queue: 256,
             namespace: None,
@@ -562,7 +570,7 @@ impl std::fmt::Debug for MultiServer {
 
 mod core_type {
     use super::{Arc, AtomicBool, AtomicU64, ClientSlot, CompletionPort, Duration, JoinHandle};
-    use super::{MultiHandler, MultiOptions, Mutex, RwLock, ServerPresence};
+    use super::{MultiHandler, MultiOptions, Mutex, PresenceStatus, RwLock, ServerPresence};
 
     /// Состояние сервера, общее для ручки `MultiServer` и потока-диспетчера.
     /// Вне крейта тип не именуем: его методы доступны через `Deref` ручки.
@@ -600,10 +608,12 @@ mod core_type {
         /// Пост пробуждения слота не удался (`wake_slot`): ближайший виток
         /// диспетчера сверяет все слоты (fix round 1, M5).
         pub(in crate::multi) wake_lost: AtomicBool,
-        /// Маяк присутствия базы `<база>_beacon` (0.10, R19): взведён после
+        /// Маяк присутствия базы `<база>_multi_beacon` (0.10, R19): взведён после
         /// создания всех слотов, `stop` сбрасывает его первым шагом и
         /// забирает (повторный `stop` маяк не трогает).
         pub(in crate::multi) presence: Mutex<Option<ServerPresence>>,
+        /// Состояние маяка базы (`presence()`, решение W(1)).
+        pub(in crate::multi) presence_status: Mutex<PresenceStatus>,
         /// Сколько ближайших привязок провалить (тест повтора привязки).
         #[cfg(test)]
         pub(in crate::multi) fail_arms: std::sync::atomic::AtomicU32,
@@ -652,9 +662,6 @@ impl MultiServer {
             )?;
             slots.push(Mutex::new(ClientSlot::new(slot_id, server)));
         }
-        // Маяк базы создаётся до старта диспетчера (ошибка -- ошибка
-        // `start`), взводится после него.
-        let beacon = ServerPresence::create(options.namespace.as_ref(), base_name, &security)?;
 
         let server = Arc::new(MultiCore {
             base_name: base_name.to_owned(),
@@ -673,6 +680,7 @@ impl MultiServer {
             slot_visits: AtomicU64::new(0),
             wake_lost: AtomicBool::new(false),
             presence: Mutex::new(None),
+            presence_status: Mutex::new(PresenceStatus::Disabled),
             #[cfg(test)]
             fail_arms: AtomicU32::new(0),
         });
@@ -695,15 +703,19 @@ impl MultiServer {
         .map_err(|e| map_spawn_error(e, "spawn multi dispatcher"))?;
         server.worker_handles.lock_clean().push(handle);
 
-        // R19: маяк базы -- строго ПОСЛЕ создания всех слотов (секций и
-        // событий): клиент, проснувшийся по нему, находит слот 0.
-        let handle = Arc::new(Self { core: server });
-        if let Err(err) = beacon.raise() {
-            handle.stop();
-            return Err(err);
-        }
-        *handle.presence.lock_clean() = Some(beacon);
-        Ok(handle)
+        // R19: маяк базы `<база>_multi_beacon` -- строго ПОСЛЕ создания всех
+        // слотов (секций и событий): клиент, проснувшийся по нему, находит
+        // слот 0. Лучшее усилие (решение W(1)): отказ создания или взвода
+        // старт не отказывает -- `presence()` сообщает причину, клиенты
+        // находят сервер резервной проверкой `discovery_fallback`.
+        let (beacon, status) = ServerPresence::start(
+            server.options.namespace.as_ref(),
+            &multi_beacon_name(base_name),
+            &security,
+        );
+        *server.presence.lock_clean() = beacon;
+        *server.presence_status.lock_clean() = status;
+        Ok(Arc::new(Self { core: server }))
     }
 }
 
@@ -880,6 +892,7 @@ impl MultiCore {
         if let Some(presence) = presence {
             presence.lower();
         }
+        *self.presence_status.lock_clean() = PresenceStatus::Disabled;
         self.running.store(false, Ordering::Release);
         // Отказ поста возможен только при негодном порте -- тогда диспетчер
         // не спит в нём и выйдет по `running` на ближайшем витке.
@@ -912,6 +925,15 @@ impl MultiCore {
             // Наблюдать «задержавшихся владельцев» больше некому.
             slot.retire_lingering();
         }
+    }
+
+    /// Маяк присутствия базы `<база>_multi_beacon` (0.10, INTEROP R19; см.
+    /// `SharedServer::presence`): `Unavailable` -- сервер работает без
+    /// маяка, `MultiClient`-ы находят его резервной проверкой
+    /// `MultiClientOptions::discovery_fallback`; после `stop` -- `Disabled`.
+    #[must_use]
+    pub fn presence(&self) -> PresenceStatus {
+        self.presence_status.lock_clean().clone()
     }
 
     /// Базовое имя канала
@@ -2460,6 +2482,7 @@ fn client_worker(
                     waiter.await_server(Failure::Absent)
                 } else {
                     if err == ShmError::NoFreeSlot {
+                        waiter.reported.note(&err);
                         handler.on_error(err);
                     } else {
                         waiter.report_once(err);
@@ -2501,7 +2524,7 @@ fn client_worker(
                 release_claim(namespace, &slot_name, token);
                 // Task 11: процесс сервера слота завершился (слоты держит
                 // кто-то ещё) -- сервера нет, сон на маяке базы; прочее --
-                // прежняя пауза, ошибка -- один раз за эпизод.
+                // прежняя пауза, одинаковая ошибка подряд -- один раз.
                 let failure = presence::classify(&err, namespace, None);
                 waiter.report_once(err);
                 let go_on = match failure {
@@ -2677,9 +2700,16 @@ impl AbsenceWaiter<'_> {
         self.shared.wakeups.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// `on_error`, если о такой ошибке в этом эпизоде ещё не сообщали.
+    /// `on_error`, если это не повтор предыдущей ошибки (M1 ревью Task 11).
     fn report_once(&mut self, err: ShmError) {
         if self.reported.first(&err) {
+            self.handler.on_error(err);
+        }
+    }
+
+    /// `on_error` для ошибки маяка базы (свой ряд повторов).
+    fn report_presence(&mut self, err: ShmError) {
+        if self.reported.presence_first(&err) {
             self.handler.on_error(err);
         }
     }
@@ -2696,48 +2726,67 @@ impl AbsenceWaiter<'_> {
         go_on
     }
 
+    /// Резерв (решение R-M): пауза `retry_delay`, но не дольше резервной
+    /// проверки `discovery_fallback` (W(3)). `false` -- остановка.
+    fn degraded_pause(&self) -> bool {
+        let delay = presence::min_timeout(
+            Some(self.options.retry_delay),
+            self.options.discovery_fallback,
+        )
+        .unwrap_or(self.options.retry_delay);
+        let go_on = wait_delay_or(&self.shared.running, &self.shared.wake, delay);
+        self.wakeup();
+        go_on
+    }
+
     /// Ждать после неудачи `failure` (см. `presence::PresenceWatch::wait`):
     /// `wake` -- индекс 0 (`stop` прерывает сразу, `send` -- отчёт о
     /// вытесненных и снова сон); ждать нечего -- резервная пауза
-    /// `retry_delay` (решение R-M). `false` -- остановка.
+    /// `retry_delay` (решение R-M). Сон -- не дольше `discovery_fallback`
+    /// от входа (решение W(3)), затем попытка. `false` -- остановка.
     fn await_server(&mut self, failure: Failure) -> bool {
+        let deadline = crate::ring::deadline_of(presence::min_timeout(
+            self.options.poll_timeout,
+            self.options.discovery_fallback,
+        ));
         loop {
             if !self.running() {
                 return false;
+            }
+            let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            if left.is_some_and(|left| left.is_zero()) {
+                return true;
             }
             if self.presence.is_none() {
                 match PresenceWatch::open(
                     self.options.namespace.as_deref(),
                     self.options.namespace.as_ref(),
-                    self.base_name,
+                    &multi_beacon_name(self.base_name),
                     &self.options.security,
                 ) {
                     Ok(watch) => self.presence = Some(watch),
                     Err(err) => {
-                        self.report_once(err);
-                        return self.pause();
+                        self.report_presence(err);
+                        return self.degraded_pause();
                     }
                 }
             }
             let wakeups = &self.shared.wakeups;
             let waited = match self.presence.as_mut() {
-                Some(watch) => watch.wait(
-                    failure,
-                    Some(self.shared.wake.as_handle()),
-                    self.options.poll_timeout,
-                    &|| {
+                Some(watch) => {
+                    watch.wait(failure, Some(self.shared.wake.as_handle()), left, &|| {
                         wakeups.fetch_add(1, Ordering::AcqRel);
-                    },
-                ),
+                    })
+                }
                 None => Ok(PresenceWait::Unavailable),
             };
             match waited {
                 Ok(PresenceWait::Retry | PresenceWait::TimedOut) => return self.running(),
                 Ok(PresenceWait::Woken) => report_evicted(&self.shared.outbox, self.handler),
-                Ok(PresenceWait::Unavailable) => return self.pause(),
+                Ok(PresenceWait::Unavailable) => return self.degraded_pause(),
                 Err(err) => {
-                    self.report_once(err);
-                    return self.pause();
+                    self.report_presence(err);
+                    return self.degraded_pause();
                 }
             }
         }

@@ -899,12 +899,20 @@ handshake time is ignored.
 
 **Presence beacon (0.10).** Every named server keeps a presence beacon for its
 name: `SharedServer::start*`, `AutoServer` and the Dispatch lobby hold
-`<name>_beacon`, a `MultiServer` holds one `<base>_beacon` (not one per slot);
+`<name>_beacon`, a `MultiServer` holds one `<base>_multi_beacon` (not one per
+slot, and never shared with a channel named `<base>`);
 Dispatch's per-client channels have none. The beacon lives in the channel's
 namespace (including a `PrivateNamespace`) with the channel's security policy.
 It is raised only after the section and all 7 events are published (Multi:
 after all slots) and lowered as the very first step of `Drop`/`stop`, so
 "beacon raised, no channel" only ever means "the server crashed".
+
+The beacon is **best effort**: if it cannot be created or raised (the name is
+squatted by another object type, a client of another user created it first
+with a DACL that excludes the server, missing privilege), the server still
+starts and works without it. `presence()` on `SharedServer`, `AutoServer`,
+`MultiServer` and `DispatchServer` returns `PresenceStatus::{Active, Disabled,
+Unavailable(err)}`.
 
 Clients use it on their own — nothing to write:
 
@@ -915,15 +923,27 @@ Clients use it on their own — nothing to write:
   `clear_if_stale` and the client keeps sleeping. A server that **refuses** the
   client (other memory format, corruption, access denied) is waited out:
   the client sleeps until that server process exits.
-- `on_error` reports the same error once per out-of-connection episode
-  (`AlreadyConnected` / `NoFreeSlot` are still reported on every attempt).
+- Every discovery wait is bounded by `discovery_fallback` (`AutoOptions`,
+  `MultiClientOptions`, `DiscoveryOptions`; default 10 s, `None` = events
+  only): a beacon that is squatted and never raised, a server without a
+  beacon (native peer without R19, best-effort failure above) or a spoofed
+  server identity costs at most one wake-up per interval while no server is
+  found — a connected client never wakes for it. Server identities in the
+  segment and in the beacon state are untrusted: identities without a
+  creation time or naming the client itself are ignored, and the segment's
+  identity must match the beacon's.
+- `on_error` reports the same error once while it repeats; a different error
+  in between makes the next repeat reported again (`AlreadyConnected` /
+  `NoFreeSlot` are still reported on every attempt).
 - The old pause remains for a busy channel, after a `Timeout`, once after a
   session ends (not after `PeerDied`) and as a fallback when the beacon is
   unusable (no access, no `SeCreateGlobalPrivilege` for `Global\`).
 - A client that starts first creates the beacon with its own policy
   (`AutoOptions::security`, `MultiClientOptions::security`): the first creator
   sets the DACL, so a `Global\` service with `ObjectSecurity::Everyone` needs
-  the same policy on its clients (or must start first).
+  the same policy on its clients (or must start first). Use the same
+  `ObjectSecurity` on both sides; otherwise the server runs without a beacon
+  and is found by the fallback.
 
 Synchronous code can wait the same way:
 
@@ -937,11 +957,13 @@ if SharedClient::wait_for_server("MyChannel", Some(Duration::from_secs(30)))? {
 }
 ```
 
-(`wait_for_server_in(&ns, name, timeout)` for a private namespace.)
+(`wait_for_server_in(&ns, name, timeout)` for a private namespace;
+`wait_for_server_with(name, timeout, &DiscoveryOptions::default().security(..)
+.fallback(..))` to choose the beacon policy and the fallback.)
 
 Native peers acting as a server must follow the same rule (INTEROP R19);
-otherwise a Rust client that started first sleeps until a server with a
-beacon appears.
+otherwise a Rust client that started first finds them only through
+`discovery_fallback` (up to 10 s by default).
 
 **Your own discovery loop.** A client that waits for a server (e.g. a profiler
 waiting for its viewer) should not poll for it. `Beacon` is a named

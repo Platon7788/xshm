@@ -2512,3 +2512,65 @@ fn multi_client_connects_when_server_appears() {
     drop(client);
     server.stop();
 }
+
+/// M2 ревью Task 11: маяк базы Multi -- `<база>_multi_beacon`, канал с тем
+/// же именем держит свой `<имя>_beacon`; остановка одного не гасит маяк
+/// другого.
+#[test]
+fn multi_base_beacon_is_distinct_from_channel_beacon() {
+    let name = unique("SHARED_NAME");
+    let channel = SharedServer::start(&name).expect("канал");
+    let multi =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).expect("multi");
+    assert_eq!(multi.presence(), PresenceStatus::Active);
+    let channel_beacon = crate::beacon::Beacon::open(&name).unwrap();
+    let multi_beacon = crate::beacon::Beacon::open(&multi_beacon_name(&name)).unwrap();
+    assert!(channel_beacon.is_raised().unwrap());
+    assert!(multi_beacon.is_raised().unwrap());
+    multi.stop();
+    assert!(!multi_beacon.is_raised().unwrap(), "маяк базы сброшен");
+    assert!(channel_beacon.is_raised().unwrap(), "маяк канала не тронут");
+    assert_eq!(multi.presence(), PresenceStatus::Disabled);
+    drop(channel);
+    assert!(!channel_beacon.is_raised().unwrap());
+}
+
+/// W(3): сервер Multi без маяка (база не взводится) -- клиент, пришедший
+/// раньше, находит его резервной проверкой `discovery_fallback`.
+#[test]
+fn multi_client_finds_beaconless_server_by_fallback() {
+    let name = unique("NOBEACON");
+    // Маяк базы занят событием другого типа: сервер стартует без маяка.
+    let sec = ObjectSecurity::default().attributes().unwrap();
+    let _squatter = EventHandle::create(
+        ObjectPath::scoped(None, &multi_beacon_name(&name), "_beacon"),
+        &sec,
+    )
+    .unwrap();
+    let recorder = Arc::new(PresenceRecorder::default());
+    let client = MultiClient::connect(
+        &name,
+        recorder.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_secs(10),
+            discovery_fallback: Some(Duration::from_millis(200)),
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("client connect");
+    thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).expect("start");
+    assert!(matches!(server.presence(), PresenceStatus::Unavailable(_)));
+    wait_for("подключение", Duration::from_secs(15), || {
+        recorder.connected_at.lock().unwrap().is_some()
+    });
+    let took = recorder.connected_at.lock().unwrap().unwrap() - started;
+    assert!(
+        took <= Duration::from_millis(600),
+        "подключение через {took:?}"
+    );
+    drop(client);
+    server.stop();
+}

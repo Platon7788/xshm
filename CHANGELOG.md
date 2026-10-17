@@ -40,7 +40,7 @@
 | Допуск Dispatch | любой зарегистрировавшийся клиент получал канал | `DispatchHandler::admit` → `Admission::{Accept, AcceptWithLayout, Reject}` (по умолчанию `Accept`), `DispatchOptions::max_clients = 64` | Больше 64 клиентов — поднять `max_clients` |
 | `MAX_MULTI_CLIENTS` | 31 | 256 (каждый слот — своя секция; 256 × 4 МиБ ≈ 1 ГиБ) | Для больших `max_clients` — маленький `MultiOptions::layout` |
 | Маяк | клиент сбрасывал маяк сам (`lower`) | `clear_if_stale` (секция `<имя>_beacon_state`, живой сервер не трогается); `lower` — только сервер | Клиенту — `clear_if_stale` вместо `lower` |
-| Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер и база Multi держат `<имя>_beacon` сами; клиенты без сервера спят на нём, `on_error` — раз за эпизод; `SharedClient::wait_for_server*`; `MultiClientOptions::security` | Ручной `raise` лобби можно убрать; литерал `MultiClientOptions` — с `..Default::default()`; не называть канал и базу Multi одинаково; нативный сервер — R19 (INTEROP §e.4) |
+| Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер держит `<имя>_beacon`, база Multi — `<база>_multi_beacon` (лучшее усилие: ошибка маяка старт не отказывает, `presence()`); клиенты без сервера спят на нём не дольше `discovery_fallback` (10 с), одинаковая ошибка подряд — один раз; `SharedClient::wait_for_server*`, `DiscoveryOptions`; `MultiClientOptions::{security, discovery_fallback}`, `AutoOptions::discovery_fallback` | Ручной `raise` лобби можно убрать; литералы `AutoOptions`/`MultiClientOptions` — с `..Default::default()`; одинаковая `ObjectSecurity` у сервера и клиентов; нативный сервер — R19 (INTEROP §e.4) |
 
 Потребители, проверенные на этой ветке (Task 19, `cargo check --workspace
 --all-targets`):
@@ -225,12 +225,17 @@
   INTEROP **R19**, «Изменения 0.10» п. 34). Каждый именованный сервер
   single-client канала (`SharedServer::start`/`start_with`, `AutoServer`,
   лобби `DispatchServer`) держит маяк `<имя>_beacon` (+ `<имя>_beacon_state`,
-  тот же `Beacon`), база `MultiServer` — один `<база>_beacon` (не слоты);
+  тот же `Beacon`), база `MultiServer` — один `<база>_multi_beacon` (не
+  слоты; своё имя — канал `X` и база Multi `X` маяк не делят);
   без маяка — только выделенные каналы Dispatch. Тот же namespace (в том
   числе `PrivateNamespace`) и та же политика, что у секции канала. `raise` —
   после публикации секции и всех 7 событий (Multi — всех слотов), `lower` —
   первым шагом `Drop`/`stop`; маяк занят объектом другого типа или с чужим
-  DACL — ошибка старта (как занятое имя секции). Лобби Dispatch взводит маяк
+  DACL — **не** ошибка старта (решение W(1), fix round 1): сервер работает
+  без маяка, причину сообщает `presence()` (`PresenceStatus::{Active,
+  Disabled, Unavailable(err)}` у `SharedServer`, `AutoServer`,
+  `MultiServer`, `DispatchServer`), клиенты находят его резервной
+  проверкой `discovery_fallback`. Лобби Dispatch взводит маяк
   само: ручной `raise` приложения (prof-shm) больше не нужен и безвреден.
   Внутреннее: `src/presence.rs` (`ServerPresence`, `PresenceWatch`,
   `Failure`, `classify`), `SharedServer::start_slot(.., presence)`,
@@ -363,23 +368,32 @@
   пробуждения и 4 `on_error` в секунду, пока сервера нет, до 250 мс лишней
   задержки, когда он появился. Стало: **сервера нет** (секции/событий нет,
   сегмент не опубликован, Multi — нет слота 0, процесс сервера завершился —
-  `PeerDied`) — сон в ядре `[wake, маяк присутствия]` без таймаута,
+  `PeerDied`) — сон в ядре `[wake, маяк присутствия]` (не дольше
+  `discovery_fallback`),
   подключение сразу после взвода; маяк упавшего сервера клиент гасит
   (`clear_if_stale`) и спит дальше; маяк взведён живым сервером, а канала нет,
   — одна повторная попытка на поколение взвода, затем сон до выхода его
   процесса. **Сервер отверг** (`VersionMismatch`, `Corrupted`, `AccessDenied`,
   `InvalidConfig`; Auto) — сон до выхода процесса этого сервера (PID из
-  `ControlBlock` или из состояния маяка). Пауза осталась: при занятом канале
+  `ControlBlock`, сверенный с состоянием маяка; если секция не открылась —
+  из состояния маяка). Пауза осталась: при занятом канале
   (`AlreadyConnected`, Multi `NoFreeSlot`/`AccessDenied` — до уведомления
   «claim освобождён»), после `Timeout`/ошибки рукопожатия, разово после
   конца сессии и как **резерв** (решение R-M: маяк недоступен — нет прав или
   привилегии `Global\`; процесс сервера не открылся; состояние маяка
-  испорчено). После `PeerDied` паузы нет. `on_error` — **один раз на эпизод
-  вне подключения** для одинаковой ошибки (кроме `AlreadyConnected` и
-  `NoFreeSlot` — о каждой попытке, как раньше); эпизод кончается
-  подключением. Счётчики пробуждений (`wakeups()`, тесты) считают и эти
+  испорчено). После `PeerDied` паузы нет. `on_error` — **одинаковая ошибка
+  подряд — один раз** (кроме `AlreadyConnected` и `NoFreeSlot` — о каждой
+  попытке, как раньше); другая ошибка между ними — и повтор сообщается
+  снова (fix round 1, M1: второй «зависший» сервер после промежуточной
+  ошибки виден); ошибки маяка — свой ряд. Счётчики пробуждений (`wakeups()`, тесты) считают и эти
   ожидания. Клиент, стартовавший раньше сервера **без** маяка (нативный пир
-  без R19), ждёт до появления сервера с маяком — резерва нет. Тесты
+  без R19, отказ создания маяка), находит его резервной проверкой
+  `discovery_fallback` (решение W(3): `AutoOptions`/`MultiClientOptions`/
+  `DiscoveryOptions`, по умолчанию 10 с, `None` — только события; каждое
+  ожидание обнаружения ограничено ею, резерв R-M — тоже). Личность сервера
+  (недоверенные данные секции и маяка, решение W(2)): без времени создания
+  или своя — не ждётся; личности секции и маяка расходятся — ни одной;
+  маяк в наборе ожидания только невзведённым (иначе горячий цикл). Тесты
   `auto::presence_tests::{absent_server_client_sleeps_without_wakeups,
   client_connects_promptly_when_server_appears,
   stale_beacon_of_dead_server_is_cleared_then_sleeps,
@@ -982,8 +996,33 @@
   `reconnect_delay` (250 мс), когда секцию мёртвого сервера держал кто-то
   ещё (ревью Task 10, N2: после решения U `PeerDied` приходит сразу, а не
   через `connect_timeout`). Теперь `PeerDied` вне подключения — «сервера
-  нет»: одна ошибка за эпизод и сон на маяке присутствия до взвода нового
+  нет»: одна ошибка на ряд и сон на маяке присутствия до взвода нового
   сервера (п. 34).
+- **Important** (ревью Task 11, решение W) Маяк присутствия первой редакции:
+  (1) занятый или недоступный `<имя>_beacon` отказывал старт сервера — в том
+  числе без злоумышленника, если маяк первым создал клиент другого
+  пользователя со своей политикой; теперь маяк — лучшее усилие,
+  `presence()` сообщает причину; (2) клиент ждал процесс по личности из
+  секции или состояния маяка, которые пишет любой с доступом к ним: время
+  `0` («любой процесс с этим PID»), свой PID, подмена — ожидание без конца;
+  теперь такие личности отвергаются, секция сверяется с маяком, процесс,
+  который не открылся, — резерв без подмены источника, маяк в наборе
+  ожидания — только невзведённым; (3) не было предела ожиданию
+  обнаружения — теперь `discovery_fallback` (10 с). Маяк базы Multi —
+  `<база>_multi_beacon` (M2). Тесты:
+  `presence::tests::{absent_beacon_down_retries_on_raise_and_times_out_on_fallback,
+  absent_stale_beacon_is_cleared,
+  live_beacon_retries_once_per_generation_then_waits_process,
+  untrusted_beacon_identity_waits_only_fallback,
+  refused_identity_is_cross_checked_with_beacon, wake_is_index_zero,
+  reported_dedupes_runs_not_episodes}`,
+  `auto::presence_tests::{refusal_by_own_process_is_rechecked_by_fallback,
+  spoofed_beacon_identity_does_not_block_discovery,
+  server_without_beacon_is_found_by_fallback,
+  squatted_beacon_does_not_fail_start, different_hung_servers_are_each_reported}`,
+  `multi::tests::{multi_base_beacon_is_distinct_from_channel_beacon,
+  multi_client_finds_beaconless_server_by_fallback}` (ключевые проверки
+  подтверждены мутацией).
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

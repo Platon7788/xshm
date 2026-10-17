@@ -437,7 +437,11 @@ fn presence_objects_use_channel_policy() {
         },
     )
     .unwrap();
-    assert_eq!(Beacon::open(&multi).err(), Some(ShmError::AccessDenied));
+    // Маяк базы Multi -- `<база>_multi_beacon` (M2 ревью Task 11).
+    assert_eq!(
+        Beacon::open(&format!("{multi}_multi")).err(),
+        Some(ShmError::AccessDenied)
+    );
     multi_server.stop();
 
     let lobby = unique_name("PRESENCE_LOBBY");

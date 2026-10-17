@@ -375,6 +375,8 @@ pub struct SharedServer {
     /// канала, сбрасывается первым шагом `Drop`. `None` -- anonymous,
     /// выделенный канал Dispatch, слот Multi (маяк у базы).
     presence: Option<ServerPresence>,
+    /// Состояние маяка присутствия (`presence()`, решение W(1)).
+    presence_status: crate::PresenceStatus,
     /// Тесты: пробуждения ожиданий `wait_for_client*` (включая внутренние
     /// повторы после `CONNECT_REQ` без заявки).
     #[cfg(test)]
@@ -429,8 +431,11 @@ impl SharedServer {
     /// первым шагом `Drop`: клиент, стартовавший раньше сервера
     /// (`AutoClient`, `MultiClient`, [`SharedClient::wait_for_server`](
     /// crate::SharedClient::wait_for_server)), спит на нём в ядре, а не
-    /// опрашивает. Маяк уже занят объектом другого типа или с чужим DACL --
-    /// ошибка старта, как занятое имя секции.
+    /// опрашивает. Маяк -- лучшее усилие (решение W(1)): занят объектом
+    /// другого типа или с чужим DACL -- старт всё равно удаётся, сервер
+    /// работает без маяка ([`SharedServer::presence`] --
+    /// `PresenceStatus::Unavailable`), клиенты находят его резервной
+    /// проверкой `discovery_fallback` (по умолчанию -- в пределах 10 с).
     pub fn start_with(name: &str, config: &ChannelConfig) -> Result<Self> {
         Self::start_slot(
             config.namespace.as_ref(),
@@ -469,14 +474,30 @@ impl SharedServer {
         server.events = Some(SharedEvents::create(root, name, security)?);
         server._namespace = namespace.cloned();
         if presence == Presence::On {
-            let beacon = ServerPresence::create(namespace, name, security)?;
             // R19: взвод -- строго ПОСЛЕ публикации секции (`magic` в
             // `from_mapping`) и всех 7 событий: клиент, проснувшийся по
-            // маяку, не получает `NOT_FOUND`.
-            beacon.raise()?;
-            server.presence = Some(beacon);
+            // маяку, не получает `NOT_FOUND`. Лучшее усилие (решение W(1)):
+            // занятый или недоступный маяк старт не отказывает -- сервер
+            // работает без него (`presence()`), клиенты находят его резервной
+            // проверкой `discovery_fallback`.
+            let (beacon, status) = ServerPresence::start(namespace, name, security);
+            server.presence = beacon;
+            server.presence_status = status;
         }
         Ok(server)
+    }
+
+    /// Маяк присутствия этого сервера (0.10, INTEROP R19): `Active` -- взведён;
+    /// `Disabled` -- маяка нет по устройству (anonymous, выделенный канал
+    /// Dispatch, слот Multi); `Unavailable(причина)` -- маяк не создан или не
+    /// взведён (имя `<имя>_beacon` занято объектом другого типа, DACL маяка,
+    /// созданного клиентом другого пользователя первым, не включает этот
+    /// процесс, нет привилегии): сервер работает, клиенты находят его
+    /// резервной проверкой `discovery_fallback` (по умолчанию -- в пределах
+    /// 10 с), а не сразу.
+    #[must_use]
+    pub fn presence(&self) -> crate::PresenceStatus {
+        self.presence_status.clone()
     }
 
     /// Создание anonymous сервера без имени (только через handle)
@@ -542,6 +563,7 @@ impl SharedServer {
             lingering: None,
             reserve_timeout: crate::constants::RESERVE_TIMEOUT,
             presence: None,
+            presence_status: crate::PresenceStatus::Disabled,
             #[cfg(test)]
             wait_wakeups: Arc::default(),
             _namespace: None,
