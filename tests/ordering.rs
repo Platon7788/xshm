@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -202,17 +203,36 @@ fn test_generation_on_reconnect() {
     client2_thread.join().unwrap().expect("client 2 ok");
 }
 
+/// Подключиться, повторяя попытки до `limit`: отказ -- последняя ошибка.
+fn connect_with_retry(name: &str, limit: Duration) -> xshm::Result<SharedClient> {
+    let deadline = Instant::now() + limit;
+    loop {
+        match SharedClient::connect(name, Duration::from_secs(2)) {
+            Ok(client) => return Ok(client),
+            Err(err) if Instant::now() >= deadline => return Err(err),
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+}
+
 /// Тест: высокая нагрузка на ordering в обоих направлениях
 #[test]
 fn test_bidirectional_ordering_stress() {
     const MESSAGES_PER_SIDE: usize = 500;
     let name = unique_name("BIDIR_ORD");
+    // Готовность сервера -- сигналом, а не фиксированной паузой: под
+    // нагрузкой полного прогона 50 мс не хватало, `connect` падал сразу, а
+    // сервер ждал клиента до своего таймаута (final review M8).
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
 
     let server_thread = thread::spawn({
         let name = name.clone();
         move || -> xshm::Result<(usize, usize)> {
             let mut server = SharedServer::start(&name)?;
-            server.wait_for_client(Some(Duration::from_secs(5)))?;
+            // Получатель жив, пока клиент не дождался; ошибка отправки --
+            // только если тест уже провален.
+            let _ = ready_tx.send(());
+            server.wait_for_client(Some(Duration::from_secs(20)))?;
 
             let mut sent = 0usize;
             let mut received = 0usize;
@@ -254,10 +274,12 @@ fn test_bidirectional_ordering_stress() {
         }
     });
 
-    thread::sleep(Duration::from_millis(50));
-
     let client_result = (|| -> xshm::Result<(usize, usize)> {
-        let client = SharedClient::connect(&name, Duration::from_secs(5))?;
+        // Сервер не поднялся -- его ошибку вернёт `join` ниже.
+        if ready_rx.recv_timeout(Duration::from_secs(20)).is_err() {
+            return Err(ShmError::NotConnected);
+        }
+        let client = connect_with_retry(&name, Duration::from_secs(15))?;
 
         let mut sent = 0usize;
         let mut received = 0usize;
@@ -300,8 +322,13 @@ fn test_bidirectional_ordering_stress() {
 
     let server_result = server_thread.join().expect("server thread panic");
 
+    // Ошибка клиента -- первой: при неудачном подключении сервер получает
+    // лишь вторичный `Timeout`, а причина -- здесь.
+    let (client_sent, client_received) = match client_result {
+        Ok(counts) => counts,
+        Err(err) => panic!("client error: {err:?} (server: {server_result:?})"),
+    };
     let (server_sent, server_received) = server_result.expect("server error");
-    let (client_sent, client_received) = client_result.expect("client error");
 
     println!("Server: sent={server_sent}, received={server_received}");
     println!("Client: sent={client_sent}, received={client_received}");

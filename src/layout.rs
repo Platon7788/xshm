@@ -661,84 +661,88 @@ mod tests {
         // SAFETY: ненулевой размер.
         let base = unsafe { alloc_zeroed(alloc) };
         assert!(!base.is_null());
-        // SAFETY: буфер выровнен на 4096, длина = segment_size, живёт до
-        // dealloc в конце теста.
-        let _view = unsafe {
-            crate::shared::SharedView::initialize(
-                base,
-                layout,
-                0x1122_3344,
-                0x0102_0304_0506_0708,
-                5,
-            )
-        }
-        .unwrap();
-        let word = |offset: usize| -> u32 {
-            assert!(offset + 4 <= size);
-            let mut bytes = [0u8; 4];
-            // SAFETY: offset + 4 <= size (проверено выше) -- адрес внутри
-            // выделенного буфера.
-            let src = unsafe { base.add(offset) };
-            // SAFETY: 4 байта от `src` лежат в буфере, он жив; поля после
-            // initialize больше никто не пишет.
-            unsafe { core::ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), 4) };
-            u32::from_le_bytes(bytes)
-        };
-        // §c.1 ControlBlock.
-        let control = [
-            (0, SHARED_MAGIC),
-            (4, 0x0002_0000),
-            (8, 1),           // generation
-            (12, 0),          // server_state = IDLE
-            (16, 0),          // client_state = IDLE
-            (20, CLAIM_FREE), // slot_claim
-            (24, 0),          // slot_owner_pid
-            (28, 0x1122_3344),
-            (32, 0),           // client_pid
-            (36, 0x0506_0708), // server_start_lo
-            (40, 0x0102_0304), // server_start_hi
-            (44, 0),
-            (48, 0),
-            (52, 0),
-            (56, 0),
-            (60, 5), // slot_count
-        ];
-        for (offset, value) in control {
-            assert_eq!(word(offset), value, "ControlBlock +{offset}");
-        }
-        // §c.2 LayoutBlock (смещения от начала сегмента).
-        let c2s = 128 + 64 + 8192;
-        let block = [
-            (64, u32::try_from(size).unwrap()),
-            (68, 0),
-            (72, 128),
-            (76, 8192),
-            (80, 7),
-            (84, u32::try_from(max_payload_for(8192)).unwrap()),
-            (88, c2s),
-            (92, 4096),
-            (96, u32::MAX), // RingConfig::new -- без лимита сообщений
-            (100, 100),
-        ];
-        for (offset, value) in block {
-            assert_eq!(word(offset), value, "LayoutBlock +{offset}");
-        }
-        for offset in (104..128).step_by(4) {
-            assert_eq!(word(offset), 0, "LayoutBlock.reserved +{offset}");
-        }
-        // §c.3 RingHeader обоих колец: позиции 0, connection_gen = 1 (@20).
-        for header in [128, c2s as usize] {
-            for field in (0..64).step_by(4) {
-                let expected = u32::from(field == 20);
-                assert_eq!(
-                    word(header + field),
-                    expected,
-                    "RingHeader {header}+{field}"
-                );
+        // Вид сегмента живёт только в этом блоке: `dealloc` ниже -- после
+        // его конца (не зависит от того, появится ли у `SharedView` `Drop`).
+        {
+            // SAFETY: буфер выровнен на 4096, длина = segment_size, живёт до
+            // dealloc в конце теста.
+            let _view = unsafe {
+                crate::shared::SharedView::initialize(
+                    base,
+                    layout,
+                    0x1122_3344,
+                    0x0102_0304_0506_0708,
+                    5,
+                )
+            }
+            .unwrap();
+            let word = |offset: usize| -> u32 {
+                assert!(offset + 4 <= size);
+                let mut bytes = [0u8; 4];
+                // SAFETY: offset + 4 <= size (проверено выше) -- адрес внутри
+                // выделенного буфера.
+                let src = unsafe { base.add(offset) };
+                // SAFETY: 4 байта от `src` лежат в буфере, он жив; поля после
+                // initialize больше никто не пишет.
+                unsafe { core::ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), 4) };
+                u32::from_le_bytes(bytes)
+            };
+            // §c.1 ControlBlock.
+            let control = [
+                (0, SHARED_MAGIC),
+                (4, 0x0002_0000),
+                (8, 1),           // generation
+                (12, 0),          // server_state = IDLE
+                (16, 0),          // client_state = IDLE
+                (20, CLAIM_FREE), // slot_claim
+                (24, 0),          // slot_owner_pid
+                (28, 0x1122_3344),
+                (32, 0),           // client_pid
+                (36, 0x0506_0708), // server_start_lo
+                (40, 0x0102_0304), // server_start_hi
+                (44, 0),
+                (48, 0),
+                (52, 0),
+                (56, 0),
+                (60, 5), // slot_count
+            ];
+            for (offset, value) in control {
+                assert_eq!(word(offset), value, "ControlBlock +{offset}");
+            }
+            // §c.2 LayoutBlock (смещения от начала сегмента).
+            let c2s = 128 + 64 + 8192;
+            let block = [
+                (64, u32::try_from(size).unwrap()),
+                (68, 0),
+                (72, 128),
+                (76, 8192),
+                (80, 7),
+                (84, u32::try_from(max_payload_for(8192)).unwrap()),
+                (88, c2s),
+                (92, 4096),
+                (96, u32::MAX), // RingConfig::new -- без лимита сообщений
+                (100, 100),
+            ];
+            for (offset, value) in block {
+                assert_eq!(word(offset), value, "LayoutBlock +{offset}");
+            }
+            for offset in (104..128).step_by(4) {
+                assert_eq!(word(offset), 0, "LayoutBlock.reserved +{offset}");
+            }
+            // §c.3 RingHeader обоих колец: позиции 0, connection_gen = 1 (@20).
+            for header in [128, c2s as usize] {
+                for field in (0..64).step_by(4) {
+                    let expected = u32::from(field == 20);
+                    assert_eq!(
+                        word(header + field),
+                        expected,
+                        "RingHeader {header}+{field}"
+                    );
+                }
             }
         }
-        // SAFETY: выделено alloc_zeroed с этим же Layout; `_view` больше не
-        // разыменовывается.
+        // SAFETY: выделено alloc_zeroed с этим же Layout; вид сегмента уже
+        // уничтожен (блок выше), к буферу больше никто не обращается.
         unsafe { dealloc(base, alloc) };
     }
 }
