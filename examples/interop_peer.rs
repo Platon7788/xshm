@@ -18,10 +18,15 @@
 //!   жёсткий самотаймаут 60 с -- `FAIL timeout`.
 //!
 //! Ключи: `s2c=<ёмкость>:<сообщений>:<макс. размер>`, `c2s=...` (раскладка
-//! сервера; по умолчанию `RingConfig::DEFAULT`), `n=<кадров>` (3000),
-//! `size=<байт>` (макс. длина кадра генератора / длина кадра lossless:
-//! 65 535 / 30 720), `seed=<u32>` (1), `mode=send|recv` (farewell),
-//! `expect=<вариант>` (ожидаемая ошибка / причина).
+//! сервера; по умолчанию `RingConfig::DEFAULT`), `n=<кадров>` (3000; у
+//! `multi-server` -- число слотов), `size=<байт>` (макс. длина кадра
+//! генератора / длина кадра lossless: 65 535 / 30 720), `seed=<u32>` (1),
+//! `mode=send|recv` (farewell) / `echo|ping` (`multi-client`),
+//! `expect=<вариант>` (ожидаемая ошибка / причина), `sessions=<k>` (1),
+//! `delay=<мс>` (500), `busy=1` (клиент повторяет и `AlreadyConnected`),
+//! `count=<k>` (клиентов `multi-client`, 1), `ends=<k>` (отключений до
+//! конца сценария Multi), `kick=<слот>` (`multi-server`), `frames=<k>` (10),
+//! `hold=<мс>` (0).
 //!
 //! Сценарии (`server-*` -- `SharedServer`, ждёт клиента после `READY`;
 //! `client-*` -- `SharedClient`, повторяет подключение, пока канала нет):
@@ -41,7 +46,30 @@
 //!   `client-expect-err expect=<вариант>` -- ошибку `expect`;
 //! - `auto-server-echo`, `auto-client-echo` -- `AutoServer`/`AutoClient`,
 //!   эхо в `on_message`, печать `on_error`/`on_disconnect_reason`; конец --
-//!   первое отключение (`expect=<причина>` -- его проверка).
+//!   первое отключение (`expect=<причина>` -- его проверка);
+//! - `server-sessions sessions=<k>` -- один сервер, `k` эхо-сессий подряд
+//!   (каждая -- `n` кадров до ухода клиента, `INFO session=<i>`); провал
+//!   рукопожатия (брошенная заявка умершего) -- `INFO handshake=HandshakeFailed`
+//!   и ожидание дальше;
+//! - `*-stall-leave delay=<мс>` -- сессия без чтения `delay` мс, затем уход;
+//! - `*-fill-wait size=<байт> expect=<вариант>` -- `try_send_*` до
+//!   `QueueFull` (`INFO full=<k>`), затем `wait_for_space` (20 с):
+//!   `INFO err=<вариант>` (`Space` -- место появилось, `Timeout` -- нет);
+//! - `client-hello-die` -- рукопожатие в потоке, через 500 мс (`INFO
+//!   hello=1`) выход с кодом 9: заявка `CLIENT_HELLO` умершего остаётся;
+//! - `multi-server n=<слотов> ends=<k> [kick=<слот>]` -- `MultiServer`, эхо
+//!   XOR `0x5A`, `INFO connect=<слот>`, `INFO disconnect=<слот>:<причина>`;
+//!   `kick` -- `disconnect_client` после первого кадра слота; конец -- `k`
+//!   отключений;
+//! - `multi-client count=<k> mode=echo|ping` -- `k` экземпляров
+//!   `MultiClient` (`retry_delay` 30 с: без переподключения в сценарии),
+//!   `INFO slot=<слот>`, `INFO reason=<причина>`; `echo` -- ответ XOR на
+//!   кадры сервера, конец -- `ends` отключений (по умолчанию `count`);
+//!   `ping` -- `frames` кадров длины 16 от каждого и их эхо (`INFO
+//!   pinged=<k>`), затем `hold` мс в сессии и остановка.
+//!
+//! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
+//! перед `INFO sent=`.
 //!
 //! Генератор кадров (общий с C-стороной): `x = xorshift32(x)` (начальное
 //! `x = seed`, `0` заменяется на `1`); кадр `k` эхо-сценария имеет длину
@@ -60,7 +88,8 @@ use std::time::{Duration, Instant};
 
 use xshm::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, ChannelConfig, ChannelKind, ChannelLayout,
-    DisconnectReason, RingConfig, SharedClient, SharedServer, ShmError,
+    DisconnectReason, MultiClient, MultiClientHandler, MultiClientOptions, MultiHandler,
+    MultiOptions, MultiServer, RingConfig, SharedClient, SharedServer, ShmError,
 };
 
 /// Жёсткий самотаймаут пира: оркестратор не должен ждать зависший пир.
@@ -71,6 +100,13 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Сколько клиент повторяет подключение к ещё не созданному каналу.
 const CONNECT_RETRY_FOR: Duration = Duration::from_secs(10);
+
+/// Сколько клиент с `busy=1` повторяет подключение к занятому каналу:
+/// дольше `RESERVE_TIMEOUT` (10 с) -- протухший захват снимается по толчку.
+const CONNECT_RETRY_BUSY_FOR: Duration = Duration::from_secs(25);
+
+/// Ожидание места в `*-fill-wait`.
+const SPACE_WAIT: Duration = Duration::from_secs(20);
 
 /// Строка протокола в stdout. Ошибку записи (оркестратор закрыл канал)
 /// некому сообщить -- пир всё равно завершится по сценарию или самотаймауту.
@@ -174,6 +210,14 @@ struct Args {
     layout: ChannelLayout,
     mode: String,
     expect: String,
+    sessions: u32,
+    delay: u64,
+    busy: bool,
+    count: u32,
+    ends: Option<u32>,
+    kick: Option<u32>,
+    frames: u32,
+    hold: u64,
 }
 
 /// `<ёмкость>:<сообщений>:<макс. размер>`.
@@ -200,6 +244,14 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
         layout: ChannelLayout::DEFAULT,
         mode: String::new(),
         expect: String::new(),
+        sessions: 1,
+        delay: 500,
+        busy: false,
+        count: 1,
+        ends: None,
+        kick: None,
+        frames: 10,
+        hold: 0,
     };
     for pair in pairs {
         let (key, value) = pair
@@ -214,6 +266,14 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
             "c2s" => args.layout.client_to_server = parse_ring(value).ok_or_else(bad)?,
             "mode" => value.clone_into(&mut args.mode),
             "expect" => value.clone_into(&mut args.expect),
+            "sessions" => args.sessions = value.parse().map_err(|_| bad())?,
+            "delay" => args.delay = value.parse().map_err(|_| bad())?,
+            "busy" => args.busy = value == "1",
+            "count" => args.count = value.parse().map_err(|_| bad())?,
+            "ends" => args.ends = Some(value.parse().map_err(|_| bad())?),
+            "kick" => args.kick = Some(value.parse().map_err(|_| bad())?),
+            "frames" => args.frames = value.parse().map_err(|_| bad())?,
+            "hold" => args.hold = value.parse().map_err(|_| bad())?,
             _ => return Err(format!("unknown key {key}")),
         }
     }
@@ -292,7 +352,15 @@ impl Side {
 
     /// Клиент `name` (повтор, пока канала ещё нет); `READY` -- подключён.
     fn connect(name: &str) -> Result<Self, String> {
+        Self::connect_with(name, false)
+    }
+
+    /// `connect`; `busy` -- повторять и `AlreadyConnected` (канал держит
+    /// чужой захват: каждая попытка толкает сервер `CONNECT_REQ`, и тот
+    /// снимает протухший захват через `RESERVE_TIMEOUT`), с `INFO busy_ms=`.
+    fn connect_with(name: &str, busy: bool) -> Result<Self, String> {
         let started = Instant::now();
+        let mut busy_seen = false;
         let client = loop {
             match SharedClient::connect(name, CONNECT_TIMEOUT) {
                 Ok(client) => break client,
@@ -301,9 +369,18 @@ impl Side {
                 {
                     thread::sleep(Duration::from_millis(10));
                 }
+                Err(ShmError::AlreadyConnected)
+                    if busy && started.elapsed() < CONNECT_RETRY_BUSY_FOR =>
+                {
+                    busy_seen = true;
+                    thread::sleep(Duration::from_millis(100));
+                }
                 Err(e) => return Err(format!("connect: {}", err_name(&e))),
             }
         };
+        if busy_seen {
+            out(&format!("INFO busy_ms={}", started.elapsed().as_millis()));
+        }
         out("READY");
         out(&format!("INFO layout={}", layout_text(client.layout())));
         Ok(Self::Client(client))
@@ -353,22 +430,34 @@ impl Side {
         }
     }
 
+    /// Запись без перезаписи: `Err(QueueFull)` -- места нет, кольцо не
+    /// тронуто.
+    fn try_send(&self, data: &[u8]) -> Result<(), ShmError> {
+        match self {
+            Self::Server(s) => s.try_send_to_client(data).map(drop),
+            Self::Client(c) => c.try_send_to_server(data).map(drop),
+        }
+    }
+
+    /// Ожидание места под `len` байт (`Ok(false)` -- таймаут).
+    fn wait_for_space(&self, len: usize, timeout: Option<Duration>) -> Result<bool, ShmError> {
+        match self {
+            Self::Server(s) => s.wait_for_space(len, timeout),
+            Self::Client(c) => c.wait_for_space(len, timeout),
+        }
+    }
+
     /// Запись без потерь: `try_send_*`, нет места -- `wait_for_space`.
-    fn send_lossless(&self, data: &[u8]) -> Result<(), ShmError> {
+    /// Возвращает, сколько раз пришлось ждать.
+    fn send_lossless(&self, data: &[u8]) -> Result<u32, ShmError> {
+        let mut waits = 0;
         loop {
-            let tried = match self {
-                Self::Server(s) => s.try_send_to_client(data).map(drop),
-                Self::Client(c) => c.try_send_to_server(data).map(drop),
-            };
-            match tried {
+            match self.try_send(data) {
                 Err(ShmError::QueueFull) => {}
-                other => return other,
+                other => return other.map(|()| waits),
             }
-            let waited = match self {
-                Self::Server(s) => s.wait_for_space(data.len(), None),
-                Self::Client(c) => c.wait_for_space(data.len(), None),
-            };
-            waited?;
+            waits += 1;
+            self.wait_for_space(data.len(), None)?;
         }
     }
 }
@@ -476,10 +565,13 @@ fn lossless_sink(side: &mut Side, args: &Args) -> Result<(), String> {
 /// пира (читатель уходит, дочитав всё).
 fn lossless_source(side: &mut Side, args: &Args) -> Result<(), String> {
     let size = args.size.unwrap_or(30_720) as usize;
+    let mut waits = 0;
     for k in 0..args.n {
-        side.send_lossless(&payload::frame(k, size))
+        waits += side
+            .send_lossless(&payload::frame(k, size))
             .map_err(|e| format!("send {k}: {}", err_name(&e)))?;
     }
+    out(&format!("INFO waits={waits}"));
     out(&format!("INFO sent={}", args.n));
     let got = until_gone(side, |_, k, _| Err(format!("unexpected frame {k}")))?;
     expect_end(got, DisconnectReason::Graceful, 0)
@@ -557,6 +649,294 @@ fn client_expect_err(name: &str, expect: &str) -> Result<(), String> {
             }
         }
     }
+}
+
+/// Один сервер, `sessions` эхо-сессий подряд: повторное принятие на том же
+/// канале (claim предыдущего клиента снят им самим, `generation + 1`).
+fn server_sessions(name: &str, args: &Args) -> Result<(), String> {
+    let mut server = SharedServer::start_with(name, &ChannelConfig::new(args.layout))
+        .map_err(|e| format!("start: {}", err_name(&e)))?;
+    out("READY");
+    for session in 1..=args.sessions {
+        loop {
+            match server.wait_for_client(None) {
+                Ok(()) => break,
+                Err(ShmError::HandshakeFailed) => out("INFO handshake=HandshakeFailed"),
+                Err(e) => return Err(format!("accept {session}: {}", err_name(&e))),
+            }
+        }
+        out(&format!("INFO session={session}"));
+        let mut side = Side::Server(server);
+        echo(&mut side, args)?;
+        let Side::Server(back) = side else {
+            return Err("side changed".to_owned());
+        };
+        server = back;
+    }
+    Ok(())
+}
+
+/// Сессия без чтения `delay` мс, затем уход (Drop: состояние `IDLE`,
+/// потом `DISCONNECT`): пир, ждущий места, будит только `DISCONNECT`.
+fn stall_leave(side: Side, args: &Args) -> Result<(), String> {
+    thread::sleep(Duration::from_millis(args.delay));
+    out("INFO leaving=1");
+    drop(side);
+    Ok(())
+}
+
+/// Заполнить кольцо (`INFO full=<k>`), затем ждать места: итог --
+/// `INFO err=<вариант>` и сверка с `expect`.
+fn fill_wait(side: &Side, args: &Args) -> Result<(), String> {
+    let size = args.size.unwrap_or(1024) as usize;
+    let frame = payload::frame(0, size);
+    let mut sent = 0u32;
+    loop {
+        match side.try_send(&frame) {
+            Ok(()) => sent += 1,
+            Err(ShmError::QueueFull) => break,
+            Err(e) => return Err(format!("fill: {}", err_name(&e))),
+        }
+    }
+    out(&format!("INFO full={sent}"));
+    let got = match side.wait_for_space(size, Some(SPACE_WAIT)) {
+        Ok(true) => "Space",
+        Ok(false) => "Timeout",
+        Err(e) => err_name(&e),
+    };
+    out(&format!("INFO err={got}"));
+    if got == args.expect {
+        Ok(())
+    } else {
+        Err(format!("expected {}", args.expect))
+    }
+}
+
+/// Клиент, умерший со стоящей заявкой: рукопожатие в потоке (сервер не
+/// отвечает), через 500 мс -- выход без деструкторов. Остаются `CLIENT_HELLO`,
+/// claim и самоописание умершего -- их снимает S2 сервера.
+fn client_hello_die(name: &str) -> Result<(), String> {
+    let name = name.to_owned();
+    thread::spawn(move || drop(SharedClient::connect(&name, Duration::from_secs(30))));
+    thread::sleep(Duration::from_millis(500));
+    out("INFO hello=1");
+    std::process::exit(DIE_EXIT_CODE);
+}
+
+// ============================================================================
+// Сценарии Multi (MultiServer / MultiClient)
+// ============================================================================
+
+/// Событие обработчика Multi для `main`.
+enum MultiEvent {
+    /// Кадр от слота.
+    Message(u32),
+    /// Отключение (сервер: слота; клиент: своё).
+    Ended,
+    /// Клиент `ping` получил эхо всех своих кадров.
+    Pinged,
+}
+
+/// Обработчик `MultiServer`: печать подключений и отключений, эхо XOR.
+struct MultiEcho {
+    server: OnceLock<Weak<MultiServer>>,
+    max: usize,
+    events: mpsc::Sender<MultiEvent>,
+}
+
+impl MultiHandler for MultiEcho {
+    fn on_client_connect(&self, client_id: u32) {
+        out(&format!("INFO connect={client_id}"));
+    }
+
+    fn on_client_disconnect(&self, client_id: u32) {
+        self.on_client_disconnect_reason(client_id, DisconnectReason::Graceful);
+    }
+
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        out(&format!(
+            "INFO disconnect={client_id}:{}",
+            reason_name(reason)
+        ));
+        let _ = self.events.send(MultiEvent::Ended);
+    }
+
+    fn on_message(&self, client_id: u32, data: &[u8]) {
+        if let Some(server) = self.server.get().and_then(Weak::upgrade)
+            && let Err(e) = server.send_to(client_id, &xor_reply(data, self.max))
+        {
+            out(&format!("INFO err={}", err_name(&e)));
+        }
+        let _ = self.events.send(MultiEvent::Message(client_id));
+    }
+
+    fn on_error(&self, _client_id: Option<u32>, err: ShmError) {
+        out(&format!("INFO err={}", err_name(&err)));
+    }
+}
+
+/// `MultiServer` на `n` слотов до `ends` отключений; `kick` -- отключить
+/// слот сервером после его первого кадра.
+fn multi_server(name: &str, args: &Args) -> Result<(), String> {
+    let (tx, rx) = mpsc::channel();
+    let handler = Arc::new(MultiEcho {
+        server: OnceLock::new(),
+        max: args.layout.server_to_client.max_message_size,
+        events: tx,
+    });
+    let dyn_handler: Arc<dyn MultiHandler> = handler.clone();
+    let options = MultiOptions {
+        max_clients: args.n,
+        layout: args.layout,
+        ..MultiOptions::default()
+    };
+    let server = MultiServer::start(name, dyn_handler, options)
+        .map_err(|e| format!("start: {}", err_name(&e)))?;
+    drop(handler.server.set(Arc::downgrade(&server)));
+    out("READY");
+    let ends = args.ends.unwrap_or(args.n);
+    let mut ended = 0;
+    let mut kicked = false;
+    while ended < ends {
+        match rx.recv().map_err(|_| "handler gone".to_owned())? {
+            MultiEvent::Message(id) if args.kick == Some(id) && !kicked => {
+                kicked = true;
+                server
+                    .disconnect_client(id)
+                    .map_err(|e| format!("kick {id}: {}", err_name(&e)))?;
+            }
+            MultiEvent::Ended => ended += 1,
+            MultiEvent::Message(_) | MultiEvent::Pinged => {}
+        }
+    }
+    server.stop();
+    Ok(())
+}
+
+/// Обработчик одного `MultiClient`: `echo` -- ответ XOR на кадры сервера;
+/// `ping` -- `frames` кадров при подключении и сверка их эха.
+struct MultiClientEcho {
+    client: OnceLock<Weak<MultiClient>>,
+    ping: bool,
+    frames: u32,
+    replies: std::sync::atomic::AtomicU32,
+    events: mpsc::Sender<MultiEvent>,
+}
+
+impl MultiClientEcho {
+    fn client(&self) -> Option<Arc<MultiClient>> {
+        self.client.get().and_then(Weak::upgrade)
+    }
+}
+
+/// Длина кадра `ping`.
+const PING_LEN: usize = 16;
+
+impl MultiClientHandler for MultiClientEcho {
+    fn on_connect(&self, slot_id: u32) {
+        out(&format!("INFO slot={slot_id}"));
+        if self.ping
+            && let Some(client) = self.client()
+        {
+            for k in 0..self.frames {
+                if let Err(e) = client.send(&payload::frame(k, PING_LEN)) {
+                    out(&format!("INFO err={}", err_name(&e)));
+                }
+            }
+        }
+    }
+
+    fn on_disconnect(&self) {}
+
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        out(&format!("INFO reason={}", reason_name(reason)));
+        let _ = self.events.send(MultiEvent::Ended);
+    }
+
+    fn on_message(&self, data: &[u8]) {
+        if self.ping {
+            let k = self
+                .replies
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let want: Vec<u8> = payload::frame(k, PING_LEN)
+                .iter()
+                .map(|b| b ^ 0x5A)
+                .collect();
+            if data != want.as_slice() {
+                out(&format!("INFO err=echo{k}"));
+            } else if k + 1 == self.frames {
+                let _ = self.events.send(MultiEvent::Pinged);
+            }
+            return;
+        }
+        if let Some(client) = self.client() {
+            let max = client
+                .layout()
+                .map_or(data.len(), |l| l.client_to_server.max_message_size);
+            if let Err(e) = client.send(&xor_reply(data, max)) {
+                out(&format!("INFO err={}", err_name(&e)));
+            }
+        }
+    }
+
+    fn on_error(&self, err: ShmError) {
+        out(&format!("INFO err={}", err_name(&err)));
+    }
+}
+
+/// `count` экземпляров `MultiClient` на базовом имени `name`.
+fn multi_client(name: &str, args: &Args) -> Result<(), String> {
+    let ping = match args.mode.as_str() {
+        "" | "echo" => false,
+        "ping" => true,
+        other => return Err(format!("mode {other}")),
+    };
+    let (tx, rx) = mpsc::channel();
+    let options = MultiClientOptions {
+        // Без переподключения внутри сценария: отключённый клиент ждёт
+        // паузу, которую прерывает `stop`.
+        retry_delay: Duration::from_secs(30),
+        ..MultiClientOptions::default()
+    };
+    let mut clients = Vec::new();
+    for _ in 0..args.count {
+        let handler = Arc::new(MultiClientEcho {
+            client: OnceLock::new(),
+            ping,
+            frames: args.frames,
+            replies: std::sync::atomic::AtomicU32::new(0),
+            events: tx.clone(),
+        });
+        let dyn_handler: Arc<dyn MultiClientHandler> = handler.clone();
+        let client = Arc::new(
+            MultiClient::connect(name, dyn_handler, options.clone())
+                .map_err(|e| format!("connect: {}", err_name(&e)))?,
+        );
+        drop(handler.client.set(Arc::downgrade(&client)));
+        clients.push(client);
+    }
+    let want = if ping {
+        args.count
+    } else {
+        args.ends.unwrap_or(args.count)
+    };
+    let mut seen = 0;
+    while seen < want {
+        match rx.recv().map_err(|_| "handler gone".to_owned())? {
+            MultiEvent::Pinged if ping => seen += 1,
+            MultiEvent::Ended if !ping => seen += 1,
+            MultiEvent::Ended => return Err("disconnected before the echo".to_owned()),
+            MultiEvent::Pinged | MultiEvent::Message(_) => {}
+        }
+    }
+    if ping {
+        out(&format!("INFO pinged={}", args.count));
+        thread::sleep(Duration::from_millis(args.hold));
+    }
+    for client in &clients {
+        client.stop();
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -688,7 +1068,7 @@ fn auto_echo(name: &str, args: &Args, server: bool) -> Result<(), String> {
 fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
     match scenario {
         "server-echo" => echo(&mut Side::serve(name, args.layout)?, args),
-        "client-echo" => echo(&mut Side::connect(name)?, args),
+        "client-echo" => echo(&mut Side::connect_with(name, args.busy)?, args),
         "server-lossless-sink" => lossless_sink(&mut Side::serve(name, args.layout)?, args),
         "client-lossless-sink" => lossless_sink(&mut Side::connect(name)?, args),
         "server-lossless-source" => lossless_source(&mut Side::serve(name, args.layout)?, args),
@@ -705,6 +1085,14 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "client-expect-err" => client_expect_err(name, &args.expect),
         "auto-server-echo" => auto_echo(name, args, true),
         "auto-client-echo" => auto_echo(name, args, false),
+        "server-sessions" => server_sessions(name, args),
+        "server-stall-leave" => stall_leave(Side::serve(name, args.layout)?, args),
+        "client-stall-leave" => stall_leave(Side::connect(name)?, args),
+        "server-fill-wait" => fill_wait(&Side::serve(name, args.layout)?, args),
+        "client-fill-wait" => fill_wait(&Side::connect(name)?, args),
+        "client-hello-die" => client_hello_die(name),
+        "multi-server" => multi_server(name, args),
+        "multi-client" => multi_client(name, args),
         other => Err(format!("unknown scenario {other}")),
     }
 }
