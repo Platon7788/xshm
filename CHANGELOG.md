@@ -32,7 +32,7 @@
 | Доставка Auto | `on_message` получает копию | по умолчанию — так же; `AutoOptions::delivery` (`Delivery::COPY`), прямая доставка — `unsafe fn AutoOptions::zero_copy_delivery` | Ничего |
 | Спин | нет | `SpinPolicy` (`NONE` по умолчанию), поля `spin` в опциях, `poll_*_spin`, `wait_for_space_spin` | Опционально; без спина — «ноль пробуждений в простое», как в 0.9 |
 | Async | нет | `accept_async`/`connect_async`/`recv_async`/`send_async`, все `&mut self`, future — `Send` | Опционально; одновременные приём и отправка одной стороны — через разделение/`Mutex` |
-| Занятый single-client канал | второй клиент перетирал заявку или ждал до `Timeout` | `ShmError::AlreadyConnected` сразу (ревизия 3: исключительная заявка `slot_claim`); `AutoClient` — `on_error(AlreadyConnected)` раз в `reconnect_delay` | Обрабатывать `AlreadyConnected` как «канал занят» |
+| Занятый single-client канал | второй клиент перетирал заявку или ждал до `Timeout` | `ShmError::AlreadyConnected` сразу (ревизия 3: исключительная заявка `slot_claim`); `AutoClient` — `on_error(AlreadyConnected)` с отступом от `reconnect_delay`, удваивающимся до 2 с | Обрабатывать `AlreadyConnected` как «канал занят» |
 | Колбэки `MultiHandler` | поток на каждые 21 слот, паника колбэка роняла группу | один поток-диспетчер на все слоты (медленный `on_message` задерживает всех клиентов); паника колбэка — `on_error(Some(slot), WorkerPanicked)` + локальное отключение слота (при `panic = "unwind"`) | Не блокировать в колбэках; тяжёлую работу — в свой поток |
 | Ошибки | `ShmError` без этих вариантов, не `#[non_exhaustive]` | новые `AccessDenied`, `WorkerPanicked { message }`, `Overrun`, `VersionMismatch`; у `AlreadyConnected` — новый случай (занятый канал, строка выше); перечисление `#[non_exhaustive]` | В `match` по `ShmError` — ветка `_` |
 | Пространства имён | только `\BaseNamedObjects` (`Local\`/`Global\`) | `PrivateNamespace::open_or_create(boundary, alias, &ObjectSecurity)`, поля `namespace`, `connect_in`, `Beacon::open_in`, `lobby_exists_in` | Опционально (защита от захвата имён) |
@@ -488,7 +488,7 @@
   и фиксирует, что без отклонений инварианты нарушаются).
   API: `SharedClient::connect`/`connect_async` при занятом канале —
   `AlreadyConnected` вместо `Timeout`/перетирания чужой заявки;
-  `AutoHandler::on_error(AlreadyConnected)` — раз в `reconnect_delay`, пока
+  `AutoHandler::on_error(AlreadyConnected)` — с растущим отступом, пока
   канал занят; выделенный канал Dispatch — `on_error` +
   `on_disconnect_reason(Error)` (канал занят чужим). Формат памяти не
   менялся (`0x00020000`): черновые нативные пиры обязаны перейти на
@@ -532,6 +532,12 @@
   `auto::claim_tests::client_notices_foreign_session_on_wakeup`,
   `client::tests::stale_session_refuses_to_send`. INTEROP «Изменения 0.10»
   п. 30.
+- **Minor** Проигравший `AutoClient` больше не шумит
+  `on_error(AlreadyConnected)` 4 раза в секунду без конца. Пауза при занятом
+  канале удваивается от `reconnect_delay` до `BUSY_RECONNECT_CAP` (2 с, или
+  `reconnect_delay`, если он больше). Первый повтор по-прежнему идёт через
+  `reconnect_delay`. Любой другой исход попытки сбрасывает отступ. Тест
+  `auto::claim_tests::already_connected_backs_off`.
 
 ### Сборка
 

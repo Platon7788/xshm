@@ -82,9 +82,11 @@ pub trait AutoHandler: Send + Sync + 'static {
     /// Ошибка worker-а. Клиент (`AutoClient::connect`): неудачная попытка
     /// подключения приходит сюда и повторяется через `reconnect_delay`. В
     /// том числе `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал
-    /// занят другим клиентом -- раз в `reconnect_delay`, пока канал не
-    /// освободится (как `Timeout` при недоступном сервере). Выделенный канал
-    /// Dispatch не повторяет: `AlreadyConnected` там -- канал занят чужим.
+    /// занят другим клиентом -- повтор, пока канал не освободится, но с
+    /// растущим отступом: пауза удваивается от `reconnect_delay` до 2 с
+    /// (`BUSY_RECONNECT_CAP`; больший `reconnect_delay` -- без роста), любой
+    /// другой исход попытки её сбрасывает. Выделенный канал Dispatch не
+    /// повторяет: `AlreadyConnected` там -- канал занят чужим.
     fn on_error(&self, _err: ShmError) {}
 }
 
@@ -98,7 +100,9 @@ pub struct AutoOptions {
     /// корректности; оставлено для диагностики).
     pub poll_timeout: Option<Duration>,
     /// Пауза между попытками переподключения `AutoClient` (`AutoServer` не
-    /// использует).
+    /// использует). Канал занят другим клиентом (`AlreadyConnected`) --
+    /// пауза удваивается с каждой неудачей до 2 с (или остаётся этой, если
+    /// она больше); первый повтор -- через `reconnect_delay`.
     pub reconnect_delay: Duration,
     /// Сколько `AutoClient` ждёт ответа сервера на одну попытку
     /// подключения (`AutoServer` не использует).
@@ -1126,6 +1130,10 @@ pub struct AutoClient {
 impl AutoClient {
     /// Клиент канала `name`: worker подключается и переподключается сам
     /// (раз в `reconnect_delay`), раскладку канала берёт из сегмента.
+    ///
+    /// Канал занят другим клиентом -- `on_error(AlreadyConnected)` на каждой
+    /// попытке, с отступом, удваивающимся от `reconnect_delay` до 2 с, пока
+    /// канал не освободится (см. `AutoOptions::reconnect_delay`).
     pub fn connect(
         name: &str,
         handler: Arc<dyn AutoHandler>,
@@ -1233,10 +1241,44 @@ enum ClientMode {
     Dedicated(Arc<AtomicU32>),
 }
 
+/// Предел отступа `AutoClient` при занятом канале (`AlreadyConnected`):
+/// пауза удваивается от `reconnect_delay` до этого значения (или остаётся
+/// `reconnect_delay`, если он сам больше).
+pub(crate) const BUSY_RECONNECT_CAP: Duration = Duration::from_secs(2);
+
+/// Отступ повторов при занятом канале (final review M4): `on_error(
+/// AlreadyConnected)` -- не 4 раза в секунду бесконечно, а с удвоением паузы
+/// до `BUSY_RECONNECT_CAP`. Первый повтор -- через `reconnect_delay`, как
+/// раньше (держатель, ушедший сразу, не задерживает нас). Любой другой исход
+/// попытки сбрасывает отступ.
+#[derive(Default)]
+struct BusyBackoff {
+    /// Пауза перед следующим повтором; `None` -- серии отказов нет.
+    current: Option<Duration>,
+}
+
+impl BusyBackoff {
+    /// Пауза после неудачной попытки (`busy` -- отказ `AlreadyConnected`).
+    fn next(&mut self, busy: bool, base: Duration) -> Duration {
+        if !busy {
+            self.reset();
+            return base;
+        }
+        let delay = self.current.unwrap_or(base);
+        self.current = Some(delay.saturating_mul(2).min(BUSY_RECONNECT_CAP.max(base)));
+        delay
+    }
+
+    const fn reset(&mut self) {
+        self.current = None;
+    }
+}
+
 fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
     let mut buffer = Vec::new();
     let gauge = &worker.gauge;
     let dedicated = matches!(mode, ClientMode::Dedicated(_));
+    let mut busy_backoff = BusyBackoff::default();
 
     while worker.running() {
         // Ревизия 2: ожидание `S2C_CONNECT` прерывается `wake` -- `stop`/Drop
@@ -1247,8 +1289,8 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             name,
             worker.options.connect_timeout,
             // Ревизия 3: канал Auto (и выделенный канал Dispatch) -- свой
-            // захват claim; занят -- `AlreadyConnected`, повтор через
-            // `reconnect_delay` (выделенный -- без повтора).
+            // захват claim; занят -- `AlreadyConnected`, повтор с
+            // отступом `BusyBackoff` (выделенный -- без повтора).
             ClaimMode::Take,
             Interrupt {
                 wake: worker.wake.as_handle(),
@@ -1259,6 +1301,7 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             Ok(client) => client,
             Err(_) if !worker.running() => break,
             Err(err) => {
+                let busy = err == ShmError::AlreadyConnected;
                 worker.handler.on_error(err);
                 if dedicated {
                     // Выделенный канал не поднялся -- повторять не к чему
@@ -1268,17 +1311,16 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 }
                 worker.report_evicted();
                 // Отступ перед новой попыткой; остановка прерывает его сразу
-                // (событие `wake`), без сна-циклов.
-                if !wait_delay_or(
-                    &worker.running,
-                    &worker.wake,
-                    worker.options.reconnect_delay,
-                ) {
+                // (событие `wake`), без сна-циклов. Канал занят
+                // (`AlreadyConnected`) -- отступ растёт (final review M4).
+                let delay = busy_backoff.next(busy, worker.options.reconnect_delay);
+                if !wait_delay_or(&worker.running, &worker.wake, delay) {
                     break;
                 }
                 continue;
             }
         };
+        busy_backoff.reset();
 
         gauge.set_layout(*client.layout(), worker.tx);
         gauge.peer_connected(client.peer_pid());
@@ -2422,6 +2464,39 @@ mod claim_tests {
             "устаревший клиент тронул состояние чужой сессии"
         );
         drop(client);
+    }
+
+    /// Final review M4: проигравший `AutoClient` повторяет с растущим
+    /// отступом (удвоение от `reconnect_delay` до `BUSY_RECONNECT_CAP`), а
+    /// не каждые `reconnect_delay` бесконечно.
+    #[test]
+    fn already_connected_backs_off() {
+        let name = unique("BACKOFF");
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        let holder = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        let log = Arc::new(Log::default());
+        let options = AutoOptions {
+            reconnect_delay: Duration::from_millis(20),
+            ..AutoOptions::default()
+        };
+        let client = AutoClient::connect(&name, log.clone(), options).unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        let attempts = log.errors.lock().unwrap().len();
+        // Без отступа -- около 75 попыток (1,5 с / 20 мс); с удвоением
+        // (20 + 40 + 80 + 160 + 320 + 640 мс) -- не больше 7.
+        assert!((2..=8).contains(&attempts), "попыток за 1,5 с: {attempts}");
+        assert!(
+            log.errors
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|err| *err == ShmError::AlreadyConnected)
+        );
+        assert!(holder.is_connected());
+        drop(client);
+        drop(holder);
+        drop(server);
     }
 
     /// §7.1 п. 13: канал занят `SharedClient` -- `AutoClient` получает
