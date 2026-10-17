@@ -2058,6 +2058,17 @@ fn flush_queue(
             return true;
         };
         if let Err(err) = client.send_to_server(&data) {
+            if err == ShmError::NotConnected {
+                // Сервер ушёл или сессия уже чужая (Task 6 надёжности, как
+                // клиент Auto): не ошибка канала, а конец сессии, о котором
+                // решит worker (`DISCONNECT`/смерть сервера/сверка
+                // `generation`). Сообщение -- обратно в голову очереди
+                // (уйдёт в следующую сессию с сервером), без `on_error` и
+                // без попыток остальных: иначе каждое сообщение очереди
+                // давало бы свою ошибку и терялось.
+                outbox.queue.lock_clean().push_front(data);
+                return true;
+            }
             let corrupted = err == ShmError::Corrupted;
             handler.on_error(err);
             if corrupted {
@@ -2079,7 +2090,9 @@ fn receive_all(
     while running.load(Ordering::Acquire) {
         match client.receive_from_server(buffer) {
             Ok(len) => handler.on_message(&buffer[..len]),
-            Err(ShmError::QueueEmpty) => break,
+            // `NotConnected` -- сессия сменилась посреди чтения (кадр новой
+            // сессии не забран): конец сессии решает worker, без `on_error`.
+            Err(ShmError::QueueEmpty | ShmError::NotConnected) => break,
             Err(err) => {
                 let corrupted = err == ShmError::Corrupted;
                 handler.on_error(err);
@@ -2224,6 +2237,12 @@ fn client_worker(
             }
             if !receive_all(&client, &mut buffer, handler, running) {
                 break Some(DisconnectReason::Error);
+            }
+            // Сессия сменилась посреди прохода (запись и чтение ответили
+            // `NotConnected` молча) -- решение сразу, а не на пробуждении,
+            // которого при чужой сессии может не быть (как клиент Auto).
+            if !client.is_session_current() {
+                break Some(DisconnectReason::Graceful);
             }
 
             // Спин (`MultiClientOptions::spin`) -- один бюджет на каждое

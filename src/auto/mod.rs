@@ -71,8 +71,10 @@ pub trait AutoHandler: Send + Sync + 'static {
     fn on_message(&self, _direction: ChannelKind, _payload: &[u8]) {}
     /// Потеряны сообщения направления `direction`: `count` вытеснено из
     /// кольца перезаписью или из очереди отправки при её переполнении
-    /// (`max_send_queue`). Вызывается раз на пачку, а не на каждое
-    /// сообщение.
+    /// (`max_send_queue`), либо (только `AutoServer`, 0.10) сброшено из
+    /// очереди в конце сессии -- неотправленное ушедшему клиенту следующему
+    /// не доставляется (в том числе принятое `try_send`). Вызывается раз на
+    /// пачку, а не на каждое сообщение.
     fn on_overflow(&self, _direction: ChannelKind, _count: u32) {}
     /// Читатель освободил место в исходящем кольце (событие SPACE: кольцо
     /// опустело или места хватает ждущему lossless-сообщению). К моменту
@@ -232,6 +234,11 @@ pub struct AutoStatsSnapshot {
     pub send_overflows: u64,
     pub received_messages: u64,
     pub receive_overflows: u64,
+    /// `AutoServer` (0.10): сообщения, сброшенные из очереди отправки в
+    /// конце сессии -- они предназначались ушедшему клиенту (о каждой
+    /// пачке -- один `on_overflow`). У `AutoClient` всегда `0`: его очередь
+    /// уходит в следующую сессию с тем же сервером.
+    pub discarded_messages: u64,
 }
 
 #[derive(Default, Debug)]
@@ -240,6 +247,7 @@ struct AutoStats {
     send_overflows: AtomicU64,
     received_messages: AtomicU64,
     receive_overflows: AtomicU64,
+    discarded_messages: AtomicU64,
     /// Возвраты worker-а из ожидания в ядре (0.9) -- тесты доказывают по
     /// нему отсутствие пробуждений в простое. В снимок не входит.
     wakeups: AtomicU64,
@@ -257,6 +265,7 @@ impl AutoStats {
             send_overflows: self.send_overflows.load(Ordering::Relaxed),
             received_messages: self.received_messages.load(Ordering::Relaxed),
             receive_overflows: self.receive_overflows.load(Ordering::Relaxed),
+            discarded_messages: self.discarded_messages.load(Ordering::Relaxed),
         }
     }
 }
@@ -697,6 +706,32 @@ impl Worker {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Сервер, конец сессии (Ruling S надёжности): очередь отправки
+    /// предназначалась ушедшему клиенту -- сбросить её, а не отдать
+    /// следующему. Возвращает число сброшенных; сообщает о них вызывающий
+    /// (`report_discarded`) -- после `on_disconnect_reason`, вне блокировки.
+    /// Очередь забирается ДО колбэка отключения: отправленное из него уже
+    /// адресовано следующему клиенту и остаётся.
+    fn discard_session_queue(&self) -> u32 {
+        let dropped = core::mem::take(&mut *self.outbox.lock());
+        for msg in &dropped {
+            self.gauge.release(msg.frame());
+        }
+        u32::try_from(dropped.len()).unwrap_or(u32::MAX)
+    }
+
+    /// Один отчёт о сброшенной очереди: счётчик и `on_overflow` -- раз на
+    /// конец сессии, не на сообщение.
+    fn report_discarded(&self, count: u32) {
+        if count > 0 {
+            // Relaxed: статистика.
+            self.stats
+                .discarded_messages
+                .fetch_add(u64::from(count), Ordering::Relaxed);
+            self.handler.on_overflow(self.tx, count);
+        }
+    }
+
     /// Сообщить о сообщениях, вытесненных отправителями из очереди.
     fn report_evicted(&self) {
         let evicted = self.outbox.evicted.swap(0, Ordering::AcqRel);
@@ -905,8 +940,13 @@ impl AutoServer {
     ///
     /// Гарантия «без потерь» действует в пределах одного подключения: при
     /// переподключении handshake сбрасывает кольца, и уже записанные, но не
-    /// прочитанные сообщения пропадают (неотправленные остаются в очереди и
-    /// уйдут новому клиенту). Смешивать с `send` можно, но сообщения `send`
+    /// прочитанные сообщения пропадают. Неотправленные к концу сессии (в
+    /// очереди) сообщения предназначались ушедшему клиенту и следующему не
+    /// достаются (0.10): worker сбрасывает очередь и сообщает об этом один
+    /// раз -- `on_overflow(ServerToClient, n)` и
+    /// `AutoStatsSnapshot::discarded_messages`. Принятое вне подключения
+    /// (до первого клиента или между сессиями) уходит следующему клиенту.
+    /// Смешивать с `send` можно, но сообщения `send`
     /// пишутся с перезаписью и могут вытеснить из КОЛЬЦА ранее записанные
     /// сообщения `try_send` -- для строго lossless-канала используйте только
     /// `try_send`.
@@ -1058,7 +1098,11 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
             worker.handle_wait(server, &set, space, result, &mut buffer)
         };
         if let Some(reason) = reason {
+            // Неотправленное ушедшему клиенту следующему не достаётся
+            // (Ruling S): забрать до колбэка, сообщить после.
+            let discarded = worker.discard_session_queue();
             worker.notify_disconnect(reason);
+            worker.report_discarded(discarded);
             if reason == DisconnectReason::Error {
                 // Разрыв по нашей ошибке (порча кольца, отказ ожидания):
                 // клиент ещё в сессии -- `IDLE`, потом `DISCONNECT`
@@ -1522,10 +1566,15 @@ where
                 break;
             }
             Err(ShmError::NotConnected) => {
-                // Task 6 надёжности: сервер ушёл или сессия уже чужая --
-                // не ошибка канала, а конец сессии, о котором worker решит
-                // сам (`DISCONNECT`/сверка `generation`). Сообщение -- в
-                // голову очереди (уйдёт в следующую сессию), без `on_error`.
+                // Task 6 надёжности: пир ушёл или сессия уже чужая -- не
+                // ошибка канала, а конец сессии, о котором worker решит сам
+                // (`DISCONNECT`/смерть пира/сверка `generation`), поэтому
+                // без `on_error` (обе стороны). Сообщение -- обратно в
+                // голову очереди, а дальше по стороне: клиент отправит его
+                // в следующую сессию с тем же сервером (семантика
+                // переподключения), сервер в конце сессии очередь
+                // сбрасывает (`Worker::discard_session_queue`: она
+                // предназначалась ушедшему клиенту, а не следующему).
                 outbox.push_front(msg);
                 break;
             }
@@ -2335,6 +2384,7 @@ mod claim_tests {
         reasons: Mutex<Vec<DisconnectReason>>,
         /// Ошибки, уже доставленные к моменту каждого `on_disconnect_reason`.
         errors_at_reason: Mutex<Vec<Vec<ShmError>>>,
+        overflows: Mutex<Vec<(ChannelKind, u32)>>,
     }
 
     impl AutoHandler for Log {
@@ -2350,6 +2400,9 @@ mod claim_tests {
         }
         fn on_error(&self, err: ShmError) {
             self.errors.lock().unwrap().push(err);
+        }
+        fn on_overflow(&self, direction: ChannelKind, count: u32) {
+            self.overflows.lock().unwrap().push((direction, count));
         }
     }
 
@@ -2648,6 +2701,99 @@ mod claim_tests {
             log.errors.lock().unwrap()
         );
         drop(a);
+    }
+
+    /// Ruling S (Task 6, fix round 1): очередь `AutoServer`, не записанная
+    /// к уходу клиента A, предназначалась A -- следующий клиент B её не
+    /// получает. Сброс сообщается один раз (`on_overflow(ServerToClient,
+    /// n)` и `discarded_messages`), без `on_error`; принятое между сессиями
+    /// уходит B.
+    #[test]
+    fn server_queue_of_departed_client_is_not_delivered_to_next() {
+        const RING_MESSAGES: u32 = 500; // `max_messages` раскладки по умолчанию
+        const QUEUED: u32 = 10;
+        let name = unique("DISCARD");
+        let log = Arc::new(Log::default());
+        let server = AutoServer::start(&name, log.clone(), AutoOptions::default()).unwrap();
+        let a = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until("подключение A", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        // A не читает: кольцо заполняется, остаток ждёт в очереди сервера.
+        for i in 0..RING_MESSAGES + QUEUED {
+            let payload = format!("a-{i:04}").into_bytes();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match server.try_send(&payload) {
+                    Ok(()) => break,
+                    Err(ShmError::QueueFull) => {
+                        assert!(Instant::now() < deadline, "очередь не разгружается");
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(err) => panic!("try_send: {err:?}"),
+                }
+            }
+        }
+        // Кольцо держит `max_messages` (+1 по правилу пересчёта §c.5) --
+        // ждём, пока запись не встанет, остаток -- в очереди.
+        wait_until(
+            "кольцо A заполнено",
+            Duration::from_secs(5),
+            || server.stats().sent_messages >= u64::from(RING_MESSAGES),
+        );
+        let mut sent = server.stats().sent_messages;
+        loop {
+            thread::sleep(Duration::from_millis(100));
+            let now = server.stats().sent_messages;
+            if now == sent {
+                break;
+            }
+            sent = now;
+        }
+        let queued = u32::try_from(u64::from(RING_MESSAGES + QUEUED) - sent).unwrap();
+        assert!(queued > 0, "очередь пуста: кольцо приняло всё");
+
+        drop(a);
+        wait_until("уход A", Duration::from_secs(5), || {
+            !log.reasons.lock().unwrap().is_empty()
+        });
+        wait_until("отчёт о сбросе", Duration::from_secs(2), || {
+            !log.overflows.lock().unwrap().is_empty()
+        });
+        assert_eq!(
+            log.overflows.lock().unwrap().as_slice(),
+            &[(ChannelKind::ServerToClient, queued)],
+            "отчёт о сбросе -- ровно один, на всю очередь"
+        );
+        assert_eq!(server.stats().discarded_messages, u64::from(queued));
+        assert!(log.errors.lock().unwrap().is_empty(), "{:?}", log.errors);
+
+        // Принятое между сессиями -- уже для следующего клиента.
+        server.send(b"for-b").unwrap();
+        let mut b = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        let mut buf = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let len = loop {
+            match b.receive_from_server(&mut buf) {
+                Ok(len) => break len,
+                Err(ShmError::QueueEmpty) => {
+                    assert!(Instant::now() < deadline, "B ничего не получил");
+                    let _ = b.poll_server(Some(Duration::from_millis(100)));
+                }
+                Err(err) => panic!("B: {err:?}"),
+            }
+        };
+        assert_eq!(&buf[..len], b"for-b", "B получил сообщение A");
+        thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            b.receive_from_server(&mut buf).err(),
+            Some(ShmError::QueueEmpty),
+            "B получил лишнее: {buf:?}"
+        );
+        assert_eq!(log.overflows.lock().unwrap().len(), 1);
+        drop(b);
+        drop(server);
     }
 
     /// Final review M4: проигравший `AutoClient` повторяет с растущим

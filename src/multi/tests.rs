@@ -1554,10 +1554,14 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
     let written = flooder.join().unwrap();
     // После обнаружения -- не больше кадров снимка (лимит кольца 64 + 1),
     // плюс обычные пачки, прочитанные до разбора DISCONNECT; поток
-    // (`written` -- обычно сотни тысяч кадров) не доставлен.
+    // (`written` -- обычно сотни тысяч кадров) не доставлен. `<=`, а не
+    // `<`: после ухода сервера (`server_state = IDLE`) клиент больше не
+    // пишет (Task 6 надёжности), и если флудер не успел дописать в место,
+    // освобождённое дочитыванием, до закрытия слота, доставлено может быть
+    // ровно всё записанное -- граница доставки от этого не меняется.
     let flood_delivered = journal.count(1) - BEFORE;
     assert!(
-        flood_delivered < 300 && u64::from(flood_delivered) < written,
+        flood_delivered < 300 && u64::from(flood_delivered) <= written,
         "доставлено из потока {flood_delivered} из {written}"
     );
     drop(honest);
@@ -2010,4 +2014,56 @@ fn broken_arm_packet_is_replaced() {
     arm.arm(&port, event.as_handle(), 3).unwrap();
     event.set().unwrap();
     assert_eq!(port.wait(Some(Duration::from_secs(5))).unwrap(), Some(3));
+}
+
+/// Task 6 надёжности (fix round 1): сервер ушёл (`server_state = IDLE`,
+/// `DISCONNECT`), а worker `MultiClient` ещё пишет очередь -- окно до
+/// решения о конце сессии. Ни одной ошибки на сообщение (`NotConnected` --
+/// не ошибка канала) и ни одного потерянного: очередь цела, в прежнем
+/// порядке, и уйдёт в следующую сессию. Чтение в том же окне тоже молчит.
+#[test]
+fn flush_after_server_left_keeps_queue_without_errors() {
+    #[derive(Default)]
+    struct Errors(Mutex<Vec<ShmError>>);
+    impl MultiClientHandler for Errors {
+        fn on_connect(&self, _slot_id: u32) {}
+        fn on_disconnect(&self) {}
+        fn on_message(&self, _data: &[u8]) {}
+        fn on_error(&self, err: ShmError) {
+            self.0.lock().unwrap().push(err);
+        }
+    }
+
+    let name = format!("XSHM_MULTI_FLUSH_LEFT_{}", std::process::id());
+    let mut server = SharedServer::start(&name).unwrap();
+    let waiter = thread::spawn(move || {
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        server
+    });
+    let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+    let mut server = waiter.join().unwrap();
+    server.disconnect_local();
+
+    let outbox = ClientOutbox::default();
+    let queued: Vec<Vec<u8>> = (0..64u32)
+        .map(|i| format!("msg-{i:02}").into_bytes())
+        .collect();
+    outbox.queue.lock_clean().extend(queued.iter().cloned());
+    let errors = Arc::new(Errors::default());
+    let handler: Arc<dyn MultiClientHandler> = errors.clone();
+
+    assert!(flush_queue(&client, &outbox, &handler));
+    let mut buffer = Vec::new();
+    let running = AtomicBool::new(true);
+    assert!(receive_all(&client, &mut buffer, &handler, &running));
+    assert!(
+        errors.0.lock().unwrap().is_empty(),
+        "шторм ошибок: {:?}",
+        errors.0.lock().unwrap()
+    );
+    let left: Vec<Vec<u8>> = outbox.queue.lock_clean().iter().cloned().collect();
+    assert_eq!(left, queued, "очередь потеряна или переставлена");
+    assert!(!server.has_unread_from_client(), "запись в закрытую сессию");
 }
