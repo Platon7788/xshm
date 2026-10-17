@@ -2819,9 +2819,11 @@ fn multi_client_sees_server_death_under_stale_disconnect_flood() {
         recorder.reasons.lock().unwrap()
     );
 
-    let started = Instant::now();
     child.kill().unwrap();
     child.wait().unwrap();
+    // M1 ревью T11c: часы -- с подтверждённой смерти (после `wait`):
+    // меряется только задержка обнаружения, а не `kill` и уборка `cmd`.
+    let started = Instant::now();
     wait_for(
         "смерть сервера под потоком",
         Duration::from_secs(3),
@@ -2909,4 +2911,53 @@ fn stale_disconnect_flood_does_not_starve_dispatcher() {
     assert!(stopped_in <= Duration::from_millis(300), "{stopped_in:?}");
     drop(newcomer);
     drop(client);
+}
+
+/// M3 ревью T11c: `MultiClient`, разбуженный `DISCONNECT` уже чужой сессии
+/// (`generation` слота сменился -- сервер принял другого клиента), уходит
+/// `Graceful` без дочитывания и **возвращает** сигнал: он адресован новому
+/// клиенту слота (уход сервера из новой сессии), и без возврата тот,
+/// ожидая без таймаута, не узнал бы об отключении никогда. Слот держит
+/// синхронный `SharedServer` -- `DISCONNECT` больше никто не ждёт, и
+/// событие после ухода старого клиента взведено только возвратом.
+#[test]
+fn multi_client_returns_disconnect_of_foreign_session() {
+    let name = unique("FOREIGN_DISC");
+    let mut server = SharedServer::start(&format!("{name}_0")).expect("start");
+    let recorder = Arc::new(ClientRecorder::default());
+    let client =
+        MultiClient::connect(&name, recorder.clone(), MultiClientOptions::default()).unwrap();
+    server
+        .wait_for_client(Some(Duration::from_secs(5)))
+        .expect("рукопожатие слота");
+    wait_for("подключение", Duration::from_secs(5), || {
+        client.is_connected()
+    });
+    let disconnect = crate::events::SharedEvents::open(&format!("{name}_0"))
+        .unwrap()
+        .disconnect;
+
+    // Сессия сменилась (S3 следующего рукопожатия), затем сервер уходит из
+    // новой сессии: сигнал -- для нового клиента.
+    server
+        .view()
+        .control_block()
+        .generation
+        .fetch_add(1, Ordering::AcqRel);
+    disconnect.set().unwrap();
+    wait_for(
+        "уход старого клиента",
+        Duration::from_secs(2),
+        || !recorder.reasons.lock().unwrap().is_empty(),
+    );
+    client.stop();
+    assert_eq!(
+        recorder.reasons.lock().unwrap().as_slice(),
+        &[DisconnectReason::Graceful]
+    );
+    assert!(
+        disconnect.wait(Some(Duration::ZERO)).unwrap(),
+        "DISCONNECT новой сессии съеден старым клиентом"
+    );
+    drop(server);
 }
