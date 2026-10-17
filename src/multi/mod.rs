@@ -92,7 +92,7 @@ use crate::ntapi::STATUS_SUCCESS;
 use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
 use crate::ring::{DrainBound, FreeSpace, SpinPolicy, UnreadProbe, spin_until};
 use crate::security::ObjectSecurity;
-use crate::server::SharedServer;
+use crate::server::{Lingering, SharedServer, release_if_holder_dead};
 use crate::shared::SharedView;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker, panic_error};
 use crate::wait_delay_or;
@@ -164,7 +164,9 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 /// уходящего клиента (`DISCONNECT`, смерть процесса, снятый claim): остаток
 /// дочитывания не доставляется, а отключение идёт обычным путём ухода -- с
 /// исходной причиной (`Graceful`/`PeerDied`) и обычным снятием claim-а, без
-/// задержки `RESERVE_TIMEOUT`. Паника самого `on_error` (и колбэка
+/// задержки `RESERVE_TIMEOUT`. Так же испорченный кадр при этом
+/// дочитывании (0.10, Task 7): `on_error(Some(slot), ShmError::Corrupted)`
+/// отдельно, причина -- исходная, а не `Error`. Паника самого `on_error` (и колбэка
 /// отключения после паники) отбрасывается без второго вызова `on_error` и
 /// без смены причины разрыва -- текст печатает panic hook. Перехват возможен только при `panic = "unwind"` у итогового
 /// бинарника; при `panic = "abort"` паника завершает процесс.
@@ -369,6 +371,14 @@ struct ClientSlot {
     /// ссылку на объект до срабатывания или отмены привязки; снимает её
     /// диспетчер при сверке слота (`Dispatcher::reconcile`).
     retired: Vec<ProcessWatch>,
+    /// Task 7: не подключён -- «задержавшийся владелец»: процесс клиента
+    /// сессии, которую закрыл сервер (`force_disconnect`, отказ S7), и токен
+    /// её claim-а, пока claim всё ещё его. Процесс привязан к порту
+    /// (`WaitKind::Peer`): подтверждённая смерть снимает claim сразу
+    /// (`release_if_holder_dead`), без `reserve_timeout`. Один на слот;
+    /// снимается, когда claim сменился (клиент ушёл сам), при новом
+    /// рукопожатии и при остановке.
+    lingering: Option<Lingering>,
 }
 
 impl ClientSlot {
@@ -383,6 +393,7 @@ impl ClientSlot {
             owner_watch: None,
             last_liveness_check: None,
             retired: Vec::new(),
+            lingering: None,
         }
     }
 
@@ -403,18 +414,42 @@ impl ClientSlot {
 
     /// Разорвать подключение слота на стороне сервера: состояния handshake
     /// -> IDLE, handle процессов -> в `retired` (закроет диспетчер).
-    fn reset_connection(&mut self) {
+    ///
+    /// `linger` (Task 7) -- сессию закрывает сервер (`force_disconnect`), а
+    /// клиент, возможно, жив: handle его процесса остаётся наблюдаемым
+    /// («задержавшийся владелец», `lingering`), если claim всё ещё claim
+    /// сессии. Тот же handle уже привязан к порту (`WaitKind::Peer`) --
+    /// привязка просто продолжается.
+    fn reset_connection(&mut self, linger: bool) {
         self.connected = false;
         self.claim_seen = None;
         self.verify_at = None;
         self.last_liveness_check = None;
-        if let Some(watch) = self.server.take_peer() {
-            self.retired.push(watch);
-        }
-        if let Some(watch) = self.owner_watch.take() {
-            self.retired.push(watch);
-        }
+        let watch = match (self.server.take_peer(), self.owner_watch.take()) {
+            (Some(peer), owner) => {
+                self.retired.extend(owner);
+                Some(peer)
+            }
+            (None, owner) => owner,
+        };
         self.server.mark_disconnected();
+        let Some(watch) = watch else {
+            return;
+        };
+        if linger && self.session_claim != CLAIM_FREE && self.claim() == self.session_claim {
+            self.retire_lingering();
+            self.lingering = Some((watch, self.session_claim));
+        } else {
+            self.retired.push(watch);
+        }
+    }
+
+    /// Снять «задержавшегося владельца»: handle -- в `retired` (закроется
+    /// в начале следующего прохода, после сверки привязок слота).
+    fn retire_lingering(&mut self) {
+        if let Some((watch, _)) = self.lingering.take() {
+            self.retired.push(watch);
+        }
     }
 
     fn claim(&self) -> u32 {
@@ -424,6 +459,18 @@ impl ClientSlot {
             .slot_claim
             .load(Ordering::Acquire)
     }
+
+    /// Тесты (решение H): владелец claim-а (`slot_owner_pid`/`owner_start`)
+    /// и наблюдаемый процесс сессии -- процесс `watch` (`pid`, `start`).
+    #[cfg(test)]
+    fn substitute_owner(&mut self, watch: ProcessWatch, pid: u32, start: u64) {
+        let control = self.server.view().control_block();
+        control.announce_owner_start(start);
+        control.slot_owner_pid.store(pid, Ordering::Release);
+        if let Some(old) = self.server.replace_peer(watch) {
+            self.retired.push(old);
+        }
+    }
 }
 
 /// Итог прохода обслуживания слотов.
@@ -431,6 +478,9 @@ impl ClientSlot {
 struct Sweep {
     /// Осиротевшие подключённые слоты: `(slot_id, ожидаемый claim, причина)`.
     orphaned: Vec<(u32, u32, DisconnectReason)>,
+    /// Слоты, с которых снят «задержавшийся владелец» (Task 7): их
+    /// привязку процесса диспетчер обязан снять (`Dispatcher::reconcile`).
+    relinquished: Vec<u32>,
     /// Ближайший дедлайн (освобождение протухшего захвата, проверка
     /// рукопожатия) -- до него и ждёт диспетчер.
     next_deadline: Option<Instant>,
@@ -664,6 +714,10 @@ impl MultiCore {
     }
 
     /// Принудительное отключение клиента (`on_client_disconnect_reason(Local)`).
+    ///
+    /// Слот освобождает сам клиент, получив `DISCONNECT`; клиента, умершего
+    /// раньше, чем он это заметил, -- сервер сразу по подтверждённой смерти
+    /// его процесса (0.10), без ожидания `RESERVE_TIMEOUT`.
     pub fn disconnect_client(&self, client_id: u32) -> Result<()> {
         if client_id >= self.max_clients {
             return Err(ShmError::NotConnected);
@@ -689,9 +743,13 @@ impl MultiCore {
             // освобождался до того, как клиент проснулся: следующий клиент
             // успевал его захватить, и его `complete_handshake` сбрасывал
             // `DISCONNECT` прежнего -- два клиента на одном SPSC-кольце.
-            // Мёртвого клиента освобождает дедлайн `reserve_timeout` (слот
-            // не подключён, claim занят -- обычный протухший захват).
-            slot.reset_connection();
+            // Task 7: клиента, умершего, не заметив отключения, освобождает
+            // его подтверждённая смерть -- handle процесса остаётся
+            // привязанным к порту («задержавшийся владелец», `lingering`);
+            // claim снимает диспетчер (`handle_slot_peer_died`) ПОСЛЕ
+            // `DISCONNECT` ниже: блокировка слота держится до сигнала.
+            // Клиента без наблюдаемого процесса -- дедлайн `reserve_timeout`.
+            slot.reset_connection(true);
             slot.server.signal_disconnect();
             drop(slot);
             drop(slots);
@@ -785,11 +843,13 @@ impl MultiCore {
         for slot_mutex in slots.iter() {
             let mut slot = slot_mutex.lock_clean();
             if slot.connected {
-                slot.reset_connection();
+                slot.reset_connection(false);
                 if let Some(events) = slot.server.events() {
                     let _ = events.disconnect.set();
                 }
             }
+            // Наблюдать «задержавшихся владельцев» больше некому.
+            slot.retire_lingering();
         }
     }
 
@@ -895,7 +955,20 @@ impl MultiCore {
                 }
                 continue;
             }
-            // Не подключён: протухший захват -- по дедлайну.
+            // Не подключён. Task 7: «задержавшийся владелец» -- claim уже
+            // не его (ушёл сам) или он подтверждённо умер (смерть могла
+            // опередить привязку) -- наблюдение снимается, привязку `Peer`
+            // слота сверит вызывающий (`Sweep::relinquished`).
+            let mut claim = claim;
+            if let Some((watch, token)) = slot.lingering.as_ref()
+                && (claim != *token
+                    || release_if_holder_dead(slot.server.view().control_block(), watch, *token))
+            {
+                slot.retire_lingering();
+                sweep.relinquished.push(slot.id);
+                claim = slot.claim();
+            }
+            // Протухший захват -- по дедлайну.
             if claim == CLAIM_FREE {
                 slot.claim_seen = None;
                 continue;
@@ -962,6 +1035,9 @@ impl MultiCore {
         match slot.server.accept_pending() {
             Ok(()) => {
                 slot.connected = true;
+                // Новая сессия: наблюдение за клиентом прошлой не нужно
+                // (claim взят свободным -- уже не его).
+                slot.retire_lingering();
                 // Ревизия 3: claim сессии -- из рукопожатия (S6: claim
                 // владельца зафиксированной заявки, а не следующего клиента).
                 slot.session_claim = slot.server.session_claim();
@@ -985,12 +1061,27 @@ impl MultiCore {
                 drop(slots);
                 self.handler.on_client_connect(id);
             }
-            Err(_) => {
-                // `CONNECT_REQ` без `CLIENT_HELLO`: клиент откатил заявку по
-                // таймауту (claim он снял сам) или это «толчок» клиента, не
-                // нашедшего свободного слота (`nudge_stale_claims`). Claim не
-                // трогаем: живой захват скоро подключится, протухший снимет
-                // дедлайн `reserve_timeout`, который назначит ближайший проход.
+            Err(err) => {
+                // Отказ S7 (Task 7): сессия, зафиксированная S5, закрыта
+                // (`disconnect_local`), а клиент сессии оставлен
+                // «задержавшимся владельцем» -- наблюдает его слот.
+                if let Some(lingering) = slot.server.take_lingering() {
+                    slot.retire_lingering();
+                    slot.lingering = Some(lingering);
+                }
+                drop(slot);
+                drop(slots);
+                // `HandshakeFailed` -- `CONNECT_REQ` без `CLIENT_HELLO`:
+                // клиент откатил заявку по таймауту (claim он снял сам) или
+                // это «толчок» клиента, не нашедшего свободного слота
+                // (`nudge_stale_claims`); claim не трогаем: живой захват
+                // скоро подключится, протухший снимет дедлайн
+                // `reserve_timeout`, который назначит ближайший проход. Иное
+                // -- отказ самого рукопожатия (п. 11: сигнал `S2C_CONNECT`,
+                // `WindowsError`) -- сообщается, а не глотается молча.
+                if !matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected) {
+                    report(self, Some(slot_id), err);
+                }
             }
         }
     }
@@ -1006,6 +1097,11 @@ impl MultiCore {
     /// `RingBuffer::drain_snapshot`), а позиция чтения ведётся приватно:
     /// пир, сдвинувший общий `read_pos` во время дочитывания, получает
     /// `Corrupted` (честный клиент к моменту ухода уже не пишет -- R14).
+    ///
+    /// `Corrupted` при дочитывании (решение C, Task 7) --
+    /// `on_error(Some(slot), Corrupted)` и конец дочитывания, но НЕ разрыв:
+    /// слот отключает вызывающий путь ухода со своей причиной и своим
+    /// снятием claim-а.
     fn drain_slot(&self, slot_id: u32, buffer: &mut Vec<u8>) {
         let mut bound = {
             let slots = self.slots.read_clean();
@@ -1064,7 +1160,7 @@ impl MultiCore {
             let was = slot.connected;
             if was {
                 let session_claim = slot.session_claim;
-                slot.reset_connection();
+                slot.reset_connection(false);
                 // Ревизия 2: CAS claim сессии -> FREE, а не store. Клиент 0.9
                 // снимает claim сам сразу после `DISCONNECT` (R13), и новый
                 // клиент мог уже захватить слот, пока мы дочитывали кольцо --
@@ -1105,6 +1201,18 @@ impl MultiCore {
             };
             let mut slot = slot_mutex.lock_clean();
             if !slot.connected {
+                // Task 7: умер «задержавшийся владелец» -- клиент сессии,
+                // которую сервер уже закрыл (`force_disconnect`, отказ S7):
+                // claim всё ещё его -- снять сразу, одним CAS токена сессии
+                // (`release_if_holder_dead`), без `reserve_timeout`.
+                // Колбэка нет: отключение о сессии уже сообщено.
+                if let Some((watch, token)) = slot.lingering.as_ref()
+                    && watch.has_exited()
+                {
+                    let _ =
+                        release_if_holder_dead(slot.server.view().control_block(), watch, *token);
+                    slot.retire_lingering();
+                }
                 return;
             }
             let control = slot.server.view().control_block();
@@ -1120,7 +1228,7 @@ impl MultiCore {
             }
             // Handle процесса обязан уйти из привязок в любом случае:
             // он сигнален навсегда и иначе будил бы диспетчер без конца.
-            slot.reset_connection();
+            slot.reset_connection(false);
             true
         };
 
@@ -1176,7 +1284,7 @@ impl MultiCore {
 
             // claim атомарно переведён в FREE выше (или уже был FREE и остался
             // им) -- освобождать его повторно не нужно.
-            slot.reset_connection();
+            slot.reset_connection(false);
             true
         };
 
@@ -1213,8 +1321,9 @@ impl MultiCore {
             for _ in 0..batch {
                 let received = match bound.as_deref_mut() {
                     // Дочитывание: только до снимка, своей позицией чтения;
-                    // сдвиг `read_pos` пиром -- `Corrupted` (обычный путь
-                    // ошибки ниже: `on_error` и разрыв с `Error`).
+                    // сдвиг `read_pos` пиром или испорченный кадр --
+                    // `Corrupted` (ниже: `on_error`, дочитывание кончается,
+                    // разрыв -- за путём ухода, решение C).
                     Some(bound) => match slot.server.drain_from_client(buffer, bound) {
                         Ok(Some(len)) => Ok(len),
                         Ok(None) => {
@@ -1252,10 +1361,17 @@ impl MultiCore {
             // Паника `on_error` отбрасывается (rustdoc `MultiHandler`): ни
             // второго `on_error`, ни подмены причины разрыва на `Local`.
             report(self, Some(slot_id), err);
-            if corrupted {
+            if corrupted && bound.is_none() {
                 // Клиент испортил кольцо: `read_pos` не сдвинется, и без
                 // разрыва слот навсегда остался бы «подключённым», а каждое
                 // `DATA` давало бы новый `on_error`.
+                //
+                // Дочитывание ушедшего (`bound`) -- без разрыва (решение C,
+                // Task 7): уход продолжает свой путь со своей причиной
+                // (`PeerDied`/`Graceful`/причина осиротевшего слота) и своим
+                // снятием claim-а, порча -- отдельный `on_error` выше. Разрыв
+                // с `Error` здесь подменял бы причину и оставлял claim
+                // умершего до `reserve_timeout`.
                 self.force_disconnect(slot_id, DisconnectReason::Error);
                 return false;
             }
@@ -1476,6 +1592,10 @@ impl<'a> Dispatcher<'a> {
                     d.core
                         .handle_orphaned_slot_disconnect(slot_id, expected_claim, reason);
                 });
+                self.reconcile(slot_id);
+            }
+            for slot_id in sweep.relinquished {
+                // «Задержавшийся владелец» снят -- снять привязку процесса.
                 self.reconcile(slot_id);
             }
             if self.rearm_at.is_some_and(|at| now >= at) {
@@ -1702,7 +1822,16 @@ impl<'a> Dispatcher<'a> {
                     WaitKind::Connect => (!slot.connected).then(|| events.connect_req.as_handle()),
                     WaitKind::Disconnect => slot.connected.then(|| events.disconnect.as_handle()),
                     WaitKind::Data => slot.connected.then(|| events.c2s.data.as_handle()),
-                    WaitKind::Peer => slot.connected.then(|| slot.peer_handle()).flatten(),
+                    // Не подключён -- «задержавшийся владелец» (Task 7),
+                    // если есть: процесс сигналит один раз, в простое
+                    // пробуждений нет.
+                    WaitKind::Peer => {
+                        if slot.connected {
+                            slot.peer_handle()
+                        } else {
+                            slot.lingering.as_ref().map(|(watch, _)| watch.as_handle())
+                        }
+                    }
                 };
                 let Some(arm) = waits.arms.get_mut(kind.index()) else {
                     continue;

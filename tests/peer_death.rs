@@ -6,18 +6,20 @@
 //! через сколько его сторона узнаёт о `PeerDied`. Контроль: штатный выход
 //! пира должен давать `Graceful`, а не `PeerDied`.
 
+use std::ffi::c_void;
 use std::process::{Child, Command};
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use xshm::{
-    Admission, AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ClientRegistration,
-    DisconnectReason, DispatchClient, DispatchClientHandler, DispatchClientOptions,
-    DispatchHandler, DispatchOptions, DispatchServer, MultiClient, MultiClientHandler,
-    MultiClientOptions, MultiHandler, MultiOptions, MultiServer, SharedClient, SharedServer,
-    ShmError, SpinPolicy,
+    Admission, AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ChannelLayout,
+    ClientRegistration, DisconnectReason, DispatchClient, DispatchClientHandler,
+    DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer, MultiClient,
+    MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer, RingConfig,
+    SharedClient, SharedServer, ShmError, SpinPolicy,
 };
 
 const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
@@ -876,6 +878,333 @@ fn peer_death_releases_claim_immediately() {
     let waited = t0.elapsed();
     println!("peer_death_releases_claim_immediately: канал свободен через {waited:?}");
     assert!(waited < Duration::from_secs(5), "{waited:?}");
+    drop(client);
+    drop(server);
+}
+
+// ─── Task 7: claim подтверждённо умершего после отключения сервером ─────────
+
+#[cfg_attr(
+    target_arch = "x86",
+    link(
+        name = "kernel32",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
+unsafe extern "system" {
+    fn OpenFileMappingW(desired_access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+    fn MapViewOfFile(
+        mapping: *mut c_void,
+        desired_access: u32,
+        offset_high: u32,
+        offset_low: u32,
+        bytes: usize,
+    ) -> *mut c_void;
+    fn UnmapViewOfFile(base: *const c_void) -> i32;
+    fn OpenEventW(desired_access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+    fn SetEvent(event: *mut c_void) -> i32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+/// `FILE_MAP_ALL_ACCESS`.
+const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
+/// `EVENT_MODIFY_STATE`.
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+/// Ёмкость колец тестовых каналов (маленькая -- смещения известны).
+const CAP: usize = 4096;
+/// Смещение `ControlBlock::slot_claim` (INTEROP §c.1).
+const SLOT_CLAIM: usize = 20;
+/// Заголовок кольца клиент -> сервер: `ControlBlock` 64 + `LayoutBlock` 64 +
+/// заголовок S2C 64 + кольцо S2C; `write_pos` -- первое поле.
+const C2S_WRITE_POS: usize = 64 + 64 + 64 + CAP;
+/// Размер отображения: до конца заголовка C2S.
+const MAPPED: usize = C2S_WRITE_POS + 64;
+
+const fn small_layout() -> ChannelLayout {
+    ChannelLayout::symmetric(RingConfig::new(CAP))
+}
+
+/// Широкая строка с нулём на конце.
+fn wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(Some(0)).collect()
+}
+
+/// Сегмент канала `name` «глазами пира» -- второе отображение секции.
+struct Segment {
+    handle: NonNull<c_void>,
+    base: NonNull<u8>,
+}
+
+impl Segment {
+    fn open(name: &str) -> Self {
+        let path = wide(&format!("Local\\{name}"));
+        // SAFETY: `path` -- строка с нулём на конце, живёт весь вызов.
+        let handle = unsafe { OpenFileMappingW(FILE_MAP_ALL_ACCESS, 0, path.as_ptr()) };
+        let handle = NonNull::new(handle).unwrap_or_else(|| panic!("OpenFileMappingW({name})"));
+        // SAFETY: `handle` -- только что открытая секция; `MAPPED` не больше
+        // секции (раскладку `small_layout` задал сервер этого теста).
+        let base = unsafe { MapViewOfFile(handle.as_ptr(), FILE_MAP_ALL_ACCESS, 0, 0, MAPPED) };
+        let base = NonNull::new(base.cast::<u8>()).unwrap_or_else(|| panic!("MapViewOfFile"));
+        Self { handle, base }
+    }
+
+    fn word(&self, offset: usize) -> &AtomicU32 {
+        assert!(offset.is_multiple_of(4) && offset + 4 <= MAPPED);
+        // SAFETY: offset + 4 <= MAPPED -- адрес внутри отображения.
+        let ptr = unsafe { self.base.as_ptr().add(offset) };
+        // SAFETY: адрес выровнен на 4 (база -- на гранулу выделения), память
+        // отображена, пока жив `self`; стороны канала обращаются к словам
+        // заголовков атомарно.
+        unsafe { AtomicU32::from_ptr(ptr.cast()) }
+    }
+
+    fn claim(&self) -> u32 {
+        self.word(SLOT_CLAIM).load(Ordering::Acquire)
+    }
+
+    /// Порча кольца клиент -> сервер: `write_pos` не кратен 8.
+    fn corrupt_c2s(&self) {
+        let write_pos = self.word(C2S_WRITE_POS);
+        let value = write_pos.load(Ordering::Acquire).wrapping_add(3);
+        write_pos.store(value, Ordering::Release);
+    }
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        // SAFETY: база получена от `MapViewOfFile` и ещё не размаплена.
+        let _ = unsafe { UnmapViewOfFile(self.base.as_ptr().cast_const().cast()) };
+        // SAFETY: handle открыт `OpenFileMappingW` и закрывается один раз.
+        let _ = unsafe { CloseHandle(self.handle.as_ptr()) };
+    }
+}
+
+/// Взвести `C2S_DATA` канала `name`, как это сделал бы писатель-пир.
+fn signal_c2s_data(name: &str) {
+    let path = wide(&format!("Local\\{name}_C2S_DATA"));
+    // SAFETY: `path` -- строка с нулём на конце, живёт весь вызов.
+    let event = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, path.as_ptr()) };
+    assert!(!event.is_null(), "OpenEventW({name}_C2S_DATA)");
+    // SAFETY: `event` -- только что открытое событие.
+    assert_ne!(unsafe { SetEvent(event) }, 0, "SetEvent");
+    // SAFETY: handle открыт выше и закрывается один раз.
+    let _ = unsafe { CloseHandle(event) };
+}
+
+/// Журнал Multi-сервера: подключения, причины отключения и ошибки по слотам.
+#[derive(Default)]
+struct MultiJournal {
+    connected: Mutex<Vec<u32>>,
+    reasons: Mutex<Vec<(u32, DisconnectReason)>>,
+    errors: Mutex<Vec<(Option<u32>, ShmError)>>,
+}
+
+impl MultiJournal {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn reason(&self, slot: u32) -> Option<DisconnectReason> {
+        self.reasons
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(id, _)| *id == slot)
+            .map(|&(_, reason)| reason)
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn errors(&self) -> Vec<(Option<u32>, ShmError)> {
+        self.errors.lock().unwrap().clone()
+    }
+
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn connected(&self) -> Vec<u32> {
+        self.connected.lock().unwrap().clone()
+    }
+}
+
+impl MultiHandler for MultiJournal {
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_client_connect(&self, client_id: u32) {
+        self.connected.lock().unwrap().push(client_id);
+    }
+    fn on_client_disconnect(&self, _client_id: u32) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_client_disconnect_reason(&self, client_id: u32, reason: DisconnectReason) {
+        self.reasons.lock().unwrap().push((client_id, reason));
+    }
+    fn on_message(&self, _client_id: u32, _data: &[u8]) {}
+    #[expect(
+        clippy::unwrap_used,
+        reason = "тестовый помощник: паника -- провал теста"
+    )]
+    fn on_error(&self, client_id: Option<u32>, err: ShmError) {
+        self.errors.lock().unwrap().push((client_id, err));
+    }
+}
+
+/// Граница освобождения claim-а умершего: против `RESERVE_TIMEOUT` (10 с).
+const RECLAIM_BOUND: Duration = Duration::from_secs(1);
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+fn multi_server(name: &str, journal: &Arc<MultiJournal>) -> Arc<MultiServer> {
+    MultiServer::start(
+        name,
+        journal.clone(),
+        MultiOptions {
+            max_clients: 2,
+            layout: small_layout(),
+            ..MultiOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+/// Убить пира, дождаться выхода и проверить: claim слота 0 снят не позже
+/// `RECLAIM_BOUND` после убийства, новый `MultiClient` занимает слот 0 не
+/// позже `RECLAIM_BOUND` после этого.
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+fn kill_and_expect_slot0_reclaimed(peer: &mut Peer, segment: &Segment, name: &str) {
+    let t0 = peer.kill();
+    peer.wait_exit(Duration::from_secs(10));
+    wait_until("claim умершего снят", RECLAIM_BOUND, || {
+        segment.claim() == 0
+    });
+    println!("claim умершего снят через {:?}", t0.elapsed());
+    let client = MultiClient::connect(name, Arc::new(Noop), MultiClientOptions::default()).unwrap();
+    wait_until(
+        "новый клиент в слоте 0",
+        RECLAIM_BOUND,
+        || client.is_connected() && client.slot_id() == 0,
+    );
+    drop(client);
+}
+
+/// Путь A (решение C): смерть клиента замечена первой, а при дочитывании
+/// его кольца -- испорченный кадр. Причина -- `PeerDied`, порча --
+/// отдельный `on_error(Corrupted)`, claim умершего снят сразу, без
+/// `RESERVE_TIMEOUT`.
+#[test]
+fn multi_dead_client_with_corrupted_frame_frees_slot_at_once() {
+    let name = unique_name("MU_CDEAD");
+    let journal = Arc::new(MultiJournal::default());
+    let server = multi_server(&name, &journal);
+    let mut peer = Peer::spawn("multi_client", &name);
+    wait_until(
+        "дочерний клиент",
+        Duration::from_secs(20),
+        || journal.connected() == [0],
+    );
+    let segment = Segment::open(&format!("{name}_0"));
+    assert_ne!(segment.claim(), 0);
+    // Без `DATA`: порчу заметит только дочитывание после смерти.
+    segment.corrupt_c2s();
+
+    kill_and_expect_slot0_reclaimed(&mut peer, &segment, &name);
+    assert_eq!(journal.reason(0), Some(DisconnectReason::PeerDied));
+    assert_eq!(journal.errors(), [(Some(0), ShmError::Corrupted)]);
+    server.stop();
+}
+
+/// Путь B: порча замечена у живого клиента (разрыв с `Error`; клиент --
+/// `SharedClient` без ожиданий -- `DISCONNECT` не замечает), затем клиент
+/// умирает. Сервер держит handle его процесса («задержавшийся владелец») и
+/// снимает claim сразу по смерти.
+#[test]
+fn multi_client_dying_after_error_disconnect_frees_slot_at_once() {
+    let name = unique_name("MU_EDEAD");
+    let journal = Arc::new(MultiJournal::default());
+    let server = multi_server(&name, &journal);
+    let slot = format!("{name}_0");
+    let mut peer = Peer::spawn("shared_client", &slot);
+    wait_until(
+        "дочерний клиент",
+        Duration::from_secs(20),
+        || journal.connected() == [0],
+    );
+    let segment = Segment::open(&slot);
+    segment.corrupt_c2s();
+    signal_c2s_data(&slot);
+    wait_until("разрыв с Error", Duration::from_secs(5), || {
+        journal.reason(0) == Some(DisconnectReason::Error)
+    });
+    // Живой владелец claim-а его держит (решение O: никогда два писателя).
+    thread::sleep(Duration::from_millis(100));
+    assert_ne!(segment.claim(), 0, "claim живого клиента снят");
+
+    kill_and_expect_slot0_reclaimed(&mut peer, &segment, &name);
+    assert_eq!(journal.errors(), [(Some(0), ShmError::Corrupted)]);
+    server.stop();
+}
+
+/// Single-client: сервер Auto разорвал сессию по порче (`Error`), клиент
+/// этого не заметил и умер. Первый толчок нового клиента освобождает claim
+/// умершего сразу -- `AutoClient` подключается за доли секунды, а не через
+/// `RESERVE_TIMEOUT`.
+#[test]
+fn auto_server_client_dying_after_error_frees_channel_at_once() {
+    let name = unique_name("AU_EDEAD");
+    let rec = Arc::new(Recorder::default());
+    let server = AutoServer::start(
+        &name,
+        rec.clone(),
+        AutoOptions {
+            layout: small_layout(),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    let mut peer = Peer::spawn("shared_client", &name);
+    wait_until(
+        "дочерний клиент",
+        Duration::from_secs(20),
+        || rec.connected.load(Ordering::Acquire),
+    );
+    let segment = Segment::open(&name);
+    segment.corrupt_c2s();
+    signal_c2s_data(&name);
+    let (reason, _) = rec.wait_reason(Duration::from_secs(5));
+    assert_eq!(reason, DisconnectReason::Error);
+    thread::sleep(Duration::from_millis(100));
+    assert_ne!(segment.claim(), 0, "claim живого клиента снят");
+
+    let t0 = peer.kill();
+    peer.wait_exit(Duration::from_secs(10));
+    let next = Arc::new(Recorder::default());
+    let client = AutoClient::connect(
+        &name,
+        next.clone(),
+        AutoOptions {
+            reconnect_delay: Duration::from_millis(50),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    wait_until("новый клиент", RECLAIM_BOUND, || {
+        next.connected.load(Ordering::Acquire)
+    });
+    println!("канал свободен через {:?}", t0.elapsed());
     drop(client);
     drop(server);
 }

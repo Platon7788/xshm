@@ -60,10 +60,39 @@ thread_local! {
     pub(crate) static FAIL_CONNECT_ACK: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Тесты (Task 7): одноразовый отказ S7 канала, чей `ControlBlock` лежит по
+/// этому адресу, -- на любом потоке (рукопожатие слота Multi идёт на
+/// потоке-диспетчере, TLS `FAIL_CONNECT_ACK` туда не достаёт). `0` -- нет.
+#[cfg(test)]
+static FAIL_CONNECT_ACK_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Тесты: следующий сигнал `S2C_CONNECT` (S7) канала `view` -- на любом
+/// потоке -- завершится ошибкой, как отказ `NtSetEvent` (одноразово).
+#[cfg(test)]
+pub(crate) fn fail_connect_ack_once(view: &SharedView) {
+    FAIL_CONNECT_ACK_AT.store(
+        core::ptr::from_ref(view.control_block()).addr(),
+        Ordering::Release,
+    );
+}
+
 /// S7: сигнал `S2C_CONNECT` (в тестах -- с инъекцией отказа).
-fn signal_connect_ack(events: &SharedEvents) -> Result<()> {
+#[cfg_attr(
+    not(test),
+    expect(unused_variables, reason = "`view` нужен только тестовой инъекции")
+)]
+fn signal_connect_ack(view: &SharedView, events: &SharedEvents) -> Result<()> {
     #[cfg(test)]
-    if FAIL_CONNECT_ACK.with(Cell::take) {
+    if FAIL_CONNECT_ACK.with(Cell::take)
+        || FAIL_CONNECT_ACK_AT
+            .compare_exchange(
+                core::ptr::from_ref(view.control_block()).addr(),
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
         return Err(ShmError::WindowsError {
             code: 0xC000_0001,
             context: "NtSetEvent (injected)",
@@ -108,6 +137,35 @@ fn claim_holder_gone(control: &crate::layout::ControlBlock, pid: u32, start: u64
         && crate::win::is_process_gone(pid, control.owner_start_time())
 }
 
+/// «Задержавшийся владелец» (Task 7): handle процесса клиента сессии,
+/// закрытой сервером, и токен claim-а этой сессии. Клиент, не заметивший
+/// `DISCONNECT` и умерший, сам claim не снимет -- по подтверждённой смерти
+/// его снимает сервер (`release_if_holder_dead`).
+pub(crate) type Lingering = (ProcessWatch, u32);
+
+/// Снять claim подтверждённо умершего держателя (Task 7, INTEROP «Изменения
+/// 0.10» п. 32): процесс `watch` завершился (handle сигнален; личность
+/// процесса сверена по времени создания при открытии -- `open_peer`), он же
+/// владелец claim-а (`slot_owner_pid == pid`), а claim -- всё ещё токен его
+/// сессии `token`, -- одним CAS `token -> 0`. `true` -- claim снят.
+///
+/// Без ABA: токены уникальны в процессе (`claim_token`), новый держатель
+/// мог взять claim только после его освобождения (тогда CAS не совпадёт), а
+/// живой процесс не бывает «умершим» -- сигнальный handle окончателен.
+pub(crate) fn release_if_holder_dead(
+    control: &crate::layout::ControlBlock,
+    watch: &ProcessWatch,
+    token: u32,
+) -> bool {
+    token != CLAIM_FREE
+        && watch.has_exited()
+        && control.slot_owner_pid.load(Ordering::Acquire) == watch.pid()
+        && control
+            .slot_claim
+            .compare_exchange(token, CLAIM_FREE, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
 /// Протухший захват single-client канала (ревизия 3, §2.3 дизайна, R18):
 /// вызывается только по `CONNECT_REQ` без заявки (толчок проигравшего
 /// клиента, C1) у неподключённого сервера -- таймера нет, ожидания остаются
@@ -117,8 +175,25 @@ fn claim_holder_gone(control: &crate::layout::ControlBlock, pid: u32, start: u64
 /// токен виден не раньше `reserve` спустя, а заявки так и нет, -- отнять
 /// CAS-ом (держатель умер между захватом и `CLIENT_HELLO` или, «не
 /// заметив» отключения сервером, держит канал). Новый токен -- новый отсчёт.
-fn observe_idle_claim(view: &SharedView, seen: &mut Option<(u32, Instant)>, reserve: Duration) {
+///
+/// Task 7 (INTEROP «Изменения 0.10» п. 32): сначала -- «задержавшийся
+/// владелец» `lingering` (клиент сессии, закрытой сервером): подтверждённо
+/// умер и claim всё ещё его -- снять сразу (`release_if_holder_dead`), не
+/// дожидаясь `reserve`; claim уже не его токен (клиент ушёл сам, L) --
+/// наблюдение больше не нужно.
+fn observe_idle_claim(
+    view: &SharedView,
+    seen: &mut Option<(u32, Instant)>,
+    lingering: &mut Option<Lingering>,
+    reserve: Duration,
+) {
     let control = view.control_block();
+    if let Some((watch, token)) = lingering.as_ref()
+        && (control.slot_claim.load(Ordering::Acquire) != *token
+            || release_if_holder_dead(control, watch, *token))
+    {
+        *lingering = None;
+    }
     let claim = control.slot_claim.load(Ordering::Acquire);
     if claim == CLAIM_FREE {
         *seen = None;
@@ -264,6 +339,12 @@ pub struct SharedServer {
     /// Не подключён: чужой claim без заявки и момент его ПЕРВОГО наблюдения
     /// (отъём -- не раньше `reserve_timeout` от него, §2.3 дизайна).
     claim_seen: Option<(u32, Instant)>,
+    /// Task 7: клиент сессии, закрытой сервером (`mark_disconnected` при
+    /// живом процессе и claim-е сессии), -- handle его процесса и токен.
+    /// Single-client: разбирается на толчке (`observe_idle_claim`), без
+    /// новых ожиданий; Multi забирает его в слот (`take_lingering`). Не
+    /// больше одного; сбрасывается новой сессией и `Drop`.
+    lingering: Option<Lingering>,
     /// Срок протухшего захвата (`RESERVE_TIMEOUT`; тесты подменяют).
     reserve_timeout: Duration,
     /// Тесты: пробуждения ожиданий `wait_for_client*` (включая внутренние
@@ -407,6 +488,7 @@ impl SharedServer {
             exclusive: false,
             session_claim: CLAIM_FREE,
             claim_seen: None,
+            lingering: None,
             reserve_timeout: crate::constants::RESERVE_TIMEOUT,
             #[cfg(test)]
             wait_wakeups: Arc::default(),
@@ -458,7 +540,12 @@ impl SharedServer {
             }
             // Толчок без заявки (ревизия 3): проверить протухший захват.
             if self.exclusive {
-                observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
+                observe_idle_claim(
+                    &self.view,
+                    &mut self.claim_seen,
+                    &mut self.lingering,
+                    self.reserve_timeout,
+                );
             }
         }
     }
@@ -607,7 +694,12 @@ impl SharedServer {
             }
             // Толчок без заявки (ревизия 3): проверить протухший захват.
             if self.exclusive {
-                observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
+                observe_idle_claim(
+                    &self.view,
+                    &mut self.claim_seen,
+                    &mut self.lingering,
+                    self.reserve_timeout,
+                );
             }
         }
     }
@@ -857,6 +949,9 @@ impl SharedServer {
         self.peer = watch;
         self.session_claim = claim;
         self.claim_seen = None;
+        // Новая сессия: наблюдение за клиентом прошлой (Task 7) больше не
+        // нужно -- claim уже не его (новый держатель взял его свободным).
+        self.lingering = None;
         // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
         // опросом `server_state`.
         // S7, отказ сигнала (0.10, INTEROP п. 29): сессия уже
@@ -864,7 +959,7 @@ impl SharedServer {
         // отзыву. Закрыть её с сигналом, как `disconnect_local` (`IDLE`,
         // потом `DISCONNECT`), а не оставить полуоткрытой.
         if let Some(events) = &self.events
-            && let Err(err) = signal_connect_ack(events)
+            && let Err(err) = signal_connect_ack(&self.view, events)
         {
             self.disconnect_local();
             return Err(err);
@@ -1004,19 +1099,39 @@ impl SharedServer {
         // подтверждённым временем создания сигнален) -- сам он claim уже не
         // снимет: освобождаем его claim сессии сразу, ПОСЛЕ сброса
         // состояния. Штатный уход и отключение сервером claim не трогают:
-        // его снимает клиент (L), «не заметившего» -- дедлайн по толчку.
-        if self.exclusive
-            && session_claim != CLAIM_FREE
-            && peer.as_ref().is_some_and(ProcessWatch::has_exited)
-        {
+        // его снимает клиент (L).
+        let Some(peer) = peer else {
+            return;
+        };
+        if session_claim == CLAIM_FREE {
+            return;
+        }
+        if self.exclusive && peer.has_exited() {
             let _ = control.slot_claim.compare_exchange(
                 session_claim,
                 CLAIM_FREE,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            return;
         }
-        drop(peer);
+        // Task 7: клиент жив (или это слот Multi), а claim всё ещё его --
+        // он может умереть, так и не заметив закрытия сессии (`DISCONNECT`
+        // сервера, порча кольца). Handle его процесса не закрываем, а
+        // держим с токеном («задержавшийся владелец»): подтверждённая смерть
+        // освобождает claim сразу (`release_if_holder_dead`), а не через
+        // `RESERVE_TIMEOUT`. Ушёл сам (L) -- claim сменится, и наблюдение
+        // снимется при первой проверке.
+        if control.slot_claim.load(Ordering::Acquire) == session_claim {
+            self.lingering = Some((peer, session_claim));
+        }
+    }
+
+    /// Multi (Task 7): забрать «задержавшегося владельца», оставленного
+    /// `mark_disconnected` (отказ S7 рукопожатия слота), -- его наблюдает
+    /// диспетчер привязкой процесса к порту.
+    pub(crate) const fn take_lingering(&mut self) -> Option<Lingering> {
+        self.lingering.take()
     }
 
     /// Взвести `DISCONNECT` канала (anonymous -- событий нет, no-op).
@@ -1033,7 +1148,9 @@ impl SharedServer {
     /// п. 5: `mark_disconnected` (состояния -> `IDLE`), потом `DISCONNECT`.
     /// Без сигнала клиент, спящий в своём наборе без таймаута, остался бы
     /// «подключённым» к никому (final review I2). Claim не трогаем: его
-    /// снимет клиент, получив `DISCONNECT` (уход L).
+    /// снимет клиент, получив `DISCONNECT` (уход L); клиента, умершего, не
+    /// заметив разрыва, -- сервер по подтверждённой смерти на первом же
+    /// толчке (Task 7, `lingering`).
     pub(crate) fn disconnect_local(&mut self) {
         self.mark_disconnected();
         self.signal_disconnect();
@@ -1044,7 +1161,12 @@ impl SharedServer {
     /// повод проверить протухший захват (см. `observe_idle_claim`).
     fn observe_idle(&mut self) {
         if self.exclusive && !self.connected {
-            observe_idle_claim(&self.view, &mut self.claim_seen, self.reserve_timeout);
+            observe_idle_claim(
+                &self.view,
+                &mut self.claim_seen,
+                &mut self.lingering,
+                self.reserve_timeout,
+            );
         }
     }
 
@@ -1454,6 +1576,13 @@ impl SharedServer {
     pub(crate) const fn take_peer(&mut self) -> Option<ProcessWatch> {
         self.peer_start = 0;
         self.peer.take()
+    }
+
+    /// Тесты: подменить наблюдаемый процесс клиента сессии; прежний --
+    /// вызывающему.
+    #[cfg(test)]
+    pub(crate) const fn replace_peer(&mut self, watch: ProcessWatch) -> Option<ProcessWatch> {
+        self.peer.replace(watch)
     }
 }
 

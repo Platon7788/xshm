@@ -1752,7 +1752,8 @@ fn connect_manually(server: &MultiServer, name: &str, claim: u32) -> SharedClien
 
 /// Fix round 2, п. 1: враждебный пир перематывает `read_pos` назад во время
 /// дочитывания (кольцо с огромным `max_messages`). Своя позиция чтения
-/// замечает сдвиг -- `Corrupted` и разрыв с `Error`; ни один кадр не
+/// замечает сдвиг -- `Corrupted` (Task 7, решение C: только `on_error`,
+/// разрыв -- за путём ухода, вызвавшим дочитывание); ни один кадр не
 /// доставлен дважды, дочитывание кончается быстро и не дальше физической
 /// ёмкости кольца. (Дочитывание идёт на потоке теста вместо диспетчера:
 /// пока оно кончается быстро, диспетчер свободен для остальных слотов --
@@ -1826,10 +1827,10 @@ fn hostile_rewind_during_drain_is_corrupted_and_delivers_once() {
             .contains(&(Some(0), ShmError::Corrupted)),
         "перемотка не замечена"
     );
-    assert_eq!(
-        journal.disconnect_of(0).map(|(reason, _)| reason),
-        Some(DisconnectReason::Error)
-    );
+    // Само дочитывание слот не рвёт (решение C): причину и снятие claim-а
+    // решает путь ухода, который его вызвал.
+    assert_eq!(journal.disconnect_of(0), None);
+    assert!(server.is_client_connected(0));
     drop(client);
 }
 
@@ -2084,4 +2085,192 @@ fn flush_after_server_left_keeps_queue_without_errors() {
     let left: Vec<Vec<u8>> = outbox.queue.lock_clean().iter().cloned().collect();
     assert_eq!(left, queued, "очередь потеряна или переставлена");
     assert!(!server.has_unread_from_client(), "запись в закрытую сессию");
+}
+
+/// Task 7 (решение C): испорченный кадр при дочитывании штатно ушедшего
+/// клиента -- отдельный `on_error(Corrupted)`, а уход остаётся уходом:
+/// причина `Graceful`, claim снят клиентом, лишнего `DISCONNECT` сервер не
+/// сигналит (до исправления дочитывание рвало слот с `Error` и взводило
+/// `DISCONNECT` уже ушедшему клиенту).
+#[test]
+fn departure_drain_corruption_keeps_graceful_reason() {
+    let name = unique("DRAIN_CORRUPT");
+    let journal = Arc::new(SlotJournal::new());
+    let server = MultiServer::start(&name, journal.clone(), single_slot(1)).expect("start");
+    let client = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .expect("connect");
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1 && client.is_connected()
+    });
+    client.send(&7u32.to_le_bytes()).unwrap();
+    wait_for(
+        "кадр доставлен",
+        Duration::from_secs(5),
+        || journal.count(0) == 1,
+    );
+    // Вид пира на ту же секцию: `write_pos` клиент -> сервер не кратен 8,
+    // без `DATA` -- порчу заметит только дочитывание при уходе.
+    let mapping = Mapping::open(ObjectPath::mapping(None, &format!("{name}_0"))).unwrap();
+    // SAFETY: отображение живо до конца теста, размер -- его собственный.
+    let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+    let write_pos = &view.header_b().write_pos;
+    write_pos.store(
+        write_pos.load(Ordering::Acquire).wrapping_add(3),
+        Ordering::Release,
+    );
+
+    client.stop();
+    wait_for("уход разобран", Duration::from_secs(5), || {
+        journal.disconnect_of(0).is_some()
+    });
+    assert_eq!(
+        journal.disconnect_of(0).map(|(reason, _)| reason),
+        Some(DisconnectReason::Graceful)
+    );
+    assert_eq!(
+        journal.errors.lock().unwrap().as_slice(),
+        &[(Some(0), ShmError::Corrupted)]
+    );
+    let slots = server.slots.read().unwrap();
+    let slot = slots[0].lock().unwrap();
+    assert!(
+        !slot
+            .server
+            .events()
+            .unwrap()
+            .disconnect
+            .wait(Some(Duration::ZERO))
+            .unwrap(),
+        "лишний DISCONNECT ушедшему клиенту"
+    );
+    assert_eq!(slot.claim(), CLAIM_FREE);
+    drop(slot);
+    drop(slots);
+    server.stop();
+}
+
+/// Task 7 (решение H): клиент, отключённый `disconnect_client` (`Local`) и
+/// умерший, не узнав об этом, освобождает слот сразу по смерти процесса, а
+/// не через `RESERVE_TIMEOUT`: сервер держит handle его процесса
+/// («задержавшийся владелец») привязанным к порту.
+///
+/// Живой `MultiClient` по `DISCONNECT` уходит сам, поэтому «умер после
+/// отключения» строится подменой: клиент -- `SharedClient` этого процесса,
+/// который не ждёт ничего и не уходит (до конца теста), а владелец claim-а
+/// (`slot_owner_pid`/`owner_start`) и наблюдаемый процесс сессии подменены
+/// на дочерний `cmd /C pause`.
+#[test]
+fn client_dying_after_local_disconnect_frees_slot_at_once() {
+    const TOKEN: u32 = 0x11E6_0001;
+    let name = unique("LINGER_LOCAL");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).expect("start");
+    let slot_name = format!("{name}_0");
+    assert!(try_claim_slot(None, &slot_name, TOKEN).unwrap());
+    let mut client = connect_held(&slot_name, TOKEN).unwrap();
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1
+    });
+
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "pause"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn cmd");
+    let pid = child.id();
+    let start = win::process_start_time(pid).expect("время создания");
+    let watch = ProcessWatch::open_peer(pid, start).expect("наблюдение");
+    server.slots.read().unwrap()[0]
+        .lock()
+        .unwrap()
+        .substitute_owner(watch, pid, start);
+
+    server.disconnect_client(0).unwrap();
+    let claim_of_slot0 = || server.slots.read().unwrap()[0].lock().unwrap().claim();
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(claim_of_slot0(), TOKEN, "claim живого владельца снят");
+
+    let t0 = Instant::now();
+    child.kill().expect("kill");
+    child.wait().expect("wait");
+    wait_for(
+        "claim умершего снят",
+        Duration::from_secs(1),
+        || claim_of_slot0() == CLAIM_FREE,
+    );
+    println!("claim снят через {:?}", t0.elapsed());
+
+    // Клиент этого процесса так и не узнал об отключении -- исчезает без L.
+    client.mark_disconnected();
+    drop(client);
+    let next = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .expect("connect");
+    wait_for("новый клиент", Duration::from_secs(1), || {
+        next.is_connected() && server.client_count() == 1
+    });
+    assert_eq!(next.slot_id(), 0);
+    next.stop();
+    server.stop();
+}
+
+/// Task 7 (п. 11): отказ S7 (`S2C_CONNECT`) рукопожатия слота доходит до
+/// `on_error(Some(slot), ..)` ровно один раз (раньше любая ошибка
+/// `accept_pending` молча считалась «толчком»); слот не подключён, клиент
+/// сходится (проигранный отзыв -> `DISCONNECT` -> уход) и подключается
+/// снова.
+#[test]
+fn failed_connect_ack_is_reported_on_slot() {
+    let name = unique("ACK_FAIL");
+    let handler = Arc::new(TestHandler::new());
+    let server = MultiServer::start(&name, handler.clone(), single_slot(1)).expect("start");
+    crate::server::fail_connect_ack_once(
+        server.slots.read().unwrap()[0]
+            .lock()
+            .unwrap()
+            .server
+            .view(),
+    );
+    let client = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions {
+            slot_timeout: Duration::from_millis(300),
+            retry_delay: Duration::from_millis(50),
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("connect");
+    wait_for(
+        "отказ S7 сообщён",
+        Duration::from_secs(5),
+        || !handler.errors.lock().unwrap().is_empty(),
+    );
+    assert_eq!(handler.connects.load(Ordering::Acquire), 0);
+    wait_for(
+        "клиент сошёлся и подключён",
+        Duration::from_secs(10),
+        || client.is_connected() && server.client_count() == 1,
+    );
+    assert_eq!(
+        handler.errors.lock().unwrap().as_slice(),
+        &[(
+            Some(0),
+            ShmError::WindowsError {
+                code: 0xC000_0001,
+                context: "NtSetEvent (injected)",
+            }
+        )]
+    );
+    assert_eq!(handler.connects.load(Ordering::Acquire), 1);
+    client.stop();
+    server.stop();
 }
