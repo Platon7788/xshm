@@ -1976,3 +1976,38 @@ fn idle_server_with_foreign_claim_does_not_wake_up() {
     assert_eq!(server.wakeups() - s0, 0, "диспетчер просыпался в простое");
     server.stop();
 }
+
+/// Fix round 1 (Task 5), Minor 2: пакет привязки, который ядро отказывается
+/// привязать (подложен уже привязанным -- `STATUS_INVALID_PARAMETER_1`),
+/// закрывается и сразу заменяется новым: привязка удаётся, а не
+/// повторяется через `REARM_BACKOFF` бесконечно. Привязка закрытого пакета
+/// снята -- чужой сигнал цел.
+#[test]
+fn broken_arm_packet_is_replaced() {
+    let port = CompletionPort::new().unwrap();
+    let event = EventHandle::create_unnamed(false).unwrap();
+    let decoy = EventHandle::create_unnamed(false).unwrap();
+    let mut arm = Arm::default();
+    arm.arm(&port, event.as_handle(), 1).unwrap();
+    assert!(!arm.cancel(), "сигнала не было");
+    port.arm(
+        arm.packet.as_mut().unwrap(),
+        decoy.as_handle().as_raw_handle(),
+        99,
+        0,
+    )
+    .unwrap();
+
+    arm.arm(&port, event.as_handle(), 2).unwrap();
+    assert!(arm.armed);
+    decoy.set().unwrap();
+    assert_eq!(port.wait(Some(Duration::from_millis(50))).unwrap(), None);
+    assert!(decoy.wait(Some(Duration::ZERO)).unwrap(), "сигнал цел");
+    event.set().unwrap();
+    assert_eq!(port.wait(Some(Duration::from_secs(5))).unwrap(), Some(2));
+    assert!(arm.take(arm.generation));
+    // Исправный пакет переиспользуется дальше.
+    arm.arm(&port, event.as_handle(), 3).unwrap();
+    event.set().unwrap();
+    assert_eq!(port.wait(Some(Duration::from_secs(5))).unwrap(), Some(3));
+}

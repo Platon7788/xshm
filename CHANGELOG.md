@@ -689,11 +689,24 @@
   поколение слота и отбрасывается — переиспользованный пакет его не
   получает. Диспетчер Multi (свой порт, пакет на привязку — пул не нужен)
   применяет то же правило: «грязный» код отмены — пакет закрывается, а не
-  перепривязывается бесконечно. Простой реактора — по-прежнему ноль
+  перепривязывается бесконечно. Отказ привязки
+  (`NtAssociateWaitCompletionPacket`) возвращает пакет в пул только при
+  доказанной вине объекта ожидания: код её допускает (`STATUS_INVALID_HANDLE`,
+  `STATUS_OBJECT_TYPE_MISMATCH`, `STATUS_ACCESS_DENIED`,
+  `STATUS_INVALID_PARAMETER_3`) **и** проба пакета отменой отвечает
+  `STATUS_CANCELLED` (`WaitPacket::survives_arm_failure`; первые два кода
+  ядро отвечает и на негодный пакет). Иначе пакет закрывается, и
+  регистрация с пакетом из пула (привязка Multi с прежним пакетом) сразу
+  повторяется один раз с новым — «грязный» пакет не отказывает каждой
+  следующей регистрации и не перепривязывается через `REARM_BACKOFF`
+  бесконечно. Пул не сжимается: после всплеска до 64 простаивающих handle-ов
+  остаются у общего реактора до конца процесса. Простой реактора — по-прежнему ноль
   пробуждений. Тесты: `reactor::tests::{registrations_reuse_pooled_packets,
   pool_is_bounded, pooled_packet_is_clean_after_every_outcome,
-  warm_pool_survives_create_failure, unexpected_cancel_status_is_not_reused}`.
-  Пир-невидимо.
+  warm_pool_survives_create_failure, unexpected_cancel_status_is_not_reused,
+  target_failure_keeps_pooled_packet, packet_failure_does_not_poison_pool,
+  bound_packet_in_pool_is_replaced, survives_arm_failure_requires_idle_packet}`,
+  `multi::tests::broken_arm_packet_is_replaced`. Пир-невидимо.
 
 ### Сборка
 

@@ -71,7 +71,14 @@
 //!   `STATUS_SUCCESS` (ожидание снято до сигнала), `STATUS_PENDING` ->
 //!   `STATUS_SUCCESS` (вынут из очереди), `STATUS_CANCELLED` (уже извлечён
 //!   из порта -- в том числе реактором, который ещё не дошёл до таблицы);
-//! - не привязавшийся (отказ `NtAssociateWaitCompletionPacket`).
+//! - не привязавшийся, когда отказ `NtAssociateWaitCompletionPacket`
+//!   доказанно -- вина объекта ожидания: код допускает её **и** проба
+//!   пакета отменой отвечает `STATUS_CANCELLED`
+//!   (`WaitPacket::survives_arm_failure`; одни коды не различают пакет и
+//!   объект -- `STATUS_INVALID_HANDLE`, `STATUS_OBJECT_TYPE_MISMATCH` ядро
+//!   отвечает и на негодный пакет). Иначе пакет закрывается, а регистрация
+//!   с пакетом из пула повторяется один раз с новым: «грязный» пакет на
+//!   вершине пула не отказывает каждой следующей регистрации.
 //!
 //! Любой иной код отмены (невозможен при живом дескрипторе) -- пакет
 //! закрывается, а не переиспользуется. Завершение, уже извлечённое
@@ -82,7 +89,10 @@
 //! только ядро по привязкам: чужих `NtSetIoCompletion` с живым ключом нет,
 //! поэтому завершение с живым ключом -- всегда завершение пакета этой
 //! записи. Пул ограничен [`POOL_LIMIT`]: сверх предела пакеты закрываются,
-//! удерживаемые handle-ы ограничены. Закрытие и пробуждение -- вне
+//! удерживаемые handle-ы ограничены. Пул не сжимается: после всплеска
+//! одновременных регистраций до `POOL_LIMIT` (64) простаивающих пакетов
+//! (handle-ов) остаются у общего реактора до конца процесса -- это цена
+//! того, что следующий всплеск не создаёт объектов ядра. Закрытие и пробуждение -- вне
 //! блокировки таблицы; пакеты пачки возвращаются в пул за тот же захват
 //! блокировки, в котором снимаются записи.
 
@@ -91,7 +101,7 @@ use std::os::windows::io::{AsRawHandle, BorrowedHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::task::Waker;
 use std::thread;
@@ -102,8 +112,10 @@ use crate::error::{Result, ShmError};
 use crate::ntapi::{
     FILE_IO_COMPLETION_INFORMATION, GENERIC_ALL, HANDLE, IO_COMPLETION_ALL_ACCESS, NTSTATUS,
     NtAssociateWaitCompletionPacket, NtCancelWaitCompletionPacket, NtCreateIoCompletion,
-    NtCreateWaitCompletionPacket, NtRemoveIoCompletionEx, NtSetIoCompletion, STATUS_CANCELLED,
-    STATUS_PENDING, STATUS_SUCCESS, STATUS_TIMEOUT, ULONG, duration_to_nt_timeout,
+    NtCreateWaitCompletionPacket, NtRemoveIoCompletionEx, NtSetIoCompletion, STATUS_ACCESS_DENIED,
+    STATUS_CANCELLED, STATUS_INVALID_HANDLE, STATUS_INVALID_PARAMETER_3,
+    STATUS_OBJECT_TYPE_MISMATCH, STATUS_PENDING, STATUS_SUCCESS, STATUS_TIMEOUT, ULONG,
+    duration_to_nt_timeout,
 };
 use crate::sync_ext::LockExt;
 use crate::win::{Handle, status_to_error};
@@ -232,6 +244,22 @@ impl CompletionPort {
         key: usize,
         tag: usize,
     ) -> Result<()> {
+        match self.arm_status(packet, target, key, tag) {
+            STATUS_SUCCESS => Ok(()),
+            status => Err(status_to_error(status, "NtAssociateWaitCompletionPacket")),
+        }
+    }
+
+    /// [`arm`](Self::arm) с сырым кодом: по нему и по пробе пакета
+    /// ([`WaitPacket::survives_arm_failure`]) владелец решает, годен ли
+    /// пакет после отказа.
+    pub(crate) fn arm_status(
+        &self,
+        packet: &mut WaitPacket,
+        target: HANDLE,
+        key: usize,
+        tag: usize,
+    ) -> NTSTATUS {
         let mut signaled: u8 = 0;
         // SAFETY: пакет и порт -- живые дескрипторы своих владельцев;
         // `target` ядро проверяет само (негодный -- код ошибки, не UB);
@@ -249,11 +277,10 @@ impl CompletionPort {
                 &raw mut signaled,
             )
         };
-        if status != STATUS_SUCCESS {
-            return Err(status_to_error(status, "NtAssociateWaitCompletionPacket"));
+        if status == STATUS_SUCCESS {
+            packet.already_signaled = signaled != 0;
         }
-        packet.already_signaled = signaled != 0;
-        Ok(())
+        status
     }
 
     /// Дождаться одного пакета: `Some(key)` или `None` по таймауту
@@ -407,11 +434,40 @@ impl WaitPacket {
         classify_cancel(self.cancel_raw(false), || self.cancel_raw(true))
     }
 
+    /// Годен ли пакет к переиспользованию после отказа привязки с кодом
+    /// `status`. Код сам по себе не доказывает, чей дескриптор негоден:
+    /// `STATUS_INVALID_HANDLE` и `STATUS_OBJECT_TYPE_MISMATCH` ядро отвечает
+    /// и на негодный пакет (проверено на x64 и i686). Поэтому нужны оба
+    /// условия: код допускает вину объекта ожидания
+    /// ([`arm_failure_may_name_target`]) **и** проба
+    /// `NtCancelWaitCompletionPacket(FALSE)` отвечает `STATUS_CANCELLED` --
+    /// дескриптор пакета годен, пакет не привязан и не в очереди порта.
+    /// Иначе (в т.ч. `STATUS_INVALID_PARAMETER_1` -- пакет уже привязан)
+    /// пакет закрывают: «грязный» пакет в пуле отказывал бы каждой
+    /// следующей регистрации.
+    pub(crate) fn survives_arm_failure(&self, status: NTSTATUS) -> bool {
+        arm_failure_may_name_target(status) && self.cancel_raw(false) == STATUS_CANCELLED
+    }
+
     /// Один вызов `NtCancelWaitCompletionPacket`.
     fn cancel_raw(&self, remove_signaled: bool) -> NTSTATUS {
         // SAFETY: дескриптор пакета жив, пока жив `self`.
         unsafe { NtCancelWaitCompletionPacket(self.handle.raw(), u8::from(remove_signaled)) }
     }
+}
+
+/// Отказ `NtAssociateWaitCompletionPacket` с этим кодом может быть виной
+/// объекта ожидания (закрытый/негодный handle, не тот тип, нет доступа
+/// `SYNCHRONIZE`, объект не ожидаемый -- порт). Прочие коды (в т.ч.
+/// `STATUS_INVALID_PARAMETER_1` -- пакет) объект не называют.
+const fn arm_failure_may_name_target(status: NTSTATUS) -> bool {
+    matches!(
+        status,
+        STATUS_INVALID_HANDLE
+            | STATUS_OBJECT_TYPE_MISMATCH
+            | STATUS_ACCESS_DENIED
+            | STATUS_INVALID_PARAMETER_3
+    )
 }
 
 /// Коды двухшаговой отмены -> (исход, пакет чист). `second` -- второй шаг
@@ -554,6 +610,10 @@ pub(crate) struct Reactor {
     /// экземпляра, чтобы не задевать параллельные тесты.
     #[cfg(test)]
     fail_create: AtomicBool,
+    /// Разовая инъекция кода отказа привязки (`register`); `STATUS_SUCCESS`
+    /// -- нет инъекции.
+    #[cfg(test)]
+    arm_fault: AtomicI32,
 }
 
 /// Общий реактор процесса.
@@ -589,6 +649,8 @@ impl Reactor {
             packets_created: AtomicU64::new(0),
             #[cfg(test)]
             fail_create: AtomicBool::new(false),
+            #[cfg(test)]
+            arm_fault: AtomicI32::new(STATUS_SUCCESS),
         })
     }
 
@@ -636,48 +698,84 @@ impl Reactor {
     ///
     /// Пакет берётся из пула (см. «Пул пакетов»); пул пуст -- создаётся.
     /// Отказ создания (`NtCreateWaitCompletionPacket`) -- `Err`, таблица и
-    /// сигнал объекта не тронуты.
+    /// сигнал объекта не тронуты. Отказ привязки, в котором не доказана
+    /// вина объекта ([`WaitPacket::survives_arm_failure`]), закрывает пакет;
+    /// если он был из пула -- один повтор с новым пакетом.
     pub(crate) fn register(&'static self, handle: isize, waker: Waker) -> Result<Registration> {
         // Пакет из пула -- под блокировкой; новый создаём вне её. Привязка
         // -- под блокировкой: пакет может прийти сразу, и поток реактора
         // обязан найти запись в таблице.
         let mut table = self.table.lock_clean();
-        let pooled = table.pool.pop();
-        let mut packet = match pooled {
-            Some(packet) => packet,
-            None => {
-                drop(table);
-                let packet = self.new_packet()?;
-                table = self.table.lock_clean();
-                packet
+        let mut pooled = table.pool.pop();
+        loop {
+            let from_pool = pooled.is_some();
+            let mut packet = match pooled.take() {
+                Some(packet) => packet,
+                None => {
+                    drop(table);
+                    let packet = self.new_packet()?;
+                    table = self.table.lock_clean();
+                    packet
+                }
+            };
+            let index = table.free.pop().unwrap_or(table.slots.len());
+            if index == table.slots.len() {
+                table.slots.push(Slot::default());
             }
-        };
-        let index = table.free.pop().unwrap_or(table.slots.len());
-        if index == table.slots.len() {
-            table.slots.push(Slot::default());
-        }
-        // Индексация не паникует: индекс -- из списка свободных (слоты не
-        // удаляются) или только что добавленного слота.
-        let generation = table.slots[index].generation;
-        if let Err(err) = self
-            .port
-            .arm(&mut packet, raw_handle(handle), index, generation)
-        {
+            // Индексация не паникует: индекс -- из списка свободных (слоты
+            // не удаляются) или только что добавленного слота.
+            let generation = table.slots[index].generation;
+            let status = self.associate(&mut packet, raw_handle(handle), index, generation);
+            if status == STATUS_SUCCESS {
+                table.slots[index].entry = Some(Entry { waker, packet });
+                drop(table);
+                return Ok(Registration {
+                    reactor: self,
+                    index,
+                    generation,
+                });
+            }
             // Привязки не было -- пакета с этим ключом в порту нет,
-            // поколение менять незачем; непривязанный пакет чист -- в пул.
+            // поколение менять незачем.
             table.free.push(index);
-            let overflow = table.recycle(packet);
             drop(table);
-            drop(overflow);
-            return Err(err);
+            let err = status_to_error(status, "NtAssociateWaitCompletionPacket");
+            // Проба пакета -- системный вызов, вне блокировки.
+            if packet.survives_arm_failure(status) {
+                // Виноват объект ожидания, пакет чист -- в пул.
+                let overflow = self.table.lock_clean().recycle(packet);
+                drop(overflow);
+                return Err(err);
+            }
+            // Пакет негоден (или его вина не исключена) -- закрыть.
+            drop(packet);
+            if !from_pool {
+                return Err(err);
+            }
+            // Негодным оказался пакет из пула: ровно один повтор -- с новым
+            // пакетом (`pooled` пуст), второй отказ возвращается как есть.
+            table = self.table.lock_clean();
         }
-        table.slots[index].entry = Some(Entry { waker, packet });
-        drop(table);
-        Ok(Registration {
-            reactor: self,
-            index,
-            generation,
-        })
+    }
+
+    /// Привязка пакета регистрации (в тестах -- с разовой инъекцией кода
+    /// отказа, `arm_fault`).
+    fn associate(
+        &self,
+        packet: &mut WaitPacket,
+        target: HANDLE,
+        key: usize,
+        tag: usize,
+    ) -> NTSTATUS {
+        #[cfg(test)]
+        {
+            // Relaxed: тестовая инъекция, ничего не публикует.
+            let fault = self.arm_fault.swap(STATUS_SUCCESS, Ordering::Relaxed);
+            if fault != STATUS_SUCCESS {
+                return fault;
+            }
+        }
+        self.port.arm_status(packet, target, key, tag)
     }
 
     /// Новый пакет для регистрации (в тестах -- со счётчиком и инъекцией
@@ -894,6 +992,10 @@ mod tests {
     use std::task::{Context, Poll, Wake, Waker};
     use std::thread::{self, Thread, ThreadId};
     use std::time::{Duration, Instant};
+
+    /// Негоден первый параметр (`NtAssociateWaitCompletionPacket` -- пакет,
+    /// например уже привязанный); проверено на x64 и i686.
+    const STATUS_INVALID_PARAMETER_1: NTSTATUS = 0xC000_00EF_u32.cast_signed();
 
     /// Щедрый дедлайн: шумный хост не должен ронять тесты.
     const DEADLINE: Duration = Duration::from_secs(10);
@@ -1691,5 +1793,135 @@ mod tests {
             classify_cancel(STATUS_PENDING, || invalid),
             (CancelOutcome::FiredNotDelivered, false)
         );
+    }
+
+    /// Прогреть пул ручного реактора одним пакетом.
+    fn warm(reactor: &'static Reactor, event: &EventHandle) {
+        let registration = reactor
+            .register(event.raw_handle(), Counter::new().waker())
+            .unwrap();
+        assert_eq!(registration.cancel(), CancelOutcome::NotFired);
+        assert_eq!(reactor.pooled(), 1);
+    }
+
+    /// Fix round 1, Minor 1: отказ привязки по вине объекта ожидания
+    /// (настоящие коды ядра: `STATUS_INVALID_HANDLE`,
+    /// `STATUS_INVALID_PARAMETER_3` -- порт вместо объекта) -- пакет
+    /// доказанно чист и возвращается в пул; новых пакетов нет.
+    #[test]
+    fn target_failure_keeps_pooled_packet() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        warm(reactor, &event);
+        let counter = Counter::new();
+        let port_handle = reactor.port.handle.raw().addr().cast_signed();
+        for handle in [0, 0x00FF_FFF0, port_handle] {
+            let result = reactor.register(handle, counter.waker());
+            assert!(result.is_err(), "handle {handle:#x}: {result:?}");
+            assert_eq!(reactor.pooled(), 1, "handle {handle:#x}: пакет закрыт");
+        }
+        assert_eq!(reactor.packets_created(), 1);
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        assert_eq!(reactor.packets_created(), 1, "пакет не из пула");
+        event.set().unwrap();
+        assert_eq!(turn(reactor), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(registration.is_fired());
+    }
+
+    /// Fix round 1, Minor 1: отказ «по вине пакета» (инъекция кода
+    /// `STATUS_INVALID_PARAMETER_1`, и неоднозначного
+    /// `STATUS_INVALID_HANDLE` при негодном пакете -- ниже) не отравляет
+    /// пул: пакет из пула закрыт, регистрация повторена с новым и удалась;
+    /// новый пакет с тем же отказом -- `Err`, в пул не попадает.
+    #[test]
+    fn packet_failure_does_not_poison_pool() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        warm(reactor, &event);
+        let counter = Counter::new();
+        reactor
+            .arm_fault
+            .store(STATUS_INVALID_PARAMETER_1, Ordering::SeqCst);
+        let registration = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        assert_eq!(reactor.packets_created(), 2, "повтор -- с новым пакетом");
+        assert_eq!(reactor.pooled(), 0);
+        event.set().unwrap();
+        assert_eq!(turn(reactor), 1);
+        assert_eq!(counter.get(), 1);
+        assert!(registration.is_fired());
+        assert_eq!(reactor.pooled(), 1, "новый пакет вернулся после доставки");
+
+        // Пул пуст, новый пакет отказал: `Err`, пакет закрыт, слот свободен.
+        let held = reactor
+            .register(event.raw_handle(), counter.waker())
+            .unwrap();
+        reactor
+            .arm_fault
+            .store(STATUS_INVALID_PARAMETER_1, Ordering::SeqCst);
+        let failed = reactor.register(event.raw_handle(), counter.waker());
+        assert!(failed.is_err(), "{failed:?}");
+        assert_eq!(reactor.packets_created(), 3);
+        assert_eq!(reactor.pooled(), 0, "негодный пакет попал в пул");
+        assert_eq!(reactor.table.lock_clean().free.len(), 1);
+        drop(held);
+        assert_eq!(reactor.pooled(), 1);
+    }
+
+    /// Fix round 1, Minor 1, настоящий «грязный» пакет: в пул подложен
+    /// уже привязанный пакет (ядро отвечает `STATUS_INVALID_PARAMETER_1`).
+    /// Регистрация его закрывает (привязка снимается, чужой сигнал цел) и
+    /// удаётся с новым пакетом; следующие регистрации пул не отравляет.
+    #[test]
+    fn bound_packet_in_pool_is_replaced() {
+        let reactor = manual_reactor();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let decoy = EventHandle::create_unnamed(false).unwrap();
+        warm(reactor, &event);
+        {
+            let mut table = reactor.table.lock_clean();
+            let packet = table.pool.last_mut().unwrap();
+            reactor
+                .port
+                .arm(packet, raw_handle(decoy.raw_handle()), usize::MAX, 0)
+                .unwrap();
+        }
+        let counter = Counter::new();
+        for round in 1..=3 {
+            let registration = reactor
+                .register(event.raw_handle(), counter.waker())
+                .unwrap();
+            event.set().unwrap();
+            assert_eq!(turn(reactor), 1);
+            assert_eq!(counter.get(), round);
+            assert!(registration.is_fired());
+        }
+        assert_eq!(reactor.packets_created(), 2, "ровно одна замена");
+        decoy.set().unwrap();
+        assert_eq!(turn_quick(reactor), 0, "привязка закрытого пакета жива");
+        assert!(decoy.wait(Some(Duration::ZERO)).unwrap(), "сигнал цел");
+        assert_eq!(reactor.stale_completions(), 0);
+    }
+
+    /// Проба пакета: код, допускающий вину объекта, не спасает негодный
+    /// пакет (уже привязанный -- проба снимает привязку и отвечает не
+    /// `STATUS_CANCELLED`).
+    #[test]
+    fn survives_arm_failure_requires_idle_packet() {
+        let port = CompletionPort::new().unwrap();
+        let event = EventHandle::create_unnamed(false).unwrap();
+        let idle = WaitPacket::new().unwrap();
+        assert!(idle.survives_arm_failure(STATUS_INVALID_HANDLE));
+        assert!(idle.survives_arm_failure(STATUS_OBJECT_TYPE_MISMATCH));
+        assert!(idle.survives_arm_failure(STATUS_ACCESS_DENIED));
+        assert!(idle.survives_arm_failure(STATUS_INVALID_PARAMETER_3));
+        assert!(!idle.survives_arm_failure(STATUS_INVALID_PARAMETER_1));
+        assert!(!idle.survives_arm_failure(0xC000_009A_u32.cast_signed()));
+        let bound = port.associate_raw(event.raw_handle(), 1, 0).unwrap();
+        assert!(!bound.survives_arm_failure(STATUS_INVALID_HANDLE));
     }
 }

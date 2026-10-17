@@ -259,6 +259,11 @@ pub const STATUS_OBJECT_NAME_EXISTS: NTSTATUS = 0x4000_0000;
 pub const STATUS_INVALID_CID: NTSTATUS = 0xC000_000B_u32.cast_signed();
 /// Имя занято объектом другого типа (например, мьютекс лобби -- событием).
 pub const STATUS_OBJECT_TYPE_MISMATCH: NTSTATUS = 0xC000_0024_u32.cast_signed();
+/// Негодный (закрытый, не выданный) дескриптор.
+pub const STATUS_INVALID_HANDLE: NTSTATUS = 0xC000_0008_u32.cast_signed();
+/// Негоден третий параметр вызова (у `NtAssociateWaitCompletionPacket` --
+/// объект ожидания, например порт завершения).
+pub const STATUS_INVALID_PARAMETER_3: NTSTATUS = 0xC000_00F1_u32.cast_signed();
 
 /// `EVENT_INFORMATION_CLASS::EventBasicInformation` для `NtQueryEvent` (0.9).
 pub const EVENT_BASIC_INFORMATION_CLASS: ULONG = 0;

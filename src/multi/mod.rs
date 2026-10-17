@@ -58,12 +58,15 @@
 //! метка-поколение устарела (снят или перепривязан), отбрасывается:
 //! завершение прежней сессии не попадает в новую.
 //!
-//! Пакет у каждой привязки свой и переиспользуется всю жизнь диспетчера:
-//! привязок фиксированное число (по видам ожидания слота), поэтому общий
-//! пул, как у реактора (`reactor`, «Пул пакетов»), не нужен -- в
-//! установившемся режиме пакеты и так не создаются. Правило чистоты общее:
-//! отмена с неожиданным кодом (`WaitPacket::cancel_for_reuse`) -- пакет
-//! закрывается, следующая привязка создаёт новый.
+//! Пакет у каждой привязки свой и переиспользуется, пока исправен (до
+//! «грязного» исхода, см. ниже): привязок фиксированное число (по видам
+//! ожидания слота), поэтому общий пул, как у реактора (`reactor`, «Пул
+//! пакетов»), не нужен -- в установившемся режиме пакеты и так не
+//! создаются. Правило чистоты общее с реактором: отмена с неожиданным
+//! кодом (`WaitPacket::cancel_for_reuse`) или отказ привязки, в котором не
+//! доказана вина объекта (`WaitPacket::survives_arm_failure`), закрывает
+//! пакет; следующая привязка (при отказе привязки -- сразу же, один раз)
+//! создаёт новый, а не повторяет отказ через `REARM_BACKOFF` бесконечно.
 
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -85,6 +88,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
 use crate::naming::{Direction, ObjectPath};
+use crate::ntapi::STATUS_SUCCESS;
 use crate::reactor::{CancelOutcome, Completion, CompletionPort, WaitPacket};
 use crate::ring::{DrainBound, FreeSpace, SpinPolicy, UnreadProbe, spin_until};
 use crate::security::ObjectSecurity;
@@ -92,7 +96,7 @@ use crate::server::SharedServer;
 use crate::shared::SharedView;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker, panic_error};
 use crate::wait_delay_or;
-use crate::win::{self, EventHandle, Mapping, ProcessWatch};
+use crate::win::{self, EventHandle, Mapping, ProcessWatch, status_to_error};
 
 /// Максимальное количество клиентов по умолчанию
 pub const DEFAULT_MAX_CLIENTS: u32 = 20;
@@ -1341,17 +1345,38 @@ struct Arm {
 
 impl Arm {
     /// Привязать пакет к `target` с ключом `key` и новым поколением.
+    ///
+    /// Отказ привязки, в котором не доказана вина объекта
+    /// (`WaitPacket::survives_arm_failure`), закрывает пакет: повтор через
+    /// `REARM_BACKOFF` на том же негодном пакете отказывал бы бесконечно.
+    /// Если пакет был прежний -- сразу один повтор с новым.
     fn arm(&mut self, port: &CompletionPort, target: BorrowedHandle<'_>, key: usize) -> Result<()> {
-        let packet = match &mut self.packet {
-            Some(packet) => packet,
-            slot @ None => slot.insert(WaitPacket::new()?),
-        };
+        let raw = target.as_raw_handle();
         let generation = self.generation.wrapping_add(1);
-        port.arm(packet, target.as_raw_handle(), key, generation)?;
-        self.generation = generation;
-        self.armed = true;
-        self.target = target.as_raw_handle().addr();
-        Ok(())
+        loop {
+            let reused = self.packet.is_some();
+            let packet = match &mut self.packet {
+                Some(packet) => packet,
+                slot @ None => slot.insert(WaitPacket::new()?),
+            };
+            let status = port.arm_status(packet, raw, key, generation);
+            if status == STATUS_SUCCESS {
+                self.generation = generation;
+                self.armed = true;
+                self.target = raw.addr();
+                return Ok(());
+            }
+            if !packet.survives_arm_failure(status) {
+                // Пакет негоден или его вина не исключена -- закрыть;
+                // прежний -- ровно один повтор с новым (на новом пакете
+                // `reused == false`, второй отказ возвращается).
+                self.packet = None;
+                if reused {
+                    continue;
+                }
+            }
+            return Err(status_to_error(status, "NtAssociateWaitCompletionPacket"));
+        }
     }
 
     /// Снять привязку: `true` -- сигнал объекта потреблён и до обработчика
