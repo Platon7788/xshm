@@ -1274,6 +1274,42 @@ impl BusyBackoff {
     }
 }
 
+/// Тесты (Task 6 надёжности): точка прохода worker-а клиента Auto, где
+/// срабатывает одноразовый хук канала (`WORKER_HOOKS`).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerPoint {
+    /// После сверки сессии в начале прохода, до записи очереди (`flush`).
+    BeforeFlush,
+}
+
+/// Тесты: одноразовый хук точки прохода.
+#[cfg(test)]
+pub(crate) type WorkerHook = Box<dyn FnOnce() + Send>;
+
+/// Тесты: хуки worker-ов клиента Auto -- (имя канала, точка, хук). Хук
+/// играет роль сервера и другого клиента, успевших сменить сессию ровно в
+/// этом окне прохода.
+#[cfg(test)]
+pub(crate) static WORKER_HOOKS: Mutex<Vec<(String, WorkerPoint, WorkerHook)>> =
+    Mutex::new(Vec::new());
+
+/// Тесты: вызвать хук канала `name` в точке `point`, если он задан.
+/// Блокировка снимается ДО вызова хука.
+#[cfg(test)]
+fn run_worker_hook(name: &str, point: WorkerPoint) {
+    let hook = {
+        let mut hooks = WORKER_HOOKS.lock_clean();
+        hooks
+            .iter()
+            .position(|(channel, at, _)| channel == name && *at == point)
+            .map(|index| hooks.swap_remove(index).2)
+    };
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
     let mut buffer = Vec::new();
     let gauge = &worker.gauge;
@@ -1352,6 +1388,8 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             if !client.is_session_current() {
                 break Some(DisconnectReason::Graceful);
             }
+            #[cfg(test)]
+            run_worker_hook(name, WorkerPoint::BeforeFlush);
             if !worker.running() {
                 // Остановка: принятое до `stop()` (например, прощальное
                 // сообщение) дописываем в кольцо, сколько влезет, -- сервер
@@ -1363,6 +1401,14 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 break Some(DisconnectReason::Error);
             }
             let outcome = worker.receive(&client, &mut buffer);
+            // Task 6 надёжности (п. 4): сессия сменилась посреди прохода
+            // (после сверки выше) -- запись и чтение ответили
+            // `NotConnected` молча (сообщение вернулось в голову очереди),
+            // решение -- сразу, а не на следующем пробуждении, которого при
+            // чужой сессии может не быть до её собственного сигнала.
+            if !client.is_session_current() {
+                break Some(DisconnectReason::Graceful);
+            }
             if outcome.fatal {
                 break Some(DisconnectReason::Error);
             }
@@ -1472,6 +1518,14 @@ where
                 outbox.push_front(msg);
             }
             Err(ShmError::QueueFull) => {
+                outbox.push_front(msg);
+                break;
+            }
+            Err(ShmError::NotConnected) => {
+                // Task 6 надёжности: сервер ушёл или сессия уже чужая --
+                // не ошибка канала, а конец сессии, о котором worker решит
+                // сам (`DISCONNECT`/сверка `generation`). Сообщение -- в
+                // голову очереди (уйдёт в следующую сессию), без `on_error`.
                 outbox.push_front(msg);
                 break;
             }
@@ -2279,6 +2333,8 @@ mod claim_tests {
         connects: AtomicU32,
         errors: Mutex<Vec<ShmError>>,
         reasons: Mutex<Vec<DisconnectReason>>,
+        /// Ошибки, уже доставленные к моменту каждого `on_disconnect_reason`.
+        errors_at_reason: Mutex<Vec<Vec<ShmError>>>,
     }
 
     impl AutoHandler for Log {
@@ -2288,6 +2344,8 @@ mod claim_tests {
         }
         fn on_disconnect_reason(&self, reason: DisconnectReason) {
             self.connected.store(false, Ordering::Release);
+            let errors = self.errors.lock().unwrap().clone();
+            self.errors_at_reason.lock().unwrap().push(errors);
             self.reasons.lock().unwrap().push(reason);
         }
         fn on_error(&self, err: ShmError) {
@@ -2426,6 +2484,8 @@ mod claim_tests {
     /// пробуждениях. Сервер провёл рукопожатие с другим клиентом (здесь --
     /// сдвиг `generation` вручную) -- «не заметивший» клиент уходит без
     /// записи в чужое кольцо, без `DISCONNECT` и без смены состояний.
+    /// Быстрый модульный вариант; настоящий второй клиент и смена сессии
+    /// посреди прохода -- `foreign_session_mid_pass_reports_graceful_without_error`.
     #[test]
     fn client_notices_foreign_session_on_wakeup() {
         let name = unique("FOREIGN_GEN");
@@ -2464,6 +2524,130 @@ mod claim_tests {
             "устаревший клиент тронул состояние чужой сессии"
         );
         drop(client);
+    }
+
+    /// Task 6 надёжности (п. 4): сессия сменяется посреди прохода worker-а
+    /// -- между сверкой в начале прохода и записью очереди (хук
+    /// `BeforeFlush`): сервер отключил A (`disconnect_local`), B получил
+    /// claim через дедлайн по толчку и подключился. A уходит ровно с
+    /// `Graceful`, без единого `on_error` (в частности без `NotConnected`),
+    /// не пишет в кольцо сессии B, а неотправленное сообщение доставляет
+    /// ровно один раз, когда сервер снова принимает A.
+    #[test]
+    fn foreign_session_mid_pass_reports_graceful_without_error() {
+        use std::sync::mpsc;
+
+        let name = unique("MID_PASS");
+        let mut server = SharedServer::start(&name).unwrap();
+        server.set_reserve_timeout(Duration::from_millis(150));
+        let log = Arc::new(Log::default());
+        let options = AutoOptions {
+            reconnect_delay: Duration::from_millis(50),
+            ..AutoOptions::default()
+        };
+        let a = AutoClient::connect(&name, log.clone(), options).unwrap();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until("подключение A", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        let (entered_tx, entered) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        WORKER_HOOKS.lock().unwrap().push((
+            name.clone(),
+            WorkerPoint::BeforeFlush,
+            Box::new(move || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }),
+        ));
+        // `send` будит worker: проход останавливается в хуке до записи "m".
+        a.send(b"m").unwrap();
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // Смена сессии в окне: сервер ушёл, B подключается через дедлайн.
+        server.disconnect_local();
+        let waiter = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while let Err(err) = server.wait_for_client(Some(Duration::from_secs(5))) {
+                assert!(Instant::now() < deadline, "сервер не принял B: {err:?}");
+            }
+            server
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let b = loop {
+            match SharedClient::connect(&name, Duration::from_secs(1)) {
+                Ok(b) => break b,
+                Err(ShmError::AlreadyConnected) => {
+                    assert!(Instant::now() < deadline, "B не подключился за 3 с");
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => panic!("B: {err:?}"),
+            }
+        };
+        let mut server = waiter.join().unwrap();
+        release.send(()).unwrap();
+
+        wait_until("уход A", Duration::from_secs(3), || {
+            !log.reasons.lock().unwrap().is_empty()
+        });
+        assert_eq!(
+            log.reasons.lock().unwrap().as_slice(),
+            &[DisconnectReason::Graceful]
+        );
+        assert_eq!(
+            log.errors_at_reason.lock().unwrap().as_slice(),
+            &[Vec::<ShmError>::new()],
+            "ложные ошибки при смене сессии"
+        );
+
+        // Сессия B: в C2S только её кадр, обмен в обе стороны.
+        let mut buf = Vec::new();
+        b.send_to_server(b"b1").unwrap();
+        assert_eq!(server.receive_from_client(&mut buf).unwrap(), 2);
+        assert_eq!(buf, b"b1", "A писал в кольцо сессии B");
+        assert!(!server.has_unread_from_client(), "лишнее в C2S сессии B");
+        server.send_to_client(b"s1").unwrap();
+        assert_eq!(b.receive_from_server(&mut buf).unwrap(), 2);
+        assert_eq!(buf, b"s1");
+
+        // B уходит -- сервер снова принимает A, "m" доставлен один раз.
+        drop(b);
+        assert_eq!(
+            server.poll_client(Some(Duration::from_secs(5))).err(),
+            Some(ShmError::NotConnected)
+        );
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        // `DATA` от "b1" прошлой сессии мог остаться взведённым -- ждём кадр.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let len = loop {
+            match server.receive_from_client(&mut buf) {
+                Ok(len) => break len,
+                Err(ShmError::QueueEmpty) => {
+                    assert!(Instant::now() < deadline, "\"m\" не доставлен");
+                    let _ = server.poll_client(Some(Duration::from_millis(100)));
+                }
+                Err(err) => panic!("сервер: {err:?}"),
+            }
+        };
+        assert_eq!(len, 1);
+        assert_eq!(buf, b"m");
+        thread::sleep(Duration::from_millis(100));
+        assert!(!server.has_unread_from_client(), "\"m\" доставлен дважды");
+        assert!(
+            log.errors
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|err| *err == ShmError::AlreadyConnected),
+            "{:?}",
+            log.errors.lock().unwrap()
+        );
+        drop(a);
     }
 
     /// Final review M4: проигравший `AutoClient` повторяет с растущим

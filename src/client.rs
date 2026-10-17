@@ -28,6 +28,16 @@ thread_local! {
         const { core::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Тесты (Task 6 надёжности): одноразовый хук `receive_from_server`
+    /// между сверкой сессии на входе и чтением кольца -- играет роль
+    /// сервера, успевшего за это окно закрыть сессию и принять другого
+    /// клиента.
+    pub(crate) static BEFORE_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Время создания текущего процесса, заявляемое в `client_start_*`.
 fn announced_start_time() -> u64 {
     #[cfg(test)]
@@ -1007,9 +1017,50 @@ impl SharedClient {
         }
     }
 
-    pub fn send_to_server(&self, payload: &[u8]) -> Result<WriteOutcome> {
+    /// Можно писать серверу (Task 6 надёжности): `ensure_connected` и
+    /// сервер ещё в сессии (`server_state == SERVER_READY`, Acquire). Сервер
+    /// ушёл (`server_state = IDLE`, `DISCONNECT`), а клиент событий ещё не
+    /// разобрал -- кольцо, которое S3 следующей сессии сбросит, кадров не
+    /// получает: запись, начатая до сброса и законченная во время него,
+    /// оставила бы кадр в кольце новой сессии. S3 сбрасывает кольца при
+    /// `server_state == IDLE`, а `SERVER_READY` ставит после `generation +
+    /// 1`, так что пара проверок закрывает окно целиком; остаток -- поток,
+    /// вытесненный между проверкой и записью дольше `RESERVE_TIMEOUT` и
+    /// рукопожатия следующего клиента (INTEROP §h). Цена -- одна
+    /// Acquire-загрузка на запись, без системных вызовов.
+    fn ensure_writable(&self) -> Result<()> {
         self.ensure_connected()?;
-        let result = self.ring_tx.write_message(payload)?;
+        if self
+            .view
+            .control_block()
+            .server_state
+            .load(Ordering::Acquire)
+            == HANDSHAKE_SERVER_READY
+        {
+            Ok(())
+        } else {
+            Err(ShmError::NotConnected)
+        }
+    }
+
+    /// Ошибка кольца после смены сессии -- не порча, а чужая сессия:
+    /// `Corrupted` от позиций, сброшенных S3 следующей сессии, при ушедшем
+    /// сервере -- `NotConnected` (только путь ошибки, на успешных операциях
+    /// проверки нет).
+    fn session_error(&self, err: ShmError) -> ShmError {
+        if err == ShmError::Corrupted && self.server_left() {
+            ShmError::NotConnected
+        } else {
+            err
+        }
+    }
+
+    pub fn send_to_server(&self, payload: &[u8]) -> Result<WriteOutcome> {
+        self.ensure_writable()?;
+        let result = self
+            .ring_tx
+            .write_message(payload)
+            .map_err(|err| self.session_error(err))?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();
         }
@@ -1022,8 +1073,11 @@ impl SharedClient {
     /// Client -> Server, либо `Err(ShmError::QueueFull)` и кольцо не
     /// меняется. Семантика -- `SharedServer::try_send_to_client`.
     pub fn try_send_to_server(&self, payload: &[u8]) -> Result<WriteOutcome> {
-        self.ensure_connected()?;
-        let result = self.ring_tx.try_write_message(payload)?;
+        self.ensure_writable()?;
+        let result = self
+            .ring_tx
+            .try_write_message(payload)
+            .map_err(|err| self.session_error(err))?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();
         }
@@ -1046,7 +1100,7 @@ impl SharedClient {
     /// }
     /// ```
     pub fn send_with(&mut self, len: usize, f: impl FnOnce(&mut [u8])) -> Result<WriteOutcome> {
-        self.ensure_connected()?;
+        self.ensure_writable()?;
         // SAFETY: контракт `write_with` -- единственный писатель В ПРЕДЕЛАХ
         // этой конечной точки: `&mut self` исключает вложенную запись из `f`
         // и запись из другого потока через этот же клиент (тип ещё и
@@ -1055,7 +1109,8 @@ impl SharedClient {
         // (одна сторона на направление); это случай враждебного пира,
         // принятый для неопубликованной области (Ruling 17): страдает только
         // сообщение, которое получит сервер.
-        let result = unsafe { self.ring_tx.write_with(len, f) }?;
+        let result =
+            unsafe { self.ring_tx.write_with(len, f) }.map_err(|err| self.session_error(err))?;
         if result.was_empty {
             let _ = self.events.c2s.data.set();
         }
@@ -1094,7 +1149,7 @@ impl SharedClient {
         timeout: Option<Duration>,
         spin: SpinPolicy,
     ) -> Result<bool> {
-        self.ensure_connected()?;
+        self.ensure_writable()?;
         let control = self.view.control_block();
         let peer_left = || control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY;
         let disconnect = DisconnectWatch {
@@ -1123,7 +1178,17 @@ impl SharedClient {
 
     pub fn receive_from_server(&self, buffer: &mut Vec<u8>) -> Result<usize> {
         self.ensure_connected()?;
-        let len = self.ring_rx.read_message(buffer)?;
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_READ.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+        // Сверка сессии ещё и перед фиксацией чтения (Task 6 надёжности):
+        // сессия сменилась после проверки на входе -- кадр новой сессии не
+        // забирается и не отдаётся.
+        let len = self
+            .ring_rx
+            .read_message_checked(buffer, || self.is_session_current())
+            .map_err(|err| self.session_error(err))?;
         self.signal_space_after_read();
         Ok(len)
     }
@@ -1167,7 +1232,12 @@ impl SharedClient {
     pub(crate) unsafe fn receive_with_shared<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
         self.ensure_connected()?;
         // SAFETY: контракт `read_with` -- контракт этой функции (`# Safety`).
-        let result = unsafe { self.ring_rx.read_with(f) };
+        // Сверка сессии -- до `f` (кадр новой сессии не отдаётся).
+        let result = unsafe {
+            self.ring_rx
+                .read_with_checked(|| self.is_session_current(), f)
+        }
+        .map_err(|err| self.session_error(err));
         if result.is_ok() {
             self.signal_space_after_read();
         }
@@ -1568,6 +1638,200 @@ mod tests {
             control.client_state.load(Ordering::Acquire),
             HANDSHAKE_SERVER_READY
         );
+    }
+
+    // ─── Task 6 надёжности: «чужая сессия» с настоящим вторым клиентом ─────
+
+    /// Сервер с коротким дедлайном протухшего захвата и подключённый A.
+    fn stale_pair(tag: &str) -> (String, SharedServer, SharedClient) {
+        let name = unique(tag);
+        let mut server = SharedServer::start(&name).unwrap();
+        server.set_reserve_timeout(Duration::from_millis(150));
+        let (server, a) = accept(server, &name);
+        (name, server, a)
+    }
+
+    /// Следующая сессия на канале, чей claim держит «не заметивший» A:
+    /// сервер (поток) ждёт заявку, B повторяет `connect` -- первые попытки
+    /// `AlreadyConnected` с толчком `CONNECT_REQ`, после дедлайна по толчку
+    /// сервер отнимает claim A, и B подключается.
+    fn take_over(mut server: SharedServer, name: &str) -> (SharedServer, SharedClient) {
+        let waiter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while let Err(err) = server.wait_for_client(Some(Duration::from_secs(5))) {
+                assert!(Instant::now() < deadline, "сервер не принял B: {err:?}");
+            }
+            server
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let b = loop {
+            match SharedClient::connect(name, Duration::from_secs(1)) {
+                Ok(b) => break b,
+                Err(ShmError::AlreadyConnected) => {
+                    assert!(Instant::now() < deadline, "B не подключился за 3 с");
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(err) => panic!("B: {err:?}"),
+            }
+        };
+        (waiter.join().unwrap(), b)
+    }
+
+    /// Снимок сегмента: заголовки обоих колец и поля сессии `ControlBlock`.
+    fn segment_snapshot(server: &SharedServer) -> Vec<u32> {
+        let (s2c, c2s) = server.view().headers();
+        let control = server.view().control_block();
+        let mut snapshot = Vec::new();
+        for header in [s2c, c2s] {
+            snapshot.extend([
+                header.write_pos.load(Ordering::Acquire),
+                header.read_pos.load(Ordering::Acquire),
+                header.message_count.load(Ordering::Acquire),
+                header.connection_gen.load(Ordering::Acquire),
+                header.handshake_state.load(Ordering::Acquire),
+            ]);
+        }
+        snapshot.extend([
+            control.client_state.load(Ordering::Acquire),
+            control.server_state.load(Ordering::Acquire),
+            control.slot_claim.load(Ordering::Acquire),
+            control.generation.load(Ordering::Acquire),
+            control.client_pid.load(Ordering::Acquire),
+        ]);
+        snapshot
+    }
+
+    /// Все пути записи «не заметившего» клиента -- `Err(NotConnected)`.
+    fn assert_refuses_to_write(client: &mut SharedClient) {
+        assert_eq!(
+            client.send_to_server(b"stale").err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            client.try_send_to_server(b"stale").err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            client.send_with(8, |buf| buf.fill(b'S')).err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            client.wait_for_space(8, Some(Duration::ZERO)).err(),
+            Some(ShmError::NotConnected)
+        );
+    }
+
+    /// Task 6: сервер ушёл (`server_state = IDLE`, `DISCONNECT`), а клиент
+    /// событий не ждал -- `generation` прежний, но запись уже отвергается:
+    /// кольцо, которое S3 следующей сессии сбросит, не получает кадров.
+    #[test]
+    fn client_refuses_to_write_after_server_left() {
+        let (_name, mut server, mut client) = stale_pair("LEFT_WRITE");
+        let write_pos =
+            |server: &SharedServer| server.view().header_b().write_pos.load(Ordering::Acquire);
+        let before = write_pos(&server);
+        server.disconnect_local();
+        assert_refuses_to_write(&mut client);
+        assert_eq!(
+            write_pos(&server),
+            before,
+            "запись в закрытую сервером сессию"
+        );
+    }
+
+    /// Task 6: настоящий второй клиент. Сервер отключил A (A не заметил),
+    /// B получил claim через дедлайн по толчку и подключился. Ни одна
+    /// операция A (запись, чтение, ожидание, уход) не меняет сегмент и не
+    /// сигналит `DISCONNECT`; B и сервер обмениваются как ни в чём не бывало.
+    #[test]
+    fn stale_client_neither_writes_nor_signals_into_new_session() {
+        let (name, mut server, mut a) = stale_pair("STALE_NEW");
+        server.disconnect_local();
+        let (mut server, b) = take_over(server, &name);
+        let snapshot = segment_snapshot(&server);
+
+        assert_refuses_to_write(&mut a);
+        let mut buf = Vec::new();
+        assert_eq!(
+            a.receive_from_server(&mut buf).err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            a.poll_server(Some(Duration::ZERO)).err(),
+            Some(ShmError::NotConnected)
+        );
+        drop(a);
+
+        assert_eq!(segment_snapshot(&server), snapshot, "A тронул чужую сессию");
+        assert!(
+            !server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "A взвёл DISCONNECT чужой сессии"
+        );
+
+        b.send_to_server(b"b1").unwrap();
+        assert_eq!(server.receive_from_client(&mut buf).unwrap(), 2);
+        assert_eq!(buf, b"b1");
+        assert!(!server.has_unread_from_client(), "лишнее в C2S сессии B");
+        server.send_to_client(b"s1").unwrap();
+        assert_eq!(b.receive_from_server(&mut buf).unwrap(), 2);
+        assert_eq!(buf, b"s1");
+        assert!(server.poll_client(Some(Duration::ZERO)).is_ok());
+    }
+
+    /// Task 6: «не заметивший» A читает, когда в S2C новой сессии лежит
+    /// кадр сервера для B. Без хука -- сверка до чтения; с хуком
+    /// `BEFORE_READ` сессия сменяется ровно между сверкой и чтением, и
+    /// кадр отвергает сверка перед фиксацией: A -- `Err(NotConnected)` без
+    /// данных, кадр остаётся B.
+    #[test]
+    fn stale_reader_does_not_deliver_foreign_frame() {
+        // Без хука: сессия сменилась до вызова.
+        let (name, mut server, a) = stale_pair("STALE_READ");
+        server.disconnect_local();
+        let (server, b) = take_over(server, &name);
+        server.send_to_client(b"for-b").unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(
+            a.receive_from_server(&mut buf).err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(b.receive_from_server(&mut buf).unwrap(), 5);
+        assert_eq!(buf, b"for-b");
+        drop((a, b, server));
+
+        // С хуком: сессия сменяется между сверкой на входе и чтением.
+        let (name, mut server, a) = stale_pair("STALE_READ_HOOK");
+        let next = std::rc::Rc::new(std::cell::RefCell::new(None));
+        {
+            let next = next.clone();
+            BEFORE_READ.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    server.disconnect_local();
+                    let (server, b) = take_over(server, &name);
+                    server.send_to_client(b"for-b").unwrap();
+                    *next.borrow_mut() = Some((server, b));
+                }));
+            });
+        }
+        let mut buf = Vec::new();
+        assert_eq!(
+            a.receive_from_server(&mut buf).err(),
+            Some(ShmError::NotConnected)
+        );
+        assert!(buf.is_empty(), "A отдал кадр чужой сессии: {buf:?}");
+        let (server, b) = next.borrow_mut().take().expect("хук не сработал");
+        assert_eq!(
+            b.receive_from_server(&mut buf).unwrap(),
+            5,
+            "кадр B украден"
+        );
+        assert_eq!(buf, b"for-b");
+        drop((a, b, server));
     }
 
     /// Fix round 1 (находка 1 ревью): перехват claim-а при брошенном

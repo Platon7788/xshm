@@ -1014,6 +1014,20 @@ impl RingBuffer {
     /// Возвращает длину payload; `Err(QueueEmpty)` -- сообщений нет,
     /// `Err(Corrupted)` -- пир испортил кольцо (позиции/заголовок кадра).
     pub fn read_message(&self, out: &mut Vec<u8>) -> Result<usize> {
+        self.read_message_checked(out, || true)
+    }
+
+    /// `read_message` со сверкой «сессия ещё наша» перед фиксацией (Task 6
+    /// надёжности): `still_current()` вызывается после копирования, прямо
+    /// перед CAS `read_pos`; `false` -- кадр НЕ забирается (он мог
+    /// принадлежать уже следующей сессии канала), `out` очищается,
+    /// `Err(NotConnected)`. Одна проверка на кадр (у клиента -- одна
+    /// Acquire-загрузка `generation`), без системных вызовов.
+    pub(crate) fn read_message_checked(
+        &self,
+        out: &mut Vec<u8>,
+        still_current: impl Fn() -> bool,
+    ) -> Result<usize> {
         loop {
             let (read, frame) = self.next_message()?;
 
@@ -1039,6 +1053,14 @@ impl RingBuffer {
             // иначе валидация теряет смысл. На x86 успешный lock cmpxchg также
             // даёт аппаратный барьер.
             compiler_fence(Ordering::Release);
+
+            // Сессия сменилась, пока шло чтение: кадр не наш -- не забираем
+            // и не отдаём (Acquire-загрузка в `still_current` не опускается
+            // ниже CAS фиксации).
+            if !still_current() {
+                out.clear();
+                return Err(ShmError::NotConnected);
+            }
 
             // Фиксация: атомарно забираем кадр. Провал => producer сдвинул
             // read_pos (перезапись) => скопированные байты невалидны.
@@ -1077,7 +1099,25 @@ impl RingBuffer {
     /// срез жив. Публичные обёртки (`Shared*::receive_with`) обеспечивают
     /// это заимствованием `&mut self`.
     pub(crate) unsafe fn read_with<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        // SAFETY: контракт `read_with` -- контракт этой функции.
+        unsafe { self.read_with_checked(|| true, f) }
+    }
+
+    /// `read_with` со сверкой «сессия ещё наша» (Task 6 надёжности):
+    /// `still_current()` -- после поиска кадра, ДО вызова `f`; `false` --
+    /// `f` не вызывается, кадр не забирается, `Err(NotConnected)`.
+    ///
+    /// # Safety
+    /// Контракт `read_with`.
+    pub(crate) unsafe fn read_with_checked<R>(
+        &self,
+        still_current: impl Fn() -> bool,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R> {
         let (read, frame) = self.next_message()?;
+        if !still_current() {
+            return Err(ShmError::NotConnected);
+        }
         // SAFETY: payload кадра -- `frame.len` байт внутри кольца одним
         // куском и внутри опубликованных данных (`frame_at`), выровнен на 8,
         // отображение живо всё время `&self`. Неизменность байтов на время
