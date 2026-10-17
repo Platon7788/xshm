@@ -1055,7 +1055,15 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
         };
         if let Some(reason) = reason {
             worker.notify_disconnect(reason);
-            server.mark_disconnected();
+            if reason == DisconnectReason::Error {
+                // Разрыв по нашей ошибке (порча кольца, отказ ожидания):
+                // клиент ещё в сессии -- `IDLE`, потом `DISCONNECT`
+                // (final review I2; так же `force_disconnect` Multi).
+                server.disconnect_local();
+            } else {
+                // Клиент ушёл сам или умер -- сигналить некому.
+                server.mark_disconnected();
+            }
             connected = false;
         }
     }
@@ -1286,7 +1294,22 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             space,
         ];
 
+        // События набора по индексам -- вернуть сигнал, потреблённый
+        // ожиданием уже чужой сессии (см. ниже).
+        let base_events = [
+            &client_events.disconnect,
+            &client_events.s2c.data,
+            &client_events.c2s.space,
+        ];
+
         let reason = loop {
+            // Final review M1: сессия уже чужая -- сервер отнял claim
+            // «не заметившего» клиента (дедлайн по толчку) и принял другого.
+            // Ни записи в кольцо, ни ответного `DISCONNECT`, ни дочитывания:
+            // кольца принадлежат новой сессии (так же MultiClient).
+            if !client.is_session_current() {
+                break Some(DisconnectReason::Graceful);
+            }
             if !worker.running() {
                 // Остановка: принятое до `stop()` (например, прощальное
                 // сообщение) дописываем в кольцо, сколько влезет, -- сервер
@@ -1313,13 +1336,23 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
             );
             let result = win::wait_any(set.handles(), timeout);
             worker.stats.wake();
+            if !client.is_session_current() {
+                // Сигнал (автосброс) был для новой сессии -- возвращаем.
+                if let Ok(Some(index)) = result
+                    && let Some(event) = base_events.get(index)
+                {
+                    let _ = event.set();
+                }
+                break Some(DisconnectReason::Graceful);
+            }
             if let Some(reason) = worker.handle_wait(&client, &set, space, result, &mut buffer) {
                 break Some(reason);
             }
         };
         if let Some(reason) = reason {
             worker.notify_disconnect(reason);
-            client.mark_disconnected();
+            // `Error` -- полный уход L в `Drop` ниже (final review I1).
+            client.end_session(reason);
         }
 
         // Соединение потеряно: писать некуда, оценка места -- ноль.
@@ -2201,16 +2234,194 @@ mod claim_tests {
     #[derive(Default)]
     struct Log {
         connected: AtomicBool,
+        connects: AtomicU32,
         errors: Mutex<Vec<ShmError>>,
+        reasons: Mutex<Vec<DisconnectReason>>,
     }
 
     impl AutoHandler for Log {
         fn on_connect(&self) {
+            self.connects.fetch_add(1, Ordering::AcqRel);
             self.connected.store(true, Ordering::Release);
+        }
+        fn on_disconnect_reason(&self, reason: DisconnectReason) {
+            self.connected.store(false, Ordering::Release);
+            self.reasons.lock().unwrap().push(reason);
         }
         fn on_error(&self, err: ShmError) {
             self.errors.lock().unwrap().push(err);
         }
+    }
+
+    /// Сработало ли событие за `limit` (автосброс: ожидание его потребляет).
+    fn fired(event: &EventHandle, limit: Duration) -> bool {
+        event.wait(Some(limit)).unwrap()
+    }
+
+    /// Final review I1: разрыв по ошибке у `AutoClient` (порча кольца
+    /// S2C -- `Corrupted`) -- штатный уход L: `client_state -> IDLE`, потом
+    /// `DISCONNECT`, claim снят. До исправления клиент помечал себя
+    /// отключённым, `Drop` пропускал L, и канал заклинивал навсегда:
+    /// сервер «подключён», а повторное подключение -- `AlreadyConnected`.
+    #[test]
+    fn client_error_leaves_channel_cleanly() {
+        let name = unique("CLIENT_ERR");
+        let mut server = SharedServer::start(&name).unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        // Порча кольца сервер -> клиент: `write_pos` не кратен 8.
+        server
+            .view()
+            .header_a()
+            .write_pos
+            .store(3, Ordering::Release);
+        server.events().unwrap().s2c.data.set().unwrap();
+
+        assert!(
+            fired(&server.events().unwrap().disconnect, Duration::from_secs(3)),
+            "клиент ушёл без DISCONNECT"
+        );
+        let control = server.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            crate::constants::HANDSHAKE_IDLE,
+            "client_state не сброшен"
+        );
+        wait_until(
+            "причина разрыва",
+            Duration::from_secs(2),
+            || !log.reasons.lock().unwrap().is_empty(),
+        );
+        assert_eq!(
+            log.reasons.lock().unwrap().as_slice(),
+            &[DisconnectReason::Error]
+        );
+        assert!(log.errors.lock().unwrap().contains(&ShmError::Corrupted));
+
+        // Канал не заклинен: следующее подключение того же клиента проходит.
+        server.mark_disconnected();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until(
+            "переподключение",
+            Duration::from_secs(5),
+            || log.connects.load(Ordering::Acquire) == 2,
+        );
+        assert!(
+            !log.errors
+                .lock()
+                .unwrap()
+                .contains(&ShmError::AlreadyConnected),
+            "{:?}",
+            log.errors.lock().unwrap()
+        );
+        drop(client);
+    }
+
+    /// Final review I2: разрыв по ошибке у `AutoServer` (порча кольца C2S)
+    /// -- уход сервера по R14: `server_state -> IDLE`, потом `DISCONNECT`.
+    /// До исправления сигнала не было: клиент оставался «подключённым» к
+    /// никому, держал claim и спал без таймаута.
+    #[test]
+    fn server_error_signals_disconnect() {
+        let name = unique("SERVER_ERR");
+        let server_log = Arc::new(Log::default());
+        let server = AutoServer::start(&name, server_log.clone(), AutoOptions::default()).unwrap();
+        let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            server_log.connected.load(Ordering::Acquire)
+        });
+
+        let mapping = Mapping::open(ObjectPath::mapping(None, &name)).unwrap();
+        // SAFETY: отображение живо до конца теста, размер -- его собственный.
+        let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+        view.header_b().write_pos.store(3, Ordering::Release);
+        client.events().c2s.data.set().unwrap();
+
+        assert!(
+            fired(&client.events().disconnect, Duration::from_secs(3)),
+            "сервер разорвал сессию без DISCONNECT"
+        );
+        assert!(client.server_left(), "server_state не сброшен до сигнала");
+        wait_until(
+            "причина разрыва",
+            Duration::from_secs(2),
+            || !server_log.reasons.lock().unwrap().is_empty(),
+        );
+        assert_eq!(
+            server_log.reasons.lock().unwrap().as_slice(),
+            &[DisconnectReason::Error]
+        );
+        assert!(
+            server_log
+                .errors
+                .lock()
+                .unwrap()
+                .contains(&ShmError::Corrupted)
+        );
+
+        // Клиент уходит, следующий подключается к тому же серверу.
+        drop(client);
+        let next = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        wait_until(
+            "второе подключение",
+            Duration::from_secs(5),
+            || server_log.connects.load(Ordering::Acquire) == 2,
+        );
+        drop(next);
+        drop(server);
+    }
+
+    /// Final review M1: клиент Auto сверяет `generation` сессии на
+    /// пробуждениях. Сервер провёл рукопожатие с другим клиентом (здесь --
+    /// сдвиг `generation` вручную) -- «не заметивший» клиент уходит без
+    /// записи в чужое кольцо, без `DISCONNECT` и без смены состояний.
+    #[test]
+    fn client_notices_foreign_session_on_wakeup() {
+        let name = unique("FOREIGN_GEN");
+        let mut server = SharedServer::start(&name).unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        wait_until("подключение", Duration::from_secs(5), || {
+            log.connected.load(Ordering::Acquire)
+        });
+
+        let control = server.view().control_block();
+        control.generation.fetch_add(1, Ordering::AcqRel);
+        // `send` будит worker (`wake`): он обязан заметить чужую сессию.
+        client.send(b"stale-session").unwrap();
+        wait_until("уход", Duration::from_secs(3), || {
+            !log.reasons.lock().unwrap().is_empty()
+        });
+        assert_eq!(
+            log.reasons.lock().unwrap().as_slice(),
+            &[DisconnectReason::Graceful]
+        );
+        assert!(
+            !server.has_unread_from_client(),
+            "устаревший клиент писал в кольцо чужой сессии"
+        );
+        assert!(
+            !fired(&server.events().unwrap().disconnect, Duration::ZERO),
+            "устаревший клиент сигналил DISCONNECT чужой сессии"
+        );
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            crate::constants::HANDSHAKE_SERVER_READY,
+            "устаревший клиент тронул состояние чужой сессии"
+        );
+        drop(client);
     }
 
     /// §7.1 п. 13: канал занят `SharedClient` -- `AutoClient` получает

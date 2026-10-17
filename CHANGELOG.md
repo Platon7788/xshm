@@ -496,6 +496,43 @@
   INTEROP §h п. 10). `INTEROP.md` §b.2, §c.1, §d.2, §e.2, §e.4, §g, §h, §i,
   «Изменения 0.10» п. 28.
 
+### Исправлено (финальное ревью ветки, 17.10.2026)
+
+- **Important** Разрыв по ошибке у клиента Auto (и выделенного канала
+  Dispatch) заклинивал канал. После `DisconnectReason::Error` (кольцо
+  `Corrupted` при чтении или записи, ошибка ожидания) клиент помечал себя
+  отключённым, и `Drop` пропускал уход L. Claim освобождался, но
+  `client_state` оставался `SERVER_READY`, а `DISCONNECT` не взводился.
+  Сервер считал себя подключённым и ждал без таймаута. Каждое повторное
+  подключение получало `AlreadyConnected` (C6), и так до перезапуска
+  одного из процессов. Теперь при `Error` клиент выполняет полный уход L:
+  `IDLE`, затем `DISCONNECT`, claim освобождается последним. Это общий
+  `SharedClient::end_session`, тот же путь, что у Multi. Тесты:
+  `auto::claim_tests::client_error_leaves_channel_cleanly`,
+  `dispatch::tests::dedicated_channel_client_error_reaches_server`.
+- **Important** Разрыв по ошибке у `AutoServer` (и серверной стороны
+  канала Dispatch) не сигналил `DISCONNECT`: сервер ставил `IDLE`, а клиент
+  спал «подключённым» к никому. `DispatchClient` оставался в состоянии
+  `is_connected() == true` на уже закрытом канале. Теперь сервер вызывает
+  `SharedServer::disconnect_local`: сначала `IDLE`, затем `DISCONNECT`
+  (R14), как Multi `force_disconnect`. Конец сессии лобби идёт через тот же
+  помощник. Тесты: `auto::claim_tests::server_error_signals_disconnect`,
+  `dispatch::tests::dedicated_channel_server_error_reaches_client`.
+  Поведение видно пиру: нативная сторона теперь получает `DISCONNECT` от
+  Rust при ошибке в своём кольце. Описано в `INTEROP.md` §c.5, §d.2 шаг 7,
+  §e.2 п. 5, R7 и «Изменения 0.10» п. 29.
+- **Minor** Клиент Auto сверяет `generation` сессии на каждом проходе и
+  пробуждении worker-а, как MultiClient. Сессия чужая — уход без записей и
+  без `DISCONNECT`. Сигнал, потреблённый ожиданием, возвращается.
+  `SharedClient::send_to_server`, `try_send_to_server`, `send_with`,
+  `receive_*`, `poll_server*` и `wait_for_space*` при сменившемся
+  `generation` отвечают `NotConnected`. Раньше «не заметивший» клиент,
+  у которого сервер отнял claim по дедлайну и принял другого, писал в
+  кольцо новой сессии (второй писатель SPSC). Тесты:
+  `auto::claim_tests::client_notices_foreign_session_on_wakeup`,
+  `client::tests::stale_session_refuses_to_send`. INTEROP «Изменения 0.10»
+  п. 30.
+
 ### Сборка
 
 - CI (Task 19): `cargo clippy --release --all-targets -- -D warnings` на x64 и

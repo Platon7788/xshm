@@ -10,7 +10,7 @@ use crate::asynch::{Endpoint, OP, PEER, RecvFuture, SendFuture, WaitSet};
 use crate::constants::{
     CLAIM_FREE, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY,
 };
-use crate::error::{Result, ShmError};
+use crate::error::{DisconnectReason, Result, ShmError};
 use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
@@ -904,11 +904,30 @@ impl SharedClient {
         self.peer = None;
     }
 
-    const fn ensure_connected(&self) -> Result<()> {
-        if !self.connected {
-            Err(ShmError::NotConnected)
-        } else {
+    /// Worker-ы (Auto, Multi): сессия кончилась по `reason`, кольцо уже
+    /// дочитано. Сервер ушёл сам (`Graceful`, `PeerDied`) или сессия уже
+    /// чужая -- `mark_disconnected`: `Drop` только снимет claim, без
+    /// ответного `DISCONNECT` (поздний сигнал достался бы следующему
+    /// клиенту). Разрыв по нашей ошибке (`Error`: порча кольца, отказ
+    /// ожидания) -- сервер ещё в сессии: отметку НЕ ставим, и `Drop`
+    /// выполняет полный уход L (`client_state -> IDLE`, потом
+    /// `DISCONNECT`, claim -- последним; INTEROP §c.5, §d.2 шаг 7). Иначе
+    /// сервер остался бы «подключённым», а следующий захват упирался бы в
+    /// C6 (`AlreadyConnected`) навсегда (final review I1).
+    pub(crate) fn end_session(&mut self, reason: DisconnectReason) {
+        if reason != DisconnectReason::Error {
+            self.mark_disconnected();
+        }
+    }
+
+    /// Подключён и сессия наша (final review M1): после смены `generation`
+    /// (сервер отнял claim «не заметившего» клиента и принял другого)
+    /// запись ушла бы в кольцо чужой сессии -- второй писатель SPSC.
+    fn ensure_connected(&self) -> Result<()> {
+        if self.connected && self.is_session_current() {
             Ok(())
+        } else {
+            Err(ShmError::NotConnected)
         }
     }
 
@@ -1408,6 +1427,40 @@ mod tests {
         );
         assert_eq!(control.slot_claim.load(Ordering::Acquire), next.claim());
         assert!(server.is_connected() && next.is_connected());
+    }
+
+    /// Final review M1: сессия сменилась (`generation` другой) -- отправка
+    /// и ожидание места отвечают `NotConnected`, а не пишут в кольцо чужой
+    /// сессии; уход такого клиента чужую сессию не трогает.
+    #[test]
+    fn stale_session_refuses_to_send() {
+        let name = unique("STALE_SEND");
+        let server = SharedServer::start(&name).unwrap();
+        let (server, client) = accept(server, &name);
+        client.send_to_server(b"current-session").unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(server.receive_from_client(&mut buf).unwrap(), 15);
+
+        let control = server.view().control_block();
+        control.generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            client.send_to_server(b"stale-session").err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            client.try_send_to_server(b"stale-session").err(),
+            Some(ShmError::NotConnected)
+        );
+        assert_eq!(
+            client.wait_for_space(8, Some(Duration::ZERO)).err(),
+            Some(ShmError::NotConnected)
+        );
+        assert!(!server.has_unread_from_client(), "запись в чужую сессию");
+        drop(client);
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_SERVER_READY
+        );
     }
 
     /// Fix round 1 (находка 1 ревью): перехват claim-а при брошенном

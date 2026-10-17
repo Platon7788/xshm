@@ -986,6 +986,26 @@ impl SharedServer {
         drop(peer);
     }
 
+    /// Взвести `DISCONNECT` канала (anonymous -- событий нет, no-op).
+    /// Вызывающий уже перевёл состояния в `IDLE` (R14: сначала состояние,
+    /// потом сигнал -- клиент, проснувшись, видит закрытую сессию).
+    pub(crate) fn signal_disconnect(&self) {
+        if let Some(events) = &self.events {
+            let _ = events.disconnect.set();
+        }
+    }
+
+    /// Локальный разрыв сессии сервером (ошибка: порча кольца, отказ
+    /// ожидания; закрытие сессии лобби) -- уход сервера по R14/INTEROP §e.2
+    /// п. 5: `mark_disconnected` (состояния -> `IDLE`), потом `DISCONNECT`.
+    /// Без сигнала клиент, спящий в своём наборе без таймаута, остался бы
+    /// «подключённым» к никому (final review I2). Claim не трогаем: его
+    /// снимет клиент, получив `DISCONNECT` (уход L).
+    pub(crate) fn disconnect_local(&mut self) {
+        self.mark_disconnected();
+        self.signal_disconnect();
+    }
+
     /// `CONNECT_REQ` без заявки у неподключённого сервера single-client
     /// канала (ревизия 3, §2.3 дизайна): толчок проигравшего клиента --
     /// повод проверить протухший захват (см. `observe_idle_claim`).
@@ -1462,10 +1482,8 @@ impl Drop for SharedServer {
         header_b
             .handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
-        if self.connected
-            && let Some(ref events) = self.events
-        {
-            let _ = events.disconnect.set();
+        if self.connected {
+            self.signal_disconnect();
         }
     }
 }

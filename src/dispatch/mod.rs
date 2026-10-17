@@ -860,16 +860,14 @@ impl DispatchCore {
                         // Сбрасываем лобби для следующего клиента
                         // (`client_state` -- CAS: HELLO следующего клиента,
                         // вошедшего по мьютексу лобби, не затирается).
-                        lobby_server.mark_disconnected();
                         // 0.10: сессия лобби закрыта -- `DISCONNECT` после
-                        // `IDLE` (R14). Клиент, ждущий ответа, просыпается
-                        // сразу, если ответа не будет (таймаут чтения, ошибка,
-                        // остановка); ответ, если он есть, уже в кольце, и
-                        // клиент читает его первым. Следующему клиенту сигнал
-                        // не мешает: `complete_handshake` сбрасывает его.
-                        if let Some(events) = lobby_server.events() {
-                            let _ = events.disconnect.set();
-                        }
+                        // `IDLE` (R14, `disconnect_local`). Клиент, ждущий
+                        // ответа, просыпается сразу, если ответа не будет
+                        // (таймаут чтения, ошибка, остановка); ответ, если он
+                        // есть, уже в кольце, и клиент читает его первым.
+                        // Следующему клиенту сигнал не мешает:
+                        // `complete_handshake` сбрасывает его.
+                        lobby_server.disconnect_local();
                     }
                     Ok(false) => continue,
                     Err(ShmError::AlreadyConnected) => {
@@ -3042,6 +3040,97 @@ mod tests {
         assert_eq!(probe.errors.load(Ordering::Acquire), 1, "повторные попытки");
         assert_eq!(*probe.reasons.lock().unwrap(), [DisconnectReason::Error]);
         drop(client);
+    }
+
+    /// Поднять сервер и клиента Dispatch, дождаться канала; вернуть их,
+    /// обработчики и имя канала.
+    fn dispatch_pair(
+        tag: &str,
+    ) -> (
+        Arc<DispatchServer>,
+        Arc<TestServerHandler>,
+        DispatchClient,
+        Arc<TestClientHandler>,
+        String,
+    ) {
+        let name = format!("TEST_DISPATCH_{tag}_{}", std::process::id());
+        let server_handler = Arc::new(TestServerHandler::new());
+        let server =
+            DispatchServer::start(&name, server_handler.clone(), DispatchOptions::default())
+                .expect("server start");
+        let client_handler = Arc::new(TestClientHandler::new());
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration::new(std::process::id(), 1, "corrupt.exe"),
+            client_handler.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+        wait_for("канал", Duration::from_secs(5), || {
+            server.client_count() == 1 && client.is_connected()
+        });
+        let channel = client.channel_name().to_owned();
+        (server, server_handler, client, client_handler, channel)
+    }
+
+    /// Испортить `write_pos` кольца канала (`s2c` -- сервер -> клиент,
+    /// иначе клиент -> сервер) и разбудить его читателя.
+    fn corrupt_channel(channel: &str, s2c: bool) {
+        let mapping = Mapping::open(ObjectPath::mapping(None, channel)).unwrap();
+        // SAFETY: отображение живо до конца функции, размер -- его собственный.
+        let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+        let events = crate::events::SharedEvents::open(channel).unwrap();
+        if s2c {
+            view.header_a().write_pos.store(3, Ordering::Release);
+            events.s2c.data.set().unwrap();
+        } else {
+            view.header_b().write_pos.store(3, Ordering::Release);
+            events.c2s.data.set().unwrap();
+        }
+    }
+
+    /// Final review I1 (канал Dispatch): клиент разорвал выделенный канал по
+    /// ошибке (порча кольца S2C) -- уход L сигналит `DISCONNECT`, сервер
+    /// узнаёт об уходе. До исправления сервер оставался «подключённым»
+    /// навсегда (процесс клиента жив).
+    #[test]
+    fn dedicated_channel_client_error_reaches_server() {
+        let (server, server_handler, client, _client_handler, channel) =
+            dispatch_pair("CLIENT_ERR");
+        corrupt_channel(&channel, true);
+        wait_for(
+            "сервер заметил уход",
+            Duration::from_secs(3),
+            || server_handler.disconnects.load(Ordering::Acquire) == 1,
+        );
+        wait_for("канал закрыт", Duration::from_secs(3), || {
+            server.client_count() == 0
+        });
+        assert!(!client.is_connected());
+        drop(client);
+        server.stop();
+    }
+
+    /// Final review I2 (канал Dispatch): сервер разорвал выделенный канал по
+    /// ошибке (порча кольца C2S) -- `DISCONNECT` после `IDLE`, клиент
+    /// узнаёт о разрыве. До исправления `DispatchClient` оставался
+    /// `is_connected() == true` на закрытом канале.
+    #[test]
+    fn dedicated_channel_server_error_reaches_client() {
+        let (server, server_handler, client, client_handler, channel) = dispatch_pair("SERVER_ERR");
+        corrupt_channel(&channel, false);
+        wait_for(
+            "клиент заметил разрыв",
+            Duration::from_secs(3),
+            || !client.is_connected() && !client_handler.connected.load(Ordering::Acquire),
+        );
+        wait_for(
+            "колбэк сервера",
+            Duration::from_secs(3),
+            || server_handler.disconnects.load(Ordering::Acquire) == 1,
+        );
+        drop(client);
+        server.stop();
     }
 
     /// Ревизия 2, дефект 6: `stop()` из колбэка обработчика не блокируется

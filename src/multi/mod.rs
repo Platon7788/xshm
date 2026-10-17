@@ -681,9 +681,7 @@ impl MultiCore {
             // Мёртвого клиента освобождает дедлайн `reserve_timeout` (слот
             // не подключён, claim занят -- обычный протухший захват).
             slot.reset_connection();
-            if let Some(events) = slot.server.events() {
-                let _ = events.disconnect.set();
-            }
+            slot.server.signal_disconnect();
             drop(slot);
             drop(slots);
             // Набор ожиданий слота изменился (слот снова ждёт CONNECT_REQ) -- диспетчер сверит привязки.
@@ -2170,6 +2168,11 @@ fn client_worker(
         };
 
         let reason = loop {
+            // Сессия уже чужая (сверка и на пробуждениях ниже): отправка и
+            // приём ответили бы `NotConnected` -- уходим, как там.
+            if !client.is_session_current() {
+                break Some(DisconnectReason::Graceful);
+            }
             if !flush_queue(&client, outbox, handler) {
                 break Some(DisconnectReason::Error);
             }
@@ -2248,9 +2251,7 @@ fn client_worker(
             // сигнал мог бы достаться уже следующему клиенту этого слота.
             // Исключение -- наш разрыв из-за порчи кольца: тогда штатный
             // уход (Drop клиента ниже) сигналит `DISCONNECT` сам.
-            if reason != DisconnectReason::Error {
-                client.mark_disconnected();
-            }
+            client.end_session(reason);
             if running.load(Ordering::Acquire) {
                 handler.on_disconnect_reason(reason);
             }
