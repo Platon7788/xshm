@@ -101,7 +101,7 @@
 use std::io::Write;
 use std::process::ExitCode;
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1113,9 +1113,27 @@ enum DispatchEvent {
 
 /// Обработчик одного `DispatchClient`: `echo` -- ответ XOR на кадры
 /// сервера; `ping` -- сверка эха своих кадров.
+/// Клиент эха (`echo`): пока `connect` не вернул ручку клиента, worker
+/// канала уже может доставить первые кадры сервера -- они ждут в очереди и
+/// отвечаются при `attach`, а не теряются.
+#[derive(Default)]
+struct EchoTarget {
+    client: Option<Weak<DispatchClient>>,
+    early: Vec<Vec<u8>>,
+}
+
+/// Ответ XOR `0x5A` клиенту `client`; ошибка -- `INFO err=`.
+fn echo_back(client: &Weak<DispatchClient>, data: &[u8]) {
+    if let Some(client) = client.upgrade()
+        && let Err(e) = client.send(&xor_reply(data, data.len()))
+    {
+        out(&format!("INFO err={}", err_name(&e)));
+    }
+}
+
 struct DispatchClientEcho {
     index: usize,
-    client: OnceLock<Weak<DispatchClient>>,
+    client: Mutex<EchoTarget>,
     ping: bool,
     frames: u32,
     replies: std::sync::atomic::AtomicU32,
@@ -1151,15 +1169,28 @@ impl DispatchClientHandler for DispatchClientEcho {
             }
             return;
         }
-        if let Some(client) = self.client.get().and_then(Weak::upgrade)
-            && let Err(e) = client.send(&xor_reply(data, data.len()))
-        {
-            out(&format!("INFO err={}", err_name(&e)));
+        let mut target = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        match &target.client {
+            Some(client) => echo_back(client, data),
+            None => target.early.push(data.to_vec()),
         }
     }
 
     fn on_error(&self, err: ShmError) {
         out(&format!("INFO err={}", err_name(&err)));
+    }
+}
+
+impl DispatchClientEcho {
+    /// Ручка клиента известна: ответить на кадры, пришедшие раньше неё (под
+    /// тем же замком, что и `on_message` -- ни один кадр не проскочит).
+    fn attach(&self, client: &Arc<DispatchClient>) {
+        let mut target = self.client.lock().unwrap_or_else(PoisonError::into_inner);
+        let weak = Arc::downgrade(client);
+        for data in core::mem::take(&mut target.early) {
+            echo_back(&weak, &data);
+        }
+        target.client = Some(weak);
     }
 }
 
@@ -1180,7 +1211,7 @@ fn dispatch_connect(
 ) -> Result<Arc<DispatchClient>, ShmError> {
     let handler = Arc::new(DispatchClientEcho {
         index,
-        client: OnceLock::new(),
+        client: Mutex::new(EchoTarget::default()),
         ping: plan.ping,
         frames: plan.frames,
         replies: std::sync::atomic::AtomicU32::new(0),
@@ -1194,7 +1225,7 @@ fn dispatch_connect(
         dyn_handler,
         DispatchClientOptions::default(),
     )?);
-    drop(handler.client.set(Arc::downgrade(&client)));
+    handler.attach(&client);
     Ok(client)
 }
 
