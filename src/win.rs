@@ -1138,6 +1138,22 @@ impl ProcessWatch {
             .filter(|watch| start_time == 0 || watch.start_time() == Some(start_time))
     }
 
+    /// Наблюдение процесса `pid`, который подтверждённо УЖЕ завершился
+    /// (решение X): вместо handle процесса -- безымянное событие с ручным
+    /// сбросом, взведённое навсегда. Для всех ожиданий и `has_exited` оно
+    /// неотличимо от сигнального handle завершившегося процесса, поэтому
+    /// клиент, подключившийся к серверу, умершему до открытия его процесса,
+    /// проходит обычный путь смерти пира: дочитать кольцо, затем `PeerDied`.
+    /// `start_time` такого наблюдения неизвестно (`None`).
+    pub(crate) fn exited(pid: u32) -> Result<Self> {
+        let event = EventHandle::create_unnamed(true)?;
+        event.set()?;
+        Ok(Self {
+            handle: event.handle,
+            pid,
+        })
+    }
+
     /// Время создания наблюдаемого процесса (`CreateTime`, 100-нс FILETIME);
     /// `None` -- запрос не удался.
     #[must_use]

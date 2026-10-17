@@ -38,6 +38,19 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Тесты: тип хука `AFTER_HELLO`.
+#[cfg(test)]
+pub(crate) type HelloHook = Box<dyn FnOnce(&SharedView)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Тесты (решение X): одноразовый хук `Hello::post` сразу после заявки
+    /// (C7), до открытия процесса сервера -- играет роль сервера, успевшего
+    /// зафиксировать рукопожатие и умереть в этом окне.
+    pub(crate) static AFTER_HELLO: std::cell::RefCell<Option<HelloHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Время создания текущего процесса, заявляемое в `client_start_*`.
 fn announced_start_time() -> u64 {
     #[cfg(test)]
@@ -683,6 +696,11 @@ impl Hello {
             .handshake_state
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
 
+        #[cfg(test)]
+        if let Some(hook) = AFTER_HELLO.with(|hook| hook.borrow_mut().take()) {
+            hook(&view);
+        }
+
         // Процесс сервера (Task 10) -- по PID и времени создания из
         // сегмента; открывается после заявки, а не на C0, чтобы проигравший
         // захват (частый исход при занятом канале) не платил за открытие.
@@ -863,10 +881,27 @@ impl Hello {
             owns_claim,
             server: peer,
             server_gone: _,
-            server_exited: _,
+            server_exited,
             mapping,
         } = self;
         let control = view.control_block();
+        // Решение X: сервер подтверждённо завершился ещё до открытия его
+        // процесса, а отзыв заявки проигран (он успел зафиксировать
+        // рукопожатие) -- подключены, но наблюдать некого. Вариант «connect
+        // отвечает `PeerDied`» отброшен: сессия зафиксирована, в кольце может
+        // лежать прощание сервера, и после фиксации смерть пира везде
+        // сообщается ПОСЛЕ дочитывания (`poll_*`, worker-ы Auto/Multi). Поэтому
+        // -- наблюдение «уже завершился» (всегда сигнально): первое же
+        // ожидание видит смерть, данные дочитываются, затем `PeerDied`. Не
+        // удалось создать событие (нехватка ресурсов) -- без наблюдения, как
+        // до исправления.
+        let peer = match peer {
+            Some(peer) => Some(peer),
+            None if server_exited => {
+                ProcessWatch::exited(control.server_pid.load(Ordering::Acquire)).ok()
+            }
+            None => None,
+        };
         let (header_a, header_b) = view.headers();
         // Процесс сервера -- открытый при заявке (`Hello::post`; `None` --
         // сервер старой версии без PID: наблюдения нет, как в 0.7).
@@ -2756,5 +2791,77 @@ mod presence_tests {
         let took = started.elapsed();
         assert!(took >= Duration::from_millis(190), "{took:?}");
         assert_eq!(kernel_waits() - before, 1, "одно ожидание в ядре");
+    }
+}
+
+#[cfg(test)]
+mod exited_server_tests {
+    //! Решение X: сервер зафиксировал рукопожатие и умер раньше, чем клиент
+    //! открыл его процесс; отзыв заявки проигран -- клиент подключён, а
+    //! наблюдать некого. Он обязан узнать о смерти сервера (`PeerDied`
+    //! после дочитывания кольца), а не ждать вечно.
+
+    use super::*;
+    use crate::server::SharedServer;
+    use crate::test_support::dead_process;
+
+    #[test]
+    fn committed_then_dead_server_is_reported_after_drain() {
+        let name = format!("CLI_EXITED_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let (pid, start) = dead_process();
+        {
+            let control = server.view().control_block();
+            control.server_start_lo.store(
+                u32::try_from(start & 0xFFFF_FFFF).unwrap(),
+                Ordering::Release,
+            );
+            control
+                .server_start_hi
+                .store(u32::try_from(start >> 32).unwrap(), Ordering::Release);
+            control.server_pid.store(pid, Ordering::Release);
+        }
+        AFTER_HELLO.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|view: &SharedView| {
+                // «Сервер»: прощальный кадр, S3 и фиксация S5 -- и смерть.
+                view.ring_a().write_message(b"farewell").unwrap();
+                let control = view.control_block();
+                control.generation.fetch_add(1, Ordering::AcqRel);
+                control
+                    .server_state
+                    .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+                control
+                    .client_state
+                    .compare_exchange(
+                        HANDSHAKE_CLIENT_HELLO,
+                        HANDSHAKE_SERVER_READY,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .unwrap();
+            }));
+        });
+        let mut client = SharedClient::connect(&name, Duration::from_secs(2))
+            .expect("отзыв проигран -- подключён");
+        assert_eq!(
+            client.is_peer_alive(),
+            Some(false),
+            "смерть сервера известна"
+        );
+        let started = Instant::now();
+        assert_eq!(client.poll_server(Some(Duration::from_secs(2))), Ok(true));
+        let mut buffer = Vec::new();
+        let len = client.receive_from_server(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"farewell", "прощание дочитано");
+        assert_eq!(
+            client.poll_server(Some(Duration::from_secs(2))),
+            Err(ShmError::PeerDied)
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "без ожидания таймаута"
+        );
+        drop(client);
+        drop(server);
     }
 }
