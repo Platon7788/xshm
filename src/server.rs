@@ -53,6 +53,25 @@ thread_local! {
         const { core::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Тесты: следующий сигнал `S2C_CONNECT` (S7) этого потока завершится
+    /// ошибкой, как отказ `NtSetEvent` (одноразово).
+    pub(crate) static FAIL_CONNECT_ACK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// S7: сигнал `S2C_CONNECT` (в тестах -- с инъекцией отказа).
+fn signal_connect_ack(events: &SharedEvents) -> Result<()> {
+    #[cfg(test)]
+    if FAIL_CONNECT_ACK.with(Cell::take) {
+        return Err(ShmError::WindowsError {
+            code: 0xC000_0001,
+            context: "NtSetEvent (injected)",
+        });
+    }
+    events.connect_ack.set()
+}
+
 /// Вызвать тестовый хук рукопожатия, если он назначен на точку `at`.
 #[cfg(test)]
 fn handshake_hook(view: &SharedView, at: HandshakePoint) {
@@ -840,8 +859,15 @@ impl SharedServer {
         self.claim_seen = None;
         // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
         // опросом `server_state`.
-        if let Some(events) = &self.events {
-            events.connect_ack.set()?;
+        // S7, отказ сигнала (0.10, INTEROP п. 29): сессия уже
+        // зафиксирована (S5) -- клиент мог засчитать её по проигранному
+        // отзыву. Закрыть её с сигналом, как `disconnect_local` (`IDLE`,
+        // потом `DISCONNECT`), а не оставить полуоткрытой.
+        if let Some(events) = &self.events
+            && let Err(err) = signal_connect_ack(events)
+        {
+            self.disconnect_local();
+            return Err(err);
         }
         self.connected = true;
         Ok(())
@@ -1680,6 +1706,59 @@ mod handshake_tests {
         );
         let control = server.view().control_block();
         assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+    }
+
+    /// S7 (0.10, INTEROP п. 29): `S2C_CONNECT` не просигналился -- сессия, уже
+    /// зафиксированная S5, закрывается с сигналом, как `disconnect_local`
+    /// (`IDLE`, потом `DISCONNECT`): клиент, засчитавший подключение по
+    /// проигранному отзыву, видит разрыв, а не сервер «подключённый» к
+    /// никому. Канал принимает следующего клиента.
+    #[test]
+    fn failed_connect_ack_closes_the_session() {
+        let name = unique("ACKFAIL");
+        let mut server = SharedServer::start(&name).unwrap();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        FAIL_CONNECT_ACK.with(|fail| fail.set(true));
+        assert!(matches!(
+            server.complete_handshake(),
+            Err(ShmError::WindowsError { .. })
+        ));
+        assert!(!server.is_connected());
+        let control = server.view().control_block();
+        assert_eq!(control.server_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        let (header_a, header_b) = server.view().headers();
+        assert_eq!(
+            header_a.handshake_state.load(Ordering::Acquire),
+            HANDSHAKE_IDLE
+        );
+        assert_eq!(
+            header_b.handshake_state.load(Ordering::Acquire),
+            HANDSHAKE_IDLE
+        );
+        assert!(
+            server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "сессия закрыта без DISCONNECT"
+        );
+        // Клиент: отзыв проигран (`generation` сменился) -- засчитан
+        // подключённым, но сервер уже ушёл; его уход освобождает claim.
+        assert!(hello.withdraw(), "фиксация S5 состоялась");
+        let client = hello.finish();
+        drop(client);
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
+        // Следующий клиент подключается.
+        let next = Hello::post(None, &name, true, ClaimMode::Take).unwrap();
+        server.complete_handshake().unwrap();
+        assert!(matches!(
+            next.wait_ack(Duration::from_secs(1), None),
+            AckWait::Accepted
+        ));
+        assert!(server.is_connected());
     }
 
     /// Заявка процесса `pid`/`start` с владельцем claim-а `owner`.
