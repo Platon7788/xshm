@@ -570,4 +570,175 @@ mod tests {
         // Значения по умолчанию и лобби Dispatch -- в пределах.
         assert!(DEFAULT_MAX_MESSAGE_SIZE <= max_payload_for(DEFAULT_RING_CAPACITY));
     }
+
+    /// Константы формата, которые INTEROP §c называет числами (Task 19):
+    /// магия и версия, кадр (§c.4), пределы колец (§c.2), состояния
+    /// рукопожатия (§c.1), порог лимита сообщений (§c.5).
+    #[test]
+    fn wire_constants_are_stable() {
+        assert_eq!(SHARED_MAGIC, 0x5853_484D);
+        assert_eq!(SHARED_MAGIC.to_le_bytes(), [0x4D, 0x48, 0x53, 0x58]);
+        assert_eq!(SHARED_VERSION, 0x0002_0000);
+        assert_eq!(FRAME_HEADER_SIZE, 8);
+        assert_eq!(FRAME_ALIGN, 8);
+        assert_eq!(FRAME_PAD, 0x1);
+        assert_eq!(MIN_MESSAGE_SIZE, 1);
+        assert_eq!(MIN_RING_CAPACITY, 4_096);
+        assert_eq!(MAX_RING_CAPACITY, 1_073_741_824);
+        assert_eq!(RECOUNT_MAX, 64);
+        assert_eq!(
+            (
+                HANDSHAKE_IDLE,
+                HANDSHAKE_CLIENT_HELLO,
+                HANDSHAKE_SERVER_READY
+            ),
+            (0, 1, 2)
+        );
+        assert_eq!(CLAIM_FREE, 0);
+        // frame_size(len) = (8 + len + 7) & !7.
+        for len in [1usize, 7, 8, 9, 15, 16, 1024, 65_535] {
+            assert_eq!(crate::ring::frame_size(len), (8 + len + 7) & !7);
+        }
+        assert_eq!(crate::ring::frame_size(1), 16);
+        assert_eq!(crate::ring::frame_size(8), 16);
+        assert_eq!(crate::ring::frame_size(9), 24);
+    }
+
+    /// Раскладки по умолчанию и каноническая раскладка Rust-сервера
+    /// (INTEROP §c, §c.2): смещения колец, `segment_size = 256 + cap_s2c +
+    /// cap_c2s`, значения `ChannelLayout::DEFAULT` и `DEFAULT_LOBBY_LAYOUT`.
+    #[test]
+    fn default_and_canonical_layouts_match_interop() {
+        assert_eq!(
+            (
+                DEFAULT_RING_CAPACITY,
+                DEFAULT_MAX_MESSAGES,
+                DEFAULT_MAX_MESSAGE_SIZE
+            ),
+            (2_097_152, 500, 65_535)
+        );
+        let default = ChannelLayout::DEFAULT;
+        assert_eq!(default.server_to_client, RingConfig::DEFAULT);
+        assert_eq!(default.client_to_server, RingConfig::DEFAULT);
+        assert_eq!(RingConfig::DEFAULT.capacity, 2_097_152);
+        assert_eq!(RingConfig::DEFAULT.max_messages, 500);
+        assert_eq!(RingConfig::DEFAULT.max_message_size, 65_535);
+        assert_eq!(default.segment_size(), 4_194_560);
+        assert_eq!(ChannelLayout::s2c_offset(), 128);
+        assert_eq!(default.c2s_offset(), 128 + 64 + 2_097_152);
+
+        let lobby = crate::DEFAULT_LOBBY_LAYOUT;
+        for ring in [lobby.server_to_client, lobby.client_to_server] {
+            assert_eq!(
+                (ring.capacity, ring.max_messages, ring.max_message_size),
+                (16_384, 16, 1_024)
+            );
+        }
+        assert!(lobby.validate().is_ok());
+
+        let asymmetric = ChannelLayout {
+            server_to_client: RingConfig::new(8192),
+            client_to_server: RingConfig::new(4096),
+        };
+        assert_eq!(asymmetric.segment_size(), 256 + 8192 + 4096);
+        assert_eq!(asymmetric.c2s_offset(), 128 + 64 + 8192);
+    }
+
+    /// Байты сегмента, записанного `SharedView::initialize`, по смещениям
+    /// таблиц INTEROP §c.1–§c.3 (а не по `offset_of!`): little-endian `u32`
+    /// в тех самых позициях, `magic` последним, канонические дескрипторы
+    /// колец, `connection_gen = generation = 1`.
+    #[test]
+    fn initialized_segment_bytes_match_interop() {
+        use std::alloc::{Layout, alloc_zeroed, dealloc};
+
+        let layout = ChannelLayout {
+            server_to_client: RingConfig::new(8192).max_messages(7),
+            client_to_server: RingConfig::new(4096).max_message_size(100),
+        };
+        let size = layout.segment_size();
+        let alloc = Layout::from_size_align(size, 4096).unwrap();
+        // SAFETY: ненулевой размер.
+        let base = unsafe { alloc_zeroed(alloc) };
+        assert!(!base.is_null());
+        // SAFETY: буфер выровнен на 4096, длина = segment_size, живёт до
+        // dealloc в конце теста.
+        let _view = unsafe {
+            crate::shared::SharedView::initialize(
+                base,
+                layout,
+                0x1122_3344,
+                0x0102_0304_0506_0708,
+                5,
+            )
+        }
+        .unwrap();
+        let word = |offset: usize| -> u32 {
+            assert!(offset + 4 <= size);
+            let mut bytes = [0u8; 4];
+            // SAFETY: offset + 4 <= size (проверено выше) -- адрес внутри
+            // выделенного буфера.
+            let src = unsafe { base.add(offset) };
+            // SAFETY: 4 байта от `src` лежат в буфере, он жив; поля после
+            // initialize больше никто не пишет.
+            unsafe { core::ptr::copy_nonoverlapping(src, bytes.as_mut_ptr(), 4) };
+            u32::from_le_bytes(bytes)
+        };
+        // §c.1 ControlBlock.
+        let control = [
+            (0, SHARED_MAGIC),
+            (4, 0x0002_0000),
+            (8, 1),           // generation
+            (12, 0),          // server_state = IDLE
+            (16, 0),          // client_state = IDLE
+            (20, CLAIM_FREE), // slot_claim
+            (24, 0),          // slot_owner_pid
+            (28, 0x1122_3344),
+            (32, 0),           // client_pid
+            (36, 0x0506_0708), // server_start_lo
+            (40, 0x0102_0304), // server_start_hi
+            (44, 0),
+            (48, 0),
+            (52, 0),
+            (56, 0),
+            (60, 5), // slot_count
+        ];
+        for (offset, value) in control {
+            assert_eq!(word(offset), value, "ControlBlock +{offset}");
+        }
+        // §c.2 LayoutBlock (смещения от начала сегмента).
+        let c2s = 128 + 64 + 8192;
+        let block = [
+            (64, u32::try_from(size).unwrap()),
+            (68, 0),
+            (72, 128),
+            (76, 8192),
+            (80, 7),
+            (84, u32::try_from(max_payload_for(8192)).unwrap()),
+            (88, c2s),
+            (92, 4096),
+            (96, u32::MAX), // RingConfig::new -- без лимита сообщений
+            (100, 100),
+        ];
+        for (offset, value) in block {
+            assert_eq!(word(offset), value, "LayoutBlock +{offset}");
+        }
+        for offset in (104..128).step_by(4) {
+            assert_eq!(word(offset), 0, "LayoutBlock.reserved +{offset}");
+        }
+        // §c.3 RingHeader обоих колец: позиции 0, connection_gen = 1 (@20).
+        for header in [128, c2s as usize] {
+            for field in (0..64).step_by(4) {
+                let expected = u32::from(field == 20);
+                assert_eq!(
+                    word(header + field),
+                    expected,
+                    "RingHeader {header}+{field}"
+                );
+            }
+        }
+        // SAFETY: выделено alloc_zeroed с этим же Layout; `_view` больше не
+        // разыменовывается.
+        unsafe { dealloc(base, alloc) };
+    }
 }
