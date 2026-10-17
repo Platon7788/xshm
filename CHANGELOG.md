@@ -1086,6 +1086,14 @@
   `multi::tests::{failed_handshake_moves_to_next_slot,
   claim_scan_wraps_around}`. INTEROP §i.1.
 
+- **Minor** (T11b) Клиент регистрации Dispatch (`lobby_register`), увидевший
+  штатный уход лобби (`DISCONNECT` при закрытой сессии) или смерть его
+  процесса, уходил полным L: CAS состояния не проходил (сервер уже
+  `IDLE`), но `DISCONNECT` всё равно взводился — поздний сигнал доставался
+  следующему клиенту лобби. Теперь — только снятие claim-а (INTEROP §d.2
+  шаг 7; так же клиент xipc). Тест
+  `dispatch::tests::lobby_client_leaves_without_disconnect_after_server_left`.
+
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
 - Пул пакетов ожидания реактора. `Reactor::register` создавал объект ядра

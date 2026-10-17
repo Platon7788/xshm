@@ -1786,7 +1786,7 @@ fn lobby_register(
     } else {
         ClaimMode::Take
     };
-    let client = SharedClient::connect_impl(
+    let mut client = SharedClient::connect_impl(
         namespace,
         base_name,
         options.lobby_timeout,
@@ -1832,6 +1832,12 @@ fn lobby_register(
             }
             Err(ShmError::QueueEmpty) => {
                 if let Some(err) = gone {
+                    // Сервер ушёл сам (`DISCONNECT` при закрытой сессии или
+                    // смерть процесса): уход клиента -- только снять claim,
+                    // без ответного `DISCONNECT` (INTEROP §d.2 шаг 7; так же
+                    // клиент xipc). Поздний сигнал достался бы следующему
+                    // клиенту лобби.
+                    client.mark_disconnected();
                     return Err(err);
                 }
                 // Хвост массива -- заполнитель, в ожидание уходит `[..count]`.
@@ -1981,6 +1987,44 @@ mod tests {
         drop(server);
         // Сервера нет -- мьютекс закрыт, клиент создаёт свой.
         assert!(NamedMutex::open_or_create(lobby_lock_name(&name), &client_policy).is_ok());
+    }
+
+    /// T11b (INTEROP §d.2 шаг 7): лобби закрыло сессию, не ответив, --
+    /// клиент регистрации уходит, только сняв claim, без ответного
+    /// `DISCONNECT` (поздний сигнал достался бы следующему клиенту лобби).
+    #[test]
+    fn lobby_client_leaves_without_disconnect_after_server_left() {
+        let name = format!("TEST_DISPATCH_LEFT_{}", std::process::id());
+        let mut lobby = SharedServer::start(&name).unwrap();
+        let client = {
+            thread::spawn(move || {
+                let options = DispatchClientOptions {
+                    response_timeout: Duration::from_secs(3),
+                    ..DispatchClientOptions::default()
+                };
+                let registration = ClientRegistration::new(std::process::id(), 1, "left");
+                lobby_register(&name, &registration, &options, &mut Vec::new())
+            })
+        };
+        lobby.wait_for_client(Some(Duration::from_secs(5))).unwrap();
+        // Запрос пришёл -- лобби уходит, не ответив.
+        assert_eq!(lobby.poll_client(Some(Duration::from_secs(5))), Ok(true));
+        lobby.disconnect().unwrap();
+        assert_eq!(client.join().unwrap().err(), Some(ShmError::NotConnected));
+        let events = lobby.events().unwrap();
+        assert!(
+            !events.disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "клиент ответил DISCONNECT уже закрытой сессии"
+        );
+        assert_eq!(
+            lobby
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            CLAIM_FREE,
+            "claim снят"
+        );
     }
 
     /// Task 11 (R19): лобби взводит свой маяк `<лобби>_beacon` само, без
