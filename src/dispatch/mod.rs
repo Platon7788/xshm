@@ -3247,7 +3247,7 @@ mod tests {
         bad_utf8[last] = 0xFF;
         let garbage: [&[u8]; 3] = [b"definitely not a registration", &trailing, &bad_utf8];
         for (i, payload) in garbage.into_iter().enumerate() {
-            let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+            let mut client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
             let started = std::time::Instant::now();
             client.send_to_server(payload).unwrap();
             // `S2C_DATA` сервер сигналит дважды (запись в пустое кольцо и

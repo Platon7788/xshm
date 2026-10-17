@@ -842,7 +842,7 @@ check of the events, so `DISCONNECT`, `SPACE` and peer death are still noticed.
 use std::time::Duration;
 use xshm::{AutoOptions, SharedClient, SpinPolicy};
 
-fn poll_fast(client: &SharedClient) -> xshm::Result<bool> {
+fn poll_fast(client: &mut SharedClient) -> xshm::Result<bool> {
     client.poll_server_spin(Some(Duration::from_millis(10)), SpinPolicy::new(2000))
 }
 
@@ -866,7 +866,7 @@ cannot fool it (re-opening by PID cannot tell "gone" from "access denied").
 
 | Mode | How death is surfaced |
 |------|-----------------------|
-| Single-client | `poll_client` / `poll_server` / `wait_for_space` return `Err(ShmError::PeerDied)` right away; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
+| Single-client | `poll_client` / `poll_server` / `wait_for_space` return `Err(ShmError::PeerDied)` right away; a graceful leave (`DISCONNECT`) is `Err(ShmError::NotConnected)` once the ring is drained (0.10: `poll_*` take `&mut self` and mark the side disconnected); `is_peer_alive() -> Option<bool>`, `peer_pid()` |
 | Auto | the peer's process handle is in the worker's wait set → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
 | Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
 | Multi-client | the client's process handle is bound to the server dispatcher's completion port → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, slot freed; `MultiServer::is_client_alive(id)`; the client sees server death → `MultiClientHandler::on_disconnect_reason(PeerDied)` |

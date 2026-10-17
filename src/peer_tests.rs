@@ -49,7 +49,7 @@ fn connect_pair(name: &str, old_server: bool, announce_pid: bool) -> (SharedServ
     (server_thread.join().unwrap(), client)
 }
 
-fn roundtrip(server: &SharedServer, client: &SharedClient) {
+fn roundtrip(server: &mut SharedServer, client: &mut SharedClient) {
     let mut buf = Vec::new();
     server.try_send_to_client(b"ping").unwrap();
     assert!(client.poll_server(Some(Duration::from_secs(1))).unwrap());
@@ -63,7 +63,7 @@ fn roundtrip(server: &SharedServer, client: &SharedClient) {
 
 #[test]
 fn new_peers_exchange_pids() {
-    let (server, client) = connect_pair(&unique("NEW"), false, true);
+    let (mut server, mut client) = connect_pair(&unique("NEW"), false, true);
     let me = std::process::id();
     assert_eq!(server.peer_pid(), Some(me));
     assert_eq!(client.peer_pid(), Some(me));
@@ -78,14 +78,14 @@ fn new_peers_exchange_pids() {
             .load(Ordering::Acquire),
         0
     );
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
 }
 
 /// Клиент 0.7/0.8.0 (без PID) + новый сервер: наблюдения за клиентом нет,
 /// всё остальное работает как раньше.
 #[test]
 fn old_client_interoperates_without_peer_watch() {
-    let (server, client) = connect_pair(&unique("OLDC"), false, false);
+    let (mut server, mut client) = connect_pair(&unique("OLDC"), false, false);
     assert_eq!(server.peer_pid(), None);
     assert_eq!(server.is_peer_alive(), None);
     assert_eq!(client.peer_pid(), Some(std::process::id()));
@@ -94,13 +94,13 @@ fn old_client_interoperates_without_peer_watch() {
         server.poll_client(Some(Duration::from_millis(10))),
         Ok(false)
     );
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
 }
 
 /// Сервер 0.7/0.8.0 (PID не опубликован) + новый клиент.
 #[test]
 fn old_server_interoperates_without_peer_watch() {
-    let (server, client) = connect_pair(&unique("OLDS"), true, true);
+    let (mut server, mut client) = connect_pair(&unique("OLDS"), true, true);
     assert_eq!(client.peer_pid(), None);
     assert_eq!(client.is_peer_alive(), None);
     assert_eq!(server.peer_pid(), Some(std::process::id()));
@@ -108,7 +108,7 @@ fn old_server_interoperates_without_peer_watch() {
         client.poll_server(Some(Duration::from_millis(10))),
         Ok(false)
     );
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
 }
 
 /// Устаревший PID (клиент упал между записью PID и HELLO, а следом пришёл
@@ -137,7 +137,7 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client = SharedClient::connect_impl(
+    let mut client = SharedClient::connect_impl(
         None,
         &name,
         Duration::from_secs(5),
@@ -146,10 +146,10 @@ fn stale_dead_pid_is_not_reported_as_peer_death() {
         None,
     )
     .unwrap();
-    let server = server_thread.join().unwrap();
+    let mut server = server_thread.join().unwrap();
     assert_eq!(server.peer_pid(), None);
     assert_eq!(server.is_peer_alive(), None);
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
     drop(child);
 }
 
@@ -207,15 +207,15 @@ fn client_with_forged_start_time_is_reported_dead() {
         None,
     );
     crate::client::FORGED_START_TIME.with(|cell| cell.set(None));
-    let client = client.unwrap();
-    let server = server_thread.join().unwrap();
+    let mut client = client.unwrap();
+    let mut server = server_thread.join().unwrap();
     assert_ne!(server.is_peer_alive(), Some(true));
     assert_eq!(server.peer_pid(), None);
     // Время одноразовое, как и PID: сервер забрал его парой.
     let control = server.view().control_block();
     assert_eq!(control.client_start_lo.load(Ordering::Acquire), 0);
     assert_eq!(control.client_start_hi.load(Ordering::Acquire), 0);
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
 }
 
 /// Тест-порча (Review Focus 1/4): мусор в старшей половине времени сервера
@@ -236,13 +236,13 @@ fn corrupted_server_start_hi_is_not_a_live_server() {
         server
     });
     thread::sleep(Duration::from_millis(30));
-    let client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
-    let server = server_thread.join().unwrap();
+    let mut client = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+    let mut server = server_thread.join().unwrap();
     assert_ne!(client.is_peer_alive(), Some(true));
     assert_eq!(client.peer_pid(), None);
     // Честное время клиента сервер принимает.
     assert_eq!(server.is_peer_alive(), Some(true));
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
 }
 
 /// Ревизия 3 (§7.1 п. 16, §5 дизайна): черновой клиент ревизии 2 без claim
@@ -258,7 +258,7 @@ fn legacy_client_without_claim_connects() {
             .unwrap();
         server
     });
-    let client = SharedClient::connect_impl(
+    let mut client = SharedClient::connect_impl(
         None,
         &name,
         Duration::from_secs(5),
@@ -267,12 +267,13 @@ fn legacy_client_without_claim_connects() {
         None,
     )
     .unwrap();
-    let server = server_thread.join().unwrap();
+    let mut server = server_thread.join().unwrap();
     let control = server.view().control_block();
     assert_eq!(control.slot_claim.load(Ordering::Acquire), 0);
     assert_eq!(server.session_claim(), 0);
     assert_eq!(server.peer_pid(), Some(std::process::id()));
-    roundtrip(&server, &client);
+    roundtrip(&mut server, &mut client);
     drop(client);
+    let control = server.view().control_block();
     assert_eq!(control.client_state.load(Ordering::Acquire), 0);
 }

@@ -373,7 +373,7 @@ fn shared_server_sees_client_death() {
     });
     thread::sleep(Duration::from_millis(100)); // писатель уже спит в ожидании
     let t0 = peer.kill();
-    let (result, woke, server) = waiter.join().unwrap();
+    let (result, woke, mut server) = waiter.join().unwrap();
     assert_eq!(result, Err(ShmError::PeerDied));
     report("shared server wait_for_space", woke - t0);
     assert_eq!(server.is_peer_alive(), Some(false));
@@ -383,6 +383,23 @@ fn shared_server_sees_client_death() {
         Err(ShmError::PeerDied)
     );
     assert!(t.elapsed() < BOUND);
+    // Завершающий исход `poll_client` помечает сервер отключённым и
+    // снимает claim умершего (R18): канал сразу принимает нового клиента.
+    assert!(!server.is_connected());
+    assert_eq!(
+        server.poll_client(Some(Duration::from_secs(10))),
+        Err(ShmError::NotConnected)
+    );
+    let acceptor = thread::spawn(move || {
+        let r = server.wait_for_client(Some(Duration::from_secs(10)));
+        (r, server)
+    });
+    let client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
+    let (accepted, server) = acceptor.join().unwrap();
+    assert_eq!(accepted, Ok(()));
+    assert!(server.is_connected());
+    assert_eq!(server.peer_pid(), Some(std::process::id()));
+    drop(client);
 }
 
 /// Клиент ждёт данных, сервер убит: `poll_server` возвращает `PeerDied`.
@@ -395,7 +412,7 @@ fn shared_client_sees_server_death() {
         client = SharedClient::connect(&name, Duration::from_millis(500)).ok();
         client.is_some()
     });
-    let client = client.unwrap();
+    let mut client = client.unwrap();
     assert_eq!(client.peer_pid(), Some(peer.pid()));
     // `SharedClient` -- `!Sync` (0.10): ждёт в своём потоке и возвращается.
     let poller = thread::spawn(move || {
@@ -407,7 +424,9 @@ fn shared_client_sees_server_death() {
     let (result, woke, client) = poller.join().unwrap();
     assert_eq!(result, Err(ShmError::PeerDied));
     report("shared client poll_server", woke - t0);
-    assert_eq!(client.is_peer_alive(), Some(false));
+    // Завершающий исход помечает клиента отключённым: наблюдения больше нет.
+    assert!(!client.is_connected());
+    assert_eq!(client.is_peer_alive(), None);
 }
 
 /// Контроль: штатное отключение клиента -- никакого `PeerDied`.

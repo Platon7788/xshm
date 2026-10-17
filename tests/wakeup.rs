@@ -75,16 +75,36 @@ fn write_all(
     Ok(())
 }
 
+/// Читающая сторона: приём и ожидание данных (`poll_*` -- `&mut self`).
+trait Reader {
+    fn receive(&mut self, buf: &mut Vec<u8>) -> xshm::Result<usize>;
+    fn poll(&mut self) -> xshm::Result<bool>;
+}
+
+impl Reader for SharedServer {
+    fn receive(&mut self, buf: &mut Vec<u8>) -> xshm::Result<usize> {
+        self.receive_from_client(buf)
+    }
+    fn poll(&mut self) -> xshm::Result<bool> {
+        self.poll_client(None)
+    }
+}
+
+impl Reader for SharedClient {
+    fn receive(&mut self, buf: &mut Vec<u8>) -> xshm::Result<usize> {
+        self.receive_from_server(buf)
+    }
+    fn poll(&mut self) -> xshm::Result<bool> {
+        self.poll_server(None)
+    }
+}
+
 /// Читатель: читать до `QueueEmpty`, потом спать ТОЛЬКО на `DATA`.
-fn read_all(
-    receive: impl Fn(&mut Vec<u8>) -> xshm::Result<usize>,
-    poll: impl Fn() -> xshm::Result<bool>,
-    progress: &AtomicU64,
-) -> xshm::Result<()> {
+fn read_all(reader: &mut impl Reader, progress: &AtomicU64) -> xshm::Result<()> {
     let mut buf = Vec::new();
     let mut seq = 0u64;
     while seq < TOTAL {
-        match receive(&mut buf) {
+        match reader.receive(&mut buf) {
             Ok(len) => {
                 check(seq, &buf[..len]);
                 seq += 1;
@@ -92,7 +112,7 @@ fn read_all(
                 progress.store(seq, Ordering::Relaxed);
             }
             Err(ShmError::QueueEmpty) => {
-                poll()?;
+                reader.poll()?;
             }
             Err(err) => return Err(err),
         }
@@ -125,11 +145,7 @@ fn run(direction: Direction, deadline: Instant) {
                     |m| server.try_send_to_client(m),
                     || server.wait_for_space(16, None),
                 ),
-                Direction::ClientToServer => read_all(
-                    |b| server.receive_from_client(b),
-                    || server.poll_client(None),
-                    &progress,
-                ),
+                Direction::ClientToServer => read_all(&mut server, &progress),
             };
             let _ = done_tx.send(("server", result));
             // Сервер живёт, пока главный поток не дождётся клиента: иначе
@@ -142,13 +158,9 @@ fn run(direction: Direction, deadline: Instant) {
     let client_thread = thread::spawn({
         let progress = Arc::clone(&progress);
         move || {
-            let client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
+            let mut client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
             let result = match direction {
-                Direction::ServerToClient => read_all(
-                    |b| client.receive_from_server(b),
-                    || client.poll_server(None),
-                    &progress,
-                ),
+                Direction::ServerToClient => read_all(&mut client, &progress),
                 Direction::ClientToServer => write_all(
                     |m| client.try_send_to_server(m),
                     || client.wait_for_space(16, None),

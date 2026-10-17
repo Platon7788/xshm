@@ -227,7 +227,7 @@ fn async_roundtrip() {
 fn async_send_waits_for_space() {
     let name = unique_name("SPACE");
     let config = ChannelConfig::default().layout(ChannelLayout::symmetric(RingConfig::new(4096)));
-    let (mut server, client) = connected_pair(&name, &config);
+    let (mut server, mut client) = connected_pair(&name, &config);
     let payload = [7u8; 1000];
     let mut sent = 0usize;
     while server.try_send_to_client(&payload).is_ok() {

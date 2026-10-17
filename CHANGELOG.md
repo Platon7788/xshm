@@ -28,6 +28,7 @@
 | Опции | `AutoOptions`, `MultiOptions`, `MultiClientOptions`, `DispatchOptions`, `DispatchClientOptions` без новых полей | поля `layout`/`channel_layout`/`lobby_layout`/`max_clients`, `security`, `namespace`, `spin`, `delivery` (Auto) | Литералы опций — с `..Default::default()` |
 | `FreeSpace` | открытая структура `{ bytes, messages }` | `#[non_exhaustive]`, новые поля `max_frame`, `max_message_size`; `fits`/`max_payload` решают по `max_frame` | Литерал `FreeSpace { .. }` заменить на `FreeSpace::ZERO`/`Default` или полученный снимок |
 | `SharedServer`/`SharedClient` | `Send + Sync` | `Send + !Sync` (гонка SPSC через `&self`) | Из нескольких потоков — `Mutex<SharedServer>`, Auto/Multi/Dispatch |
+| `poll_client`/`poll_server` (и `*_spin`) | `&self`; штатный уход пира не виден — `Ok(true)` на устаревшем `DATA` или `Ok(false)` по таймауту, сторона оставалась «подключённой» | `&mut self`; после дочитывания кольца — `Err(NotConnected)` (уход) / `Err(PeerDied)` (смерть), сторона помечается отключённой: `is_connected() == false`, сервер снова принимает клиента (`wait_for_client`) | `let mut server`/`let mut client`, `&mut` в помощниках; `NotConnected` из `poll_*` — конец сессии (после смерти пира `is_peer_alive()` — `None`) |
 | Zero-copy | нет | `send_with(len, f)` (`&mut self`, безопасно), `unsafe fn receive_with(f)` (`&mut self`; новая ошибка `ShmError::Overrun`) | Опционально; копирующие методы не менялись |
 | Доставка Auto | `on_message` получает копию | по умолчанию — так же; `AutoOptions::delivery` (`Delivery::COPY`), прямая доставка — `unsafe fn AutoOptions::zero_copy_delivery` | Ничего |
 | Спин | нет | `SpinPolicy` (`NONE` по умолчанию), поля `spin` в опциях, `poll_*_spin`, `wait_for_space_spin` | Опционально; без спина — «ноль пробуждений в простое», как в 0.9 |
@@ -209,6 +210,17 @@
 
 ### Изменено (несовместимо)
 
+- **`SharedServer::poll_client`/`poll_client_spin` и
+  `SharedClient::poll_server`/`poll_server_spin` берут `&mut self`** (было
+  `&self`): на завершающем исходе (`Err(NotConnected)` после штатного ухода
+  пира, `Err(PeerDied)`) сторона помечается отключённой — `is_connected()`
+  становится `false`, повторный `poll_*` сразу даёт `NotConnected`, сервер
+  снова принимает клиента. Claim штатно ушедшего клиента сервер не трогает
+  (его снимает клиент), умершего — снимает (R18); клиент, увидевший уход
+  сервера, при `Drop` только снимает claim, без ответного `DISCONNECT`.
+  `wait_for_space*` остаются `&self` и сторону не помечают (сообщают
+  `NotConnected`, событие взведено) — сессию закончит следующий `poll_*`.
+  Миграция: `let mut` у стороны, `&mut` в помощниках.
 - **`SharedServer`/`SharedClient` — `!Sync`** (остаются `Send`): параллельные
   `&self`-вызовы `try_send_*`/`send_*`/`receive_from_*` из двух потоков были
   гонкой данных на одной стороне SPSC-кольца в безопасном коде (UB). Теперь
@@ -596,6 +608,29 @@
   `tests/hostile.rs::client_rejects_uncached_squatter`. Поведение видно
   пиру, нативная реализация (xipc) обязана повторить. INTEROP §b.2,
   §c.5 п. 1, §g п. 14 и «Изменения 0.10» п. 31.
+- **Major** Синхронный читатель не видел штатного ухода пира.
+  `poll_client`/`poll_server` ждали только `[DATA, процесс пира]`: клиент,
+  ушедший штатно (`IDLE`, потом `DISCONNECT`), оставлял сервер
+  «подключённым» — `poll_client` отвечал `Ok(true)` на устаревший `DATA` или
+  `Ok(false)` по таймауту бесконечно, а `wait_for_client` давал
+  `AlreadyConnected`. Теперь набор ожидания — `[DATA, S2C_DISCONNECT,
+  процесс пира]` (`RingBuffer::wait_for_data` с `DisconnectWatch`, как у
+  `wait_for_space`): уход пира (сервер — `client_state != SERVER_READY`,
+  клиент — `server_state != SERVER_READY` или сменился `generation`) —
+  сначала дочитать кольцо (`Ok(true)`), потом `Err(NotConnected)` и пометка
+  отключения; событие возвращается взведённым; устаревший `DISCONNECT`
+  поглощается, ожидание продолжается остатком таймаута. Пир, ушедший до
+  вызова, распознаётся по памяти без ожидания. Anonymous-сервер: при пустом
+  кольце и `client_state != SERVER_READY` — `Err(NotConnected)`. Простой —
+  по-прежнему одно ожидание в ядре. Тесты:
+  `ring::try_write_tests::wait_for_data_wakes_on_disconnect_and_ignores_stale_signal`,
+  `server::poll_tests::{poll_client_sees_graceful_leave_after_drain,
+  poll_client_idle_is_single_kernel_wait, anonymous_poll_sees_client_state_idle}`,
+  `client::tests::{poll_server_sees_server_leave,
+  poll_server_spin_sees_server_leave}`,
+  `tests/peer_death.rs::shared_server_sees_client_death` (после `PeerDied`
+  канал принимает нового клиента). Новых обязанностей у пира нет — только
+  R14 (состояние `IDLE` до `DISCONNECT`); INTEROP §e.1, §i.6, §f.
 
 ### Сборка
 

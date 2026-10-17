@@ -196,10 +196,12 @@ pub(crate) struct DrainBound {
     pub(crate) left: u32,
 }
 
-/// Штатное отключение пира для `wait_for_space`: событие `DISCONNECT` (одно
-/// на обе стороны, автосброс) и проверка по разделяемой памяти, что пир
-/// действительно ушёл (его состояние handshake уже не `SERVER_READY`) --
-/// отличает свежий сигнал от устаревшего.
+/// Штатное отключение пира для `wait_for_space` и `wait_for_data`: событие
+/// `DISCONNECT` (одно на обе стороны, автосброс) и проверка по разделяемой
+/// памяти, что пир действительно ушёл (его состояние handshake уже не
+/// `SERVER_READY`; клиент сверяет и `generation`) -- отличает свежий сигнал
+/// от устаревшего. Свежий сигнал ожидающий возвращает взведённым,
+/// устаревший -- поглощает.
 pub(crate) struct DisconnectWatch<'a> {
     pub event: &'a EventHandle,
     pub peer_left: &'a dyn Fn() -> bool,
@@ -1408,42 +1410,103 @@ impl RingBuffer {
     /// Читатель: дождаться данных (`poll_*`). `Ok(true)` -- в кольце есть
     /// кадр ИЛИ сигнален `DATA` (возможно, устаревший: вызывающий читает
     /// до `QueueEmpty`), `Ok(false)` -- истёк `timeout`, `Err(PeerDied)` --
-    /// процесс писателя завершился и всё, что он записал, прочитано.
+    /// процесс писателя завершился и всё, что он записал, прочитано,
+    /// `Err(NotConnected)` -- писатель штатно ушёл (`DISCONNECT` при
+    /// `peer_left`) и всё, что он записал, прочитано.
     ///
     /// Порядок: `is_empty` (с барьером, Dekker-пара с `publish`), затем
-    /// `spin` -- один бюджет на вызов с проверкой по позициям, затем ОДНО
-    /// ожидание в ядре по `[DATA, процесс писателя]` (индекс 0 -- данные:
-    /// при одновременном сигнале последние данные мёртвого пира не
-    /// теряются). Спин, увидевший кадр, возвращает `Ok(true)` без ядра;
-    /// `DATA`, который писатель мог при этом взвести, остаётся взведённым и
-    /// даст позже одно лишнее пробуждение -- сбрасывать его нельзя (можно
+    /// `spin` -- один бюджет на вызов с проверкой по позициям, затем
+    /// проверка ухода по разделяемой памяти (`peer_left`: пир, ушедший до
+    /// вызова, не требует ожидания), затем ожидание в ядре по `[DATA,
+    /// DISCONNECT, процесс писателя]` (меньший индекс важнее: при
+    /// одновременном сигнале последние данные ушедшего пира не теряются).
+    /// Спин, увидевший кадр, возвращает `Ok(true)` без ядра; `DATA`,
+    /// который писатель мог при этом взвести, остаётся взведённым и даст
+    /// позже одно лишнее пробуждение -- сбрасывать его нельзя (можно
     /// потерять сигнал следующего кадра). При нулевом таймауте спина нет;
     /// дедлайн `timeout` спин сверяет раз в `SPIN_DEADLINE_STRIDE` итераций.
+    ///
+    /// `DISCONNECT` -- по правилу `DisconnectWatch` (как `wait_for_space`):
+    /// при `peer_left` событие возвращается взведённым (оно одно на обе
+    /// стороны), при живом пире -- устаревший сигнал прошлой сессии,
+    /// поглощён, ожидание продолжается остатком таймаута (одно лишнее
+    /// пробуждение -- только на событие пира, не таймер). Пир пишет данные
+    /// до перевода состояния в `IDLE` (R14), поэтому перепроверка кольца
+    /// после `peer_left` видит всё, что он успел записать.
     pub(crate) fn wait_for_data(
         &self,
         data: &EventHandle,
         peer: Option<&ProcessWatch>,
+        disconnect: Option<&DisconnectWatch<'_>>,
         timeout: Option<Duration>,
         spin: SpinPolicy,
     ) -> Result<bool> {
         if !self.is_empty() {
             return Ok(true);
         }
-        if timeout != Some(Duration::ZERO)
-            && spin_until(spin, deadline_of(timeout), || self.has_unread())
-        {
+        let deadline = deadline_of(timeout);
+        if timeout != Some(Duration::ZERO) && spin_until(spin, deadline, || self.has_unread()) {
             return Ok(true);
         }
-        #[cfg(test)]
-        DATA_KERNEL_WAITS.with(|c| c.set(c.get() + 1));
-        let Some(peer) = peer else {
-            return data.wait(timeout);
-        };
-        match wait_any(&[data.as_handle(), peer.as_handle()], timeout)? {
-            Some(0) => Ok(true),
-            Some(_) if !self.is_empty() => Ok(true),
-            Some(_) => Err(ShmError::PeerDied),
-            None => Ok(false),
+        // Пир уже ушёл (его сигнал мог достаться другому ждущему, который
+        // вернул его, или ещё в пути): решаем по памяти, событие не трогаем.
+        if let Some(d) = disconnect
+            && (d.peer_left)()
+        {
+            return self.left_outcome(ShmError::NotConnected);
+        }
+
+        // Индекс 0 -- данные, затем отключение, затем смерть. Хвост массива
+        // -- заполнитель, в ожидание уходит `[..count]`.
+        let mut handles = [data.as_handle(); 3];
+        let mut count = 1;
+        let disconnect_index = disconnect.map(|d| {
+            handles[count] = d.event.as_handle();
+            count += 1;
+            count - 1
+        });
+        if let Some(peer) = peer {
+            handles[count] = peer.as_handle();
+            count += 1;
+        }
+        loop {
+            // Остаток до дедлайна; таймаут, не представимый как `Instant`,
+            // -- без ограничения (как `deadline_of`).
+            let remaining = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            #[cfg(test)]
+            DATA_KERNEL_WAITS.with(|c| c.set(c.get() + 1));
+            match wait_any(&handles[..count], remaining)? {
+                Some(0) => return Ok(true),
+                None => return Ok(false),
+                Some(i) if Some(i) == disconnect_index => {
+                    if let Some(d) = disconnect
+                        && (d.peer_left)()
+                    {
+                        // Событие одно на обе стороны и автосбросное: мы его
+                        // поглотили -- возвращаем взведённым для остальных
+                        // ждущих (`wait_for_space`, worker).
+                        let _ = d.event.set();
+                        return self.left_outcome(ShmError::NotConnected);
+                    }
+                    // Устаревший сигнал прошлой сессии -- поглощён. Дедлайн
+                    // истёк -- таймаут без лишнего ожидания в ядре.
+                    if deadline.is_some_and(|at| Instant::now() >= at) {
+                        return Ok(false);
+                    }
+                }
+                // Процесс писателя завершился.
+                Some(_) => return self.left_outcome(ShmError::PeerDied),
+            }
+        }
+    }
+
+    /// Писатель ушёл (`reason`): пока в кольце есть недочитанное --
+    /// `Ok(true)` (сначала дочитать), пусто -- `Err(reason)`.
+    fn left_outcome(&self, reason: ShmError) -> Result<bool> {
+        if self.is_empty() {
+            Err(reason)
+        } else {
+            Ok(true)
         }
     }
 }
@@ -2552,6 +2615,67 @@ mod try_write_tests {
         );
     }
 
+    /// Читатель (`poll_*`): `DISCONNECT` в наборе ожидания данных с тем же
+    /// правилом, что у `wait_for_space` -- устаревший сигнал поглощается и
+    /// ожидание продолжается остатком таймаута; настоящий уход при пустом
+    /// кольце -- `NotConnected` (событие взведено для остальных), при
+    /// непустом -- сначала дочитать (`Ok(true)` без ожидания в ядре).
+    #[test]
+    fn wait_for_data_wakes_on_disconnect_and_ignores_stale_signal() {
+        let data_waits = || DATA_KERNEL_WAITS.with(std::cell::Cell::get);
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let disconnect = EventHandle::create_unnamed(false).unwrap();
+        let left = AtomicBool::new(false);
+        let peer_left = || left.load(O::Acquire);
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+        let timeout = Duration::from_millis(150);
+
+        // (а) Устаревший сигнал: поглощён, ожидание -- остаток таймаута.
+        disconnect.set().unwrap();
+        let before = data_waits();
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(&watch), Some(timeout), SpinPolicy::NONE),
+            Ok(false)
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(140), "{elapsed:?}");
+        assert!(elapsed < Duration::from_millis(1000), "{elapsed:?}");
+        assert_eq!(data_waits() - before, 2, "устаревший сигнал + таймаут");
+        assert!(
+            !disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "устаревший сигнал поглощён"
+        );
+
+        // (б) Настоящий уход, кольцо пусто.
+        left.store(true, O::Release);
+        disconnect.set().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(&watch), Some(timeout), SpinPolicy::NONE),
+            Err(ShmError::NotConnected)
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(
+            disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "сигнал отключения возвращён остальным ждущим"
+        );
+
+        // (в) Настоящий уход, в кольце кадр: сначала дочитать.
+        disconnect.set().unwrap();
+        ring.try_write_message(&[5u8; 16]).unwrap();
+        let before = data_waits();
+        assert_eq!(
+            ring.wait_for_data(&data, None, Some(&watch), Some(timeout), SpinPolicy::NONE),
+            Ok(true)
+        );
+        assert_eq!(data_waits() - before, 0);
+    }
+
     /// Писатель быстрее читателя: try_write упирается в QueueFull, но ни одно
     /// сообщение не теряется, не переставляется и не рвётся; после того как
     /// читатель разгребает кольцо, запись продолжается.
@@ -2755,7 +2879,7 @@ mod tests {
         let writer = spawn_writer(&ring, &data);
         let before = data_waits();
         assert_eq!(
-            ring.wait_for_data(&data, None, Some(Duration::from_secs(5)), LONG_SPIN),
+            ring.wait_for_data(&data, None, None, Some(Duration::from_secs(5)), LONG_SPIN),
             Ok(true)
         );
         writer.join().unwrap();
@@ -2769,7 +2893,13 @@ mod tests {
         let writer = spawn_writer(&ring, &data);
         let before = data_waits();
         assert_eq!(
-            ring.wait_for_data(&data, None, Some(Duration::from_secs(5)), SpinPolicy::NONE),
+            ring.wait_for_data(
+                &data,
+                None,
+                None,
+                Some(Duration::from_secs(5)),
+                SpinPolicy::NONE
+            ),
             Ok(true)
         );
         writer.join().unwrap();
@@ -2788,6 +2918,7 @@ mod tests {
             ring.wait_for_data(
                 &data,
                 None,
+                None,
                 Some(Duration::from_millis(30)),
                 SpinPolicy::new(1_000)
             ),
@@ -2797,7 +2928,7 @@ mod tests {
 
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_data(&data, None, Some(Duration::ZERO), LONG_SPIN),
+            ring.wait_for_data(&data, None, None, Some(Duration::ZERO), LONG_SPIN),
             Ok(false)
         );
         assert!(
@@ -2816,7 +2947,13 @@ mod tests {
         let data = EventHandle::create_unnamed(false).unwrap();
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_data(&data, None, Some(Duration::from_millis(30)), unbounded),
+            ring.wait_for_data(
+                &data,
+                None,
+                None,
+                Some(Duration::from_millis(30)),
+                unbounded
+            ),
             Ok(false)
         );
         assert!(

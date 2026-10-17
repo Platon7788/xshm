@@ -148,7 +148,7 @@ mod tests {
             // прогона секции может ещё не быть -- повторяем подключение до
             // 5 с, а не угадываем фиксированной паузой.
             let deadline = Instant::now() + Duration::from_secs(5);
-            let client = loop {
+            let mut client = loop {
                 match SharedClient::connect(NAME, Duration::from_secs(2)) {
                     Ok(client) => break client,
                     Err(_) if Instant::now() < deadline => {

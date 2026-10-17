@@ -1149,6 +1149,10 @@ impl SharedServer {
     /// Клиент без PID (старая версия), упавший без `DISCONNECT`, не будит
     /// ничем: единственная граница тогда -- `timeout` вызывающего. Без
     /// событий (anonymous) -- опрос с шагом 1 мс.
+    ///
+    /// `wait_for_space` (по `&self`) сторону отключённой не помечает: уход
+    /// клиента только сообщается (`NotConnected`, `DISCONNECT` остаётся
+    /// взведённым), сессию заканчивает следующий `poll_client`.
     pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
         self.wait_for_space_spin(payload_len, timeout, SpinPolicy::NONE)
     }
@@ -1166,8 +1170,7 @@ impl SharedServer {
         spin: SpinPolicy,
     ) -> Result<bool> {
         self.ensure_connected()?;
-        let control = self.view.control_block();
-        let peer_left = || control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY;
+        let peer_left = || self.client_left();
         let disconnect = self.events.as_ref().map(|e| DisconnectWatch {
             event: &e.disconnect,
             peer_left: &peer_left,
@@ -1263,11 +1266,32 @@ impl SharedServer {
         }
     }
 
-    /// Ждать данных от клиента. `Ok(true)` -- в кольце есть сообщение,
-    /// `Ok(false)` -- таймаут (или anonymous-режим без данных),
-    /// `Err(PeerDied)` -- процесс клиента умер и всё, что он успел записать,
-    /// уже прочитано (пока в кольце есть данные, возвращается `Ok(true)`).
-    pub fn poll_client(&self, timeout: Option<Duration>) -> Result<bool> {
+    /// Ждать данных от клиента.
+    ///
+    /// Исходы:
+    /// - `Ok(true)` -- в кольце есть сообщение или сработал `C2S_DATA`
+    ///   (возможно, устаревший: читать до `QueueEmpty`);
+    /// - `Ok(false)` -- таймаут (anonymous-режим без данных -- сразу);
+    /// - `Err(NotConnected)` -- клиент штатно ушёл (`DISCONNECT` при
+    ///   `client_state != SERVER_READY`) и всё, что он успел записать, уже
+    ///   прочитано; либо сервер не подключён;
+    /// - `Err(PeerDied)` -- процесс клиента умер и всё, что он успел
+    ///   записать, уже прочитано.
+    ///
+    /// Пока в кольце есть данные ушедшего клиента, возвращается `Ok(true)`.
+    /// На завершающем исходе (`NotConnected` по уходу, `PeerDied`) сервер
+    /// помечается отключённым (отсюда `&mut self`): `is_connected() ==
+    /// false`, следующий `wait_for_client` примет нового клиента, повторный
+    /// `poll_client` -- `Err(NotConnected)` сразу. Claim штатно ушедшего
+    /// клиента не трогается (его снимает сам клиент), умершего -- снимается.
+    ///
+    /// Набор ожидания -- `[C2S_DATA, S2C_DISCONNECT, процесс клиента]`,
+    /// одно ожидание в ядре на весь `timeout`; устаревший `DISCONNECT`
+    /// (клиент в сессии) поглощается, ожидание продолжается остатком
+    /// таймаута. `wait_for_space` (по `&self`) об уходе только сообщает
+    /// (`NotConnected`, событие взведено) и сторону не помечает -- сессию
+    /// закончит следующий `poll_client`.
+    pub fn poll_client(&mut self, timeout: Option<Duration>) -> Result<bool> {
         self.poll_client_spin(timeout, SpinPolicy::NONE)
     }
 
@@ -1278,8 +1302,26 @@ impl SharedServer {
     /// при `timeout = Some(0)` спина нет; дедлайн `timeout` спин сверяет раз
     /// в 64 итерации (перебег -- не больше 64 итераций). `SpinPolicy::NONE` -- то же, что
     /// `poll_client`.
-    pub fn poll_client_spin(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
+    pub fn poll_client_spin(
+        &mut self,
+        timeout: Option<Duration>,
+        spin: SpinPolicy,
+    ) -> Result<bool> {
         self.ensure_connected()?;
+        let result = self.wait_client_data(timeout, spin);
+        if matches!(result, Err(ShmError::NotConnected | ShmError::PeerDied)) {
+            // Завершающий исход: кольцо дочитано, клиент ушёл или умер.
+            // `mark_disconnected` снимает claim только умершего (R18).
+            self.mark_disconnected();
+        }
+        result
+    }
+
+    /// Ожидание данных `poll_client_spin` без пометки отключения.
+    /// `Err(NotConnected)`/`Err(PeerDied)` -- только завершающие исходы
+    /// (кольцо пусто, клиент ушёл/умер).
+    fn wait_client_data(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
+        let peer_left = || self.client_left();
         // Для anonymous режима просто проверяем буфер (polling)
         let Some(events) = self.events.as_ref() else {
             if !self.ring_rx.is_empty()
@@ -1288,6 +1330,16 @@ impl SharedServer {
             {
                 return Ok(true);
             }
+            // Событий нет -- уход виден только по состоянию в памяти.
+            // Клиент пишет данные до `IDLE` (R14): перепроверка кольца
+            // после состояния не теряет его последних кадров.
+            if peer_left() {
+                return if self.ring_rx.is_empty() {
+                    Err(ShmError::NotConnected)
+                } else {
+                    Ok(true)
+                };
+            }
             return match &self.peer {
                 Some(peer) if peer.has_exited() && self.ring_rx.is_empty() => {
                     Err(ShmError::PeerDied)
@@ -1295,8 +1347,28 @@ impl SharedServer {
                 _ => Ok(false), // Нет данных, но не timeout
             };
         };
-        self.ring_rx
-            .wait_for_data(&events.c2s.data, self.peer.as_ref(), timeout, spin)
+        let disconnect = DisconnectWatch {
+            event: &events.disconnect,
+            peer_left: &peer_left,
+        };
+        self.ring_rx.wait_for_data(
+            &events.c2s.data,
+            self.peer.as_ref(),
+            Some(&disconnect),
+            timeout,
+            spin,
+        )
+    }
+
+    /// Клиент закрыл сессию: `client_state` уже не `SERVER_READY` (уход L
+    /// ставит `IDLE` до `DISCONNECT`, R14). Отличает свежий `DISCONNECT`
+    /// от устаревшего.
+    fn client_left(&self) -> bool {
+        self.view
+            .control_block()
+            .client_state
+            .load(Ordering::Acquire)
+            != HANDSHAKE_SERVER_READY
     }
 
     /// Worker-ы (спин перед сном, 0.10): в кольце от клиента есть
@@ -1408,11 +1480,7 @@ impl Endpoint for SharedServer {
     }
 
     fn peer_left(&self) -> bool {
-        self.view
-            .control_block()
-            .client_state
-            .load(Ordering::Acquire)
-            != HANDSHAKE_SERVER_READY
+        self.client_left()
     }
 
     fn receive(&self, buf: &mut Vec<u8>) -> Result<usize> {
@@ -2026,5 +2094,132 @@ mod tests {
         assert_eq!(result, Err(ShmError::Timeout));
         assert!(elapsed >= Duration::from_millis(190), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+}
+
+#[cfg(test)]
+mod poll_tests {
+    //! Синхронное ожидание данных (`poll_client*`) видит штатный уход
+    //! клиента (`DISCONNECT`) так же, как `wait_for_space`: сначала
+    //! дочитать кольцо, потом `Err(NotConnected)` и пометка отключения.
+
+    use super::*;
+    use crate::client::SharedClient;
+    use crate::ring::DATA_KERNEL_WAITS;
+
+    fn unique(tag: &str) -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("XSHM_POLL_{tag}_{}_{}", std::process::id(), ts % 1_000_000)
+    }
+
+    /// Сервер принимает клиента в отдельном потоке.
+    fn accept(mut server: SharedServer, name: &str) -> (SharedServer, SharedClient) {
+        let waiter = std::thread::spawn(move || {
+            server
+                .wait_for_client(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+        });
+        let client = SharedClient::connect(name, Duration::from_secs(5)).unwrap();
+        (waiter.join().unwrap(), client)
+    }
+
+    fn data_waits() -> u32 {
+        DATA_KERNEL_WAITS.with(Cell::get)
+    }
+
+    /// Клиент записал три кадра и ушёл (L: `IDLE`, потом `DISCONNECT`):
+    /// сервер дочитывает их байт-в-байт, затем `poll_client` -- сразу
+    /// `NotConnected`, сторона помечена отключённой и принимает нового
+    /// клиента.
+    #[test]
+    fn poll_client_sees_graceful_leave_after_drain() {
+        let name = unique("LEAVE");
+        let server = SharedServer::start(&name).unwrap();
+        let (mut server, client) = accept(server, &name);
+        let frames: [&[u8]; 3] = [b"first", b"second-frame", b"third!!"];
+        for frame in frames {
+            client.send_to_server(frame).unwrap();
+        }
+        drop(client);
+
+        assert_eq!(server.poll_client(Some(Duration::from_secs(5))), Ok(true));
+        let mut buf = Vec::new();
+        for frame in frames {
+            assert_eq!(server.receive_from_client(&mut buf), Ok(frame.len()));
+            assert_eq!(buf, frame);
+        }
+        let started = Instant::now();
+        assert_eq!(
+            server.poll_client(Some(Duration::from_secs(5))),
+            Err(ShmError::NotConnected)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!server.is_connected());
+        let started = Instant::now();
+        assert_eq!(
+            server.poll_client(Some(Duration::from_secs(5))),
+            Err(ShmError::NotConnected)
+        );
+        assert!(started.elapsed() < Duration::from_millis(100));
+
+        // Канал свободен: второй клиент принят, claim -- его.
+        let (server, client) = accept(server, &name);
+        assert!(server.is_connected());
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            client.claim()
+        );
+    }
+
+    /// Подключённая пара без трафика: одно ожидание в ядре на весь
+    /// таймаут, без нарезки и без лишних пробуждений.
+    #[test]
+    fn poll_client_idle_is_single_kernel_wait() {
+        let name = unique("IDLE");
+        let server = SharedServer::start(&name).unwrap();
+        let (mut server, _client) = accept(server, &name);
+        let before = data_waits();
+        let started = Instant::now();
+        assert_eq!(
+            server.poll_client(Some(Duration::from_millis(200))),
+            Ok(false)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(190));
+        assert_eq!(data_waits() - before, 1);
+        assert!(server.is_connected());
+    }
+
+    /// Anonymous-сервер (событий нет): клиент вернул `client_state` в
+    /// `IDLE` -- при пустом кольце `poll_client` заканчивает сессию.
+    #[test]
+    fn anonymous_poll_sees_client_state_idle() {
+        let mut server = SharedServer::start_anonymous().unwrap();
+        let control = server.view().control_block();
+        control
+            .client_state
+            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        server
+            .wait_for_client_noevent(Some(Duration::from_secs(1)))
+            .unwrap();
+        assert!(server.is_connected());
+        assert_eq!(server.poll_client(Some(Duration::ZERO)), Ok(false));
+        server
+            .view()
+            .control_block()
+            .client_state
+            .store(HANDSHAKE_IDLE, Ordering::Release);
+        assert_eq!(
+            server.poll_client(Some(Duration::ZERO)),
+            Err(ShmError::NotConnected)
+        );
+        assert!(!server.is_connected());
     }
 }

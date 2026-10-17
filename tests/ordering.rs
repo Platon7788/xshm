@@ -67,7 +67,7 @@ fn test_message_count_before_write_pos() {
     thread::sleep(Duration::from_millis(100));
 
     let client_result = (|| -> xshm::Result<usize> {
-        let client = SharedClient::connect(&name, Duration::from_secs(5))?;
+        let mut client = SharedClient::connect(&name, Duration::from_secs(5))?;
         let mut recv_buf = Vec::new();
         let mut received = 0usize;
         let mut empty_after_data = 0u32;
@@ -279,7 +279,7 @@ fn test_bidirectional_ordering_stress() {
         if ready_rx.recv_timeout(Duration::from_secs(20)).is_err() {
             return Err(ShmError::NotConnected);
         }
-        let client = connect_with_retry(&name, Duration::from_secs(15))?;
+        let mut client = connect_with_retry(&name, Duration::from_secs(15))?;
 
         let mut sent = 0usize;
         let mut received = 0usize;

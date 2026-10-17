@@ -100,7 +100,7 @@ fn stress_server_to_client() {
     const TOTAL: usize = 4000;
     let name = unique_name("S2C");
 
-    let server_thread = spawn_server(&name, |server| -> xshm::Result<(usize, usize)> {
+    let server_thread = spawn_server(&name, |mut server| -> xshm::Result<(usize, usize)> {
         let mut dog = Watchdog::new("server S2C");
         let mut overwritten_total = 0usize;
         for i in 0..TOTAL {
@@ -141,7 +141,7 @@ fn stress_server_to_client() {
     });
 
     let client_result = (|| -> xshm::Result<usize> {
-        let client = SharedClient::connect(&name, CONNECT)?;
+        let mut client = SharedClient::connect(&name, CONNECT)?;
         let mut recv_buf = Vec::new();
         let mut expected = 0u32;
         let mut dog = Watchdog::new("client S2C");
@@ -208,7 +208,7 @@ fn stress_client_to_server() {
     const TOTAL: usize = 4000;
     let name = unique_name("C2S");
 
-    let server_thread = spawn_server(&name, |server| -> xshm::Result<usize> {
+    let server_thread = spawn_server(&name, |mut server| -> xshm::Result<usize> {
         let mut recv_buf = Vec::new();
         let mut expected = 0u32;
         let mut dog = Watchdog::new("server C2S");
@@ -252,7 +252,7 @@ fn stress_client_to_server() {
     });
 
     let client_result = (|| -> xshm::Result<(usize, usize)> {
-        let client = SharedClient::connect(&name, CONNECT)?;
+        let mut client = SharedClient::connect(&name, CONNECT)?;
         let mut dog = Watchdog::new("client C2S");
         let mut overwritten_total = 0usize;
         for i in 0..TOTAL {
@@ -320,7 +320,7 @@ fn stress_bidirectional() {
     const TOTAL: usize = 2000;
     let name = unique_name("BI");
 
-    let server_thread = spawn_server(&name, |server| -> xshm::Result<()> {
+    let server_thread = spawn_server(&name, |mut server| -> xshm::Result<()> {
         let mut recv_buf = Vec::new();
         let mut received = 0u32;
         let mut sent = 0u32;
@@ -372,7 +372,7 @@ fn stress_bidirectional() {
     });
 
     let client_result = (|| -> xshm::Result<()> {
-        let client = SharedClient::connect(&name, CONNECT)?;
+        let mut client = SharedClient::connect(&name, CONNECT)?;
         let mut recv_buf = Vec::new();
         let mut received = 0u32;
         let mut sent = 0u32;

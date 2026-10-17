@@ -1232,7 +1232,7 @@ fn overwrite_flood_shared() {
             .unwrap();
         server
     });
-    let client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
+    let mut client = SharedClient::connect(&name, Duration::from_secs(10)).unwrap();
     let server = waiter.join().unwrap();
     let seg = Segment::open(&name, FLOOD_SEGMENT);
     let started = Instant::now();

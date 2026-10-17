@@ -79,7 +79,7 @@ fn child_slow_consumer_entry() {
         return;
     };
     let total: u32 = std::env::var(CHILD_TOTAL_ENV).unwrap().parse().unwrap();
-    let client = SharedClient::connect(&name, Duration::from_secs(10)).expect("child connect");
+    let mut client = SharedClient::connect(&name, Duration::from_secs(10)).expect("child connect");
     let mut buf = Vec::new();
     let mut expected = 0u32;
     let deadline = Instant::now() + Duration::from_secs(60);

@@ -390,7 +390,7 @@ fn send_c2s(client: &SharedClient, payload: &[u8], spin: SpinPolicy) -> BenchRes
 }
 
 /// Принять одно сообщение от сервера, ожидая его в ядре.
-fn recv_s2c(client: &SharedClient, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
+fn recv_s2c(client: &mut SharedClient, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
     loop {
         match client.receive_from_server(buf) {
             Ok(len) => return Ok(len),
@@ -404,7 +404,7 @@ fn recv_s2c(client: &SharedClient, buf: &mut Vec<u8>, spin: SpinPolicy) -> Bench
     }
 }
 
-fn recv_c2s(server: &SharedServer, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
+fn recv_c2s(server: &mut SharedServer, buf: &mut Vec<u8>, spin: SpinPolicy) -> BenchResult<usize> {
     loop {
         match server.receive_from_client(buf) {
             Ok(len) => return Ok(len),
@@ -534,7 +534,7 @@ fn run_throughput(name: &str, config: &ChannelConfig, plan: &Plan) -> BenchResul
                 if zero_copy {
                     return recv_s2c_zero_copy(&mut client, size, expected, spin);
                 }
-                let len = recv_s2c(&client, &mut buf, spin)?;
+                let len = recv_s2c(&mut client, &mut buf, spin)?;
                 check(&buf, len, size, expected, "клиент")?;
                 black_box(&buf);
                 Ok(())
@@ -609,46 +609,50 @@ fn run_latency(
     spin: SpinPolicy,
 ) -> BenchResult<Vec<Sample>> {
     let rounds = LATENCY_WARMUP + LATENCY_ITERS;
-    let (server, client) = connect_pair(name, config, move |client| -> BenchResult<Vec<Sample>> {
-        let mut payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
-        let mut buf = Vec::with_capacity(size);
-        let mut rtt = Vec::with_capacity(LATENCY_ITERS);
-        let mut samples = Vec::with_capacity(runs);
-        let mut seq = 0u64;
-        for _ in 0..runs {
-            rtt.clear();
-            let mut start = Instant::now();
-            for i in 0..rounds {
-                if i == LATENCY_WARMUP {
-                    start = Instant::now();
+    let (mut server, client) = connect_pair(
+        name,
+        config,
+        move |mut client| -> BenchResult<Vec<Sample>> {
+            let mut payload: Vec<u8> = (0..size).map(|i| i as u8).collect();
+            let mut buf = Vec::with_capacity(size);
+            let mut rtt = Vec::with_capacity(LATENCY_ITERS);
+            let mut samples = Vec::with_capacity(runs);
+            let mut seq = 0u64;
+            for _ in 0..runs {
+                rtt.clear();
+                let mut start = Instant::now();
+                for i in 0..rounds {
+                    if i == LATENCY_WARMUP {
+                        start = Instant::now();
+                    }
+                    stamp(&mut payload, seq);
+                    let t0 = Instant::now();
+                    send_c2s(&client, &payload, spin)?;
+                    let len = recv_s2c(&mut client, &mut buf, spin)?;
+                    let dt = t0.elapsed();
+                    check(&buf, len, size, seq, "клиент (эхо)")?;
+                    seq += 1;
+                    if i >= LATENCY_WARMUP {
+                        rtt.push(u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX));
+                    }
                 }
-                stamp(&mut payload, seq);
-                let t0 = Instant::now();
-                send_c2s(&client, &payload, spin)?;
-                let len = recv_s2c(&client, &mut buf, spin)?;
-                let dt = t0.elapsed();
-                check(&buf, len, size, seq, "клиент (эхо)")?;
-                seq += 1;
-                if i >= LATENCY_WARMUP {
-                    rtt.push(u64::try_from(dt.as_nanos()).unwrap_or(u64::MAX));
-                }
+                let secs = start.elapsed().as_secs_f64();
+                rtt.sort_unstable();
+                samples.push(Sample {
+                    msgs: LATENCY_ITERS as f64 / secs,
+                    mib: (LATENCY_ITERS * size) as f64 / secs / f64::from(1u32 << 20),
+                    p50: Some(percentile_us(&rtt, 50)),
+                    p99: Some(percentile_us(&rtt, 99)),
+                });
             }
-            let secs = start.elapsed().as_secs_f64();
-            rtt.sort_unstable();
-            samples.push(Sample {
-                msgs: LATENCY_ITERS as f64 / secs,
-                mib: (LATENCY_ITERS * size) as f64 / secs / f64::from(1u32 << 20),
-                p50: Some(percentile_us(&rtt, 50)),
-                p99: Some(percentile_us(&rtt, 99)),
-            });
-        }
-        Ok(samples)
-    })?;
+            Ok(samples)
+        },
+    )?;
 
     let echoed = (|| -> BenchResult<()> {
         let mut buf = Vec::with_capacity(size);
         for expected in 0..(runs * rounds) as u64 {
-            let len = recv_c2s(&server, &mut buf, spin)?;
+            let len = recv_c2s(&mut server, &mut buf, spin)?;
             check(&buf, len, size, expected, "сервер")?;
             send_s2c(&server, &buf[..len], spin)?;
         }

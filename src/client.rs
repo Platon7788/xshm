@@ -1003,7 +1003,9 @@ impl SharedClient {
     ///
     /// Набор ожидания -- `[C2S_SPACE, S2C_DISCONNECT, процесс сервера]`,
     /// одно ожидание на весь `timeout`; `DISCONNECT` при `server_state !=
-    /// SERVER_READY` -- `Err(NotConnected)`.
+    /// SERVER_READY` -- `Err(NotConnected)`. Сторону отключённой не
+    /// помечает (`&self`; событие остаётся взведённым) -- сессию заканчивает
+    /// следующий `poll_server`.
     pub fn wait_for_space(&self, payload_len: usize, timeout: Option<Duration>) -> Result<bool> {
         self.wait_for_space_spin(payload_len, timeout, SpinPolicy::NONE)
     }
@@ -1105,16 +1107,45 @@ impl SharedClient {
     }
 
     /// Ждать данных от сервера (семантика -- `SharedServer::poll_client`).
-    pub fn poll_server(&self, timeout: Option<Duration>) -> Result<bool> {
+    ///
+    /// Набор ожидания -- `[S2C_DATA, S2C_DISCONNECT, процесс сервера]`.
+    /// `Err(NotConnected)` -- сервер закрыл сессию (`server_state !=
+    /// SERVER_READY` или сменился `generation`) и всё, что он записал, уже
+    /// прочитано; `Err(PeerDied)` -- процесс сервера умер, кольцо дочитано.
+    /// На завершающем исходе клиент помечается отключённым (отсюда `&mut
+    /// self`): повторный вызов -- `Err(NotConnected)` сразу, `Drop` только
+    /// снимет claim, без ответного `DISCONNECT` (сервер уже ушёл; поздний
+    /// сигнал достался бы следующему клиенту). `wait_for_space` об уходе
+    /// только сообщает и сторону не помечает.
+    pub fn poll_server(&mut self, timeout: Option<Duration>) -> Result<bool> {
         self.poll_server_spin(timeout, SpinPolicy::NONE)
     }
 
     /// `poll_server` со спином перед ожиданием в ядре (0.10; семантика --
     /// `SharedServer::poll_client_spin`).
-    pub fn poll_server_spin(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
+    pub fn poll_server_spin(
+        &mut self,
+        timeout: Option<Duration>,
+        spin: SpinPolicy,
+    ) -> Result<bool> {
         self.ensure_connected()?;
-        self.ring_rx
-            .wait_for_data(&self.events.s2c.data, self.peer.as_ref(), timeout, spin)
+        let peer_left = || self.server_left();
+        let disconnect = DisconnectWatch {
+            event: &self.events.disconnect,
+            peer_left: &peer_left,
+        };
+        let result = self.ring_rx.wait_for_data(
+            &self.events.s2c.data,
+            self.peer.as_ref(),
+            Some(&disconnect),
+            timeout,
+            spin,
+        );
+        if matches!(result, Err(ShmError::NotConnected | ShmError::PeerDied)) {
+            // Завершающий исход: кольцо дочитано, сервер ушёл или умер.
+            self.mark_disconnected();
+        }
+        result
     }
 
     /// Worker-ы (спин перед сном, 0.10): в кольце от сервера есть
@@ -1584,5 +1615,61 @@ mod tests {
                 .unwrap()
         );
         assert!(Endpoint::peer_left(&server));
+    }
+
+    /// Сервер записал два кадра и ушёл (`disconnect_local`: состояния ->
+    /// `IDLE`, потом `DISCONNECT`): клиент дочитывает их, затем
+    /// `poll_server` -- `NotConnected`, сторона помечена отключённой, и
+    /// `Drop` только снимает claim -- без ответного `DISCONNECT`.
+    fn poll_server_sees_server_leave_with(spin: SpinPolicy) {
+        let name = unique("POLL_LEAVE");
+        let server = SharedServer::start(&name).unwrap();
+        let (mut server, mut client) = accept(server, &name);
+        let frames: [&[u8]; 2] = [b"alpha", b"beta-frame"];
+        for frame in frames {
+            server.send_to_client(frame).unwrap();
+        }
+        server.disconnect_local();
+
+        let mut buf = Vec::new();
+        for frame in frames {
+            assert_eq!(
+                client.poll_server_spin(Some(Duration::from_secs(5)), spin),
+                Ok(true)
+            );
+            assert_eq!(client.receive_from_server(&mut buf), Ok(frame.len()));
+            assert_eq!(buf, frame);
+        }
+        let started = Instant::now();
+        assert_eq!(
+            client.poll_server_spin(Some(Duration::from_secs(5)), spin),
+            Err(ShmError::NotConnected)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!client.is_connected());
+        assert_eq!(
+            client.poll_server_spin(Some(Duration::from_secs(5)), spin),
+            Err(ShmError::NotConnected)
+        );
+
+        // Второй handle того же `DISCONNECT`: после `Drop` клиента взвод
+        // ровно один -- сигнал сервера (возвращённый `poll`), ответного нет.
+        let events = SharedEvents::open(&name).unwrap();
+        drop(client);
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert!(events.disconnect.wait(Some(Duration::ZERO)).unwrap());
+        assert!(!events.disconnect.wait(Some(Duration::ZERO)).unwrap());
+    }
+
+    #[test]
+    fn poll_server_sees_server_leave() {
+        poll_server_sees_server_leave_with(SpinPolicy::NONE);
+    }
+
+    #[test]
+    fn poll_server_spin_sees_server_leave() {
+        poll_server_sees_server_leave_with(SpinPolicy { iterations: 1000 });
     }
 }
