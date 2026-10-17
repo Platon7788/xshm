@@ -86,13 +86,20 @@ pub(crate) fn multi_beacon_name(base: &str) -> String {
     format!("{base}{MULTI_BEACON_SUFFIX}")
 }
 
-/// Проверка `discovery_fallback` (m1 повторного ревью): нулевой интервал
-/// превратил бы каждое ожидание обнаружения в немедленную попытку -- цикл
-/// без сна. `None` (только события) и любой ненулевой -- допустимы.
+/// Наименьшая допустимая резервная проверка обнаружения (n1 ревью Task 11):
+/// интервал короче превращает ожидание обнаружения почти в опрос (тысячи
+/// попыток в секунду, а `NtWaitForMultipleObjects` округляет таймаут вниз до
+/// 100 нс -- и до нуля).
+pub(crate) const MIN_DISCOVERY_FALLBACK: Duration = Duration::from_millis(1);
+
+/// Проверка `discovery_fallback` (m1 повторного ревью, n1): интервал короче
+/// [`MIN_DISCOVERY_FALLBACK`] (1 мс, в том числе ноль) превратил бы каждое
+/// ожидание обнаружения в (почти) немедленную попытку -- цикл без сна.
+/// `None` (только события) и любой интервал от 1 мс -- допустимы.
 pub(crate) fn validate_fallback(fallback: Option<Duration>) -> Result<()> {
-    if fallback == Some(Duration::ZERO) {
+    if fallback.is_some_and(|fallback| fallback < MIN_DISCOVERY_FALLBACK) {
         return Err(ShmError::InvalidConfig(
-            "discovery_fallback must be non-zero (None disables it)",
+            "discovery_fallback must be at least 1 ms (None disables it)",
         ));
     }
     Ok(())
@@ -516,7 +523,8 @@ pub struct DiscoveryOptions {
     pub security: ObjectSecurity,
     /// Резервная проверка (решение W(3)): пока сервер не найден, проверять
     /// канал не реже этого интервала, даже если маяк молчит. `None` --
-    /// только события; `Some(Duration::ZERO)` -- `ShmError::InvalidConfig`
+    /// только события; меньше 1 мс (в том числе `Duration::ZERO`) --
+    /// `ShmError::InvalidConfig`
     /// (цикл без сна).
     pub fallback: Option<Duration>,
     /// Частное пространство имён канала (`None` -- `\BaseNamedObjects`).

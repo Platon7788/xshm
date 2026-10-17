@@ -328,7 +328,7 @@ pub struct MultiClientOptions {
     /// маяке базы или процессе сервера, попытка захвата -- не реже этого
     /// интервала. Подключённый клиент по нему не просыпается. По умолчанию
     /// -- `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с); `None` -- только события;
-    /// `Some(Duration::ZERO)` -- `MultiClient::connect` отказывает
+    /// меньше 1 мс (в том числе `Duration::ZERO`) -- `MultiClient::connect` отказывает
     /// `ShmError::InvalidConfig`.
     pub discovery_fallback: Option<Duration>,
     /// Количество сообщений за один цикл

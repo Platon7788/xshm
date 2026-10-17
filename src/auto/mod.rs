@@ -135,7 +135,7 @@ pub struct AutoOptions {
     /// клиент по нему не просыпается. По умолчанию --
     /// `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с: не больше 0,1 пробуждения в
     /// секунду, пока сервера нет); `None` -- только события.
-    /// `Some(Duration::ZERO)` -- `AutoClient::connect` отказывает
+    /// Меньше 1 мс (в том числе `Duration::ZERO`) -- `AutoClient::connect` отказывает
     /// `ShmError::InvalidConfig` (каждое ожидание стало бы немедленной
     /// попыткой -- цикл без сна).
     pub discovery_fallback: Option<Duration>,
@@ -3660,6 +3660,56 @@ mod presence_tests {
             },
         )
         .unwrap();
+        drop(client);
+    }
+
+    /// n1 ревью Task 11: интервал короче 1 мс -- почти опрос (тысячи
+    /// попыток в секунду) -- отвергается так же, как ноль; ровно 1 мс --
+    /// допустим.
+    #[test]
+    fn sub_millisecond_discovery_fallback_is_rejected() {
+        let tiny = Some(Duration::from_micros(500));
+        assert!(matches!(
+            AutoClient::connect(
+                &unique("TINY"),
+                Arc::new(Log::default()),
+                AutoOptions {
+                    discovery_fallback: tiny,
+                    ..AutoOptions::default()
+                },
+            )
+            .err(),
+            Some(ShmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            crate::multi::MultiClient::connect(
+                &unique("TINY_MULTI"),
+                Arc::new(ZeroMulti),
+                crate::multi::MultiClientOptions {
+                    discovery_fallback: tiny,
+                    ..crate::multi::MultiClientOptions::default()
+                },
+            )
+            .err(),
+            Some(ShmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            SharedClient::wait_for_server_with(
+                &unique("TINY_WAIT"),
+                Some(Duration::from_millis(10)),
+                &crate::DiscoveryOptions::default().fallback(tiny),
+            ),
+            Err(ShmError::InvalidConfig(_))
+        ));
+        let client = AutoClient::connect(
+            &unique("ONE_MS"),
+            Arc::new(Log::default()),
+            AutoOptions {
+                discovery_fallback: Some(Duration::from_millis(1)),
+                ..AutoOptions::default()
+            },
+        )
+        .expect("1 мс -- допустимо");
         drop(client);
     }
 

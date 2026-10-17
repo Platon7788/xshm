@@ -1308,7 +1308,7 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
   `SeCreateGlobalPrivilege`, `STATUS_ACCESS_DENIED`), процесс сервера не
   открылся, состояние маяка испорчено. Каждое ожидание обнаружения
   ограничено `discovery_fallback` (10 с, решение W(3)): сервер без R19
-  находится в его пределах; `Some(0)` — `ShmError::InvalidConfig` при
+  находится в его пределах; меньше 1 мс (в том числе `Some(0)`) — `ShmError::InvalidConfig` при
   подключении (`AutoClient::connect`, `MultiClient::connect`,
   `wait_for_server_with`). `on_error` — одинаковая ошибка подряд один раз
   (кроме `AlreadyConnected`). Маяк или его состояние заняты заранее

@@ -929,7 +929,7 @@ Clients use it on their own — nothing to write:
   only): a beacon that is squatted and never raised, a server without a
   beacon (native peer without R19, best-effort failure above) or a spoofed
   server identity costs at most one wake-up per interval while no server is
-  found — a connected client never wakes for it. `Some(Duration::ZERO)` is
+  found — a connected client never wakes for it. An interval below 1 ms (including `Duration::ZERO`) is
   rejected with `ShmError::InvalidConfig`. Server identities in the
   segment and in the beacon state are untrusted: identities without a
   creation time or naming the client itself are ignored, and the segment's

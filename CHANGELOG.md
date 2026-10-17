@@ -1070,6 +1070,13 @@
   (хук `AFTER_HELLO`: «сервер» фиксирует и умирает до открытия его
   процесса). Пир-невидимо.
 
+- **Minor** (n1 ревью Task 11) `discovery_fallback` короче 1 мс (не только
+  ноль) превращал ожидание обнаружения почти в опрос — тысячи попыток в
+  секунду. Теперь любой интервал меньше 1 мс — `ShmError::InvalidConfig` в
+  `AutoClient::connect`, `MultiClient::connect` и `wait_for_server*`;
+  `None` и интервалы от 1 мс допустимы. Тест
+  `auto::presence_tests::sub_millisecond_discovery_fallback_is_rejected`.
+
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
 - Пул пакетов ожидания реактора. `Reactor::register` создавал объект ядра
