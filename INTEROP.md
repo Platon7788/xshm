@@ -1327,6 +1327,18 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 `ring::try_write_tests::wait_for_space_wakes_on_{space,peer_death}_without_slicing`
 (ровно одно ожидание в ядре).
 
+**Межъязыковая проверка (0.10).** `examples/interop_peer.rs` — Rust-сторона
+сценариев single-client канала: `interop_peer <сценарий> <имя>
+[ключ=значение ...]`, в stdout только строки `READY`, `INFO <ключ>=<значение>`
+(ошибки и причины — именами вариантов `ShmError`/`DisconnectReason`), `PASS`
+или `FAIL <текст>`; коды выхода 0/1/2 (2 — ошибка аргументов), самотаймаут
+60 с. Перечень сценариев, ключи, генератор кадров и правило эха — в шапке
+файла. Нативная реализация переиспользует его как есть: `cargo build
+--release --example interop_peer` (и `--target i686-pc-windows-msvc` для
+32-битного пира), запуск из своих тестов, проверки — на своей стороне. Так
+устроены оркестраторы xhook/xipc (`tests_static/test_ipc_interop_*.c`,
+`scripts/run_interop.ps1` — все четыре пары разрядностей C ↔ Rust).
+
 ---
 
 ## h. Известные неоднозначности и риски

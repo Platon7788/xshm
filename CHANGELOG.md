@@ -198,6 +198,15 @@
     переходы, что у синхронных `wait_for_client`/`connect`/`poll_*`/
     `wait_for_space`.
 
+- **`examples/interop_peer.rs`** — Rust-сторона межъязыковой проверки
+  xhook/xipc: один сценарий single-client канала на запуск (эхо, раскладки,
+  backpressure, прощание, смерть пира, занятость, уход по ошибке Auto,
+  отказ по версии). Протокол stdout построчный (`READY`, `INFO`, `PASS`,
+  `FAIL`), ошибки и причины печатаются именами вариантов. Только публичный
+  API, без зависимостей. Оркестраторы и матрица разрядностей живут в
+  xhook (`tests_static/test_ipc_interop_*`, `scripts/run_interop.ps1`);
+  INTEROP §g.
+
 ### Изменено (несовместимо)
 
 - **`SharedServer`/`SharedClient` — `!Sync`** (остаются `Send`): параллельные
