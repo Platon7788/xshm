@@ -53,6 +53,11 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
 
+      # Release-профиль даёт свои предупреждения (cfg(debug_assertions),
+      # LTO-специфичный код): потребитель видел предупреждение только в release
+      - name: cargo clippy --release
+        run: cargo clippy --release --all-targets --target ${{ matrix.target }} -- -D warnings
+
       # Тесты делят имена объектов в \BaseNamedObjects -- только последовательно
       - name: cargo test
         run: cargo test --target ${{ matrix.target }} -- --test-threads=1
