@@ -33,7 +33,8 @@
 //!   (`try_send_*` + `wait_for_space`), затем ждёт ухода пира;
 //! - `*-farewell` -- `mode=send`: кадры длины 7, 8, 9 и уход (Drop);
 //!   `mode=recv`: эти 3 кадра от пира и его `Graceful`;
-//! - `*-die` -- 2 кадра длины 7, `INFO sent=2`, `abort()` без ухода;
+//! - `*-die` -- 2 кадра длины 7, `INFO sent=2`, выход с кодом 9 без ухода
+//!   (`process::exit`, без деструкторов);
 //!   `*-expect-death` -- 2 кадра от пира и `reason=PeerDied`;
 //! - `*-hold` -- держать сессию до ухода пира;
 //! - `client-expect-busy` -- подключение обязано дать `AlreadyConnected`;
@@ -324,11 +325,24 @@ impl Side {
         };
         result.map_err(|e| match e {
             // `recv_async`: отключение пира -- `NotConnected`, смерть его
-            // процесса -- `PeerDied`; обе -- после дочитанного кольца.
-            ShmError::NotConnected => Ended::Gone(DisconnectReason::Graceful),
-            ShmError::PeerDied => Ended::Gone(DisconnectReason::PeerDied),
+            // процесса -- `PeerDied`; обе -- после дочитанного кольца, и
+            // сторона отмечена отключённой. `NotConnected` при стороне, всё
+            // ещё «подключённой», -- не уход пира, а чужая сессия клиента
+            // (`generation` сменился, `ensure_connected`): это ошибка
+            // сценария, а не `Graceful`.
+            ShmError::NotConnected if !self.is_connected() => {
+                Ended::Gone(DisconnectReason::Graceful)
+            }
+            ShmError::PeerDied if !self.is_connected() => Ended::Gone(DisconnectReason::PeerDied),
             other => Ended::Failed(other),
         })
+    }
+
+    const fn is_connected(&self) -> bool {
+        match self {
+            Self::Server(s) => s.is_connected(),
+            Self::Client(c) => c.is_connected(),
+        }
     }
 
     /// Запись с перезаписью (эхо: в кольце не больше одного кадра).
@@ -497,14 +511,21 @@ fn farewell(side: Side, args: &Args) -> Result<(), String> {
     }
 }
 
-/// Смерть: 2 кадра и аварийное завершение процесса (без ухода).
+/// Код выхода сценариев `*-die`.
+const DIE_EXIT_CODE: i32 = 9;
+
+/// Смерть: 2 кадра и завершение процесса без ухода. `process::exit` --
+/// `ExitProcess` без деструкторов: ни `IDLE`, ни `DISCONNECT`, пир узнаёт
+/// о смерти только по handle процесса. Не `abort()`: `__fastfail` проходит
+/// через Windows Error Reporting, и задержка отчёта (LocalDumps, очередь
+/// WER) отодвигала бы завершение процесса за границу 1 с C-стороны.
 fn die(side: &Side) -> Result<(), String> {
     for k in 0..2 {
         side.send(&payload::frame(k, 7))
             .map_err(|e| format!("send {k}: {}", err_name(&e)))?;
     }
     out("INFO sent=2");
-    std::process::abort();
+    std::process::exit(DIE_EXIT_CODE);
 }
 
 /// Ждать смерти пира: 2 кадра, затем `PeerDied`.
