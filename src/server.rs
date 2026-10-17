@@ -76,6 +76,25 @@ pub(crate) fn fail_connect_ack_once(view: &SharedView) {
     );
 }
 
+/// Тесты (Task 10): метка «противника, всегда выигрывающего гонку» в
+/// `ControlBlock::slot_count` канала (поле -- только подсказка Multi;
+/// single-client и лобби его не читают). Пока метка стоит, цикл,
+/// поглотивший пустой сигнал пира, тут же взводит его снова
+/// (`adversary_resignal`) -- худший порядок потока пустых сигналов,
+/// воспроизводимый без гонки потоков. Метка в самой памяти канала:
+/// работает на любом потоке и не задевает соседние тесты.
+#[cfg(test)]
+pub(crate) const ADVERSARY_MARK: u32 = 0xAD5E_A5E1;
+
+/// Тесты (Task 10): взвести `event` снова, если в канале `view` стоит
+/// `ADVERSARY_MARK`.
+#[cfg(test)]
+pub(crate) fn adversary_resignal(view: &SharedView, event: &EventHandle) {
+    if view.control_block().slot_count.load(Ordering::Acquire) == ADVERSARY_MARK {
+        let _ = event.set();
+    }
+}
+
 /// S7: сигнал `S2C_CONNECT` (в тестах -- с инъекцией отказа).
 #[cfg_attr(
     not(test),
@@ -218,6 +237,10 @@ fn observe_idle_claim(
         _ => *seen = Some((claim, now)),
     }
 }
+
+/// Индекс `CONNECT_REQ` в наборе `wait_for_client_or` (`[wake, CONNECT_REQ]`,
+/// Task 10, INTEROP §e.1).
+const ACCEPT_CONNECT_REQ: usize = 1;
 
 /// Дедлайн ожидания клиента: повторные ожидания после ложного
 /// `CONNECT_REQ` получают остаток исходного таймаута, а не новый целиком.
@@ -675,22 +698,32 @@ impl SharedServer {
         // повод вернуть управление: сигнал поглощён, ждём остаток таймаута
         // (как в `wait_for_client`). Наружу выходят только подключение,
         // `wake`, таймаут и ошибки самого рукопожатия.
+        //
+        // Task 10 (INTEROP §e.1, П1-П3): `wake` -- индекс 0. Цикл поглощает
+        // пустой `CONNECT_REQ` и ждёт снова, не возвращаясь к вызывающему:
+        // стой `wake` вторым, процесс, взводящий `CONNECT_REQ` чаще, чем мы
+        // ждём, держал бы `stop()` worker-а Auto и лобби Dispatch вечно. А
+        // чтобы индекс 0 не скрыл заявку (поток `send` взводит `wake` на
+        // каждой отправке), исход решает СОСТОЯНИЕ: после любого возврата
+        // из ожидания сначала `hello_pending()` -- заявка есть, рукопожатие
+        // (оставшийся взведённым `CONNECT_REQ` следующее ожидание поглотит
+        // как пустой). Пустой сигнал стоит O(1): одно чтение состояния и
+        // `observe_idle_claim`.
         let deadline = Deadline::new(timeout);
         loop {
-            // CONNECT_REQ первым: при одновременном сигнале клиент важнее.
             let fired = wait_any(
-                &[events.connect_req.as_handle(), wake],
+                &[wake, events.connect_req.as_handle()],
                 deadline.remaining(),
             )?;
             #[cfg(test)]
             self.wait_wakeups.fetch_add(1, Ordering::AcqRel);
-            match fired {
-                Some(0) => {}
-                _ => return Ok(false),
-            }
             if self.hello_pending() {
                 self.complete_handshake()?;
                 return Ok(true);
+            }
+            if fired != Some(ACCEPT_CONNECT_REQ) {
+                // `wake` или таймаут.
+                return Ok(false);
             }
             // Толчок без заявки (ревизия 3): проверить протухший захват.
             if self.exclusive {
@@ -701,6 +734,8 @@ impl SharedServer {
                     self.reserve_timeout,
                 );
             }
+            #[cfg(test)]
+            adversary_resignal(&self.view, &events.connect_req);
         }
     }
 
@@ -2160,9 +2195,11 @@ mod handshake_tests {
 }
 
 #[cfg(test)]
-mod tests {
+mod stray_tests {
     use super::*;
     use crate::client::SharedClient;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
 
     fn unique(tag: &str) -> String {
         let ts = std::time::SystemTime::now()
@@ -2230,6 +2267,152 @@ mod tests {
         assert_eq!(result, Err(ShmError::Timeout));
         assert!(elapsed >= Duration::from_millis(190), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+    }
+
+    /// Поток-атакующий: взводит `event` без пауз, пока `run` истинно.
+    fn flood(event: Arc<EventHandle>, run: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while run.load(Ordering::Acquire) {
+                let _ = event.set();
+            }
+        })
+    }
+
+    /// Task 10 (П1): поток пустых `CONNECT_REQ` (два атакующих без пауз и
+    /// «противник, всегда выигрывающий гонку» -- `ADVERSARY_MARK`: сигнал
+    /// снова взведён к каждому ожиданию) не голодит `wake` --
+    /// `wait_for_client_or` возвращает `Ok(false)` вскоре после `wake`, а
+    /// не ждёт конца потока. 20 повторов.
+    #[test]
+    fn wake_not_starved_by_connect_req_flood() {
+        let name = unique("WAKEFLOOD");
+        let mut server = SharedServer::start(&name).unwrap();
+        server
+            .view()
+            .control_block()
+            .slot_count
+            .store(ADVERSARY_MARK, Ordering::Release);
+        let connect_req = Arc::new(SharedEvents::open(&name).unwrap().connect_req);
+        let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let run = Arc::new(AtomicBool::new(true));
+        let attackers: Vec<_> = (0..2)
+            .map(|_| flood(Arc::clone(&connect_req), Arc::clone(&run)))
+            .collect();
+        let (tx, rx) = mpsc::channel();
+        let server_wake = Arc::clone(&wake);
+        let waiter = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let result = server.wait_for_client_or(server_wake.as_handle(), None);
+                if tx.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut worst = Duration::ZERO;
+        for round in 0..20 {
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            wake.set().unwrap();
+            let result = rx.recv_timeout(Duration::from_secs(5));
+            let elapsed = started.elapsed();
+            if result.is_err() {
+                // До исправления: снять противника, чтобы поток завершился.
+                run.store(false, Ordering::Release);
+                let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+                let control = SharedView::peek_control(&mapping).unwrap();
+                control.slot_count.store(0, Ordering::Release);
+            }
+            assert_eq!(result, Ok(Ok(false)), "повтор {round}");
+            worst = worst.max(elapsed);
+        }
+        run.store(false, Ordering::Release);
+        for attacker in attackers {
+            attacker.join().unwrap();
+        }
+        waiter.join().unwrap();
+        assert!(worst <= Duration::from_millis(200), "{worst:?}");
+    }
+
+    /// Task 10 (П2, страж): поток `wake` (команды worker-а) не голодит
+    /// заявку -- индекс 0 у `wake` не скрывает `CONNECT_REQ`: исход решает
+    /// состояние (`hello_pending`).
+    #[test]
+    fn hello_accepted_under_wake_storm() {
+        let name = unique("WAKESTORM");
+        let mut server = SharedServer::start(&name).unwrap();
+        let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let run = Arc::new(AtomicBool::new(true));
+        let storm = flood(Arc::clone(&wake), Arc::clone(&run));
+        let server_wake = Arc::clone(&wake);
+        let waiter = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let result = server.wait_for_client_or(server_wake.as_handle(), None);
+                if result != Ok(false) || Instant::now() >= deadline {
+                    return (result, server);
+                }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let started = Instant::now();
+        let client = SharedClient::connect(&name, Duration::from_secs(2));
+        let elapsed = started.elapsed();
+        run.store(false, Ordering::Release);
+        storm.join().unwrap();
+        let (result, server) = waiter.join().unwrap();
+        let client = client.unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(server.is_connected() && client.is_connected());
+        assert!(elapsed <= Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    /// Task 10 (П3): пустой `CONNECT_REQ` -- одно пробуждение и ни одной
+    /// записи: 100 сигналов -- 100 пробуждений, `slot_claim`,
+    /// `client_state`, `generation` не изменились, рукопожатия не было.
+    #[test]
+    fn stray_connect_req_costs_one_wakeup() {
+        let name = unique("STRAYCOST");
+        let mut server = SharedServer::start(&name).unwrap();
+        let wakeups = server.wait_wakeups();
+        let events = SharedEvents::open(&name).unwrap();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        let control = SharedView::peek_control(&mapping).unwrap();
+        let before = (
+            control.slot_claim.load(Ordering::Acquire),
+            control.client_state.load(Ordering::Acquire),
+            control.generation.load(Ordering::Acquire),
+        );
+        let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let server_wake = Arc::clone(&wake);
+        let waiter = std::thread::spawn(move || {
+            let result = server.wait_for_client_or(server_wake.as_handle(), None);
+            (result, server)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        for round in 1..=100u64 {
+            events.connect_req.set().unwrap();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            while wakeups.load(Ordering::Acquire) < round {
+                assert!(
+                    Instant::now() < deadline,
+                    "сигнал {round} не разбудил сервер"
+                );
+                std::thread::yield_now();
+            }
+        }
+        // Последнее пробуждение могло ещё не дойти до нового ожидания.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(wakeups.load(Ordering::Acquire), 100);
+        wake.set().unwrap();
+        let (result, server) = waiter.join().unwrap();
+        assert_eq!(result, Ok(false));
+        assert!(!server.is_connected());
+        let after = (
+            control.slot_claim.load(Ordering::Acquire),
+            control.client_state.load(Ordering::Acquire),
+            control.generation.load(Ordering::Acquire),
+        );
+        assert_eq!(after, before);
     }
 }
 

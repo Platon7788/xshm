@@ -2274,3 +2274,141 @@ fn failed_connect_ack_is_reported_on_slot() {
     client.stop();
     server.stop();
 }
+
+// ─── Task 10: пустой CONNECT_REQ -- O(1), поток не голодит диспетчер ─────
+
+/// Поток-атакующий: взводит `events` по кругу без пауз, пока `run` истинно.
+fn flood_events(events: Vec<EventHandle>, run: Arc<AtomicBool>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        while run.load(Ordering::Acquire) {
+            for event in &events {
+                let _ = event.set();
+            }
+        }
+    })
+}
+
+/// `CONNECT_REQ` слота `slot` сервера `name`.
+fn slot_connect_req(name: &str, slot: u32) -> EventHandle {
+    crate::events::SharedEvents::open(&format!("{name}_{slot}"))
+        .unwrap()
+        .connect_req
+}
+
+/// П3 (Task 10, решение R): пустой `CONNECT_REQ` одного слота стоит O(1)
+/// блокировок слотов, а не обхода всех 256 (полный проход дедлайнов --
+/// только на дедлайне или не чаще `LIVENESS_CHECK_INTERVAL`).
+#[test]
+fn stray_connect_req_work_is_constant() {
+    let name = unique("STRAY_O1");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(256)).expect("start");
+    thread::sleep(Duration::from_millis(200));
+    let run = Arc::new(AtomicBool::new(true));
+    // Relaxed: тестовая статистика.
+    let (v0, w0) = (server.slot_visits.load(Ordering::Relaxed), server.wakeups());
+    let attacker = flood_events(vec![slot_connect_req(&name, 7)], run.clone());
+    thread::sleep(Duration::from_millis(500));
+    run.store(false, Ordering::Release);
+    attacker.join().unwrap();
+    thread::sleep(Duration::from_millis(50));
+    let visits = server.slot_visits.load(Ordering::Relaxed) - v0;
+    let wakeups = server.wakeups() - w0;
+    assert!(wakeups >= 10, "поток не дошёл до диспетчера: {wakeups}");
+    assert!(
+        visits <= 2 * wakeups,
+        "блокировок слотов {visits} на {wakeups} пробуждений"
+    );
+    server.stop();
+}
+
+/// Время доставки сообщений: в каждом -- наносекунды от `base` в момент
+/// отправки (LE).
+struct Latency {
+    base: Instant,
+    samples: Mutex<Vec<Duration>>,
+}
+
+impl MultiHandler for Latency {
+    fn on_client_connect(&self, _client_id: u32) {}
+    fn on_client_disconnect(&self, _client_id: u32) {}
+    fn on_message(&self, _client_id: u32, data: &[u8]) {
+        if let Some(sent) = data.first_chunk::<8>() {
+            let sent = Duration::from_nanos(u64::from_le_bytes(*sent));
+            let latency = self.base.elapsed().saturating_sub(sent);
+            self.samples.lock().unwrap().push(latency);
+        }
+    }
+}
+
+/// П1/П3: поток пустых `CONNECT_REQ` на все слоты не голодит диспетчер --
+/// подключённый слот обслуживается (p99 доставки < 100 мс), новый клиент
+/// подключается, `stop()` возвращается быстро.
+#[test]
+fn connect_req_flood_does_not_starve_dispatcher() {
+    let name = unique("FLOOD_ALL");
+    let journal = Arc::new(Latency {
+        base: Instant::now(),
+        samples: Mutex::new(Vec::new()),
+    });
+    let server = MultiServer::start(&name, journal.clone(), single_slot(4)).expect("start");
+    let honest = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "честный клиент",
+        Duration::from_secs(5),
+        || honest.is_connected() && honest.slot_id() == 0,
+    );
+    let run = Arc::new(AtomicBool::new(true));
+    let attacker = flood_events(
+        (0..4).map(|slot| slot_connect_req(&name, slot)).collect(),
+        run.clone(),
+    );
+    thread::sleep(Duration::from_millis(50));
+
+    for _ in 0..100 {
+        let sent = u64::try_from(journal.base.elapsed().as_nanos()).unwrap();
+        honest.send(&sent.to_le_bytes()).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    wait_for(
+        "доставка под потоком",
+        Duration::from_secs(5),
+        || journal.samples.lock().unwrap().len() == 100,
+    );
+    let mut samples = journal.samples.lock().unwrap().clone();
+    samples.sort();
+    let p99 = samples[98];
+    assert!(p99 < Duration::from_millis(100), "p99 {p99:?}");
+
+    let started = Instant::now();
+    let newcomer = MultiClient::connect(
+        &name,
+        Arc::new(ClientRecorder::default()),
+        MultiClientOptions::default(),
+    )
+    .unwrap();
+    wait_for(
+        "новый клиент под потоком",
+        Duration::from_secs(5),
+        || newcomer.is_connected(),
+    );
+    let connected_in = started.elapsed();
+    assert!(
+        connected_in <= Duration::from_millis(500),
+        "{connected_in:?}"
+    );
+
+    let started = Instant::now();
+    server.stop();
+    let stopped_in = started.elapsed();
+    run.store(false, Ordering::Release);
+    attacker.join().unwrap();
+    assert!(stopped_in <= Duration::from_millis(300), "{stopped_in:?}");
+    drop(newcomer);
+    drop(honest);
+}

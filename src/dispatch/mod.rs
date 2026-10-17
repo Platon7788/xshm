@@ -328,6 +328,13 @@ impl Default for DispatchClientOptions {
 /// ошибки; прерывается остановкой сервера).
 const LOBBY_RETRY_DELAY: Duration = Duration::from_millis(250);
 
+/// Набор ожидания запроса регистрации (`handle_lobby_client`, Task 10,
+/// INTEROP §e.1): `[остановка, C2S_DATA лобби, процесс клиента]` --
+/// остановка первой (П1).
+const LOBBY_READ_STOP: usize = 0;
+const LOBBY_READ_DATA: usize = 1;
+const LOBBY_READ_PEER: usize = 2;
+
 /// Префикс пространства имён лобби, который наследует имя выделенного
 /// канала: `Global\`, `Local\`, каталог NT-пути (`\...\`) или пусто (имя
 /// без префикса -- неявный `Local\`, как у самого лобби).
@@ -960,18 +967,31 @@ impl DispatchCore {
                     // запишет данные, по остановке или по смерти клиента
                     // (0.9: не ждём `lobby_timeout` за упавшим клиентом).
                     // Хвост массива -- заполнитель, в ожидание уходит `[..count]`.
+                    //
+                    // Task 10 (INTEROP §e.1, П1): остановка -- индекс 0.
+                    // Пустой `C2S_DATA` (кольцо пусто) цикл поглощает и ждёт
+                    // снова; стой остановка после него, поток пустых
+                    // сигналов держал бы `stop()` до `lobby_timeout`.
+                    // Индекс 0 ничего не скрывает: событие остановки
+                    // взводится только остановкой (`running` уже ложь), а
+                    // процесс клиента и кольцо проверяются на следующем
+                    // проходе. Пустой сигнал стоит O(1): одно чтение кольца.
+                    #[cfg(test)]
+                    crate::server::adversary_resignal(lobby.view(), &events.c2s.data);
                     let data = events.c2s.data.as_handle();
-                    let mut handles = [data, self.stop_event.as_handle(), data];
+                    let mut handles = [data; 3];
+                    handles[LOBBY_READ_STOP] = self.stop_event.as_handle();
+                    handles[LOBBY_READ_DATA] = data;
                     let count = match lobby.peer_wait_handle() {
                         Some(peer) => {
-                            handles[2] = peer;
+                            handles[LOBBY_READ_PEER] = peer;
                             3
                         }
                         None => 2,
                     };
                     let woke = win::wait_any(&handles[..count], Some(remaining));
                     self.lobby_wakeups.fetch_add(1, Ordering::Relaxed);
-                    if woke == Ok(Some(2)) {
+                    if woke == Ok(Some(LOBBY_READ_PEER)) {
                         // Клиент умер посреди регистрации: канал ему не нужен
                         // (даже если запрос успел лечь в кольцо).
                         self.handler.on_error(None, ShmError::PeerDied);
@@ -3703,5 +3723,95 @@ mod tests {
         assert!(count > 0 && count < accepted, "{log:?}");
         assert_eq!(log[1], "disconnect");
         server.stop();
+    }
+
+    // ─── Task 10: остановка не голодает под потоком пустых сигналов ───────
+
+    /// Поток-атакующий: взводит `event` без пауз, пока `run` истинно.
+    fn flood(event: Arc<EventHandle>, run: Arc<AtomicBool>) -> JoinHandle<()> {
+        thread::spawn(move || {
+            while run.load(Ordering::Acquire) {
+                let _ = event.set();
+            }
+        })
+    }
+
+    /// П1: поток пустых `CONNECT_REQ` лобби (атакующий без пауз и
+    /// «противник, всегда выигрывающий гонку» -- `ADVERSARY_MARK`) не
+    /// держит `stop()` -- событие остановки стоит в наборе лобби первым.
+    /// 5 свежих серверов.
+    #[test]
+    fn stop_not_starved_by_lobby_connect_req_flood() {
+        for round in 0..5 {
+            let name = format!("TEST_DISPATCH_REQFLOOD_{}_{round}", std::process::id());
+            let server = DispatchServer::start(
+                &name,
+                Arc::new(TestServerHandler::new()),
+                DispatchOptions::default(),
+            )
+            .unwrap();
+            let connect_req = Arc::new(
+                crate::events::SharedEvents::open(&name)
+                    .unwrap()
+                    .connect_req,
+            );
+            let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+            let control = SharedView::peek_control(&mapping).unwrap();
+            control
+                .slot_count
+                .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+            let run = Arc::new(AtomicBool::new(true));
+            let attacker = flood(connect_req, Arc::clone(&run));
+            thread::sleep(Duration::from_millis(50));
+            let started = std::time::Instant::now();
+            server.stop();
+            let elapsed = started.elapsed();
+            run.store(false, Ordering::Release);
+            attacker.join().unwrap();
+            assert!(
+                elapsed <= Duration::from_millis(300),
+                "повтор {round}: {elapsed:?}"
+            );
+        }
+    }
+
+    /// П1: «клиент» лобби подключился и молчит, а поток пустых `C2S_DATA`
+    /// лобби (атакующий и `ADVERSARY_MARK`) не держит `stop()` до
+    /// `lobby_timeout`.
+    #[test]
+    fn stop_not_starved_by_registration_data_flood() {
+        let name = format!("TEST_DISPATCH_DATAFLOOD_{}", std::process::id());
+        let server = DispatchServer::start(
+            &name,
+            Arc::new(TestServerHandler::new()),
+            DispatchOptions::default(),
+        )
+        .unwrap();
+        // Как настоящий клиент лобби -- под мьютексом лобби, но запроса не
+        // пишет.
+        let lock = NamedMutex::open_or_create(
+            lobby_lock_name(&name),
+            &ObjectSecurity::default().attributes().unwrap(),
+        )
+        .unwrap();
+        let turn = lock.lock(Some(Duration::from_secs(5))).unwrap().unwrap();
+        let silent = SharedClient::connect(&name, Duration::from_secs(5)).unwrap();
+        let mapping = Mapping::open_header(ObjectPath::mapping(None, &name)).unwrap();
+        SharedView::peek_control(&mapping)
+            .unwrap()
+            .slot_count
+            .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        let data = Arc::new(crate::events::SharedEvents::open(&name).unwrap().c2s.data);
+        let run = Arc::new(AtomicBool::new(true));
+        let attacker = flood(data, Arc::clone(&run));
+        thread::sleep(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        server.stop();
+        let elapsed = started.elapsed();
+        run.store(false, Ordering::Release);
+        attacker.join().unwrap();
+        drop(silent);
+        drop(turn);
+        assert!(elapsed <= Duration::from_millis(300), "{elapsed:?}");
     }
 }

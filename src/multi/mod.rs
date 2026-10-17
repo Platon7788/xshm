@@ -172,9 +172,11 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(3);
 /// бинарника; при `panic = "abort"` паника завершает процесс.
 ///
 /// Клиент, который шлёт `CONNECT_REQ` без `CLIENT_HELLO` («толчки») без
-/// остановки, стоит серверу только CPU (пробуждение и проход на каждый
-/// сигнал): порт отдаёт завершения по очереди, остальных слотов это не
-/// заслоняет; ограничения частоты нет.
+/// остановки, стоит серверу только CPU: пробуждение и O(1) работы на
+/// каждый сигнал (сверка одного слота; полный проход всех слотов -- только
+/// на дедлайне или не чаще раза в 3 с, Task 10). Порт отдаёт завершения по
+/// очереди, остальных слотов и остановку это не заслоняет; ограничения
+/// частоты нет.
 pub trait MultiHandler: Send + Sync + 'static {
     /// Вызывается при подключении нового клиента
     fn on_client_connect(&self, client_id: u32);
@@ -364,12 +366,13 @@ struct ClientSlot {
     /// Подключён без наблюдаемого процесса: момент последней разовой
     /// проверки живости по PID (ограничение частоты, не таймер).
     last_liveness_check: Option<Instant>,
-    /// Handle процессов отключённых клиентов: закрываются в начале
-    /// следующего прохода диспетчера (`reclaim_stale_claims`), а не под
-    /// блокировкой вызывающего `disconnect_client`. Пакет ожидания, ещё
-    /// привязанный к такому процессу, закрытия не боится -- ядро держит
-    /// ссылку на объект до срабатывания или отмены привязки; снимает её
-    /// диспетчер при сверке слота (`Dispatcher::reconcile`).
+    /// Handle процессов отключённых клиентов: закрываются диспетчером в
+    /// конце сверки привязок этого слота (`Dispatcher::reconcile`, Task 10;
+    /// прежде -- в общем проходе всех слотов), а не под блокировкой
+    /// вызывающего `disconnect_client`. Пакет ожидания, ещё привязанный к
+    /// такому процессу, закрытия не боится -- ядро держит ссылку на объект
+    /// до срабатывания или отмены привязки; снимает её та же сверка, до
+    /// закрытия handle.
     retired: Vec<ProcessWatch>,
     /// Task 7: не подключён -- «задержавшийся владелец»: процесс клиента
     /// сессии, которую закрыл сервер (`force_disconnect`, отказ S7), и токен
@@ -445,7 +448,7 @@ impl ClientSlot {
     }
 
     /// Снять «задержавшегося владельца»: handle -- в `retired` (закроется
-    /// в начале следующего прохода, после сверки привязок слота).
+    /// в конце сверки привязок слота).
     fn retire_lingering(&mut self) {
         if let Some((watch, _)) = self.lingering.take() {
             self.retired.push(watch);
@@ -566,6 +569,11 @@ mod core_type {
         /// привязка) -- тесты.
         #[cfg(test)]
         pub(in crate::multi) stale_completions: AtomicU64,
+        /// Блокировки слотов диспетчером (проход дедлайнов, обработка
+        /// `CONNECT_REQ`, сверка привязок) -- тесты: работа на пробуждение
+        /// O(1) (Task 10). Relaxed: тестовая статистика, ничего не публикует.
+        #[cfg(test)]
+        pub(in crate::multi) slot_visits: AtomicU64,
         /// Сколько ближайших привязок провалить (тест повтора привязки).
         #[cfg(test)]
         pub(in crate::multi) fail_arms: std::sync::atomic::AtomicU32,
@@ -626,6 +634,8 @@ impl MultiServer {
             wakeups: AtomicU64::new(0),
             #[cfg(test)]
             stale_completions: AtomicU64::new(0),
+            #[cfg(test)]
+            slot_visits: AtomicU64::new(0),
             #[cfg(test)]
             fail_arms: AtomicU32::new(0),
         });
@@ -879,24 +889,29 @@ impl MultiCore {
         let _ = self.port.post(WAKE_KEY, slot_id as usize);
     }
 
-    /// Обслуживание слотов `range` (диспетчер зовёт его в начале каждого
-    /// витка, для всех слотов). Никаких собственных пробуждений не
-    /// планирует, кроме ДЕДЛАЙНОВ в `Sweep::next_deadline`.
+    /// Полный проход слотов `range` (Task 10, решение R: диспетчер зовёт
+    /// его для всех слотов только на ближайшем дедлайне `Dispatcher::
+    /// sweep_due` и не чаще `LIVENESS_CHECK_INTERVAL` оппортунистически --
+    /// на пробуждении по другой причине; не на каждом витке). Никаких
+    /// собственных пробуждений не планирует, кроме ДЕДЛАЙНОВ в
+    /// `Sweep::next_deadline`.
     ///
     /// - **не подключён, claim занят** -- захват без подключения. Дедлайн
     ///   `first_seen + reserve_timeout`; наступил -- CAS(claim -> FREE).
-    ///   «Первое наблюдение» случается при любом пробуждении диспетчера, в том
-    ///   числе от «толчка» клиента, не нашедшего свободного слота
-    ///   (`nudge_stale_claims`), так что протухший захват не ждёт тика.
+    ///   «Первое наблюдение» (`observe_claim`) случается и вне прохода -- при
+    ///   сверке слота после любого его события, в том числе «толчка»
+    ///   клиента, не нашедшего свободного слота (`nudge_stale_claims`), с
+    ///   дедлайном в `Dispatcher::schedule`, так что протухший захват не
+    ///   ждёт тика.
     /// - **подключён, claim снят** -- «осиротевший» слот (брошенное
     ///   рукопожатие: сервер завершил handshake ровно когда клиент отвалился
     ///   по таймауту, снял claim и ушёл без `DISCONNECT`). Ловится на
-    ///   ближайшем проходе, гарантированно -- на разовом дедлайне
+    ///   ближайшем полном проходе, гарантированно -- на разовом дедлайне
     ///   `HANDSHAKE_VERIFY_DELAY` после handshake.
     /// - **подключён, процесс не наблюдается** (клиент старой версии, handle
     ///   не открылся) -- разовая проверка живости по PID владельца claim-а,
-    ///   только при пробуждении по другой причине и не чаще
-    ///   `LIVENESS_CHECK_INTERVAL`. Периодического тика ради неё нет:
+    ///   только в полном проходе (на пробуждении по другой причине) и не
+    ///   чаще `LIVENESS_CHECK_INTERVAL`. Периодического тика ради неё нет:
     ///   смерть такого клиента замечается при следующем событии сервера.
     ///
     /// Отключение осиротевших (`handle_orphaned_slot_disconnect`) --
@@ -914,9 +929,8 @@ impl MultiCore {
                 continue;
             };
             let mut slot = slot_mutex.lock_clean();
-            // Новый проход диспетчера -- handle отключённых клиентов можно
-            // закрыть (привязку к процессу ядро держит по ссылке на объект).
-            slot.retired.clear();
+            #[cfg(test)]
+            self.slot_visits.fetch_add(1, Ordering::Relaxed);
             let claim = slot.claim();
             if slot.connected {
                 if claim == CLAIM_FREE {
@@ -959,28 +973,18 @@ impl MultiCore {
             // не его (ушёл сам) или он подтверждённо умер (смерть могла
             // опередить привязку) -- наблюдение снимается, привязку `Peer`
             // слота сверит вызывающий (`Sweep::relinquished`).
-            let mut claim = claim;
             if let Some((watch, token)) = slot.lingering.as_ref()
                 && (claim != *token
                     || release_if_holder_dead(slot.server.view().control_block(), watch, *token))
             {
                 slot.retire_lingering();
                 sweep.relinquished.push(slot.id);
-                claim = slot.claim();
             }
-            // Протухший захват -- по дедлайну.
-            if claim == CLAIM_FREE {
-                slot.claim_seen = None;
+            // Протухший захват -- по дедлайну (claim перечитывается: снятие
+            // умершего «задержавшегося» его освободило).
+            let Some((claim, due)) = self.observe_claim(&mut slot, now) else {
                 continue;
-            }
-            let seen_at = match slot.claim_seen {
-                Some((token, at)) if token == claim => at,
-                _ => {
-                    slot.claim_seen = Some((claim, now));
-                    now
-                }
             };
-            let due = seen_at + self.reserve_timeout;
             if now >= due {
                 // CAS: если за это время claim сменился, это уже другой захват.
                 let _ = slot
@@ -1018,15 +1022,23 @@ impl MultiCore {
         }
     }
 
-    /// `C2S_CONNECT_REQ` на свободном слоте.
-    fn handle_slot_connect(&self, slot_id: u32) {
+    /// `C2S_CONNECT_REQ` на свободном слоте. Принят клиент -- возвращает
+    /// дедлайн проверки брошенного рукопожатия: диспетчер включает его в
+    /// ближайший полный проход (`Dispatcher::schedule`).
+    ///
+    /// Task 10 (П3, решение R): работа -- только над ЭТИМ слотом. Толчок
+    /// без заявки (`nudge_stale_claims`, откатившийся клиент, чужой
+    /// процесс) -- первое наблюдение claim-а следом, в сверке этого же
+    /// слота (`Dispatcher::reconcile` -> `observe_claim`); обход всех
+    /// слотов по пустому сигналу не делается.
+    fn handle_slot_connect(&self, slot_id: u32) -> Option<Instant> {
         let slots = self.slots.read_clean();
-        let Some(slot_mutex) = slots.get(slot_id as usize) else {
-            return;
-        };
+        let slot_mutex = slots.get(slot_id as usize)?;
         let mut slot = slot_mutex.lock_clean();
+        #[cfg(test)]
+        self.slot_visits.fetch_add(1, Ordering::Relaxed);
         if slot.connected {
-            return; // Уже подключён
+            return None; // Уже подключён
         }
 
         // Handshake -- общий с `SharedServer` (`complete_handshake`): PID
@@ -1043,7 +1055,8 @@ impl MultiCore {
                 slot.session_claim = slot.server.session_claim();
                 slot.claim_seen = None;
                 slot.last_liveness_check = None;
-                slot.verify_at = Some(Instant::now() + HANDSHAKE_VERIFY_DELAY);
+                let verify_at = Instant::now() + HANDSHAKE_VERIFY_DELAY;
+                slot.verify_at = Some(verify_at);
                 if slot.server.peer_pid().is_none() {
                     // Клиент старой версии не передал PID в handshake, но
                     // PID владельца claim-а он пишет всегда -- наблюдаем его.
@@ -1060,6 +1073,7 @@ impl MultiCore {
                 drop(slot);
                 drop(slots);
                 self.handler.on_client_connect(id);
+                Some(verify_at)
             }
             Err(err) => {
                 // Отказ S7 (Task 7): сессия, зафиксированная S5, закрыта
@@ -1076,14 +1090,38 @@ impl MultiCore {
                 // это «толчок» клиента, не нашедшего свободного слота
                 // (`nudge_stale_claims`); claim не трогаем: живой захват
                 // скоро подключится, протухший снимет дедлайн
-                // `reserve_timeout`, который назначит ближайший проход. Иное
+                // `reserve_timeout`, который назначит сверка слота следом
+                // (`Dispatcher::reconcile` -> `observe_claim`). Иное
                 // -- отказ самого рукопожатия (п. 11: сигнал `S2C_CONNECT`,
                 // `WindowsError`) -- сообщается, а не глотается молча.
                 if !matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected) {
                     report(self, Some(slot_id), err);
                 }
+                None
             }
         }
+    }
+
+    /// Захват свободного слота без заявки: первое наблюдение claim-а
+    /// (`claim_seen` -- токен и момент; новый токен -- новый отсчёт) и его
+    /// дедлайн `момент + reserve_timeout`: `(токен, дедлайн)`. Сам отъём --
+    /// в полном проходе на этом дедлайне (`reclaim_stale_claims`) и только
+    /// CAS-ом именно этого токена. Claim свободен -- ни наблюдения, ни
+    /// дедлайна.
+    fn observe_claim(&self, slot: &mut ClientSlot, now: Instant) -> Option<(u32, Instant)> {
+        let claim = slot.claim();
+        if claim == CLAIM_FREE {
+            slot.claim_seen = None;
+            return None;
+        }
+        let seen_at = match slot.claim_seen {
+            Some((token, at)) if token == claim => at,
+            _ => {
+                slot.claim_seen = Some((claim, now));
+                now
+            }
+        };
+        Some((claim, seen_at + self.reserve_timeout))
     }
 
     /// Дочитать кольцо ушедшего клиента -- ДО колбэка отключения, но только
@@ -1555,6 +1593,18 @@ struct Dispatcher<'a> {
     /// Когда повторить неудавшиеся привязки (`Arm::failed`); входит в
     /// таймаут ожидания порта, чтобы повтор не ждал постороннего события.
     rearm_at: Option<Instant>,
+    /// Ближайший дедлайн слотов (отъём протухшего захвата, проверка
+    /// брошенного рукопожатия): на нём -- полный проход
+    /// `reclaim_stale_claims` (Task 10, решение R). Назначает его полный
+    /// проход (`Sweep::next_deadline`) и обработка событий слота
+    /// (`schedule`); входит в таймаут ожидания порта.
+    sweep_due: Option<Instant>,
+    /// Момент последнего полного прохода: не реже раза в
+    /// `LIVENESS_CHECK_INTERVAL` полный проход делается и без дедлайна --
+    /// оппортунистически, только на пробуждении (не таймер), ради проверки
+    /// живости клиентов без наблюдаемого процесса и ловли осиротевших
+    /// слотов раньше их дедлайна.
+    last_sweep: Instant,
 }
 
 impl<'a> Dispatcher<'a> {
@@ -1568,7 +1618,16 @@ impl<'a> Dispatcher<'a> {
             completions: Vec::new(),
             buffer: Vec::new(),
             rearm_at: None,
+            // Первый виток -- полный проход (слоты могли быть захвачены до
+            // старта диспетчера).
+            sweep_due: Some(Instant::now()),
+            last_sweep: Instant::now(),
         }
+    }
+
+    /// Включить дедлайн `at` в ближайший полный проход.
+    fn schedule(&mut self, at: Instant) {
+        self.sweep_due = Some(self.sweep_due.map_or(at, |due| due.min(at)));
     }
 
     /// Цикл диспетчера: проход дедлайнов, спин, ожидание порта до события
@@ -1582,7 +1641,21 @@ impl<'a> Dispatcher<'a> {
 
         while core.running.load(Ordering::Acquire) {
             let now = Instant::now();
-            let sweep = core.reclaim_stale_claims(0..core.max_clients, now);
+            // Task 10 (П3, решение R): полный проход всех слотов -- O(N)
+            // блокировок -- только на дедлайне или не чаще
+            // `LIVENESS_CHECK_INTERVAL` (на пробуждении по другой причине),
+            // а не на каждом витке: пустой `CONNECT_REQ` одного слота стоит
+            // O(1) (`handle_slot_connect` + `reconcile` этого слота).
+            let full = self.sweep_due.is_some_and(|due| now >= due)
+                || now.saturating_duration_since(self.last_sweep) >= LIVENESS_CHECK_INTERVAL;
+            let sweep = if full {
+                self.last_sweep = now;
+                let sweep = core.reclaim_stale_claims(0..core.max_clients, now);
+                self.sweep_due = sweep.next_deadline;
+                sweep
+            } else {
+                Sweep::default()
+            };
             for (slot_id, expected_claim, reason) in sweep.orphaned {
                 // Клиент мог уйти штатно (DISCONNECT, затем снял claim), а
                 // диспетчер разобрал проход раньше его DISCONNECT: всё, что
@@ -1636,7 +1709,7 @@ impl<'a> Dispatcher<'a> {
             let timeout = if spun || !self.ready.is_empty() {
                 Some(Duration::ZERO)
             } else {
-                let nearest = match (sweep.next_deadline, self.rearm_at) {
+                let nearest = match (self.sweep_due, self.rearm_at) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 };
@@ -1664,7 +1737,7 @@ impl<'a> Dispatcher<'a> {
                 }
                 Err(err) => report(core, None, err),
             }
-            // Таймаут (дедлайн) разберёт проход в начале витка.
+            // Таймаут (дедлайн) разберёт полный проход в начале витка.
             if !self.ready.is_empty() {
                 self.round();
             }
@@ -1736,7 +1809,11 @@ impl<'a> Dispatcher<'a> {
             return;
         };
         self.isolate(Some(slot_id), |d| match kind {
-            WaitKind::Connect => d.core.handle_slot_connect(slot_id),
+            WaitKind::Connect => {
+                if let Some(at) = d.core.handle_slot_connect(slot_id) {
+                    d.schedule(at);
+                }
+            }
             WaitKind::Disconnect => d.core.handle_slot_disconnect(slot_id, &mut d.buffer),
             WaitKind::Peer => d.core.handle_slot_peer_died(slot_id, &mut d.buffer),
             // Перепривязка -- в `reconcile` ниже, ДО чтения кольца.
@@ -1803,6 +1880,7 @@ impl<'a> Dispatcher<'a> {
         let mut failure = None;
         let mut any_failed = false;
         let mut recheck = false;
+        let mut claim_due = None;
         {
             let slots = core.slots.read_clean();
             let (Some(slot_mutex), Some(waits)) = (
@@ -1811,7 +1889,9 @@ impl<'a> Dispatcher<'a> {
             ) else {
                 return;
             };
-            let slot = slot_mutex.lock_clean();
+            let mut slot = slot_mutex.lock_clean();
+            #[cfg(test)]
+            core.slot_visits.fetch_add(1, Ordering::Relaxed);
             // Слоты всегда named (`start_slot`), но на anonymous-слоте событий
             // нет -- молча пропускаем вместо паники в диспетчере.
             let Some(events) = slot.server.events() else {
@@ -1875,6 +1955,20 @@ impl<'a> Dispatcher<'a> {
                     }
                 }
             }
+            // Привязки слота сведены -- handle отключённых клиентов можно
+            // закрыть (привязку к процессу ядро держит по ссылке на объект,
+            // а снятая выше уже не ссылается на него).
+            slot.retired.clear();
+            // Task 10 (П3): захват свободного слота без заявки (толчок,
+            // клиент, отключённый сервером и не ушедший) -- первое
+            // наблюдение и дедлайн здесь, в сверке ЭТОГО слота, а не обходом
+            // всех слотов на каждом витке.
+            if !slot.connected {
+                claim_due = core.observe_claim(&mut slot, Instant::now());
+            }
+        }
+        if let Some((_, due)) = claim_due {
+            self.schedule(due);
         }
         if recheck {
             self.enqueue(slot_id);

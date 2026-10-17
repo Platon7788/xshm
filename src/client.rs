@@ -143,6 +143,14 @@ pub(crate) struct Interrupt<'a> {
     pub(crate) should_stop: &'a mut dyn FnMut() -> bool,
 }
 
+/// Набор ожидания `S2C_CONNECT` с прерыванием (Task 10, INTEROP §e.1):
+/// индекс `wake` вызывающего.
+const WAKE: usize = 0;
+/// Индексы объектов пира в наборе `[S2C_CONNECT, процесс сервера]` (с
+/// прерыванием они сдвинуты на 1 -- за `wake`).
+const PEER_ACK: usize = 0;
+const PEER_PROCESS: usize = 1;
+
 /// Чем кончилось ожидание `S2C_CONNECT`.
 pub(crate) enum AckWait {
     /// Сервер принял именно нашу заявку (`accepted_on_signal`).
@@ -410,6 +418,21 @@ pub(crate) struct Hello {
     /// Claim взят этой заявкой (`Take`/`TakeOverAbandoned`) -- освобождается
     /// при отзыве и уходе; `Held` -- освобождает владелец (Multi).
     owns_claim: bool,
+    /// Процесс сервера (PID и время создания из `ControlBlock`, Task 10):
+    /// его смерть во время ожидания `S2C_CONNECT` -- `PeerDied`; тот же
+    /// handle после рукопожатия наблюдает сервер подключённого клиента
+    /// (`finish`). `None` -- сервер старой версии без PID или процесс не
+    /// открылся (другая сессия без прав): тогда границу задаёт только
+    /// таймаут.
+    server: Option<ProcessWatch>,
+    /// Сервер подтверждённо ушёл ещё до открытия его процесса
+    /// (`is_process_gone`; `open_peer` не наблюдает мёртвый процесс). Им
+    /// пользуется `connect_async` (`PeerDied` на первом опросе, Task 18);
+    /// синхронное ожидание по-прежнему ограничено таймаутом: время сервера
+    /// в сегменте -- данные пира, и при их порче (`peer_tests::
+    /// corrupted_server_start_hi_is_not_a_live_server`) `connect`
+    /// подключается без наблюдения, а не отказывает.
+    server_gone: bool,
     /// Последним: view указывает в эту память.
     mapping: Mapping,
 }
@@ -578,12 +601,26 @@ impl Hello {
             .handshake_state
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
 
+        // Процесс сервера (Task 10) -- по PID и времени создания из
+        // сегмента; открывается после заявки, а не на C0, чтобы проигравший
+        // захват (частый исход при занятом канале) не платил за открытие.
+        // Сервер сегмента за время рукопожатия не меняется: это тот же
+        // процесс, что наблюдает подключённый клиент (`finish`).
+        let (server_pid, server_start) = (
+            control.server_pid.load(Ordering::Acquire),
+            control.server_start_time(),
+        );
+        let server = ProcessWatch::open_peer(server_pid, server_start);
+        let server_gone = server.is_none() && crate::win::is_process_gone(server_pid, server_start);
+
         let hello = Self {
             view,
             events,
             generation_before,
             claim: token,
             owns_claim,
+            server,
+            server_gone,
             mapping,
         };
 
@@ -617,9 +654,35 @@ impl Hello {
         accepted_on_signal(&self.view, self.generation_before)
     }
 
-    /// Ждать `S2C_CONNECT` (и `wake` вызывающего, если задан) до `timeout`
-    /// (C10). Устаревший сигнал (`accepted_on_signal == false`) поглощается,
-    /// ожидание продолжается.
+    /// Процесс сервера, наблюдаемый с заявки (`None` -- не наблюдается).
+    pub(crate) const fn server_watch(&self) -> Option<&ProcessWatch> {
+        self.server.as_ref()
+    }
+
+    /// Ждать `S2C_CONNECT` (C10) до `timeout`, следя за процессом сервера
+    /// и -- если задано -- за `wake` вызывающего (Task 10, INTEROP §e.1).
+    ///
+    /// Набор: с прерыванием -- `[wake, S2C_CONNECT, процесс сервера]`, без
+    /// него -- `[S2C_CONNECT, процесс сервера]` (процесс -- если открылся).
+    ///
+    /// Почему `wake` -- индекс 0 (П1): устаревший `S2C_CONNECT` цикл
+    /// поглощает и ждёт снова, не возвращаясь к вызывающему. Стой `wake`
+    /// после него, процесс, взводящий `S2C_CONNECT` чаще, чем мы ждём,
+    /// держал бы `stop()` worker-а до `connect_timeout`.
+    ///
+    /// Почему после `wake` -- нулевое ожидание остальных, а не решение по
+    /// состоянию (П2): `wake` взводит и каждый `send` приложения, и поток
+    /// отправок не должен голодить подтверждение. Но засчитать заявку можно
+    /// только по сигналу: `client_state == SERVER_READY` сервер публикует
+    /// (S5) раньше сигнала (S7), а модель рукопожатия (`handshake_model`)
+    /// доказана для «принят по `S2C_CONNECT`» -- поэтому, если не пора
+    /// остановиться, одно ожидание `[S2C_CONNECT, процесс]` с нулевым
+    /// таймаутом, и его исход разбирается как обычный.
+    ///
+    /// Процесс сервера сигнален -- `Abandoned(PeerDied)`: сервер умер, не
+    /// ответив (отзыв W как при таймауте; проигранный отзыв -- подключены,
+    /// смерть увидит приём). Устаревший сигнал (`accepted_on_signal ==
+    /// false`) поглощается, ожидание продолжается.
     pub(crate) fn wait_ack(
         &self,
         timeout: Duration,
@@ -628,34 +691,58 @@ impl Hello {
         // Таймаут, непредставимый как `Instant` (`Duration::MAX`), -- ждать без
         // дедлайна, а не паниковать на переполнении.
         let deadline = crate::ring::deadline_of(Some(timeout));
+        // Объекты пира: `[S2C_CONNECT, процесс сервера]`; хвост массива --
+        // заполнитель, в ожидание уходит `[..peer_count]`.
+        let ack = self.events.connect_ack.as_handle();
+        let mut peer = [ack, ack];
+        let peer_count = match self.server.as_ref() {
+            Some(server) => {
+                peer[PEER_PROCESS] = server.as_handle();
+                2
+            }
+            None => 1,
+        };
+        let peer = &peer[..peer_count];
         loop {
             let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
             if left.is_some_and(|left| left.is_zero()) {
                 return AckWait::Abandoned(ShmError::Timeout);
             }
             let fired = match interrupt.as_deref_mut() {
-                Some(int) => wait_any(&[self.events.connect_ack.as_handle(), int.wake], left),
-                None => self
-                    .events
-                    .connect_ack
-                    .wait(left)
-                    .map(|signaled| signaled.then_some(0)),
+                Some(int) => {
+                    let mut set = [int.wake, ack, ack];
+                    set[1..=peer_count].copy_from_slice(peer);
+                    match wait_any(&set[..=peer_count], left) {
+                        Ok(Some(WAKE)) => {
+                            if (int.should_stop)() {
+                                return AckWait::Abandoned(ShmError::NotReady);
+                            }
+                            // `wake` от `send`: исход решает сигнал --
+                            // одно нулевое ожидание объектов пира.
+                            wait_any(peer, Some(Duration::ZERO))
+                        }
+                        Ok(Some(index)) => Ok(Some(index - 1)),
+                        other => other,
+                    }
+                }
+                None => wait_any(peer, left),
             };
             match fired {
-                Ok(Some(0)) => {
+                Ok(Some(PEER_ACK)) => {
                     if self.accepted() {
                         return AckWait::Accepted;
                     }
+                    #[cfg(test)]
+                    crate::server::adversary_resignal(&self.view, &self.events.connect_ack);
                 }
-                Ok(Some(_)) => {
-                    if interrupt
-                        .as_deref_mut()
-                        .is_some_and(|int| (int.should_stop)())
-                    {
-                        return AckWait::Abandoned(ShmError::NotReady);
+                Ok(Some(_)) => return AckWait::Abandoned(ShmError::PeerDied),
+                // Нулевое ожидание после `wake` ничего не застало -- ждём
+                // дальше; иначе истёк таймаут.
+                Ok(None) => {
+                    if deadline.is_some_and(|at| Instant::now() >= at) {
+                        return AckWait::Abandoned(ShmError::Timeout);
                     }
                 }
-                Ok(None) => return AckWait::Abandoned(ShmError::Timeout),
                 Err(err) => return AckWait::Abandoned(err),
             }
         }
@@ -682,16 +769,14 @@ impl Hello {
             generation_before: _,
             claim,
             owns_claim,
+            server: peer,
+            server_gone: _,
             mapping,
         } = self;
         let control = view.control_block();
         let (header_a, header_b) = view.headers();
-
-        // PID сервера (0 -- сервер старой версии: наблюдения нет, как в 0.7).
-        let peer = ProcessWatch::open_peer(
-            control.server_pid.load(Ordering::Acquire),
-            control.server_start_time(),
-        );
+        // Процесс сервера -- открытый при заявке (`Hello::post`; `None` --
+        // сервер старой версии без PID: наблюдения нет, как в 0.7).
 
         let generation = control.generation.load(Ordering::Acquire);
         header_a.connection_gen.store(generation, Ordering::Release);
@@ -733,12 +818,9 @@ struct ConnectFuture {
     hello: Option<Hello>,
     /// Первый опрос уже был (заявка выставлялась).
     started: bool,
-    /// Процесс сервера (PID и время создания из `ControlBlock`): его смерть
-    /// во время рукопожатия -- `Err(PeerDied)`. `None` -- сервер старой
-    /// версии без PID или процесс не открылся (другая сессия без прав):
-    /// тогда, как у синхронного `connect`, границу задаёт только таймаут
-    /// (у async -- таймаут исполнителя).
-    server: Option<ProcessWatch>,
+    /// Процесс сервера наблюдает сама заявка (`Hello::server_watch`): его
+    /// смерть во время рукопожатия -- `Err(PeerDied)`; без наблюдения, как
+    /// у синхронного `connect`, границу задаёт таймаут исполнителя.
     waits: WaitSet,
 }
 
@@ -749,7 +831,6 @@ impl ConnectFuture {
             name: name.to_owned(),
             hello: None,
             started: false,
-            server: None,
             waits: WaitSet::default(),
         }
     }
@@ -766,10 +847,11 @@ impl ConnectFuture {
     /// идёт до его отпуска), любой `S2C_CONNECT` адресован нам -- claim
     /// исключителен, а следующий заявитель сбрасывает событие до своей
     /// заявки (C4); `DISCONNECT` набор не регистрирует, процесс сервера --
-    /// уведомление (остаётся взведённым).
+    /// уведомление (остаётся взведённым). Handle процесса сервера живёт в
+    /// заявке и переходит подключённому клиенту (`Hello::finish`) -- его
+    /// регистрация к этому моменту уже снята.
     fn release(&mut self) {
         self.waits.clear(None, None);
-        self.server = None;
     }
 
     fn step(&mut self, waker: &Waker) -> Step {
@@ -785,12 +867,6 @@ impl ConnectFuture {
                 // всё же подключение.
                 return Step::Abandon(hello, err);
             }
-            let control = hello.view.control_block();
-            let (pid, start) = (
-                control.server_pid.load(Ordering::Acquire),
-                control.server_start_time(),
-            );
-            self.server = ProcessWatch::open_peer(pid, start);
             // Task 18 (Task 16 N1): `open_peer` не наблюдает уже мёртвый
             // процесс («неизвестно» -- верно для PID из рукопожатия). Здесь
             // PID -- сервер, владеющий открытым сегментом: подтверждённо
@@ -798,7 +874,8 @@ impl ConnectFuture {
             // занят процессом с другим временем создания) -- `PeerDied` с
             // откатом, как при таймауте. Иначе future ждал бы вечно.
             // Двусмысленность (нет прав, PID 0) -- без наблюдения, как раньше.
-            if self.server.is_none() && crate::win::is_process_gone(pid, start) {
+            // Признак вычисляет `Hello::post` при открытии процесса.
+            if hello.server_gone {
                 return Step::Abandon(hello, ShmError::PeerDied);
             }
             self.hello = Some(hello);
@@ -823,7 +900,7 @@ impl ConnectFuture {
         let registered = self
             .waits
             .ensure_handle(OP, hello.events.connect_ack.as_handle(), waker)
-            .and_then(|()| match self.server.as_ref() {
+            .and_then(|()| match hello.server_watch() {
                 Some(server) => self.waits.ensure_handle(PEER, server.as_handle(), waker),
                 None => Ok(()),
             });
@@ -2130,7 +2207,9 @@ mod tests {
     }
 
     /// Успешное подключение: после `Ready(Ok)` в наборе нет регистраций
-    /// (процесс сервера в том числе), наблюдение за сервером отпущено.
+    /// (процесс сервера в том числе), а заявка с handle процесса сервера
+    /// перешла подключённому клиенту (Task 10: тот же handle, без второго
+    /// открытия).
     #[test]
     fn connect_async_ready_clears_all_registrations() {
         let name = unique("AREADY");
@@ -2143,10 +2222,8 @@ mod tests {
             client
         });
         assert!(future.waits.is_empty(), "регистрации пережили Ready");
-        assert!(
-            future.server.is_none(),
-            "handle процесса сервера не отпущен"
-        );
+        assert!(future.hello.is_none(), "заявка не отпущена");
+        assert_eq!(client.is_peer_alive(), Some(true), "сервер не наблюдается");
         drop(future);
         drop(client);
     }
@@ -2245,5 +2322,159 @@ mod tests {
     #[test]
     fn poll_server_spin_sees_server_leave() {
         poll_server_sees_server_leave_with(SpinPolicy { iterations: 1000 });
+    }
+
+    // ─── Task 10: приоритет в наборе ожидания `S2C_CONNECT` ────────────────
+
+    /// Поток-атакующий: взводит `event` без пауз, пока `run` истинно.
+    fn flood(
+        event: Arc<EventHandle>,
+        run: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while run.load(Ordering::Acquire) {
+                let _ = event.set();
+            }
+        })
+    }
+
+    /// Подключение с прерыванием: `wake` -- событие вызывающего,
+    /// `running == false` -- остановка.
+    fn connect_with_wake(
+        name: &str,
+        timeout: Duration,
+        wake: &EventHandle,
+        running: &std::sync::atomic::AtomicBool,
+    ) -> Result<SharedClient> {
+        let mut should_stop = || !running.load(Ordering::Acquire);
+        SharedClient::connect_interruptible(
+            None,
+            name,
+            timeout,
+            ClaimMode::Take,
+            Interrupt {
+                wake: wake.as_handle(),
+                should_stop: &mut should_stop,
+            },
+        )
+    }
+
+    /// П1: поток устаревших `S2C_CONNECT` (сервер не принимает; атакующий
+    /// без пауз и «противник, всегда выигрывающий гонку» --
+    /// `ADVERSARY_MARK`) не голодит остановку -- `Err(NotReady)` вскоре
+    /// после `wake`, а не по `connect_timeout`; заявка отозвана, claim
+    /// освобождён. 20 повторов.
+    #[test]
+    fn connect_stop_not_starved_by_ack_flood() {
+        use std::sync::atomic::AtomicBool;
+        let name = unique("ACKFLOOD");
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        control
+            .slot_count
+            .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        let ack = Arc::new(SharedEvents::open(&name).unwrap().connect_ack);
+        let run = Arc::new(AtomicBool::new(true));
+        let attacker = flood(Arc::clone(&ack), Arc::clone(&run));
+        let mut worst = Duration::ZERO;
+        for round in 0..20 {
+            let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+            let running = Arc::new(AtomicBool::new(true));
+            let (client_wake, client_running, client_name) =
+                (Arc::clone(&wake), Arc::clone(&running), name.clone());
+            let connecting = std::thread::spawn(move || {
+                connect_with_wake(
+                    &client_name,
+                    Duration::from_secs(10),
+                    &client_wake,
+                    &client_running,
+                )
+                .map(drop)
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            let started = Instant::now();
+            running.store(false, Ordering::Release);
+            wake.set().unwrap();
+            let result = connecting.join().unwrap();
+            worst = worst.max(started.elapsed());
+            assert_eq!(result, Err(ShmError::NotReady), "повтор {round}");
+            assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+            assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        }
+        run.store(false, Ordering::Release);
+        attacker.join().unwrap();
+        assert!(worst <= Duration::from_millis(200), "{worst:?}");
+    }
+
+    /// П2 (страж): поток `wake` от `send` приложения (`should_stop` --
+    /// ложь) не голодит подтверждение -- нулевое ожидание `S2C_CONNECT`
+    /// после индекса 0 видит ответ сервера.
+    #[test]
+    fn connect_accepts_under_send_wake_storm() {
+        use std::sync::atomic::AtomicBool;
+        let name = unique("SENDSTORM");
+        let mut server = SharedServer::start(&name).unwrap();
+        let wake = Arc::new(EventHandle::create_unnamed(false).unwrap());
+        let run = Arc::new(AtomicBool::new(true));
+        let storm = flood(Arc::clone(&wake), Arc::clone(&run));
+        let accepting = std::thread::spawn(move || {
+            let result = server.wait_for_client(Some(Duration::from_secs(5)));
+            (result, server)
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        let running = AtomicBool::new(true);
+        let started = Instant::now();
+        let client = connect_with_wake(&name, Duration::from_secs(5), &wake, &running);
+        let elapsed = started.elapsed();
+        run.store(false, Ordering::Release);
+        storm.join().unwrap();
+        let (accepted, server) = accepting.join().unwrap();
+        assert_eq!(accepted, Ok(()));
+        assert!(client.unwrap().is_connected() && server.is_connected());
+        assert!(elapsed <= Duration::from_millis(500), "{elapsed:?}");
+    }
+
+    /// Ожидание `S2C_CONNECT` наблюдает процесс сервера: сервер умер, не
+    /// ответив, -- `Err(PeerDied)` сразу (а не `Timeout` через весь
+    /// таймаут), заявка отозвана, claim освобождён.
+    #[test]
+    fn connect_sees_server_death_before_timeout() {
+        let name = unique("ACKDEATH");
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        // «Сервер» -- живой дочерний процесс (ждёт stdin).
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = ProcessWatch::open(pid).unwrap().start_time().unwrap();
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+
+        let client_name = name;
+        let connecting = std::thread::spawn(move || {
+            SharedClient::connect(&client_name, Duration::from_secs(10)).map(drop)
+        });
+        // Заявка выставлена -- клиент ждёт ответа.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO {
+            assert!(Instant::now() < deadline, "заявка не выставлена");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let result = connecting.join().unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err(ShmError::PeerDied));
+        assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
     }
 }

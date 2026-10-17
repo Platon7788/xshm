@@ -67,6 +67,8 @@ unsafe extern "system" {
     ) -> *mut c_void;
     fn UnmapViewOfFile(base: *const c_void) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn OpenEventW(desired_access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+    fn SetEvent(event: *mut c_void) -> i32;
 }
 
 /// `FILE_MAP_ALL_ACCESS`.
@@ -1507,4 +1509,122 @@ fn client_rejects_uncached_squatter() {
         // SAFETY: handle создан `CreateFileMappingW` и закрывается один раз.
         let _ = unsafe { CloseHandle(squatter.as_ptr()) };
     }
+}
+
+// ─── поток пустых CONNECT_REQ (Task 10) ─────────────────────────────────────
+
+/// `EVENT_MODIFY_STATE`: права на `SetEvent`.
+const EVENT_MODIFY_STATE: u32 = 0x0002;
+
+/// Событие канала, открытое «чужим процессом» через kernel32.
+struct ForeignEvent(NonNull<c_void>);
+
+// SAFETY: handle события -- просто дескриптор ядра; `SetEvent` и
+// `CloseHandle` допустимы с любого потока.
+unsafe impl Send for ForeignEvent {}
+
+impl ForeignEvent {
+    /// Открыть `Local\<канал>_C2S_CONNECT_REQ` с правом `EVENT_MODIFY_STATE`.
+    fn connect_req(channel: &str) -> Self {
+        let wide: Vec<u16> = format!("Local\\{channel}_C2S_CONNECT_REQ")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: `wide` -- строка с нулём на конце, живёт весь вызов.
+        let raw = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, wide.as_ptr()) };
+        Self(NonNull::new(raw).unwrap_or_else(|| panic!("OpenEventW({channel}) не удался")))
+    }
+
+    fn set(&self) {
+        // SAFETY: handle открыт `OpenEventW` и жив до `Drop`.
+        let _ = unsafe { SetEvent(self.0.as_ptr()) };
+    }
+}
+
+impl Drop for ForeignEvent {
+    fn drop(&mut self) {
+        // SAFETY: handle открыт `OpenEventW` и закрывается один раз.
+        let _ = unsafe { CloseHandle(self.0.as_ptr()) };
+    }
+}
+
+/// Сервер и клиент: факт и число подключений.
+#[derive(Default)]
+struct Sessions {
+    connected: AtomicBool,
+}
+
+impl AutoHandler for Sessions {
+    fn on_connect(&self) {
+        self.connected.store(true, Ordering::Release);
+    }
+    fn on_disconnect(&self) {
+        self.connected.store(false, Ordering::Release);
+    }
+}
+
+/// Task 10 (П1, П2): два атакующих взводят `CONNECT_REQ` Auto-сервера без
+/// пауз (как чужой процесс -- kernel32), а 10 клиентов подряд всё равно
+/// подключаются каждый ≤ 500 мс, и `stop()` под потоком -- ≤ 300 мс.
+#[test]
+fn connect_req_flood_does_not_starve_auto_server() {
+    let name = unique("REQFLOOD");
+    let server_probe = Arc::new(Sessions::default());
+    let server = AutoServer::start(&name, server_probe.clone(), AutoOptions::default()).unwrap();
+    let run = Arc::new(AtomicBool::new(true));
+    let started = Instant::now();
+    let attackers: Vec<_> = (0..2)
+        .map(|_| {
+            let event = ForeignEvent::connect_req(&name);
+            let run = run.clone();
+            thread::spawn(move || {
+                while run.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(3) {
+                    event.set();
+                }
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(50));
+    for round in 0..10 {
+        let probe = Arc::new(Sessions::default());
+        let t = Instant::now();
+        let client = AutoClient::connect(
+            &name,
+            probe.clone(),
+            AutoOptions {
+                reconnect_delay: Duration::from_millis(50),
+                ..AutoOptions::default()
+            },
+        )
+        .unwrap();
+        wait_for(
+            "подключение клиента",
+            Duration::from_secs(5),
+            || probe.connected.load(Ordering::Acquire),
+        );
+        let elapsed = t.elapsed();
+        assert!(
+            elapsed <= Duration::from_millis(500),
+            "клиент {round}: {elapsed:?}"
+        );
+        client.stop();
+        wait_for(
+            "сервер увидел уход",
+            Duration::from_secs(5),
+            || !server_probe.connected.load(Ordering::Acquire),
+        );
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "поток кончился раньше клиентов: {:?}",
+        started.elapsed()
+    );
+    let t = Instant::now();
+    server.stop();
+    let stopped_in = t.elapsed();
+    run.store(false, Ordering::Release);
+    for attacker in attackers {
+        attacker.join().unwrap();
+    }
+    assert!(stopped_in <= Duration::from_millis(300), "{stopped_in:?}");
 }

@@ -648,3 +648,65 @@ fn anonymous_server_rejects_async() {
         Err(ShmError::InvalidConfig(_))
     ));
 }
+
+// ─── поток пустых CONNECT_REQ (Task 10) ─────────────────────────────────────
+
+#[cfg_attr(
+    target_arch = "x86",
+    link(
+        name = "kernel32",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
+unsafe extern "system" {
+    fn OpenEventW(desired_access: u32, inherit: i32, name: *const u16) -> *mut std::ffi::c_void;
+    fn SetEvent(event: *mut std::ffi::c_void) -> i32;
+    fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+}
+
+/// Закрепление (Task 10, решение B): поток пустых `CONNECT_REQ` (чужой
+/// процесс -- kernel32) не мешает `accept_async` принять настоящего
+/// клиента -- ≤ 500 мс.
+#[test]
+fn accept_async_under_flood_accepts() {
+    use std::sync::atomic::AtomicBool;
+    let name = unique_name("ACCFLOOD");
+    let mut server = SharedServer::start(&name).unwrap();
+    let wide: Vec<u16> = format!("Local\\{name}_C2S_CONNECT_REQ")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    // SAFETY: `wide` -- строка с нулём на конце, живёт весь вызов;
+    // `EVENT_MODIFY_STATE` (2) -- право на `SetEvent`.
+    let raw = unsafe { OpenEventW(2, 0, wide.as_ptr()) };
+    assert!(!raw.is_null(), "OpenEventW не удался");
+    let handle = raw.addr();
+    let run = Arc::new(AtomicBool::new(true));
+    let attacker = {
+        let run = run.clone();
+        thread::spawn(move || {
+            let event = std::ptr::without_provenance_mut::<std::ffi::c_void>(handle);
+            while run.load(Ordering::Acquire) {
+                // SAFETY: handle события открыт выше и закрывается только
+                // после join этого потока.
+                let _ = unsafe { SetEvent(event) };
+            }
+        })
+    };
+    thread::sleep(Duration::from_millis(50));
+    let started = Instant::now();
+    let client_name = name;
+    let client = thread::spawn(move || SharedClient::connect(&client_name, DEADLINE));
+    let accepted = block_on(server.accept_async());
+    let elapsed = started.elapsed();
+    let client = client.join().unwrap();
+    run.store(false, Ordering::Release);
+    attacker.join().unwrap();
+    // SAFETY: handle открыт `OpenEventW`, поток-атакующий завершён.
+    let _ = unsafe { CloseHandle(raw) };
+    accepted.unwrap();
+    assert!(client.unwrap().is_connected() && server.is_connected());
+    assert!(elapsed <= Duration::from_millis(500), "{elapsed:?}");
+}

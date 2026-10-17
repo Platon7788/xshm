@@ -812,6 +812,63 @@
   `multi::tests::failed_connect_ack_is_reported_on_slot` (инъекция отказа S7
   на потоке-диспетчере: ровно один `on_error(Some(0), WindowsError)`, клиент
   сходится и подключается). Пир-невидимо.
+- **Major** Поток пустых сигналов пира голодил локальную остановку там,
+  где цикл поглощает пустой сигнал и ждёт снова, не возвращаясь к
+  вызывающему: событие пира стояло в наборе раньше `wake`/остановки, а NT
+  отдаёт меньший индекс. Процесс с доступом к имени, взводящий
+  `C2S_CONNECT_REQ` чаще, чем сервер ждёт, держал `AutoServer::stop()` и
+  `DispatchServer::stop()` (лобби) вечно; поток `S2C_CONNECT` держал
+  `stop()` подключающегося клиента Auto/Multi/Dispatch до
+  `connect_timeout`/`slot_timeout`/`channel_timeout`. Теперь (Task 10,
+  взамен паузы по потоку пустых сигналов; INTEROP §e.1 П1–П3, п. 33):
+  `SharedServer::wait_for_client_or` ждёт `[wake, CONNECT_REQ]` и после
+  любого возврата сначала проверяет заявку по состоянию
+  (`client_state == CLIENT_HELLO` → рукопожатие, даже если проснулся по
+  `wake`); ожидание `S2C_CONNECT` (`Hello::wait_ack`) — `[wake,
+  S2C_CONNECT, процесс сервера]`, а после `wake` без остановки (`send`
+  приложения) — одно нулевое ожидание `[S2C_CONNECT, процесс]`, так что
+  поток отправок не голодит подтверждение; чтение регистрации лобби —
+  `[стоп, C2S_DATA, процесс клиента]` (здесь голода не было: цикл и так
+  сверял `running` на каждом проходе; порядок выровнен по П1). Подключённые
+  worker-ы Auto и `MultiClient` порядок сохраняют — решают по состоянию.
+  Тесты (с «противником, всегда выигрывающим гонку» — метка
+  `ADVERSARY_MARK` в `ControlBlock::slot_count`, сигнал снова взведён к
+  каждому ожиданию; без неё гонка двух потоков воспроизводит голод лишь
+  изредка): `server::stray_tests::{wake_not_starved_by_connect_req_flood,
+  hello_accepted_under_wake_storm, stray_connect_req_costs_one_wakeup}`,
+  `client::tests::{connect_stop_not_starved_by_ack_flood,
+  connect_accepts_under_send_wake_storm}`,
+  `dispatch::tests::{stop_not_starved_by_lobby_connect_req_flood,
+  stop_not_starved_by_registration_data_flood}`,
+  `tests/hostile.rs::connect_req_flood_does_not_starve_auto_server`
+  (атакующие — kernel32 `OpenEventW`/`SetEvent`),
+  `tests/async.rs::accept_async_under_flood_accepts`. Пиру ничего не
+  обязательно; нативному — ЖЕЛАТЕЛЬНО (п. 33).
+- **Minor** Синхронное ожидание `S2C_CONNECT` (`SharedClient::connect`,
+  клиенты Auto/Multi/Dispatch) не наблюдало процесс сервера: сервер,
+  умерший, не ответив, стоил ожидания всего таймаута (`Timeout`). Теперь
+  процесс сервера (PID и время создания из сегмента) открывается при
+  заявке (`Hello::post`) и стоит в наборе ожидания: смерть — `PeerDied` с
+  отзывом заявки (W), как у `connect_async`; тот же handle затем наблюдает
+  сервер подключённого клиента (`Hello::finish`) и `connect_async` (второго
+  открытия нет). Тест `client::tests::connect_sees_server_death_before_timeout`
+  (`PeerDied` ≤ 1 с вместо `Timeout` через 10 с, claim свободен,
+  `client_state == IDLE`). INTEROP §e.1, п. 33.
+- **Minor** `MultiServer`: пустой `CONNECT_REQ` одного слота стоил прохода
+  всех слотов (`reclaim_stale_claims(0..max_clients)` в начале каждого
+  витка диспетчера — 256 слотов ≈ 257 блокировок на сигнал). Теперь
+  (решение R) полный проход — только на ближайшем дедлайне
+  (`Dispatcher::sweep_due`) или, оппортунистически на пробуждении, не чаще
+  `LIVENESS_CHECK_INTERVAL` (3 с); первое наблюдение claim-а свободного
+  слота и закрытие handle отключённых клиентов (`ClientSlot::retired`) —
+  в сверке привязок этого слота (`Dispatcher::reconcile`), дедлайн проверки
+  рукопожатия назначает обработка `CONNECT_REQ`. Осиротевший слот
+  по-прежнему гарантированно ловится дедлайном `HANDSHAKE_VERIFY_DELAY`
+  («на ближайшем проходе» — теперь «на ближайшем полном проходе»). Тесты
+  `multi::tests::{stray_connect_req_work_is_constant (блокировок слотов на
+  пробуждение ≤ 2; до — ≈ 258), connect_req_flood_does_not_starve_dispatcher}`;
+  `idle_server_with_foreign_claim_does_not_wake_up` и прочие `idle_*` не
+  изменились. Пир-невидимо (INTEROP §i.2, §i.3).
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
