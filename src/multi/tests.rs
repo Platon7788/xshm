@@ -1496,9 +1496,18 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
                 client.try_send_to_server(b"before").unwrap();
             }
             go_rx.recv().unwrap();
-            client.events().disconnect.set().unwrap();
-            ready_tx.send(Instant::now()).unwrap();
+            // Кольцо полно кадрами потока ДО `DISCONNECT`: снимок дочитывания
+            // гарантированно непуст, тест не проходит «вхолостую», даже если
+            // диспетчер, разбуженный сигналом, вытеснит флудер до его первой
+            // записи после сигнала (а после закрытия слота клиент уже не
+            // пишет -- Task 6 надёжности).
             let mut written = 0u64;
+            while client.try_send_to_server(b"flood-flood-flood").is_ok() {
+                written += 1;
+            }
+            let prefilled = written;
+            client.events().disconnect.set().unwrap();
+            ready_tx.send((Instant::now(), prefilled)).unwrap();
             while flooding.load(Ordering::Acquire) {
                 // Без перезаписи: `QueueFull`, пока читатель не освободит
                 // место, -- `read_pos` двигает только он.
@@ -1516,7 +1525,13 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
     );
     journal.slow_slot.store(1, Ordering::Release);
     go_tx.send(()).unwrap();
-    let signalled_at = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let (signalled_at, prefilled) = ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Медленный читатель (1 мс на кадр) не успевает за записью: кольцо
+    // заполнено до лимита сообщений (64, +1 по правилу пересчёта).
+    assert!(
+        prefilled >= 64,
+        "кольцо не заполнено до DISCONNECT: {prefilled}"
+    );
 
     // Пока идёт поток, честный слот обслуживается.
     let before = journal.count(0);
@@ -1555,11 +1570,14 @@ fn hostile_disconnect_flood_does_not_stall_dispatcher() {
     // После обнаружения -- не больше кадров снимка (лимит кольца 64 + 1),
     // плюс обычные пачки, прочитанные до разбора DISCONNECT; поток
     // (`written` -- обычно сотни тысяч кадров) не доставлен. `<=`, а не
-    // `<`: после ухода сервера (`server_state = IDLE`) клиент больше не
-    // пишет (Task 6 надёжности), и если флудер не успел дописать в место,
-    // освобождённое дочитыванием, до закрытия слота, доставлено может быть
-    // ровно всё записанное -- граница доставки от этого не меняется.
+    // `<`: после закрытия слота (`server_state = IDLE`) клиент больше не
+    // пишет (Task 6 надёжности), и если после снимка дочитывания флудер
+    // не опубликовал ни одного кадра (диспетчер, разбуженный `DISCONNECT`,
+    // вытеснил его до закрытия слота), доставлено ровно всё записанное --
+    // это лучший исход, граница доставки от этого не меняется. Поток
+    // дошёл до дочитывания: кольцо было полно кадрами потока к сигналу.
     let flood_delivered = journal.count(1) - BEFORE;
+    assert!(flood_delivered > 0, "дочитывание не состоялось");
     assert!(
         flood_delivered < 300 && u64::from(flood_delivered) <= written,
         "доставлено из потока {flood_delivered} из {written}"

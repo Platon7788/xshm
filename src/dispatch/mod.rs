@@ -151,6 +151,17 @@ pub trait DispatchHandler: Send + Sync + 'static {
         let _ = client_id;
     }
 
+    /// Потеряны сообщения сервера клиенту `client_id` (0.10; направление
+    /// всегда сервер -> клиент): `count` вытеснено из кольца перезаписью
+    /// (`send_to`) или из очереди при её переполнении, либо сброшено из
+    /// очереди в конце сессии канала -- неотправленное ушедшему клиенту
+    /// (в том числе принятое `try_send_to`). Раз на пачку, не на сообщение;
+    /// отчёт о сбросе -- последний колбэк клиента перед
+    /// `on_client_disconnect_reason`. По умолчанию ничего не делает.
+    fn on_overflow(&self, client_id: u32, count: u32) {
+        let _ = (client_id, count);
+    }
+
     /// Вызывается при ошибке (client_id = None для общих ошибок).
     fn on_error(&self, client_id: Option<u32>, err: ShmError) {
         let _ = (client_id, err);
@@ -1368,6 +1379,16 @@ impl AutoHandler for AutoProxyHandler {
         let _scope = ServerThreadScope::enter(&self.clients);
         if self.is_active() {
             self.handler.on_space_available(self.client_id);
+        }
+    }
+
+    /// Канал -- только сервер -> клиент, направление не передаём. Сброс
+    /// очереди в конце сессии worker сообщает ДО `on_disconnect_reason` --
+    /// клиент ещё активен, отчёт доходит.
+    fn on_overflow(&self, _direction: ChannelKind, count: u32) {
+        let _scope = ServerThreadScope::enter(&self.clients);
+        if self.is_active() {
+            self.handler.on_overflow(self.client_id, count);
         }
     }
 
@@ -3583,6 +3604,104 @@ mod tests {
         control.slot_claim.store(0x1D1E_C1A1, Ordering::Release);
         thread::sleep(Duration::from_secs(1));
         assert_eq!(server.wakeups() - s0, 0, "лобби просыпалось в простое");
+        server.stop();
+    }
+
+    /// Ruling S (Task 6, fix round 2): канал Dispatch -- `AutoServer`, его
+    /// очередь, не записанная к уходу клиента, сбрасывается; прокси
+    /// передаёт отчёт `DispatchHandler::on_overflow` -- один, на всю
+    /// очередь, ДО `on_client_disconnect_reason` этого клиента.
+    #[test]
+    fn dispatch_reports_discarded_queue_before_disconnect() {
+        #[derive(Default)]
+        struct Events(Mutex<Vec<String>>);
+        impl DispatchHandler for Events {
+            fn on_client_connect(&self, _id: u32, _info: &ClientRegistration) {}
+            fn on_client_disconnect(&self, _id: u32) {
+                self.0.lock().unwrap().push("disconnect".into());
+            }
+            fn on_message(&self, _id: u32, _data: &[u8]) {}
+            fn on_overflow(&self, _id: u32, count: u32) {
+                self.0.lock().unwrap().push(format!("overflow {count}"));
+            }
+            fn on_error(&self, _id: Option<u32>, err: ShmError) {
+                self.0.lock().unwrap().push(format!("error {err:?}"));
+            }
+        }
+        /// Клиент, застревающий в `on_message`, пока ворота закрыты: кольцо
+        /// сервер -> клиент заполняется, остаток ждёт в очереди сервера.
+        #[derive(Default)]
+        struct Gate {
+            open: Mutex<bool>,
+            cv: std::sync::Condvar,
+        }
+        impl DispatchClientHandler for Gate {
+            fn on_connect(&self, _client_id: u32, _channel_name: &str) {}
+            fn on_disconnect(&self) {}
+            fn on_message(&self, _data: &[u8]) {
+                let mut open = self.open.lock().unwrap();
+                while !*open {
+                    open = self.cv.wait(open).unwrap();
+                }
+            }
+        }
+
+        let name = format!("TEST_DISPATCH_DISCARD_{}", std::process::id());
+        let events = Arc::new(Events::default());
+        let server = DispatchServer::start(&name, events.clone(), DispatchOptions::default())
+            .expect("server start");
+        let gate = Arc::new(Gate::default());
+        let client = DispatchClient::connect(
+            &name,
+            ClientRegistration::new(std::process::id(), 1, "discard.exe"),
+            gate.clone(),
+            DispatchClientOptions::default(),
+        )
+        .expect("client connect");
+        wait_for("канал", Duration::from_secs(5), || {
+            server.client_count() == 1 && client.is_connected()
+        });
+        let id = server.connected_clients()[0];
+
+        // Наполнить кольцо и очередь: `QueueFull` 50 раз подряд (0,5 с) --
+        // ни кольцо, ни очередь больше не разгружаются.
+        let mut accepted = 0u32;
+        let mut full_streak = 0;
+        while full_streak < 50 {
+            match server.try_send_to(id, b"for-departed") {
+                Ok(()) => {
+                    accepted += 1;
+                    full_streak = 0;
+                }
+                Err(ShmError::QueueFull) => {
+                    full_streak += 1;
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("try_send_to: {err:?}"),
+            }
+        }
+        assert!(accepted > 300, "принято {accepted}");
+
+        // Клиент уходит: `stop` ждёт worker, застрявший в `on_message`;
+        // ворота открываются -- worker дочитывает пачку и уходит (L).
+        let stopper = thread::spawn(move || drop(client));
+        thread::sleep(Duration::from_millis(50));
+        *gate.open.lock().unwrap() = true;
+        gate.cv.notify_all();
+        stopper.join().unwrap();
+
+        wait_for("отключение", Duration::from_secs(5), || {
+            events.0.lock().unwrap().iter().any(|e| e == "disconnect")
+        });
+        let log = events.0.lock().unwrap().clone();
+        assert_eq!(log.len(), 2, "{log:?}");
+        let count: u32 = log[0]
+            .strip_prefix("overflow ")
+            .unwrap_or_else(|| panic!("первым -- отчёт о сбросе: {log:?}"))
+            .parse()
+            .unwrap();
+        assert!(count > 0 && count < accepted, "{log:?}");
+        assert_eq!(log[1], "disconnect");
         server.stop();
     }
 }
