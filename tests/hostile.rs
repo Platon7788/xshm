@@ -679,6 +679,10 @@ const fn multi_error_allowed(err: &ShmError) -> bool {
                 | ShmError::VersionMismatch { .. }
                 | ShmError::NotReady
                 | ShmError::NoFreeSlot
+                // Решение U (Task 10, fix round 1): испорченный
+                // `server_pid` -- PID без процесса (`STATUS_INVALID_CID`)
+                // -- для клиента это сервер, завершившийся до заявки.
+                | ShmError::PeerDied
         )
 }
 
@@ -1548,7 +1552,7 @@ impl Drop for ForeignEvent {
     }
 }
 
-/// Сервер и клиент: факт и число подключений.
+/// Сервер и клиент: факт подключения.
 #[derive(Default)]
 struct Sessions {
     connected: AtomicBool,
@@ -1566,6 +1570,11 @@ impl AutoHandler for Sessions {
 /// Task 10 (П1, П2): два атакующих взводят `CONNECT_REQ` Auto-сервера без
 /// пауз (как чужой процесс -- kernel32), а 10 клиентов подряд всё равно
 /// подключаются каждый ≤ 500 мс, и `stop()` под потоком -- ≤ 300 мс.
+///
+/// Регрессионный страж «из жизни», а не доказательство П1: гонка двух
+/// потоков голод воспроизводит лишь изредка, и тест проходит и на прежнем
+/// порядке `[CONNECT_REQ, wake]`. Детерминированно П1 проверяют
+/// unit-тесты с `ADVERSARY_MARK` (`server::stray_tests`).
 #[test]
 fn connect_req_flood_does_not_starve_auto_server() {
     let name = unique("REQFLOOD");

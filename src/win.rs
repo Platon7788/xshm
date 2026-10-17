@@ -1215,6 +1215,27 @@ pub fn is_process_gone(pid: u32, start_time: u64) -> bool {
     }
 }
 
+/// Процесс, объявленный пиром как `(pid, start_time)`, подтверждённо
+/// завершился (Task 10, fix round 1, решение U): процесса с таким PID нет
+/// вовсе (`STATUS_INVALID_CID`), либо он открылся, сигнален и его время
+/// создания совпало с объявленным (или время не объявлено). Уже́, чем
+/// [`is_process_gone`]: живой процесс с чужим временем (порча поля
+/// времени или переиспользованный PID) -- НЕ «завершился», и подключение
+/// к нему не отвергается как к мёртвому серверу. PID 0 и любая
+/// двусмысленность (нет прав, время не узнать) -- `false`.
+#[must_use]
+pub fn is_announced_process_exited(pid: u32, start_time: u64) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    match ProcessWatch::open_status(pid) {
+        Ok(watch) => {
+            watch.has_exited() && (start_time == 0 || watch.start_time() == Some(start_time))
+        }
+        Err(status) => status == STATUS_INVALID_CID,
+    }
+}
+
 /// Время создания процесса `pid` (`KERNEL_USER_TIMES::CreateTime`, 100-нс
 /// FILETIME). `None` -- PID 0, процесс не открылся (нет прав, не существует)
 /// или запрос не удался.

@@ -2412,3 +2412,34 @@ fn connect_req_flood_does_not_starve_dispatcher() {
     drop(newcomer);
     drop(honest);
 }
+
+/// Fix round 1 (M5): пост пробуждения слота потерян (`wake_lost`) -- handle
+/// отключённых клиентов (`retired`) закрываются на ближайшем витке
+/// диспетчера по событию ЛЮБОГО слота, а не ждут события своего.
+#[test]
+fn lost_wake_post_closes_retired_on_next_pass() {
+    let name = unique("WAKE_LOST");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    thread::sleep(Duration::from_millis(100));
+    {
+        let slots = server.slots.read().unwrap();
+        let mut slot = slots[0].lock().unwrap();
+        slot.retired
+            .push(ProcessWatch::open(std::process::id()).unwrap());
+    }
+    server.wake_lost.store(true, Ordering::Release);
+    slot_connect_req(&name, 1).set().unwrap();
+    wait_for(
+        "retired слота 0 закрыты",
+        Duration::from_secs(2),
+        || {
+            server.slots.read().unwrap()[0]
+                .lock()
+                .unwrap()
+                .retired
+                .is_empty()
+        },
+    );
+    server.stop();
+}

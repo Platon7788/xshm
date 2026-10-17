@@ -2335,7 +2335,8 @@ mod stray_tests {
 
     /// Task 10 (П2, страж): поток `wake` (команды worker-а) не голодит
     /// заявку -- индекс 0 у `wake` не скрывает `CONNECT_REQ`: исход решает
-    /// состояние (`hello_pending`).
+    /// состояние (`hello_pending`). Детерминированно: `wake` взводится и
+    /// перед каждым ожиданием (fix round 1, M1).
     #[test]
     fn hello_accepted_under_wake_storm() {
         let name = unique("WAKESTORM");
@@ -2347,6 +2348,10 @@ mod stray_tests {
         let waiter = std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
+                // Fix round 1 (M1): `wake` взведён к КАЖДОМУ ожиданию --
+                // без решения по состоянию (`hello_pending` до индекса)
+                // ожидание всегда возвращало бы `Ok(false)`.
+                server_wake.set().unwrap();
                 let result = server.wait_for_client_or(server_wake.as_handle(), None);
                 if result != Ok(false) || Instant::now() >= deadline {
                     return (result, server);

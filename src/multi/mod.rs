@@ -574,6 +574,9 @@ mod core_type {
         /// O(1) (Task 10). Relaxed: тестовая статистика, ничего не публикует.
         #[cfg(test)]
         pub(in crate::multi) slot_visits: AtomicU64,
+        /// Пост пробуждения слота не удался (`wake_slot`): ближайший виток
+        /// диспетчера сверяет все слоты (fix round 1, M5).
+        pub(in crate::multi) wake_lost: AtomicBool,
         /// Сколько ближайших привязок провалить (тест повтора привязки).
         #[cfg(test)]
         pub(in crate::multi) fail_arms: std::sync::atomic::AtomicU32,
@@ -636,6 +639,7 @@ impl MultiServer {
             stale_completions: AtomicU64::new(0),
             #[cfg(test)]
             slot_visits: AtomicU64::new(0),
+            wake_lost: AtomicBool::new(false),
             #[cfg(test)]
             fail_arms: AtomicU32::new(0),
         });
@@ -885,8 +889,16 @@ impl MultiCore {
 
     /// Разбудить диспетчер: набор ожиданий слота изменился (слот отключён
     /// не им) -- он сверит привязки слота (`Dispatcher::reconcile`).
+    ///
+    /// Пост не удался (`NtSetIoCompletion`, нехватка ресурсов -- редко):
+    /// отметка `wake_lost` -- диспетчер на ближайшем витке (следующее
+    /// событие любого слота, дедлайн или `stop`) сверит ВСЕ слоты, закрыв
+    /// handle отключённых клиентов (`ClientSlot::retired`), а не ждёт
+    /// события именно этого слота (Task 10, fix round 1, M5).
     fn wake_slot(&self, slot_id: u32) {
-        let _ = self.port.post(WAKE_KEY, slot_id as usize);
+        if self.port.post(WAKE_KEY, slot_id as usize).is_err() {
+            self.wake_lost.store(true, Ordering::Release);
+        }
     }
 
     /// Полный проход слотов `range` (Task 10, решение R: диспетчер зовёт
@@ -1640,6 +1652,13 @@ impl<'a> Dispatcher<'a> {
         let mut probes: Vec<(u32, UnreadProbe<'a>)> = Vec::new();
 
         while core.running.load(Ordering::Acquire) {
+            // Потерянный пост `wake_slot` (M5): сверить все слоты -- O(N),
+            // только после отказа ядра, не на каждом витке.
+            if core.wake_lost.swap(false, Ordering::AcqRel) {
+                for slot_id in 0..core.max_clients {
+                    self.reconcile(slot_id);
+                }
+            }
             let now = Instant::now();
             // Task 10 (П3, решение R): полный проход всех слотов -- O(N)
             // блокировок -- только на дедлайне или не чаще

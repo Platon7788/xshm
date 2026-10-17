@@ -976,6 +976,15 @@ impl DispatchCore {
                     // взводится только остановкой (`running` уже ложь), а
                     // процесс клиента и кольцо проверяются на следующем
                     // проходе. Пустой сигнал стоит O(1): одно чтение кольца.
+                    //
+                    // Fix round 1 (M2): процесс клиента стоит после
+                    // `C2S_DATA`, и поток пустых `C2S_DATA` скрывал бы его
+                    // смерть до `lobby_timeout` -- поэтому на каждом пустом
+                    // проходе одна проверка процесса (нулевое ожидание, O(1)).
+                    if lobby.is_peer_alive() == Some(false) {
+                        self.handler.on_error(None, ShmError::PeerDied);
+                        return;
+                    }
                     #[cfg(test)]
                     crate::server::adversary_resignal(lobby.view(), &events.c2s.data);
                     let data = events.c2s.data.as_handle();

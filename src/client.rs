@@ -275,10 +275,18 @@ impl SharedClient {
         mut interrupt: Option<Interrupt<'_>>,
     ) -> Result<Self> {
         let hello = Hello::post(namespace, name, announce_pid, claim)?;
+        // Сервер подтверждённо завершился ещё до открытия его процесса
+        // (решение U): `S2C_CONNECT` никто не пошлёт, а наблюдать нечего --
+        // ожидание заняло бы весь таймаут (с `Duration::MAX` -- вечно).
+        // Отзыв W -- как при таймауте; проигранный отзыв -- подключены.
         // C9: сигнал серверу, C10: ожидание ответа.
-        let waited = match hello.events.connect_req.set() {
-            Ok(()) => hello.wait_ack(timeout, interrupt.as_mut()),
-            Err(err) => AckWait::Abandoned(err),
+        let waited = if hello.server_exited {
+            AckWait::Abandoned(ShmError::PeerDied)
+        } else {
+            match hello.events.connect_req.set() {
+                Ok(()) => hello.wait_ack(timeout, interrupt.as_mut()),
+                Err(err) => AckWait::Abandoned(err),
+            }
         };
         // Отзыв проиграл CAS сервера -- рукопожатие состоялось: продолжаем
         // как подключённые (сервер ждёт нас; если уже отключил -- worker
@@ -433,6 +441,13 @@ pub(crate) struct Hello {
     /// corrupted_server_start_hi_is_not_a_live_server`) `connect`
     /// подключается без наблюдения, а не отказывает.
     server_gone: bool,
+    /// Узкое «сервер завершился» для синхронного пути (fix round 1, решение
+    /// U; `win::is_announced_process_exited`): процесса с PID сервера нет
+    /// вовсе, либо он открылся, сигнален и время создания совпало с
+    /// объявленным. Живой процесс с чужим временем сюда не попадает.
+    /// `SharedClient::connect_impl` при `true` не ждёт `S2C_CONNECT` --
+    /// `PeerDied` с отзывом заявки.
+    server_exited: bool,
     /// Последним: view указывает в эту память.
     mapping: Mapping,
 }
@@ -612,6 +627,8 @@ impl Hello {
         );
         let server = ProcessWatch::open_peer(server_pid, server_start);
         let server_gone = server.is_none() && crate::win::is_process_gone(server_pid, server_start);
+        let server_exited =
+            server_gone && crate::win::is_announced_process_exited(server_pid, server_start);
 
         let hello = Self {
             view,
@@ -621,6 +638,7 @@ impl Hello {
             owns_claim,
             server,
             server_gone,
+            server_exited,
             mapping,
         };
 
@@ -732,6 +750,13 @@ impl Hello {
                     if self.accepted() {
                         return AckWait::Accepted;
                     }
+                    // Устаревший сигнал (fix round 1, M2): процесс сервера
+                    // стоит в наборе после `S2C_CONNECT`, и поток устаревших
+                    // сигналов скрывал бы его смерть до таймаута. Одна
+                    // проверка на пустой сигнал -- O(1) (нулевое ожидание).
+                    if self.server.as_ref().is_some_and(ProcessWatch::has_exited) {
+                        return AckWait::Abandoned(ShmError::PeerDied);
+                    }
                     #[cfg(test)]
                     crate::server::adversary_resignal(&self.view, &self.events.connect_ack);
                 }
@@ -771,6 +796,7 @@ impl Hello {
             owns_claim,
             server: peer,
             server_gone: _,
+            server_exited: _,
             mapping,
         } = self;
         let control = view.control_block();
@@ -2422,9 +2448,25 @@ mod tests {
             (result, server)
         });
         std::thread::sleep(Duration::from_millis(30));
-        let running = AtomicBool::new(true);
         let started = Instant::now();
-        let client = connect_with_wake(&name, Duration::from_secs(5), &wake, &running);
+        // Fix round 1 (M1): `should_stop` сам снова взводит `wake` -- к
+        // каждому ожиданию `wake` сигнален. Без нулевого ожидания
+        // `[S2C_CONNECT, процесс]` после индекса 0 ответ сервера не был бы
+        // виден никогда (таймаут).
+        let mut should_stop = || {
+            wake.set().unwrap();
+            false
+        };
+        let client = SharedClient::connect_interruptible(
+            None,
+            &name,
+            Duration::from_secs(5),
+            ClaimMode::Take,
+            Interrupt {
+                wake: wake.as_handle(),
+                should_stop: &mut should_stop,
+            },
+        );
         let elapsed = started.elapsed();
         run.store(false, Ordering::Release);
         storm.join().unwrap();
@@ -2472,6 +2514,113 @@ mod tests {
         child.wait().unwrap();
         let result = connecting.join().unwrap();
         let elapsed = started.elapsed();
+        assert_eq!(result, Err(ShmError::PeerDied));
+        assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+    }
+
+    // ─── Fix round 1 (решение U, M2) ─────────────────────────────────────────
+
+    /// Сегмент «сервера» -- PID и время создания уже завершившегося
+    /// процесса; `keep_handle` -- держать `Child` (handle процесса жив:
+    /// ветка «открылся и сигнален»), иначе все handle закрыты (ветка
+    /// `STATUS_INVALID_CID`). Возвращает сервер и, если держится, `Child`.
+    fn dead_server(
+        tag: &str,
+        keep_handle: bool,
+    ) -> (String, SharedServer, Option<std::process::Child>) {
+        let name = unique(tag);
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let watch = ProcessWatch::open(pid).unwrap();
+        let start = watch.start_time().unwrap();
+        child.wait().unwrap();
+        drop(watch);
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+        (name, server, keep_handle.then_some(child))
+    }
+
+    /// Решение U: синхронный `connect` к серверу, чей процесс завершился до
+    /// открытия, -- `Err(PeerDied)` сразу (двойник
+    /// `connect_async_sees_server_dead_before_open`), откат заявки.
+    fn sync_connect_sees_server_dead_before_open(keep_handle: bool) {
+        let (name, server, child) = dead_server("SYNCDEAD", keep_handle);
+        let control = server.view().control_block();
+        let started = Instant::now();
+        let result = SharedClient::connect(&name, Duration::from_secs(10)).map(drop);
+        let elapsed = started.elapsed();
+        assert_eq!(result, Err(ShmError::PeerDied));
+        assert!(elapsed < Duration::from_secs(1), "{elapsed:?}");
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
+        drop(child);
+    }
+
+    #[test]
+    fn connect_sees_server_dead_before_open() {
+        sync_connect_sees_server_dead_before_open(false);
+    }
+
+    #[test]
+    fn connect_sees_server_dead_before_open_with_handle_held() {
+        sync_connect_sees_server_dead_before_open(true);
+    }
+
+    /// M2: поток устаревших `S2C_CONNECT` («противник» `ADVERSARY_MARK` --
+    /// сигнал снова взведён к каждому ожиданию) не скрывает смерть сервера:
+    /// процесс стоит в наборе после `S2C_CONNECT`, но проверяется на каждом
+    /// пустом сигнале -- `PeerDied` ≤ 1 с, а не `Timeout`.
+    #[test]
+    fn server_death_seen_under_ack_flood() {
+        let name = unique("ACKFLOODDEATH");
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = ProcessWatch::open(pid).unwrap().start_time().unwrap();
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+        control
+            .slot_count
+            .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        let ack = SharedEvents::open(&name).unwrap().connect_ack;
+
+        let client_name = name;
+        let connecting = std::thread::spawn(move || {
+            SharedClient::connect(&client_name, Duration::from_secs(10)).map(drop)
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO {
+            assert!(Instant::now() < deadline, "заявка не выставлена");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Запуск потока: первый устаревший сигнал, дальше его взводит
+        // сам цикл (противник).
+        ack.set().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let result = connecting.join().unwrap();
+        let elapsed = started.elapsed();
+        control.slot_count.store(0, Ordering::Release);
         assert_eq!(result, Err(ShmError::PeerDied));
         assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
