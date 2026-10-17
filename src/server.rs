@@ -34,6 +34,8 @@ pub(crate) enum HandshakePoint {
     BeforeCommit,
     /// Между фиксацией S5 и сигналом `S2C_CONNECT` (S6, S7).
     AfterCommit,
+    /// S2: заявка признана заявкой умершего, перед перепроверкой claim и CAS.
+    BeforeDeadWithdraw,
 }
 
 /// Тесты: хук рукопожатия -- получает отображение сервера.
@@ -670,7 +672,23 @@ impl SharedServer {
         // claim-а (защита от ABA G2: PID прочитан у прежнего клиента) и
         // подтверждённо ушёл. Снимаем CAS-ом -- отзыв самого клиента или
         // гонка с ним решаются однозначно.
-        if watch.is_none() && claim_holder_gone(control, pid, start) {
+        //
+        // Fix round 1: непосредственно перед CAS -- перепроверка `slot_claim
+        // == T`. S1-чтения могли устареть: прежний клиент P отозвал заявку,
+        // освободил claim и умер, а новый держатель A уже поставил свою
+        // заявку (`slot_owner_pid` ещё P, пока A не дошёл до C2). Пока стоит
+        // `T`, новой заявки нет (I3) -- CAS снимает заявку именно умершего;
+        // claim сменился -- S2 пропускается, заявку A фиксируют S3-S7 (S6
+        // наблюдает процесс A по его самоописанию). Клиент без claim
+        // (`T == 0`, наследный путь) -- без перепроверки.
+        let holder_dead = watch.is_none() && claim_holder_gone(control, pid, start);
+        #[cfg(test)]
+        if holder_dead {
+            handshake_hook(&self.view, HandshakePoint::BeforeDeadWithdraw);
+        }
+        if holder_dead
+            && (claim == CLAIM_FREE || control.slot_claim.load(Ordering::Acquire) == claim)
+        {
             if control
                 .client_state
                 .compare_exchange(
@@ -1673,6 +1691,43 @@ mod handshake_tests {
                 .wait(Some(Duration::ZERO))
                 .unwrap()
         );
+    }
+
+    /// Fix round 1 (находка 2 ревью): S1 прочитал заявку умершего P, но до
+    /// CAS S2 P успел отозвать её и освободить claim, а живой A -- поставить
+    /// свою (`slot_owner_pid` в момент проверки ещё P). Перепроверка
+    /// `slot_claim == T` перед CAS пропускает S2: заявку A фиксируют S3-S7,
+    /// сервер наблюдает процесс A, A принят.
+    #[test]
+    fn dead_hello_withdrawal_rechecks_claim() {
+        let name = unique("DEADRECHECK");
+        let mut server = SharedServer::start(&name).unwrap();
+        let dead = dead_process();
+        post_foreign_hello(&server, dead, dead);
+        let slot: Rc<RefCell<Option<Hello>>> = Rc::default();
+        let (a_slot, a_name) = (slot.clone(), name);
+        set_hook(HandshakePoint::BeforeDeadWithdraw, move |view| {
+            // P отозвал заявку (W) и освободил claim, затем умер.
+            let control = view.control_block();
+            control
+                .client_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+            control.client_pid.store(0, Ordering::Release);
+            control.announce_client_start(0);
+            control.slot_claim.store(CLAIM_FREE, Ordering::Release);
+            // Живой A захватил канал и поставил заявку.
+            let a = Hello::post(None, &a_name, true, ClaimMode::Take).unwrap();
+            *a_slot.borrow_mut() = Some(a);
+        });
+        assert_eq!(server.complete_handshake(), Ok(()), "заявка живого A снята");
+        let a = slot.borrow_mut().take().unwrap();
+        assert_eq!(server.peer_pid(), Some(std::process::id()));
+        assert!(matches!(
+            a.wait_ack(Duration::from_secs(1), None),
+            AckWait::Accepted
+        ));
+        let client = a.finish();
+        assert_eq!(server.session_claim(), client.claim());
     }
 
     /// §7.1 п. 8: PID заявки не совпадает с владельцем claim-а (ABA G2: PID

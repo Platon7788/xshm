@@ -449,9 +449,14 @@ impl Hello {
                     Ok(_) => true,
                     // Лобби: мьютекс брошен -- захват `held` принадлежит его
                     // умершему держателю (R12: claim лобби берут только под
-                    // мьютексом), перехватываем.
+                    // мьютексом), перехватываем. Только из `IDLE` (fix
+                    // round 1): стоящие `CLIENT_HELLO`/`SERVER_READY`
+                    // умершего разбирает сервер -- S2 (по его самоописанию и
+                    // `slot_owner_pid`, которые перехват затёр бы в C2/C5)
+                    // или наблюдение процесса; нам -- обычный отказ и толчок.
                     Err(held) => {
                         claim == ClaimMode::TakeOverAbandoned
+                            && control.client_state.load(Ordering::Acquire) == HANDSHAKE_IDLE
                             && control
                                 .slot_claim
                                 .compare_exchange(held, token, Ordering::AcqRel, Ordering::Acquire)
@@ -1397,6 +1402,59 @@ mod tests {
         );
         assert_eq!(control.slot_claim.load(Ordering::Acquire), next.claim());
         assert!(server.is_connected() && next.is_connected());
+    }
+
+    /// Fix round 1 (находка 1 ревью): перехват claim-а при брошенном
+    /// мьютексе лобби -- только из `IDLE`. Умерший держатель D оставил
+    /// стоящий `CLIENT_HELLO`: перехват не трогает ни claim, ни его
+    /// самоописание (иначе S2 его заявку уже не снял бы), а толкает сервер;
+    /// S2 снимает заявку D. Затем claim D без заявки (`IDLE`) перехватывается.
+    #[test]
+    fn takeover_only_from_idle() {
+        let name = unique("TAKEOVER");
+        let mut server = SharedServer::start(&name).unwrap();
+        // Завершившийся процесс D: PID и время создания.
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let watch = ProcessWatch::open(pid).unwrap();
+        let start = watch.start_time().unwrap();
+        child.wait().unwrap();
+        drop(watch);
+        drop(child);
+        const T_D: u32 = 0x0DEA_D7A1;
+        {
+            let control = server.view().control_block();
+            control.slot_claim.store(T_D, Ordering::Release);
+            control.announce_owner_start(start);
+            control.slot_owner_pid.store(pid, Ordering::Release);
+            control.announce_client_start(start);
+            control.client_pid.store(pid, Ordering::Release);
+            control
+                .client_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        }
+        let before = claim_fields(server.view().control_block());
+        let err = Hello::post(None, &name, true, ClaimMode::TakeOverAbandoned).unwrap_err();
+        assert_eq!(err, ShmError::AlreadyConnected);
+        assert_eq!(claim_fields(server.view().control_block()), before);
+        // Толчок разбудил сервер, S2 снял заявку умершего D и его claim.
+        assert_eq!(
+            server.wait_for_client(Some(Duration::from_secs(1))),
+            Err(ShmError::HandshakeFailed)
+        );
+        let control = server.view().control_block();
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+
+        // Claim D без заявки -- перехватывается.
+        control.slot_claim.store(T_D, Ordering::Release);
+        let hello = Hello::post(None, &name, true, ClaimMode::TakeOverAbandoned).unwrap();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), hello.claim);
+        assert!(!hello.withdraw());
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
     }
 
     /// §7.1 п. 12: `connect_async` при занятом канале -- `AlreadyConnected`

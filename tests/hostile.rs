@@ -8,7 +8,9 @@
 //!   `LayoutBlock`).
 //! - `handshake_storm` -- 8 клиентов × 200 подключений к одному `AutoServer`:
 //!   ревизия 3 -- каждое принятие клиентом ровно одна сессия сервера, занятый
-//!   канал -- `AlreadyConnected`, причины отключений -- только `Graceful`.
+//!   канал -- `AlreadyConnected`, причины отключений -- только `Graceful`;
+//!   `handshake_storm_with_retry` -- повтор при занятом канале до 200 настоящих
+//!   рукопожатий на клиента (1600 сессий).
 //! - `overwrite_flood_*` -- 10⁶ малых сообщений с перезаписью: ни одного
 //!   потерянного `DATA`, порядок и сходимость счётчиков (`drop_count`).
 //!
@@ -906,19 +908,40 @@ impl AutoHandler for StormProbe {
     }
 }
 
-/// 8 клиентов × 200 подключений/отключений к одному `AutoServer` со
-/// случайными паузами 0–2 мс. Клиенты соревнуются за одно `client_state`
-/// (single-client канал), поэтому часть подключений -- `Timeout`: это
-/// допустимо, зависание -- нет (ни один `connect`/`Drop` не дольше 5 с).
-/// Итог: колбэки сервера чередуются, `on_connect` = `on_disconnect_reason`
-/// + текущее подключение (0 или 1).
-#[test]
-fn handshake_storm() {
+/// Режим клиента шторма.
+#[derive(Clone, Copy, Debug)]
+enum StormMode {
+    /// `ROUNDS` попыток подключения; `AlreadyConnected`/`Timeout` -- исход
+    /// попытки.
+    Attempts(u32),
+    /// Повтор при `AlreadyConnected` (короткая пауза) до `n` настоящих
+    /// рукопожатий на клиента: под нагрузкой снова идут S1-S7, W и S5.
+    Sessions(u32),
+}
+
+/// 8 клиентов одного `AutoServer` со случайными паузами 0–2 мс. Клиенты
+/// соревнуются за один single-client канал: занятый канал --
+/// `AlreadyConnected` (ревизия 3), отозванная по таймауту заявка --
+/// `Timeout`; зависание -- нет (ни один `connect`/`Drop` не дольше 5 с).
+/// Итог: колбэки сервера чередуются, `on_connect` равен сумме
+/// `on_disconnect_reason` и текущего подключения (0 или 1), каждое принятие
+/// клиентом -- ровно одна сессия сервера, причины отключений -- только
+/// `Graceful`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "один сценарий шторма: клиенты, тишина, итоговые утверждения"
+)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+fn run_storm(tag: &str, mode: StormMode) {
     const CLIENTS: u64 = 8;
-    const ROUNDS: u32 = 200;
     const SEED: u64 = 0x5EED_0018_5708_0001;
     const HANG: Duration = Duration::from_secs(5);
-    let name = unique("STORM");
+    /// Общий предел шторма с повтором (в debug -- около 60 с с запасом).
+    const OVERALL: Duration = Duration::from_secs(120);
+    let name = unique(tag);
     let probe = Arc::new(StormProbe::default());
     let server = AutoServer::start(
         &name,
@@ -936,7 +959,21 @@ fn handshake_storm() {
             thread::spawn(move || {
                 let mut rng = Rng(SEED ^ (index + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
                 let (mut accepted, mut timeouts, mut busy) = (0u32, 0u32, 0u32);
-                for round in 0..ROUNDS {
+                let mut round = 0u32;
+                loop {
+                    let done = match mode {
+                        StormMode::Attempts(rounds) => round >= rounds,
+                        StormMode::Sessions(sessions) => accepted >= sessions,
+                    };
+                    if done {
+                        break;
+                    }
+                    assert!(
+                        started.elapsed() < OVERALL,
+                        "шторм дольше {OVERALL:?}; seed {SEED:#x}, клиент {index}, \
+                         принято {accepted}"
+                    );
+                    round += 1;
                     let t = Instant::now();
                     let result = SharedClient::connect(&name, Duration::from_millis(200));
                     let elapsed = t.elapsed();
@@ -955,7 +992,14 @@ fn handshake_storm() {
                         }
                         Err(ShmError::Timeout) => timeouts += 1,
                         // Ревизия 3: канал занят другим клиентом шторма.
-                        Err(ShmError::AlreadyConnected) => busy += 1,
+                        Err(ShmError::AlreadyConnected) => {
+                            busy += 1;
+                            if let StormMode::Sessions(_) = mode {
+                                // Повтор: короткая пауза, без паузы раунда.
+                                thread::sleep(Duration::from_micros(rng.below(301)));
+                                continue;
+                            }
+                        }
                         Err(err) => panic!(
                             "connect: {err:?}; seed {SEED:#x}, клиент {index}, раунд {round}"
                         ),
@@ -994,7 +1038,7 @@ fn handshake_storm() {
     let current = u32::from(probe.connected.load(Ordering::Acquire));
     let reasons = probe.reasons.each_ref().map(|r| r.load(Ordering::Acquire));
     println!(
-        "handshake_storm: seed {SEED:#x}, {storm:?}, клиент: принято {accepted}, \
+        "{tag}: {mode:?}, seed {SEED:#x}, {storm:?}, клиент: принято {accepted}, \
          таймаутов {timeouts}, занято {busy}; \
          сервер: on_connect {connects}, on_disconnect_reason {disconnects}, сейчас {current}; \
          причины [Graceful, PeerDied, Local, Error] = {reasons:?}"
@@ -1015,9 +1059,28 @@ fn handshake_storm() {
     );
     assert_eq!(connects, disconnects + current);
     assert!(connects > 0 && accepted > 0, "ни одного подключения");
+    if let StormMode::Sessions(sessions) = mode {
+        let expected = u32::try_from(CLIENTS).unwrap() * sessions;
+        assert_eq!(accepted, expected, "seed {SEED:#x}: не все сессии");
+    }
     let t = Instant::now();
     drop(server);
     assert!(t.elapsed() < HANG, "остановка сервера {:?}", t.elapsed());
+}
+
+/// 8 клиентов × 200 попыток: занятый канал -- исход попытки (в основном
+/// проверяет конкуренцию за claim).
+#[test]
+fn handshake_storm() {
+    run_storm("STORM", StormMode::Attempts(200));
+}
+
+/// Fix round 1 (находка 4 ревью): клиенты повторяют при
+/// `AlreadyConnected`, пока каждый не наберёт 200 настоящих рукопожатий --
+/// 1600 сессий под нагрузкой проходят полный путь S1-S7, W/S5 и уход.
+#[test]
+fn handshake_storm_with_retry() {
+    run_storm("STORM_RETRY", StormMode::Sessions(200));
 }
 
 // ─── поток с перезаписью ────────────────────────────────────────────────────
