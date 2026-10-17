@@ -333,6 +333,12 @@ pub const SEC_RESERVE: ULONG = 0x0400_0000;
 pub const SEC_IMAGE: ULONG = 0x0100_0000;
 /// Секция, отображающая файл (а не файл подкачки).
 pub const SEC_FILE: ULONG = 0x0080_0000;
+/// Некэшируемая секция (UC): каждая атомарная операция идёт мимо кэша,
+/// `lock`-операции -- шинные блокировки.
+pub const SEC_NOCACHE: ULONG = 0x1000_0000;
+/// Секция с объединением записи (WC): записи не упорядочены между собой --
+/// модель TSO на такой памяти не действует.
+pub const SEC_WRITECOMBINE: ULONG = 0x4000_0000;
 
 /// Полный доступ к порту завершения ввода-вывода
 /// (STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3).

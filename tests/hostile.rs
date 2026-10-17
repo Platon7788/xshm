@@ -50,6 +50,14 @@ use xshm::{
 #[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
 unsafe extern "system" {
     fn OpenFileMappingW(desired_access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+    fn CreateFileMappingW(
+        file: *mut c_void,
+        attributes: *const c_void,
+        protect: u32,
+        size_high: u32,
+        size_low: u32,
+        name: *const u16,
+    ) -> *mut c_void;
     fn MapViewOfFile(
         mapping: *mut c_void,
         desired_access: u32,
@@ -1446,4 +1454,57 @@ fn overwrite_flood_multi() {
     drop(seg);
     client.stop();
     server.stop();
+}
+
+// ─── секция с атрибутом кэширования под именем канала ───────────────────────
+
+/// `INVALID_HANDLE_VALUE` -- секция из файла подкачки.
+const INVALID_HANDLE_VALUE: *mut c_void = std::ptr::without_provenance_mut(usize::MAX);
+const PAGE_READWRITE: u32 = 0x04;
+const SEC_COMMIT: u32 = 0x0800_0000;
+const SEC_NOCACHE: u32 = 0x1000_0000;
+const SEC_WRITECOMBINE: u32 = 0x4000_0000;
+
+/// Надёжность (17.10.2026, пункт 3): чужой процесс занял имя канала секцией
+/// `SEC_NOCACHE`/`SEC_WRITECOMBINE` (WC-память нарушает TSO, UC -- каждая
+/// атомарная операция мимо кэша). Клиент обязан отвергнуть её при открытии
+/// (`Corrupted`), не дожидаясь таймаута и не трогая кольца.
+#[test]
+fn client_rejects_uncached_squatter() {
+    for (tag, extra) in [("NOCACHE", SEC_NOCACHE), ("WRITECOMBINE", SEC_WRITECOMBINE)] {
+        let name = unique(tag);
+        let wide: Vec<u16> = format!("Local\\{name}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        // SAFETY: `wide` -- строка с нулём на конце, живёт весь вызов;
+        // атрибуты безопасности -- NULL (дескриптор по умолчанию).
+        let raw = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE | SEC_COMMIT | extra,
+                0,
+                65536,
+                wide.as_ptr(),
+            )
+        };
+        let squatter =
+            NonNull::new(raw).unwrap_or_else(|| panic!("CreateFileMappingW(SEC_{tag}) не удался"));
+
+        let started = Instant::now();
+        let result = SharedClient::connect(&name, Duration::from_secs(1));
+        match result {
+            Err(ShmError::Corrupted) => {}
+            Ok(_) => panic!("секция SEC_{tag} принята клиентом"),
+            Err(other) => panic!("SEC_{tag}: ожидался Corrupted, получено {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(900),
+            "SEC_{tag}: отказ должен быть сразу, а не по таймауту"
+        );
+
+        // SAFETY: handle создан `CreateFileMappingW` и закрывается один раз.
+        let _ = unsafe { CloseHandle(squatter.as_ptr()) };
+    }
 }

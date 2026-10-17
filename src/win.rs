@@ -63,7 +63,9 @@ use crate::ntapi::{
     SEC_COMMIT,
     SEC_FILE,
     SEC_IMAGE,
+    SEC_NOCACHE,
     SEC_RESERVE,
+    SEC_WRITECOMBINE,
     SECTION_ALL_ACCESS,
     SECTION_BASIC_INFORMATION,
     STATUS_ABANDONED_WAIT_0,
@@ -794,8 +796,9 @@ impl Mapping {
     /// Секция `name` размером не меньше `size`: создаётся (дескриптор
     /// `security`, `SEC_COMMIT`) или, если имя уже занято, открывается
     /// (`OBJ_OPENIF`; дескриптор существующей не меняется).
-    /// Существующая секция проверяется как чужая: тип `SEC_COMMIT` и view не
-    /// меньше `size`, иначе `Corrupted`. Для объектов, которые создаёт
+    /// Существующая секция проверяется как чужая: атрибуты -- как в
+    /// `check_commit` (`SEC_COMMIT`, без резервирования, файла/образа и
+    /// атрибутов кэширования) и view не меньше `size`, иначе `Corrupted`. Для объектов, которые создаёт
     /// первая пришедшая сторона (состояние маяка).
     pub(crate) fn open_or_create<'a>(
         name: impl Into<ObjectPath<'a>>,
@@ -844,13 +847,33 @@ impl Mapping {
         Ok(mapping)
     }
 
-    /// Тип секции -- до отображения: под именем канала враждебный процесс
-    /// может держать `SEC_RESERVE` (страницы не выделены -- первое
-    /// обращение к ним даёт access violation) или секцию файла/образа.
-    /// Сегмент канала всегда `SEC_COMMIT` из файла подкачки.
+    /// Тип секции -- до отображения. Сегмент канала всегда `SEC_COMMIT` из
+    /// файла подкачки с обычным (кэшируемым) режимом памяти; под именем
+    /// канала враждебный процесс может держать что угодно. `Corrupted`, если:
+    ///
+    /// - нет `SEC_COMMIT`;
+    /// - `SEC_RESERVE` -- страницы не выделены, первое обращение даёт
+    ///   access violation;
+    /// - `SEC_IMAGE` / `SEC_FILE` -- секция образа или файла;
+    /// - `SEC_NOCACHE` (`0x10000000`) -- некэшируемая память: каждая
+    ///   атомарная операция мимо кэша, `lock`-операции -- шинные блокировки;
+    /// - `SEC_WRITECOMBINE` (`0x40000000`) -- записи не упорядочены.
+    ///
+    /// Прочие биты (`SEC_LARGE_PAGES` и служебные) допускаются.
     fn check_commit(handle: &Handle) -> Result<()> {
+        // Запрет-список, а не строгое «ровно SEC_COMMIT»: ядро может
+        // возвращать в `AllocationAttributes` служебные биты, которых мы не
+        // знаем, -- строгий список дал бы ложный отказ честной секции на
+        // другой сборке Windows. `SEC_LARGE_PAGES` (`0x80000000`) -- обычная
+        // кэшируемая память, допускается.
+        //
+        // `SEC_WRITECOMBINE`: WC-память не держит порядок записей (store-store
+        // переупорядочивание) -- нарушен TSO, на котором стоят все
+        // Release/Acquire-публикации кольца. `SEC_NOCACHE`: UC-память --
+        // DoS по латентности на каждом атомарном доступе.
+        const REJECTED: u32 = SEC_RESERVE | SEC_IMAGE | SEC_FILE | SEC_NOCACHE | SEC_WRITECOMBINE;
         let attributes = Self::section_attributes(handle)?;
-        if attributes & (SEC_RESERVE | SEC_IMAGE | SEC_FILE) != 0 || attributes & SEC_COMMIT == 0 {
+        if attributes & REJECTED != 0 || attributes & SEC_COMMIT == 0 {
             return Err(ShmError::Corrupted);
         }
         Ok(())
@@ -1387,6 +1410,59 @@ mod tests {
         let _commit_owner = create_test_section(&commit, SEC_COMMIT);
         assert!(Mapping::open(&commit).is_ok());
         assert!(Mapping::open_header(&commit).is_ok());
+    }
+
+    /// Надёжность (17.10.2026, пункт 3): чужая секция с атрибутом кэширования
+    /// под именем канала. `SEC_WRITECOMBINE` -- записи не упорядочены
+    /// (нарушен TSO, на котором стоят Release/Acquire-публикации кольца),
+    /// `SEC_NOCACHE` -- каждая атомарная операция мимо кэша. Все три пути
+    /// открытия чужой секции (`open`, `open_header`, `open_or_create` при
+    /// занятом имени) обязаны дать `Corrupted`; контроль -- `SEC_COMMIT`
+    /// открывается всеми тремя.
+    #[test]
+    fn open_rejects_uncached_sections() {
+        let pid = std::process::id();
+        for (tag, extra) in [("NOCACHE", SEC_NOCACHE), ("WRITECOMBINE", SEC_WRITECOMBINE)] {
+            let name = format!("Local\\XSHM_TEST_SEC_{tag}_{pid}");
+            let _owner = create_test_section(&name, SEC_COMMIT | extra);
+            match Mapping::open(&name) {
+                Err(ShmError::Corrupted) => {}
+                Ok(_) => panic!("секция SEC_{tag} принята (open)"),
+                Err(other) => panic!("SEC_{tag}: ожидался Corrupted, получено {other:?}"),
+            }
+            match Mapping::open_header(&name) {
+                Err(ShmError::Corrupted) => {}
+                Ok(_) => panic!("секция SEC_{tag} принята (open_header)"),
+                Err(other) => panic!("SEC_{tag}: ожидался Corrupted, получено {other:?}"),
+            }
+            match Mapping::open_or_create(&name, 4096, &sec()) {
+                Err(ShmError::Corrupted) => {}
+                Ok(_) => panic!("секция SEC_{tag} принята (open_or_create)"),
+                Err(other) => panic!("SEC_{tag}: ожидался Corrupted, получено {other:?}"),
+            }
+        }
+
+        let commit = format!("Local\\XSHM_TEST_SEC_CACHED_{pid}");
+        let _commit_owner = create_test_section(&commit, SEC_COMMIT);
+        assert!(Mapping::open(&commit).is_ok());
+        assert!(Mapping::open_header(&commit).is_ok());
+        assert!(Mapping::open_or_create(&commit, 4096, &sec()).is_ok());
+    }
+
+    /// Своя секция (`Mapping::create`, политика по умолчанию) проходит
+    /// проверку чужой: служебные биты, которые ядро возвращает в
+    /// `AllocationAttributes`, не дают ложного отказа. Фактические атрибуты
+    /// печатаются для протокола (x64 и i686).
+    #[test]
+    fn own_section_attributes_pass_check() {
+        let name = format!("Local\\XSHM_TEST_SEC_OWN_{}", std::process::id());
+        let mapping = Mapping::create(&name, 64 * 1024, &sec()).unwrap();
+        let attributes = Mapping::section_attributes(&mapping._handle).unwrap();
+        eprintln!("AllocationAttributes своей секции: {attributes:#010x}");
+        assert_eq!(attributes & (SEC_NOCACHE | SEC_WRITECOMBINE), 0);
+        Mapping::check_commit(&mapping._handle).unwrap();
+        // Открытие по имени -- тот же путь, что у пира.
+        assert!(Mapping::open(&name).is_ok());
     }
 
     /// Находка 11 (состояние маяка): `open_or_create` создаёт секцию, второй

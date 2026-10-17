@@ -574,6 +574,29 @@
   загруженной машине тест падал с `server error: Timeout`, скрывая
   настоящую причину.
 
+### Исправлено (надёжность, 17.10.2026)
+
+- **Major** Чужая секция с атрибутом кэширования под именем канала
+  принималась. Проверка `NtQuerySection` отвергала только `SEC_RESERVE`,
+  `SEC_IMAGE`, `SEC_FILE` и отсутствие `SEC_COMMIT`, поэтому процесс,
+  занявший имя секцией `SEC_COMMIT | SEC_WRITECOMBINE` (`0x40000000`),
+  подсовывал память без порядка записей: TSO, на котором стоят все
+  Release/Acquire-публикации кольца, там не действует. С `SEC_NOCACHE`
+  (`0x10000000`) каждая атомарная операция шла мимо кэша (DoS по
+  латентности). Теперь `Mapping::check_commit` отвергает и эти два
+  атрибута (`ShmError::Corrupted`, до отображения) на всех путях открытия
+  чужой секции: `Mapping::open` (канал), `Mapping::open_header` (перебор
+  слотов Multi) и `Mapping::open_or_create` при занятом имени (состояние
+  маяка). Проверка остаётся запрет-списком: `SEC_LARGE_PAGES` и
+  неизвестные служебные биты ядра допускаются, чтобы честная секция не
+  получила ложный отказ на другой сборке Windows. Константы `SEC_NOCACHE`
+  и `SEC_WRITECOMBINE` добавлены в `ntapi::types`. Тесты:
+  `win::tests::{open_rejects_uncached_sections,
+  own_section_attributes_pass_check}`,
+  `tests/hostile.rs::client_rejects_uncached_squatter`. Поведение видно
+  пиру, нативная реализация (xipc) обязана повторить. INTEROP §b.2,
+  §c.5 п. 1, §g п. 14 и «Изменения 0.10» п. 31.
+
 ### Сборка
 
 - CI (Task 19): `cargo clippy --release --all-targets -- -D warnings` на x64 и

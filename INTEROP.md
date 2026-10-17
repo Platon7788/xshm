@@ -154,7 +154,7 @@ handle пространства и относительное имя, §b.4).
 
 | Объект | Имя | Тип | Нач. состояние | Создаёт (флаги, доступ) | Открывает | Кто сигналит | Кто ждёт |
 |---|---|---|---|---|---|---|---|
-| Секция канала | `Local\B` / `B` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, размер `LayoutBlock.segment_size` (0.10; по умолчанию `4 194 560`) | нули | сервер: `NtCreateSection(SECTION_ALL_ACCESS=0x000F001F)`, **без** `OBJ_OPENIF` — существующее имя = ошибка (`STATUS_OBJECT_NAME_COLLISION`) (`Mapping::create`) | клиент: `NtOpenSection(SECTION_ALL_ACCESS)` + проверка типа `NtQuerySection` = `SEC_COMMIT` (0.10) + отображение целиком + проверки §c.5 (`magic`/`version`/`LayoutBlock` против размера view; `SharedView::attach`) | — | — |
+| Секция канала | `Local\B` / `B` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, размер `LayoutBlock.segment_size` (0.10; по умолчанию `4 194 560`) | нули | сервер: `NtCreateSection(SECTION_ALL_ACCESS=0x000F001F)`, **без** `OBJ_OPENIF` — существующее имя = ошибка (`STATUS_OBJECT_NAME_COLLISION`) (`Mapping::create`) | клиент: `NtOpenSection(SECTION_ALL_ACCESS)` + проверка типа `NtQuerySection` = `SEC_COMMIT` без `SEC_RESERVE`/`SEC_IMAGE`/`SEC_FILE`/`SEC_NOCACHE`/`SEC_WRITECOMBINE` (0.10, §c.5 п. 1) + отображение целиком + проверки §c.5 (`magic`/`version`/`LayoutBlock` против размера view; `SharedView::attach`) | — | — |
 | `P S2C_DATA` | | SynchronizationEvent (автосброс, `1`) | FALSE | сервер: `NtCreateEvent(EVENT_ALL_ACCESS=0x001F0003)`, без `OBJ_OPENIF` (`EventHandle::create`) | клиент: `NtOpenEvent(EVENT_ALL_ACCESS)` + проверка типа `NtQueryEvent` = SynchronizationEvent (0.10, `EventHandle::open_auto_reset`) | писатель-сервер | читатель-клиент |
 | `P C2S_DATA` | | SynchronizationEvent | FALSE | сервер | клиент | писатель-клиент | читатель-сервер |
 | `P S2C_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-клиент** | писатель-сервер |
@@ -163,7 +163,7 @@ handle пространства и относительное имя, §b.4).
 | `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`); ревизия 3 — и клиент, проигравший захват claim-а, если `server_state != SERVER_READY` («толчок», R18, §i.3) | сервер |
 | `P S2C_DISCONNECT` | | SynchronizationEvent | FALSE | сервер | клиент | **обе** стороны при штатном закрытии (одно событие на оба направления, несмотря на `S2C` в имени) | обе стороны |
 | **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`EventHandle::open_or_create_notification`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
-| **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, дескриптор — политика создателя маяка (та же, что у `_beacon`; 0.10, до 0.10 — NULL DACL); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они; второй — в том числе DACL чужой секции не включает этого пользователя) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
+| **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, дескриптор — политика создателя маяка (та же, что у `_beacon`; 0.10, до 0.10 — NULL DACL); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` без `SEC_RESERVE`/`SEC_IMAGE`/`SEC_FILE`/`SEC_NOCACHE`/`SEC_WRITECOMBINE` (§c.5 п. 1) и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они; второй — в том числе DACL чужой секции не включает этого пользователя) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, `SEC_NOCACHE`, `SEC_WRITECOMBINE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
 | **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | 0.10: **сервер** в `start` (после секции лобби, держит до остановки, не захватывает; дескриптор — политика лобби) и **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, дескриптор — политика создателя (до 0.10 — NULL DACL, создавал только клиент); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс только держит открытым (0.10) |
 | Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`EventHandle::create_unnamed`) | не открывается по имени | свой процесс | свой процесс |
 | Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`ProcessWatch::open`, `ProcessWatch::open_peer`) | ядро (при завершении процесса) | сторона, открывшая handle |
@@ -591,7 +591,17 @@ capacity`).
    ОБЯЗАН отвергать секции не `SEC_COMMIT` — отказ, если в
    `AllocationAttributes` есть `SEC_RESERVE` (`0x04000000`), `SEC_IMAGE`
    (`0x01000000`) или `SEC_FILE` (`0x00800000`), либо нет `SEC_COMMIT`
-   (`0x08000000`) (0.10, `Mapping::open_view`); затем отображение секции
+   (`0x08000000`) (0.10, `Mapping::open_view`). Также ОБЯЗАН отвергать
+   секции с атрибутом кэширования: `SEC_NOCACHE` (`0x10000000`) и
+   `SEC_WRITECOMBINE` (`0x40000000`) (0.10, «Изменения 0.10» п. 31) —
+   на WC-памяти записи не упорядочены (TSO нарушен, публикации
+   Release/Acquire кольца теряют смысл), на UC-памяти каждая атомарная
+   операция идёт мимо кэша. Проверка — запрет-список: прочие биты
+   `AllocationAttributes` (`SEC_LARGE_PAGES` `0x80000000`, служебные биты
+   ядра) допускаются. Отказ — `ShmError::Corrupted`, без повтора. Правило
+   действует на всех путях открытия чужой секции: секция канала (в т.ч.
+   слоты Multi при переборе — отображение только заголовка) и состояние
+   маяка, найденное существующим (§b.2). Затем отображение секции
    целиком (`ViewSize = 0`).
 2. Отображение меньше 128 байт → отказ.
 3. `magic` (acquire): `0` → «не готово» (повторить позже), иное ≠
@@ -1312,6 +1322,19 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
     `tests/hostile.rs::{handshake_storm, handshake_storm_with_retry}` (принятий
     клиентами ровно столько, сколько сессий сервера; причины отключений —
     только `Graceful`; с повтором — 1600 полных рукопожатий).
+14. **Атрибуты чужой секции (§c.5 п. 1, «Изменения 0.10» п. 31)**: на
+    каждом открытии чужой секции (канал, заголовок слота Multi, существующее
+    состояние маяка) — `NtQuerySection(SectionBasicInformation)` до
+    отображения; отказ, если в `AllocationAttributes` есть хоть один из
+    `SEC_RESERVE` (`0x04000000`), `SEC_IMAGE` (`0x01000000`), `SEC_FILE`
+    (`0x00800000`), `SEC_NOCACHE` (`0x10000000`), `SEC_WRITECOMBINE`
+    (`0x40000000`), либо нет `SEC_COMMIT` (`0x08000000`); прочие биты
+    (`SEC_LARGE_PAGES` `0x80000000`, служебные) не проверять. Тесты-эталоны:
+    `win::tests::{open_rejects_reserved_or_image_section,
+    open_rejects_uncached_sections, own_section_attributes_pass_check,
+    open_or_create_shares_section_and_rejects_reserved_squatter}`,
+    `tests/hostile.rs::client_rejects_uncached_squatter` (клиент получает
+    `Corrupted` сразу, без ожидания таймаута).
 
 Прогон: `cargo test --all-features` (на 2026-09-25, рабочее дерево 0.9.0
 после ревизии 2: 116 unit + 1 ignored, 7 backpressure, 5 multi, 4 ordering,
@@ -1805,6 +1828,7 @@ R1–R17), §g (фактический прогон).
 | 28.12 | Лобби: мьютекс достался брошенным | — | ЖЕЛАТЕЛЬНО перехватить claim умершего держателя: `CAS c → T` после проигранного `CAS 0 → T`, только при `client_state == IDLE` (стоящую заявку/сессию умершего разбирает сервер); сервер в S2 обнуляет самоописание умершего **до** CAS `HELLO → IDLE`, поэтому перехват в окне «заявка снята, claim ещё стоит» безопасен. Клиент Rust при стоящей заявке или сессии умершего получает `AlreadyConnected` сразу, без повтора внутри `DispatchClient::connect`; повтор после того, как сервер снимет заявку (S2 или наблюдение процесса), проходит | §d.2 шаги 3–4 |
 | 29 | Разрыв сессии по своей ошибке (`Corrupted` при чтении/записи кольца, отказ ожидания) — канал Auto и выделенный канал Dispatch (final review I1/I2) | Rust (0.9 и 0.10 до исправления): клиент помечал себя отключённым и уходил **без** `IDLE`/`DISCONNECT` — сервер оставался «подключённым»; в 0.9 это лечил store `CLIENT_HELLO` следующего подключения, а с исключительной заявкой ревизии 3 (п. 28.2) повторный захват упирался в C6 (`AlreadyConnected`) навсегда; сервер Rust ставил `IDLE` **без** `S2C_DISCONNECT` — клиент спал «подключённым» к никому | клиент — полный уход L (`CAS SERVER_READY → IDLE`, заголовки `IDLE`, `DISCONNECT`, claim последним); сервер — `IDLE`, затем `S2C_DISCONNECT` (как Multi `force_disconnect`); так же сервер закрывает сессию, если не удался сигнал `S2C_CONNECT` (S7, §d.2 шаг 4). Нативный пир ОБЯЗАН так же; со своей стороны получит `DISCONNECT` от Rust при ошибке в своём кольце | §c.5, §d.2 шаг 7, §e.2 п. 5, R7 |
 | 30 | Сверка сессии клиентом Auto (final review M1) | клиент Auto не сверял `generation`: «не заметивший» клиент (claim отнят по дедлайну, принят другой) писал в кольцо новой сессии | на каждом пробуждении и в каждой отправке/приёме — `generation == G`; иначе уход без записей, без `DISCONNECT`, потреблённый сигнал (`DATA`/`SPACE`/`DISCONNECT`) ЖЕЛАТЕЛЬНО вернуть `NtSetEvent` (как MultiClient; иначе следующий владелец сессии теряет пробуждение до своего сигнала) | общее правило ухода (§e.2 п. 5); для лобби — §d.2 шаг 7 |
+| 31 | Атрибуты кэширования чужой секции (надёжность, 17.10.2026) | открывающая сторона отвергала только `SEC_RESERVE` (`0x04000000`), `SEC_IMAGE` (`0x01000000`), `SEC_FILE` (`0x00800000`) и отсутствие `SEC_COMMIT` (`0x08000000`): секция `SEC_COMMIT \| SEC_NOCACHE` или `SEC_COMMIT \| SEC_WRITECOMBINE`, занявшая имя канала, принималась — на WC-памяти записи не упорядочены (TSO нарушен, публикации кольца Release/Acquire теряют смысл), на UC-памяти каждая атомарная операция мимо кэша (DoS по латентности, `lock` — шинная блокировка) | в `NtQuerySection(SectionBasicInformation).AllocationAttributes` также отвергаются `SEC_NOCACHE` (`0x10000000`) и `SEC_WRITECOMBINE` (`0x40000000`) → `ShmError::Corrupted` до отображения; запрет-список, а не «ровно `SEC_COMMIT`»: `SEC_LARGE_PAGES` (`0x80000000`) и неизвестные служебные биты допускаются. Пути: открытие секции канала клиентом (`NtOpenSection`, отображение целиком), открытие заголовка слота Multi при переборе, существующая секция состояния маяка (`NtOpenSection` и ветка `STATUS_OBJECT_NAME_EXISTS` у `NtCreateSection(OBJ_OPENIF)`). Свою секцию создатель делает `SEC_COMMIT` без этих битов (как и прежде). Нативный пир ОБЯЗАН так же (маска отказа дополняется `SEC_NOCACHE \| SEC_WRITECOMBINE`) | §b.2, §c.5 п. 1, §g п. 14 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации
