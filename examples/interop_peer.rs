@@ -86,7 +86,14 @@
 //!   pinged=<k>`), затем уход; `echo` -- ответ XOR на кадры сервера до
 //!   `ends` разрывов (`INFO reason=`); `expect=<вариант>` -- регистрация
 //!   обязана провалиться этой ошибкой (`INFO err=`; отказ лобби --
-//!   `HandshakeFailed`).
+//!   `HandshakeFailed`);
+//! - `beacon-server` -- `dispatch-server` с явным маяком `<лобби>_beacon`:
+//!   `Beacon::raise` после старта лобби, `lower` перед остановкой;
+//!   `beacon-server-crash` -- лобби и `raise`, после `READY` выход с кодом 9
+//!   без `lower` (маяк упавшего сервера остаётся взведённым);
+//! - `beacon-client` -- `Beacon::open` (`INFO waiting=1`), ожидание взвода
+//!   (20 с), затем `INFO lobby=<0|1>` (`DispatchClient::lobby_exists`),
+//!   `INFO cleared=<true|false>` (`clear_if_stale`), `INFO raised=<0|1>`.
 //!
 //! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
 //! перед `INFO sent=`.
@@ -129,6 +136,9 @@ const CONNECT_RETRY_BUSY_FOR: Duration = Duration::from_secs(25);
 
 /// Ожидание места в `*-fill-wait`.
 const SPACE_WAIT: Duration = Duration::from_secs(20);
+
+/// Сколько `beacon-client` ждёт взвода маяка.
+const BEACON_WAIT: Duration = Duration::from_secs(20);
 
 /// Строка протокола в stdout. Ошибку записи (оркестратор закрыл канал)
 /// некому сообщить -- пир всё равно завершится по сценарию или самотаймауту.
@@ -1076,9 +1086,23 @@ impl DispatchHandler for DispatchEcho {
     }
 }
 
+/// Что сервер Dispatch делает с маяком `<лобби>_beacon` (сверх маяка
+/// присутствия, который `DispatchServer` держит сам).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BeaconRole {
+    /// Явно не трогает (`dispatch-server`).
+    None,
+    /// Явный `raise` после старта, `lower` перед остановкой (`beacon-server`).
+    Raise,
+    /// Явный `raise`, затем выход с кодом 9 без `lower` и остановки
+    /// (`beacon-server-crash`).
+    Crash,
+}
+
 /// `DispatchServer` с лобби по умолчанию (16 КиБ) и `max_clients`; эхо до
-/// `ends` отключений клиентов (по умолчанию 1).
-fn dispatch_server(name: &str, args: &Args) -> Result<(), String> {
+/// `ends` отключений клиентов (по умолчанию 1). `beacon` -- явный маяк
+/// лобби (`BeaconRole`).
+fn dispatch_server(name: &str, args: &Args, beacon: BeaconRole) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let options = DispatchOptions {
         max_clients: args.max_clients,
@@ -1093,11 +1117,55 @@ fn dispatch_server(name: &str, args: &Args) -> Result<(), String> {
     let server = DispatchServer::start(name, dyn_handler, options)
         .map_err(|e| format!("start: {}", err_name(&e)))?;
     drop(handler.server.set(Arc::downgrade(&server)));
+    // Маяк -- строго после того, как лобби создано (§b.3).
+    let lobby_beacon = match beacon {
+        BeaconRole::None => None,
+        BeaconRole::Raise | BeaconRole::Crash => {
+            let b = Beacon::open(name).map_err(|e| format!("beacon: {}", err_name(&e)))?;
+            b.raise().map_err(|e| format!("raise: {}", err_name(&e)))?;
+            Some(b)
+        }
+    };
     out("READY");
+    if beacon == BeaconRole::Crash {
+        // «Упал» взведённым: без `lower`, без деструкторов.
+        std::process::exit(9);
+    }
     for _ in 0..args.ends.unwrap_or(1) {
         rx.recv().map_err(|_| "handler gone".to_owned())?;
     }
+    // Сброс -- до остановки лобби.
+    if let Some(b) = &lobby_beacon {
+        b.lower().map_err(|e| format!("lower: {}", err_name(&e)))?;
+    }
     server.stop();
+    Ok(())
+}
+
+/// Клиент маяка: открыть маяк `name` (`INFO waiting=1`), ждать взвода (20 с),
+/// затем `INFO lobby=<0|1>` (`DispatchClient::lobby_exists`), `INFO
+/// cleared=<true|false>` (`Beacon::clear_if_stale`) и `INFO raised=<0|1>`.
+fn beacon_client(name: &str) -> Result<(), String> {
+    let beacon = Beacon::open(name).map_err(|e| format!("beacon: {}", err_name(&e)))?;
+    out("INFO waiting=1");
+    if !beacon
+        .wait(Some(BEACON_WAIT))
+        .map_err(|e| format!("wait: {}", err_name(&e)))?
+    {
+        return Err("beacon not raised".to_owned());
+    }
+    out(&format!(
+        "INFO lobby={}",
+        u8::from(DispatchClient::lobby_exists(name))
+    ));
+    let cleared = beacon
+        .clear_if_stale()
+        .map_err(|e| format!("clear_if_stale: {}", err_name(&e)))?;
+    out(&format!("INFO cleared={cleared}"));
+    let raised = beacon
+        .is_raised()
+        .map_err(|e| format!("is_raised: {}", err_name(&e)))?;
+    out(&format!("INFO raised={}", u8::from(raised)));
     Ok(())
 }
 
@@ -1111,8 +1179,6 @@ enum DispatchEvent {
     Ended,
 }
 
-/// Обработчик одного `DispatchClient`: `echo` -- ответ XOR на кадры
-/// сервера; `ping` -- сверка эха своих кадров.
 /// Клиент эха (`echo`): пока `connect` не вернул ручку клиента, worker
 /// канала уже может доставить первые кадры сервера -- они ждут в очереди и
 /// отвечаются при `attach`, а не теряются.
@@ -1131,6 +1197,8 @@ fn echo_back(client: &Weak<DispatchClient>, data: &[u8]) {
     }
 }
 
+/// Обработчик одного `DispatchClient`: `echo` -- ответ XOR на кадры
+/// сервера; `ping` -- сверка эха своих кадров.
 struct DispatchClientEcho {
     index: usize,
     client: Mutex<EchoTarget>,
@@ -1464,7 +1532,10 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "client-ping" => client_ping(name, args),
         "multi-server" => multi_server(name, args),
         "multi-client" => multi_client(name, args),
-        "dispatch-server" => dispatch_server(name, args),
+        "dispatch-server" => dispatch_server(name, args, BeaconRole::None),
+        "beacon-server" => dispatch_server(name, args, BeaconRole::Raise),
+        "beacon-server-crash" => dispatch_server(name, args, BeaconRole::Crash),
+        "beacon-client" => beacon_client(name),
         "dispatch-client" => dispatch_client(name, args),
         other => Err(format!("unknown scenario {other}")),
     }
