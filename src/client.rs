@@ -212,6 +212,11 @@ pub struct SharedClient {
     claim: u32,
     /// Claim наш (`Take`): освобождается последним шагом ухода (L).
     owns_claim: bool,
+    /// Смерть сервера ВЫВЕДЕНА, а не наблюдена (N1 повторного ревью T11b):
+    /// `Drop` выполняет полный уход L и после отметки отключения
+    /// (`PeerDied` от наблюдения «уже завершился»), чтобы живой сервер с
+    /// испорченным временем в сегменте не остался в сессии навсегда.
+    leave_on_drop: bool,
     /// Последним: view и кольца указывают в эту память.
     _mapping: Mapping,
     /// Делает тип `!Sync` (0.10, нулевой размер): кольцо -- SPSC, и
@@ -917,7 +922,7 @@ impl Hello {
             owns_claim,
             server: peer,
             server_gone: _,
-            server_exited: _,
+            server_exited,
             mapping,
         } = self;
         let control = view.control_block();
@@ -935,12 +940,25 @@ impl Hello {
         // сегменте (`server_gone` без `server_exited`), чью заявку синхронный
         // путь принял по `S2C_CONNECT`, наблюдения не получает и работает
         // (`peer_tests::corrupted_server_start_hi_is_not_a_live_server`).
-        let peer = match peer {
-            Some(peer) => Some(peer),
-            None if server_dead => {
-                ProcessWatch::exited(control.server_pid.load(Ordering::Acquire)).ok()
-            }
-            None => None,
+        //
+        // N1 повторного ревью T11b: смерть НАБЛЮДЁННАЯ (`server_exited`:
+        // процесса с PID нет либо он сигнален и время совпало) и
+        // ВЫВЕДЕННАЯ (`connect_async` по широкому `server_gone`: процесс с
+        // этим PID жив, но время создания другое -- PID переиспользован ИЛИ
+        // время в сегменте испорчено у живого сервера) различаются при
+        // уходе. Выведенная оставляет `Drop` полный уход L (CAS пары +
+        // `DISCONNECT`), даже после `PeerDied`: иначе живой сервер,
+        // успевший зафиксировать (а `CONNECT_REQ` async уже подал), остался
+        // бы «в сессии» навсегда, и все следующие клиенты получали бы
+        // `AlreadyConnected`. Если сервер и правда мёртв, лишний сигнал
+        // безвреден (S4 следующей сессии его сбросит).
+        let (peer, inferred_death) = match peer {
+            Some(peer) => (Some(peer), false),
+            None if server_dead => (
+                ProcessWatch::exited(control.server_pid.load(Ordering::Acquire)).ok(),
+                !server_exited,
+            ),
+            None => (None, false),
         };
         let (header_a, header_b) = view.headers();
         // Процесс сервера -- открытый при заявке (`Hello::post`; `None` --
@@ -969,6 +987,7 @@ impl Hello {
             generation,
             claim,
             owns_claim,
+            leave_on_drop: inferred_death,
             _mapping: mapping,
             _not_sync: PhantomData,
         }
@@ -1602,9 +1621,11 @@ impl Drop for SharedClient {
     /// `Drop` сервера уже перевели `client_state` в `IDLE`) CAS тоже не
     /// проходит -- `DISCONNECT` не сигналим: сессии, которую он закрыл бы,
     /// уже нет, а сигнал остался бы для следующей (INTEROP §d.2 шаг 7).
-    /// Отключён (`mark_disconnected`: сервер ушёл сам) -- только claim.
+    /// Отключён (`mark_disconnected`: сервер ушёл сам) -- только claim;
+    /// исключение -- смерть сервера, выведенная, а не наблюдённая
+    /// (`leave_on_drop`, N1 повторного ревью T11b): полный уход L.
     fn drop(&mut self) {
-        if self.connected && self.is_session_current() && self.leave_cas() {
+        if (self.connected || self.leave_on_drop) && self.is_session_current() && self.leave_cas() {
             let (header_a, header_b) = self.view.headers();
             header_a
                 .handshake_state
@@ -2991,6 +3012,49 @@ mod exited_server_tests {
         assert_async_drain_then_peer_died(&mut client);
         drop(client);
         drop(server);
+    }
+
+    /// N1 повторного ревью T11b: тот же исход у ЖИВОГО сервера, чьё время в
+    /// сегменте испорчено (`connect_async` вывел смерть по несовпадению
+    /// времени, а сервер успел зафиксировать). Клиент сообщает `PeerDied`
+    /// (решение V), но уходит полным L: сервер видит уход (`IDLE` и
+    /// `DISCONNECT`), claim свободен, и следующий клиент принимается -- сервер
+    /// не застревает в сессии с `AlreadyConnected` для всех.
+    #[test]
+    fn async_inferred_death_still_leaves_live_server_fully() {
+        let corrupted = (
+            std::process::id(),
+            crate::win::current_process_start_time() ^ 0x5A5A,
+        );
+        let (name, mut server) = forged_server("ASYNC_LIVE", corrupted);
+        commit_and_die_after_hello();
+        let mut client =
+            block_on(SharedClient::connect_async(&name)).expect("отзыв проигран -- подключён");
+        assert_async_drain_then_peer_died(&mut client);
+        drop(client);
+        let control = server.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_IDLE,
+            "живой сервер остался в сессии ушедшего клиента"
+        );
+        assert!(
+            server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "сервер не получил DISCONNECT ухода"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        // Следующий клиент принимается (не `AlreadyConnected`).
+        let next =
+            { std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5))) };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(next.join().unwrap().is_ok());
     }
 }
 
