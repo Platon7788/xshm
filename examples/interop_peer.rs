@@ -15,7 +15,8 @@
 //!   `reason=<вариант DisconnectReason>` (только ИМЯ варианта, без полей),
 //!   `frames=<n>`, `layout=<s2c>/<c2s>`, `connected=1`;
 //! - `PASS` (код 0) или `FAIL <текст>` (код 1); ошибка аргументов -- код 2;
-//!   жёсткий самотаймаут 60 с -- `FAIL timeout`.
+//!   самотаймаут -- `FAIL timeout`: 60 с без прогресса (строки протокола,
+//!   принятого кадра) или 600 с всего.
 //!
 //! Ключи: `s2c=<ёмкость>:<сообщений>:<макс. размер>`, `c2s=...` (раскладка
 //! сервера; по умолчанию `RingConfig::DEFAULT`), `n=<кадров>` (3000; у
@@ -121,8 +122,25 @@ use xshm::{
     SharedClient, SharedServer, ShmError,
 };
 
-/// Жёсткий самотаймаут пира: оркестратор не должен ждать зависший пир.
+/// Самотаймаут пира: оркестратор не должен ждать зависший пир. Зависание --
+/// это отсутствие прогресса (`progress`) дольше этого срока, а не общая
+/// длительность: под нагрузкой CPU эхо из 3000 кадров идёт медленно, но идёт.
 const SELF_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Абсолютный предел жизни пира (и при медленном прогрессе).
+const HARD_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Шаг сторожевого потока.
+const WATCHDOG_STEP: Duration = Duration::from_secs(1);
+
+/// Счётчик прогресса: строки протокола и принятые кадры.
+static PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Отметить прогресс (сторожевой поток `main` сверяет счётчик).
+fn progress() {
+    // Relaxed: только счётчик для сторожа, ничего не публикует.
+    PROGRESS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Сколько клиент ждёт ответа сервера на одну попытку подключения.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -143,6 +161,7 @@ const BEACON_WAIT: Duration = Duration::from_secs(20);
 /// Строка протокола в stdout. Ошибку записи (оркестратор закрыл канал)
 /// некому сообщить -- пир всё равно завершится по сценарию или самотаймауту.
 fn out(line: &str) {
+    progress();
     let mut stdout = std::io::stdout().lock();
     drop(writeln!(stdout, "{line}"));
     drop(stdout.flush());
@@ -524,6 +543,7 @@ fn until_gone(
             Ok(len) => {
                 let frame = buf.get(..len).ok_or("bad length")?;
                 on_frame(side, k, frame)?;
+                progress();
                 k += 1;
             }
             Err(Ended::Gone(reason)) => {
@@ -1542,11 +1562,28 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    // Самотаймаут: зависший сценарий не держит оркестратор.
+    // Самотаймаут: зависший сценарий (нет прогресса `SELF_TIMEOUT` или прошло
+    // `HARD_TIMEOUT`) не держит оркестратор. Медленный, но живой обмен
+    // (CPU отдан другим процессам) -- не зависание.
     thread::spawn(|| {
-        thread::sleep(SELF_TIMEOUT);
-        out("FAIL timeout");
-        std::process::exit(1);
+        let started = Instant::now();
+        let mut seen = PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+        let mut last = started;
+        loop {
+            // Сверка раз в секунду: зависание замечается через
+            // `SELF_TIMEOUT` после последнего прогресса, а не через окно
+            // до `2 * SELF_TIMEOUT`.
+            thread::sleep(WATCHDOG_STEP);
+            let now = PROGRESS.load(std::sync::atomic::Ordering::Relaxed);
+            if now != seen {
+                seen = now;
+                last = Instant::now();
+            }
+            if last.elapsed() >= SELF_TIMEOUT || started.elapsed() >= HARD_TIMEOUT {
+                out("FAIL timeout");
+                std::process::exit(1);
+            }
+        }
     });
     // Аргументы -- UTF-16 командной строки Windows (имя канала может быть
     // не-ASCII); невалидный UTF-16 -- ошибка аргументов.
