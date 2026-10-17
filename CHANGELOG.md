@@ -1094,6 +1094,16 @@
   шаг 7; так же клиент xipc). Тест
   `dispatch::tests::lobby_client_leaves_without_disconnect_after_server_left`.
 
+- **Minor** (T11b) Устаревший `DISCONNECT` от `Drop` `SharedClient`: сервер
+  закрыл сессию сам (`disconnect`, `Drop` сервера — `client_state` уже
+  `IDLE`, `generation` прежний), клиент этого ещё не разобрал и уходил: CAS
+  `SERVER_READY → IDLE` не проходил, а `DISCONNECT` всё равно взводился —
+  сигнал оставался для следующей сессии канала. Теперь уход сигналит
+  `DISCONNECT` только при удачном CAS (сессия была открыта и с точки зрения
+  сервера); claim снимается, как прежде. Пир-видимо: INTEROP R15, §d.2
+  шаг 7, «Изменения 0.10» п. 6 (нативному клиенту — ЖЕЛАТЕЛЬНО так же). Тест
+  `client::stale_leave_tests::drop_after_server_closed_session_sends_no_disconnect`.
+
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 
 - Пул пакетов ожидания реактора. `Reactor::register` создавал объект ядра

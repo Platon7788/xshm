@@ -1540,14 +1540,27 @@ impl Drop for SharedClient {
     /// новой сессии нет (I3), поэтому сверка и записи не разделены чужим
     /// рукопожатием. Отключён (`mark_disconnected`: сервер ушёл сам) --
     /// ответный `DISCONNECT` не сигналим, только освобождаем claim.
+    ///
+    /// T11b: сервер закрыл сессию сам, а клиент этого ещё не разобрал
+    /// (`disconnect`/`Drop` сервера перевели `client_state` в `IDLE`,
+    /// `generation` прежний) -- CAS не проходит, и `DISCONNECT` тоже не
+    /// сигналим: сессии, которую он закрыл бы, уже нет, а сигнал остался бы
+    /// взведённым для следующей сессии канала (INTEROP §d.2 шаг 7).
     fn drop(&mut self) {
-        if self.connected && self.is_session_current() {
-            let _ = self.view.control_block().client_state.compare_exchange(
-                HANDSHAKE_SERVER_READY,
-                HANDSHAKE_IDLE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
+        if self.connected
+            && self.is_session_current()
+            && self
+                .view
+                .control_block()
+                .client_state
+                .compare_exchange(
+                    HANDSHAKE_SERVER_READY,
+                    HANDSHAKE_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        {
             let (header_a, header_b) = self.view.headers();
             header_a
                 .handshake_state
@@ -2863,5 +2876,62 @@ mod exited_server_tests {
         );
         drop(client);
         drop(server);
+    }
+}
+
+#[cfg(test)]
+mod stale_leave_tests {
+    //! T11b: уход клиента после того, как сервер сам закрыл сессию, не
+    //! оставляет устаревший `DISCONNECT` следующей сессии.
+
+    use super::*;
+    use crate::server::SharedServer;
+
+    #[test]
+    fn drop_after_server_closed_session_sends_no_disconnect() {
+        let name = format!("CLI_STALE_LEAVE_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let client = {
+            let name = name.clone();
+            std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)))
+        };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = client.join().unwrap().unwrap();
+        server.disconnect().unwrap();
+        let disconnect_fired = |server: &SharedServer| {
+            server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap()
+        };
+        // Сигнал сервера клиенту -- разобран (клиент его так и не увидел).
+        assert!(disconnect_fired(&server));
+        drop(client);
+        assert!(
+            !disconnect_fired(&server),
+            "клиент взвёл DISCONNECT закрытой сервером сессии"
+        );
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            CLAIM_FREE,
+            "claim снят"
+        );
+
+        // Уход клиента из живой сессии сигналит, как прежде.
+        let client =
+            std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)));
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        drop(client.join().unwrap().unwrap());
+        assert!(disconnect_fired(&server), "штатный уход");
     }
 }
