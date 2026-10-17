@@ -11,6 +11,49 @@
 контракту отвергаются по версии (`ShmError::VersionMismatch`). Нормативно —
 [`INTEROP.md`](INTEROP.md) §c и «Изменения 0.10».
 
+### Миграция с 0.9
+
+Все видимые изменения API и поведения, из-за которых код или развёртывание
+0.9 требуют правки. Подробности — в разделах ниже.
+
+| Что | Было (0.9) | Стало (0.10) | Что сделать |
+|---|---|---|---|
+| Формат памяти | `SHARED_VERSION = 0x00010000`, пир с другой версией — `HandshakeFailed` | `0x00020000`; чужой формат — `ShmError::VersionMismatch { found, expected }` | Обновить обе стороны одновременно (Rust и нативные пиры по INTEROP §c, рукопожатие — ревизия 3) |
+| Дескриптор объектов | NULL DACL — открыть мог любой процесс | `ObjectSecurity::CurrentUser` по умолчанию (пользователь токена + SYSTEM); чужой пользователь — `ShmError::AccessDenied` | Служба SYSTEM ↔ пользователь (`Global\`), песочницы: у создающей стороны `security: ObjectSecurity::Everyone` (поведение 0.9), `CurrentUserAllowLowIntegrity` или `Descriptor(..)` |
+| Раскладка канала | фиксированная: 2 × 2 МиБ, 500 сообщений, до 65 535 байт | `ChannelLayout { server_to_client, client_to_server }` из `RingConfig`; `SharedServer::start_with(name, &ChannelConfig)`, поля `layout`/`channel_layout`/`lobby_layout` в опциях; клиент читает раскладку из сегмента | Ничего, если устраивает раскладка по умолчанию (она та же); лобби Dispatch по умолчанию — 2 × 16 КиБ |
+| Константы | `RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, `MESSAGE_HEADER_SIZE` | первые три — `#[deprecated]` псевдонимы значений по умолчанию; `MESSAGE_HEADER_SIZE` удалён | `DEFAULT_RING_CAPACITY`/`DEFAULT_MAX_MESSAGES`/`DEFAULT_MAX_MESSAGE_SIZE`, лимит канала — `FreeSpace::max_message_size`/`layout()`; размер кадра — `frame_size(len)` |
+| Предел сообщения | `max_message_size ≤ capacity − 8` | `≤ capacity / 2 − 8` (PAD-кадры), иначе `InvalidConfig`; клиент отвергает такой сегмент (`Corrupted`) | Большие сообщения — кольцо вдвое больше (`max_payload_for(capacity)`) |
+| Лимит сообщений | вытеснение по одному `message_count` | при `max_messages ≤ RECOUNT_MAX = 64` — пересчёт по кадрам (точно), выше — кольцо может держать `max_messages + 1` | Ничего (нативному писателю — тот же порог, INTEROP §c.5) |
+| `ClientRegistration` | литерал из трёх полей | новое поле `handshake_pid: Option<u32>`, derive `Default`/`PartialEq`/`Eq` | `ClientRegistration::new(pid, revision, name)` или `..Default::default()` |
+| Опции | `AutoOptions`, `MultiOptions`, `MultiClientOptions`, `DispatchOptions`, `DispatchClientOptions` без новых полей | поля `layout`/`channel_layout`/`lobby_layout`/`max_clients`, `security`, `namespace`, `spin`, `delivery` (Auto) | Литералы опций — с `..Default::default()` |
+| `FreeSpace` | открытая структура `{ bytes, messages }` | `#[non_exhaustive]`, новые поля `max_frame`, `max_message_size`; `fits`/`max_payload` решают по `max_frame` | Литерал `FreeSpace { .. }` заменить на `FreeSpace::ZERO`/`Default` или полученный снимок |
+| `SharedServer`/`SharedClient` | `Send + Sync` | `Send + !Sync` (гонка SPSC через `&self`) | Из нескольких потоков — `Mutex<SharedServer>`, Auto/Multi/Dispatch |
+| Zero-copy | нет | `send_with(len, f)` (`&mut self`, безопасно), `unsafe fn receive_with(f)` (`&mut self`; новая ошибка `ShmError::Overrun`) | Опционально; копирующие методы не менялись |
+| Доставка Auto | `on_message` получает копию | по умолчанию — так же; `AutoOptions::delivery` (`Delivery::COPY`), прямая доставка — `unsafe fn AutoOptions::zero_copy_delivery` | Ничего |
+| Спин | нет | `SpinPolicy` (`NONE` по умолчанию), поля `spin` в опциях, `poll_*_spin`, `wait_for_space_spin` | Опционально; без спина — «ноль пробуждений в простое», как в 0.9 |
+| Async | нет | `accept_async`/`connect_async`/`recv_async`/`send_async`, все `&mut self`, future — `Send` | Опционально; одновременные приём и отправка одной стороны — через разделение/`Mutex` |
+| Занятый single-client канал | второй клиент перетирал заявку или ждал до `Timeout` | `ShmError::AlreadyConnected` сразу (ревизия 3: исключительная заявка `slot_claim`); `AutoClient` — `on_error(AlreadyConnected)` раз в `reconnect_delay` | Обрабатывать `AlreadyConnected` как «канал занят» |
+| Колбэки `MultiHandler` | поток на каждые 21 слот, паника колбэка роняла группу | один поток-диспетчер на все слоты (медленный `on_message` задерживает всех клиентов); паника колбэка — `on_error(Some(slot), WorkerPanicked)` + локальное отключение слота (при `panic = "unwind"`) | Не блокировать в колбэках; тяжёлую работу — в свой поток |
+| Ошибки | `ShmError` без этих вариантов, не `#[non_exhaustive]` | новые `AccessDenied`, `WorkerPanicked { message }`, `Overrun`, `VersionMismatch`; у `AlreadyConnected` — новый случай (занятый канал, строка выше); перечисление `#[non_exhaustive]` | В `match` по `ShmError` — ветка `_` |
+| Пространства имён | только `\BaseNamedObjects` (`Local\`/`Global\`) | `PrivateNamespace::open_or_create(boundary, alias, &ObjectSecurity)`, поля `namespace`, `connect_in`, `Beacon::open_in`, `lobby_exists_in` | Опционально (защита от захвата имён) |
+| Допуск Dispatch | любой зарегистрировавшийся клиент получал канал | `DispatchHandler::admit` → `Admission::{Accept, AcceptWithLayout, Reject}` (по умолчанию `Accept`), `DispatchOptions::max_clients = 64` | Больше 64 клиентов — поднять `max_clients` |
+| `MAX_MULTI_CLIENTS` | 31 | 256 (каждый слот — своя секция; 256 × 4 МиБ ≈ 1 ГиБ) | Для больших `max_clients` — маленький `MultiOptions::layout` |
+| Маяк | клиент сбрасывал маяк сам (`lower`) | `clear_if_stale` (секция `<имя>_beacon_state`, живой сервер не трогается); `lower` — только сервер | Клиенту — `clear_if_stale` вместо `lower` |
+
+Потребители, проверенные на этой ветке (Task 19, `cargo check --workspace
+--all-targets`):
+
+- `useful-lib/prof-shm` — собирается (правки `ClientRegistration::new` и
+  `DEFAULT_MAX_MESSAGE_SIZE` уже сделаны там), release-сборка без
+  предупреждений xshm;
+- `NxT` — собирается без правок;
+- `E-NxT` — `crates/shm-server/tests/roundtrip.rs` (3 места): литерал
+  `ClientRegistration { pid, revision, name }` → `ClientRegistration::new(pid,
+  revision, name)` (или `handshake_pid: None`);
+- `APIScout` — воркспейс целиком не разрешается из-за собственного конфликта
+  `dear-imgui-sys` 0.18/0.20; крейты `engine-ipc` и `protocol` собираются без
+  правок.
+
 ### Добавлено
 
 - **Раскладка канала по направлениям**: `RingConfig { capacity,
@@ -455,6 +498,16 @@
 
 ### Сборка
 
+- CI (Task 19): `cargo clippy --release --all-targets -- -D warnings` на x64 и
+  i686 — release-профиль давал предупреждение, которое видел только
+  потребитель (`let_underscore_drop`, `e046606`).
+- Тесты раскладки (Task 19): `layout::tests::initialized_segment_bytes_match_interop`
+  (байты сегмента после `SharedView::initialize` по смещениям таблиц INTEROP
+  §c.1–§c.3), `wire_constants_are_stable`, `default_and_canonical_layouts_match_interop`;
+  у каждой таблицы INTEROP §c — ссылка на свой тест. В INTEROP больше нет
+  ссылок на номера строк кода — только имена функций.
+- rustdoc `Beacon::open`: маяк без состояния не подхватывает секцию
+  `<имя>_beacon_state`, созданную позже, — переоткрыть.
 - `ntdll` импортируется через `#[link(name = "ntdll", kind = "raw-dylib")]`:
   `ntdll.lib` из Windows SDK больше не нужна, `build.rs` ничего не линкует.
   Объявлены импорты для следующих задач 0.10 (`NtQuerySection`, токен и

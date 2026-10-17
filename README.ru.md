@@ -7,9 +7,9 @@
 Двунаправленный обмен сообщениями через lock-free SPSC кольцевые буферы, поверх прямых вызовов NT API. Чистый Rust-крейт — без C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.10.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
-  <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
+  <img alt="rust" src="https://img.shields.io/badge/rust-1.99%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="status" src="https://img.shields.io/badge/status-production--ready-brightgreen">
 </p>
@@ -23,7 +23,99 @@
 
 ---
 
-## 🆕 Что нового в v0.9.0
+## 🆕 Что нового в v0.10.0
+
+> **Несовместимо:** новый формат разделяемой памяти `0x00020000`. Пиры 0.9 (и
+> нативные пиры по контракту 0.9) отвергаются по версии —
+> `ShmError::VersionMismatch`; обновляйте обе стороны. Полный список изменений
+> API — таблица «Миграция с 0.9» в [`CHANGELOG.md`](CHANGELOG.md); контракт для
+> нативных пиров — [`INTEROP.md`](INTEROP.md).
+
+- ✅ **Раскладка канала по направлениям** — `RingConfig { capacity,
+  max_messages, max_message_size }` на каждое направление, вместе —
+  `ChannelLayout { server_to_client, client_to_server }`. Ёмкость — степень
+  двойки от 4 КиБ до 1 ГиБ, сообщение — до `capacity / 2 − 8` байт (намного
+  больше прежних 64 КиБ). Раскладку выбирает сервер и пишет в сегмент
+  (`LayoutBlock`); клиент читает её оттуда и сверяет с фактическим размером
+  отображения. `SharedServer::start_with(name, &ChannelConfig)`, поля `layout` в
+  `AutoOptions`/`MultiOptions`, `channel_layout`/`lobby_layout` в
+  `DispatchOptions`. Раскладка по умолчанию — как в 0.9 (2 × 2 МиБ, 500
+  сообщений, 65 535 байт).
+- ✅ **Безопасность объектов** — именованные объекты больше не создаются с NULL
+  DACL: по умолчанию `ObjectSecurity::CurrentUser` (пользователь токена +
+  SYSTEM), также `CurrentUserAllowLowIntegrity`, `Everyone` (поведение ≤ 0.9) и
+  свой `Descriptor`. Отказ при открытии — `ShmError::AccessDenied`. См.
+  [Безопасность объектов](#безопасность-объектов-010).
+- ✅ **Частные пространства имён** — `PrivateNamespace` переносит каналы, лобби,
+  слоты Multi и маяки в каталог по дескриптору границы: другие пользователи их
+  не видят и не могут занять. См.
+  [Частное пространство имён](#частное-пространство-имён-010).
+- ✅ **Zero-copy** — кадр больше не разрывается концом кольца (остаток
+  занимает PAD-кадр), payload всегда непрерывен: `send_with(len, |buf| ..)`
+  заполняет сообщение на месте (безопасно), `unsafe receive_with(|msg| ..)`
+  читает на месте (`ShmError::Overrun`, если писатель успел перезаписать); Auto
+  может отдавать `on_message` срезом прямо из кольца —
+  `unsafe AutoOptions::zero_copy_delivery`. См. [Zero-copy](#zero-copy-010).
+- ✅ **Async API** — `accept_async`/`connect_async`/`recv_async`/`send_async` у
+  `SharedServer`/`SharedClient`, без привязки к исполнителю (только
+  `core::task`), ожидание ведёт один на процесс поток-реактор IOCP, а не поток
+  на канал. См. [Async API](#async-api-010).
+- ✅ **Адаптивный спин** — `SpinPolicy { iterations }` перепроверяет кольцо
+  перед засыпанием (`poll_*_spin`, `wait_for_space_spin`, поля `spin` в
+  опциях). По умолчанию выключен («ноль пробуждений в простое» сохраняется);
+  с `--spin 2000` p50 круга 16 байт падает примерно на порядок (≈ 6,8 → 0,6 мкс на ненагруженной машине). См.
+  [Спин](#спин-перед-ожиданием-010).
+- ✅ **Multi-client на одном потоке** — сервер обслуживает все слоты (до 256)
+  одним потоком-диспетчером на своём порту завершения вместо worker-а на
+  каждые 21 слот. Дочитывание ушедшего клиента ограничено, паника колбэка
+  изолирована в своём слоте (`on_error(Some(slot), WorkerPanicked)`).
+- ✅ **Исключительная заявка single-client канала (рукопожатие ревизии 3)** —
+  клиент берёт канал CAS-ом `slot_claim`; второй клиент сразу получает
+  `ShmError::AlreadyConnected`, а не перетирает заявку первого. Заявку
+  упавшего держателя снимает сервер (сразу при подтверждённой смерти или через
+  `RESERVE_TIMEOUT` после толчка проигравшего клиента) — таймеров в простое
+  по-прежнему нет. Доказательство — исчерпывающая модель двух клиентов и
+  сервера (`handshake_model`, ≈1,9 млн состояний).
+- ✅ **Допуск в Dispatch** — `DispatchHandler::admit` → `Admission::{Accept,
+  AcceptWithLayout, Reject}` до создания канала; `max_clients` (64); протокол
+  лобби строгий (неверная длина, хвостовые байты, невалидный UTF-8 —
+  `Corrupted`).
+- 🔒 **Защита** — личность пира, устойчивая к переиспользованию PID (рядом с
+  каждым PID — время создания процесса), принимаются только секции
+  `SEC_COMMIT`, каждое значение от пира проверяется по границам (фаззер
+  `attach`, тесты враждебного пира), маяк помнит свой сервер
+  (`<имя>_beacon_state`, `clear_if_stale` не опускает маяк живого сервера),
+  `SharedServer`/`SharedClient` — `!Sync` (параллельные `&self`-вызовы гонялись
+  на одной стороне SPSC-кольца).
+- 🐛 **Исправлен потерянный сигнал `DATA`** — писатель решает по позициям
+  кольца с перепроверкой, читатель подтверждает «пусто» после полного
+  барьера; раньше сообщение могло лежать непрочитанным до следующего.
+
+**Миграция с 0.9** — типичные правки:
+
+```rust
+use xshm::{AutoOptions, ChannelLayout, ClientRegistration, ObjectSecurity, RingConfig};
+
+// 0.9: ClientRegistration { pid, revision, name }  (добавлено поле)
+let registration = ClientRegistration::new(std::process::id(), 1, "my_app");
+
+// 0.9: литералы опций без `..Default::default()` больше не собираются
+let options = AutoOptions {
+    // служба в сессии 0 <-> процесс пользователя через Global\: NULL DACL как в 0.9
+    security: ObjectSecurity::Everyone,
+    // по желанию: крупные снимки от сервера, короткие команды обратно
+    layout: ChannelLayout {
+        server_to_client: RingConfig::new(32 << 20).max_message_size(4 << 20),
+        client_to_server: RingConfig::new(64 << 10),
+    },
+    ..Default::default()
+};
+
+// 0.9: xshm::MAX_MESSAGE_SIZE (теперь устаревший псевдоним значения по умолчанию)
+// 0.10: лимит живого канала, например `server.free_space().max_message_size`
+```
+
+## Ранее в v0.9.0
 
 - ✅ **Auto/Dispatch целиком по событиям** (breaking: `poll_timeout` теперь
   `Option<Duration>`, по умолчанию `None`) — каждый worker, поток лобби и поток
@@ -124,16 +216,19 @@
 
 ## Возможности
 
-- Межпроцессный канал с двумя кольцевыми буферами (сервер→клиент и клиент→сервер), по 2 МБ каждый
-- Lock-free конкурентный доступ: независимые чтение/запись, автоматический overwrite при переполнении, защита от torn-read при переполнении (seqlock-копирование)
-- Синхронизация на событиях NT API для уведомлений о данных/месте/подключении
-- Гарантия чистого старта: буферы сбрасываются при каждом новом подключении с отслеживанием generation
+- Межпроцессный канал с двумя кольцевыми буферами (сервер→клиент и клиент→сервер), размер **по направлениям** (`ChannelLayout`, от 4 КиБ до 1 ГиБ каждое, по умолчанию 2 МиБ); раскладка самоописана в сегменте
+- Lock-free SPSC-кольца: независимые чтение/запись, запись с вытеснением старейшего или без потерь (`try_send*`), защита от torn-read при переполнении (seqlock-копирование), кадры не разрываются концом кольца — zero-copy `send_with` / `receive_with`
+- Синхронизация на событиях NT API для уведомлений о данных/месте/подключении — ноль пробуждений в простое; по желанию адаптивный спин (`SpinPolicy`)
+- Async API без привязки к исполнителю поверх общего реактора IOCP
+- Гарантия чистого старта: буферы сбрасываются при каждом новом подключении с отслеживанием generation; исключительная заявка single-client канала (`AlreadyConnected`)
+- Безопасность объектов по политике создателя (`ObjectSecurity`, по умолчанию текущий пользователь + SYSTEM) и частные пространства имён (`PrivateNamespace`)
+- Живость пира по handle процесса, сверенного по времени создания (переиспользованный PID не обманет)
 - Трейты-обработчики вместо callback-структур: `AutoHandler`, `MultiHandler`, `MultiClientHandler`, `DispatchHandler`, `DispatchClientHandler`
 - **Auto-режим**: фоновая обработка сообщений с callback'ами (`on_message`/`on_overflow`), автоматический reconnect
-- **Multi-client режим**: один сервер обслуживает до `MAX_MULTI_CLIENTS` (256) клиентов через lock-free конкурентный захват слота
-- **Dispatch-режим**: одно лобби + динамический канал на клиента, вообще без фиксированного числа слотов
-- **Прямой NT API**: статическая линковка с ntdll.dll, без внешних зависимостей
-- **Статический CRT**: TLS и CRT линкуются статически, без зависимости от runtime DLL
+- **Multi-client режим**: один сервер обслуживает до `MAX_MULTI_CLIENTS` (256) клиентов через lock-free конкурентный захват слота, все слоты — на одном потоке-диспетчере
+- **Dispatch-режим**: одно лобби + динамический канал на клиента, управление допуском (`admit`, `max_clients`)
+- **Прямой NT API**: импорт `ntdll.dll` через `raw-dylib` (без `ntdll.lib` и `GetProcAddress`), без внешних зависимостей
+- **Статический CRT**: CRT линкуется статически, без зависимости от runtime DLL
 
 ## Архитектура
 
@@ -141,18 +236,26 @@
 flowchart TD
     App["Ваше Rust-приложение"]
     App --> Auto["Auto — auto/mod.rs<br/>worker-поток + reconnect"]
-    App --> Multi["Multi-client — multi/mod.rs<br/>фиксированные слоты, lock-free захват"]
+    App --> Multi["Multi-client — multi/mod.rs<br/>фиксированные слоты, lock-free захват,<br/>один поток-диспетчер"]
     App --> Dispatch["Dispatch — dispatch/mod.rs<br/>лобби + динамические каналы"]
+    App --> Async["Async API — asynch.rs<br/>future recv/send/accept/connect"]
     App --> Endpoint
 
     Dispatch -. переиспользует .-> Auto
 
     Auto --> Endpoint["Endpoint — server.rs / client.rs<br/>SharedServer / SharedClient"]
     Multi --> Endpoint
+    Async --> Endpoint
+    Async --> Reactor["reactor.rs<br/>IOCP + пакеты ожидания<br/>(один поток xsr на процесс)"]
+    Multi --> Port["свой CompletionPort<br/>(reactor.rs)"]
 
-    Endpoint --> Ring["ring.rs<br/>lock-free SPSC кольцевой буфер"]
-    Ring --> Layout["layout.rs / shared.rs<br/>ControlBlock + RingHeader"]
-    Layout --> Platform["win.rs + ntapi/<br/>прямой NT API (ntdll.dll)"]
+    Endpoint --> Ring["ring.rs<br/>lock-free SPSC кольцо, PAD-кадры"]
+    Ring --> Layout["layout.rs / shared.rs<br/>ControlBlock + LayoutBlock + RingHeader"]
+    Endpoint --> Security["security.rs / namespace.rs<br/>ObjectSecurity, PrivateNamespace"]
+    Layout --> Platform["win.rs + ntapi/<br/>прямой NT API (ntdll.dll, raw-dylib)"]
+    Security --> Platform
+    Reactor --> Platform
+    Port --> Platform
 ```
 
 ## Layout Shared Memory
@@ -161,46 +264,78 @@ flowchart TD
 
 ```mermaid
 flowchart LR
-    CB["ControlBlock<br/>64 Б<br/>magic · version · generation<br/>server_state · client_state"]
-    RHA["RingHeader A<br/>64 Б"]
-    RBA["RingBuffer A<br/>2 МБ<br/>Сервер → Клиент"]
-    RHB["RingHeader B<br/>64 Б"]
-    RBB["RingBuffer B<br/>2 МБ<br/>Клиент → Сервер"]
-    CB --> RHA --> RBA --> RHB --> RBB
+    CB["ControlBlock @0<br/>64 Б<br/>magic · version · generation<br/>состояния · slot_claim · PID<br/>время создания процессов · slot_count"]
+    LB["LayoutBlock @64<br/>64 Б<br/>segment_size · flags<br/>дескрипторы s2c / c2s"]
+    RHA["RingHeader S2C @128<br/>64 Б"]
+    RBA["кольцо S2C @192<br/>cap_s2c<br/>Сервер → Клиент"]
+    RHB["RingHeader C2S<br/>@192 + cap_s2c<br/>64 Б"]
+    RBB["кольцо C2S<br/>cap_c2s<br/>Клиент → Сервер"]
+    CB --> LB --> RHA --> RBA --> RHB --> RBB
 ```
 
-Итого: ~4 МБ + заголовки, вычисляется функцией `shared_mapping_size()`.
+Формат `SHARED_VERSION = 0x00020000`. Размер сегмента —
+`256 + cap_s2c + cap_c2s` (4 194 560 байт при 2 × 2 МиБ по умолчанию,
+`ChannelLayout::segment_size()`). Смещения колец записаны в `LayoutBlock` явно
+(дескриптор: `offset`, `capacity`, `max_messages`, `max_message_size`), клиент
+проверяет только границы — сервер вправе разложить кольца иначе. `magic`
+публикуется последним.
+
+Кадр — `u32 len` + `u32 flags` + payload, дополненный до 8 байт. Кадр никогда
+не пересекает конец кольца: если не помещается, писатель занимает остаток
+PAD-кадром (`flags = FRAME_PAD`) и кладёт кадр с индекса 0, публикуя оба одной
+записью `write_pos`, — отсюда предел сообщения `capacity / 2 − 8`:
+
+```text
+ индекс 0                                              capacity
+ |  кадр N+1 (len, 0, payload...)  | ... свободно ... | кадр N | PAD (len = остаток − 8) |
+                                                               ^ write_pos до PAD
+```
 
 ## Как устанавливается соединение
+
+Рукопожатие ревизии 3 (нормативные шаги C1–C10 / S1–S7 — `INTEROP.md` §d.2,
+правила R15, R16, R18):
 
 ```mermaid
 sequenceDiagram
     participant S as Сервер
+    participant M as Сегмент (ControlBlock)
     participant C as Клиент
 
-    S->>S: NtCreateSection + NtMapViewOfSection
-    S->>S: ControlBlock::reset()
-    S->>S: wait_for_client() — блокируется на connect_req
+    S->>M: секция, ControlBlock + LayoutBlock + заголовки колец, magic последним
+    S->>S: wait_for_client() — спит на CONNECT_REQ
 
-    C->>C: NtOpenSection, проверка magic/version
-    C->>S: client_state = CLIENT_HELLO
-    C->>S: сигнал connect_req
+    C->>M: открыть, проверить magic / version / LayoutBlock против размера view
+    C->>M: C1: CAS slot_claim 0 → токен
+    Note over C,M: проиграл? толчок CONNECT_REQ (если сервер не READY) → AlreadyConnected
+    C->>M: C2: owner_start, slot_owner_pid
+    C->>M: C3: g0 = generation · C4: сброс S2C_CONNECT
+    C->>M: C5: client_start, client_pid
+    C->>M: C6: CAS client_state IDLE → CLIENT_HELLO
+    C->>S: C9: сигнал CONNECT_REQ
 
-    S->>S: видит CLIENT_HELLO → сброс ring-заголовков
-    S->>S: generation += 1
-    S->>C: server_state = SERVER_READY
-    S->>C: сигнал connect_ack
+    S->>M: S1: прочитать claim + PID/время клиента (без потребления), открыть процесс
+    Note over S,M: S2: заявитель подтверждённо умер → снять его HELLO, generation не трогать
+    S->>M: S3: сброс колец, generation + 1, server_state = SERVER_READY
+    S->>S: S4: сброс S2C_DISCONNECT (до фиксации)
+    S->>M: S5: фиксация CAS client_state CLIENT_HELLO → SERVER_READY
+    S->>M: S6: потребить client_pid / client_start, взять claim сессии
+    S->>C: S7: сигнал S2C_CONNECT
 
-    C->>C: проверка SERVER_READY, принятие generation
-    Note over S,C: соединение установлено — обе стороны строят кольцевые буферы
+    C->>M: C10: принят, если client_state == SERVER_READY (или IDLE при generation ≠ g0)
+    Note over S,C: подключены — уход: состояние IDLE, затем DISCONNECT, slot_claim освобождается последним
 ```
+
+Клиент, у которого истёк таймаут, отзывает заявку `CAS CLIENT_HELLO → IDLE` и
+освобождает claim; проигранный CAS при сменившемся `generation` означает, что
+его всё-таки приняли (он дочитывает кольцо и уходит).
 
 ## Выбор режима
 
 | | Single-client | Auto | Multi-client | Dispatch |
 |---|:---:|:---:|:---:|:---:|
 | Клиентов на сервер | 1 | 1 | до 256 (фикс. слоты) | не ограничено |
-| Потоки | нет — управляется вызывающим | фоновый worker | фоновый worker на слот | worker лобби + worker на клиента |
+| Потоки | нет — управляется вызывающим (или async future на общем реакторе) | фоновый worker | один поток-диспетчер на все слоты (сервер), worker на клиента | worker лобби + worker на клиента |
 | Reconnect | вручную | автоматически | автоматически (re-claim) | автоматически |
 | Стоимость подключения | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 round-trip к лобби + 1 handshake |
 | Когда использовать | простейший парный IPC, интеграция с драйвером | один пир, нужна устойчивость | известный/ограниченный парк клиентов | размер парка заранее неизвестен |
@@ -304,10 +439,11 @@ let client = SharedClient::connect_in(&ns, "Chan", Duration::from_secs(2))?;
 thiserror = "2"
 ```
 
-Вызовы NT API делаются напрямую через статическую линковку с `ntdll.dll`:
+Вызовы NT API импортируются напрямую из `ntdll.dll` через
+`#[link(name = "ntdll", kind = "raw-dylib")]`:
+- Без `ntdll.lib` из Windows SDK
 - Без зависимости от SSN
 - Без `GetProcAddress` в рантайме
-- Без TLS (Thread Local Storage)
 
 ## Сборка
 
@@ -326,7 +462,15 @@ cargo build --release --target i686-pc-windows-msvc     # x86 MSVC
 cargo test -- --test-threads=1   # последовательно: тесты делят пространство имён объектов
 ```
 
-Крейт собирается только как `rlib`. `build.rs` делает ровно одно — `cargo:rustc-link-lib=ntdll`, — так что `ntdll` линкуется в итоговый бинарь потребителя.
+Крейт собирается только как `rlib`. `build.rs` выдаёт только `rerun-if-changed`;
+импорты `ntdll` — `raw-dylib`, поэтому библиотека импорта не нужна и при сборке
+бинаря потребителя.
+
+```bash
+cargo run --release --example bench -- throughput 4096 5          # SharedServer -> SharedClient
+cargo run --release --example bench -- latency 16 5 --spin 2000    # RTT ping-pong со спином
+cargo run --release --example bench -- throughput 1048576 5 --zero-copy
+```
 
 ## Использование
 
@@ -407,12 +551,12 @@ sequenceDiagram
     participant S1 as Слот 1 (shared memory)
 
     par Клиент A захватывает слот
-        A->>S0: CAS reserved[CLAIM]: FREE → token_A
+        A->>S0: CAS slot_claim: FREE → token_A
         S0-->>A: успех — слот 0 захвачен
     and Клиент B захватывает слот
-        B->>S0: CAS reserved[CLAIM]: FREE → token_B
+        B->>S0: CAS slot_claim: FREE → token_B
         S0-->>B: неудача — уже token_A
-        B->>S1: CAS reserved[CLAIM]: FREE → token_B
+        B->>S1: CAS slot_claim: FREE → token_B
         S1-->>B: успех — слот 1 захвачен
     end
 
@@ -559,10 +703,13 @@ fn main() -> Result<()> {
 - Сообщение либо **целиком** ложится в свободное место, либо отклоняется с
   `ShmError::QueueFull`; непрочитанные данные не трогаются никогда (`overwritten` всегда 0).
   Атомарность та же, что у обычной отправки: читатель видит сообщение целиком или не видит вовсе.
-- `FreeSpace { bytes, messages }` (+ `fits(len)`, `max_payload()`), снятый на стороне писателя, --
-  **нижняя граница**: если `fits(n)`, следующий `try_send*` длины `n` пройдёт. Каждое сообщение
-  занимает `MESSAGE_HEADER_SIZE` (4) + длину payload; в кольце не больше `MAX_MESSAGES` (500)
-  сообщений и `RING_CAPACITY` (2 МиБ) байт. Сообщение в 65 535 байт всегда помещается в пустое кольцо.
+- `FreeSpace` (`bytes`, `max_frame`, `messages`, `max_message_size`; `fits(len)`,
+  `max_payload()`), снятый на стороне писателя, — **нижняя граница**: если `fits(n)`,
+  следующий `try_send*` длины `n` пройдёт. Сообщение занимает `frame_size(len)` = заголовок
+  8 байт + payload с округлением до 8, плюс PAD-кадр, если не помещается до конца кольца, —
+  `fits` решает по `max_frame` (наибольший кадр, помещающийся непрерывно прямо сейчас), а не
+  по `bytes`. Лимиты — по направлениям (`RingConfig`, по умолчанию 500 сообщений / 2 МиБ);
+  сообщение длины `max_message_size` (≤ `capacity / 2 − 8`) всегда помещается в пустое кольцо.
 - `wait_for_space` спит на событии `SPACE` канала: читатель будит писателя, только когда места
   стало достаточно. С 0.9 это одно ожидание в ядре по `[SPACE, DISCONNECT, процесс пира]`
   (без срезов по 50 мс): мёртвый читатель — `Err(PeerDied)`, штатное отключение —
@@ -600,8 +747,9 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 }
 ```
 
-Layout не менялся: заявка на пробуждение живёт в бывшем зарезервированном слове
-`RingHeader`, поэтому `SHARED_VERSION` прежний и пиры 0.7.0 совместимы.
+Заявка на пробуждение живёт в `RingHeader::space_waiter`: сколько свободных байт
+нужно ждущему писателю (кадр и возможный PAD); читатель, освободивший достаточно
+места, снимает заявку и сигналит `SPACE`.
 
 ### Async API (0.10)
 
@@ -660,6 +808,66 @@ async fn main() -> xshm::Result<()> {
 }
 ```
 
+### Zero-copy (0.10)
+
+Кадры не пересекают конец кольца (PAD-кадры, см.
+[Layout Shared Memory](#layout-shared-memory)), поэтому payload — один
+непрерывный срез в разделяемой памяти:
+
+```rust
+use xshm::{SharedClient, SharedServer};
+
+fn send_in_place(server: &mut SharedServer, frame: &[u8]) -> xshm::Result<()> {
+    // Запись без перезаписи (как try_send_to_client): срез заполняется прямо в кольце.
+    server.send_with(frame.len(), |buf| buf.copy_from_slice(frame))?;
+    Ok(())
+}
+
+fn checksum_in_place(client: &mut SharedClient) -> xshm::Result<u32> {
+    // SAFETY (контракт вызывающего): сервер доверенный и пишет это направление
+    // без перезаписи (try_send*/send_with/wait_for_space) — срез во время
+    // замыкания никто не меняет.
+    unsafe { client.receive_with(|msg| msg.iter().map(|&b| u32::from(b)).sum()) }
+}
+```
+
+- `send_with` безопасен: срез — ещё не опубликованная часть кольца.
+- `receive_with` — `unsafe`: срез указывает в память, которую может писать другой
+  процесс. Перезапись, замеченная после замыкания, отбрасывает результат и даёт
+  `ShmError::Overrun` (защита в глубину, а не гарантия). Для недоверенных пиров —
+  копирующие `receive_from_*`.
+- Оба берут `&mut self`: вложенная или параллельная вторая запись/чтение того же
+  направления не компилируется.
+- Auto по умолчанию копирует; `unsafe { AutoOptions::default().zero_copy_delivery() }`
+  отдаёт `on_message` срез прямо из кольца с тем же контрактом.
+- Максимальное сообщение — `capacity / 2 − 8` (`max_payload_for(capacity)`).
+
+### Спин перед ожиданием (0.10)
+
+`SpinPolicy { iterations }` перепроверяет кольцо по позициям до `iterations` раз
+(`std::hint::spin_loop` между проверками), прежде чем уснуть в ядре. Бюджет —
+один на засыпание: простаивающий поток отспинивает его один раз и спит без
+таймаута — «ноль пробуждений в простое» сохраняется. За удачным спином всегда
+идёт проверка событий с нулевым таймаутом: `DISCONNECT`, `SPACE` и смерть пира
+по-прежнему замечаются.
+
+```rust
+use std::time::Duration;
+use xshm::{AutoOptions, SharedClient, SpinPolicy};
+
+fn poll_fast(client: &SharedClient) -> xshm::Result<bool> {
+    client.poll_server_spin(Some(Duration::from_millis(10)), SpinPolicy::new(2000))
+}
+
+let options = AutoOptions { spin: SpinPolicy::new(2000), ..Default::default() };
+```
+
+Также `poll_client_spin`, `wait_for_space_spin` и поля `spin` в `MultiOptions`,
+`MultiClientOptions`, `DispatchOptions`, `DispatchClientOptions` (только каналы
+клиентов, лобби не спинит). `SpinPolicy::NONE` (по умолчанию) — поведение 0.9.
+Цена — занятое ядро CPU во время спина. Замер на своей машине:
+`cargo run --release --example bench -- latency 16 5 --spin 2000`.
+
 ### Живость пира
 
 Штатное отключение сигналится событием `DISCONNECT`, но упавший или убитый
@@ -674,7 +882,7 @@ async fn main() -> xshm::Result<()> {
 | Single-client | `poll_client` / `poll_server` / `wait_for_space` сразу возвращают `Err(ShmError::PeerDied)`; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
 | Auto | handle процесса пира лежит в наборе ожидания worker-а → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
 | Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
-| Multi-client | handle процесса клиента в наборе ожидания worker-а сервера → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, слот освобождается; `MultiServer::is_client_alive(id)`; клиент видит смерть сервера → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
+| Multi-client | handle процесса клиента привязан к порту завершения диспетчера сервера → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, слот освобождается; `MultiServer::is_client_alive(id)`; клиент видит смерть сервера → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
 
 - Новые колбэки -- **методы по умолчанию**, которые вызывают `on_disconnect` /
   `on_client_disconnect`, поэтому существующие обработчики работают как раньше.
@@ -687,10 +895,12 @@ async fn main() -> xshm::Result<()> {
 - Замер на Windows 11 (`tests/peer_death.rs`, `TerminateProcess` пира): 1–5 мс от
   убийства до колбэка / ошибки во всех режимах.
 
-Расширение протокола (без изменения layout и `SHARED_VERSION`): сервер пишет свой
-PID в `ControlBlock.reserved[2]` при создании; клиент пишет свой PID в
-`reserved[3]` до `CLIENT_HELLO`, сервер забирает его `swap(0)`. PID процесса, уже
-мёртвого на момент handshake, игнорируется.
+Протокол: сервер при создании пишет свой PID в `ControlBlock::server_pid` (и время
+создания своего процесса — в `server_start_lo/hi`); клиент до `CLIENT_HELLO` пишет
+время создания и PID в `client_start_lo/hi` и `client_pid`, сервер потребляет их
+после фиксации рукопожатия (ревизия 3, шаг S6). Наблюдатель открывает процесс по PID
+и сверяет время создания: другое время — PID переиспользован, это не пир. PID
+процесса, уже мёртвого на момент handshake, игнорируется.
 
 ### Обнаружение сервера
 
@@ -736,17 +946,26 @@ loop {
 
 ## Константы
 
-Лимиты кольца реэкспортированы из корня крейта
-(`xshm::RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, `MIN_MESSAGE_SIZE`, `MESSAGE_HEADER_SIZE`).
+Реэкспортированы из корня крейта. Размеры колец — у каждого канала и направления
+свои (`RingConfig`); значения `DEFAULT_*` — то, что берут `RingConfig::DEFAULT` /
+`ChannelLayout::DEFAULT`. `RING_CAPACITY`, `MAX_MESSAGES` и `MAX_MESSAGE_SIZE`
+остались `#[deprecated]`-псевдонимами значений по умолчанию; `MESSAGE_HEADER_SIZE`
+удалён (используйте `frame_size(len)`).
 
 | Константа | Значение | Описание |
 |-----------|----------|----------|
-| `RING_CAPACITY` | 2 МБ | Размер каждого кольцевого буфера |
-| `MAX_MESSAGES` | 500 | Максимум сообщений в очереди |
-| `MAX_MESSAGE_SIZE` | 65535 | Максимальный размер сообщения (байт) |
-| `MIN_MESSAGE_SIZE` | 2 | Минимальный размер сообщения (байт) |
-| `DEFAULT_MAX_CLIENTS` | 20 | Число слотов `MultiServer` по умолчанию |
-| `MAX_MULTI_CLIENTS` | 256 | Жёсткий предел `MultiServer`; его задаёт цена перебора (клиент перебирает слоты `0..256` до первого отсутствующего; сервер ещё пишет `slot_count` в каждый слот как подсказку — перебор клиенты по ней не ограничивают), а не лимит 64 handle — worker-ы делятся по 21 слоту (256 слотов = 13 потоков) |
+| `SHARED_VERSION` | `0x00020000` | Формат разделяемой памяти (иначе `VersionMismatch`) |
+| `DEFAULT_RING_CAPACITY` | 2 МиБ | Размер кольца по умолчанию на направление |
+| `MIN_RING_CAPACITY` / `MAX_RING_CAPACITY` | 4 КиБ / 1 ГиБ | Диапазон ёмкости кольца (степень двойки) |
+| `DEFAULT_MAX_MESSAGES` | 500 | Лимит непрочитанных сообщений в кольце по умолчанию |
+| `DEFAULT_MAX_MESSAGE_SIZE` | 65 535 | Максимальный payload по умолчанию; жёсткий предел — `max_payload_for(capacity)` = `capacity / 2 − 8` |
+| `MIN_MESSAGE_SIZE` | 1 | Минимальный payload (байт) |
+| `FRAME_HEADER_SIZE` / `FRAME_ALIGN` | 8 / 8 | Заголовок кадра (`u32 len` + `u32 flags`) и выравнивание кадров |
+| `FRAME_PAD` | 1 | Бит `flags` PAD-кадра |
+| `RECOUNT_MAX` | 64 | До этого `max_messages` писатель пересчитывает кадры (лимит точный); выше кольцо может кратковременно держать `max_messages + 1` |
+| `DEFAULT_LOBBY_LAYOUT` | 2 × 16 КиБ, 16 сообщ., 1 КиБ | Раскладка лобби Dispatch по умолчанию |
+| `multi::DEFAULT_MAX_CLIENTS` | 20 | Число слотов `MultiServer` по умолчанию |
+| `multi::MAX_MULTI_CLIENTS` | 256 | Жёсткий предел `MultiServer`; его задаёт цена перебора (клиент перебирает слоты `0..256` до первого отсутствующего; сервер ещё пишет `slot_count` в каждый слот как подсказку — перебор клиенты по ней не ограничивают); все слоты обслуживает один поток-диспетчер |
 
 ## Event Handles для kernel-драйверов
 
@@ -774,9 +993,10 @@ if let Some(handles) = server.get_event_handles() {
 - **SPSC**: строго один producer и один consumer на канал
 - **Overwrite при переполнении** (по умолчанию): новые сообщения вытесняют старые, когда очередь заполнена -- для backpressure без потерь есть `try_send*`
 - **Только Windows**: использует прямые вызовы NT API, полагается на x86/x86_64 TSO memory ordering (не переносимо на ARM/RISC-V без переработки)
-- **Размер сообщения**: от 2 до 65535 байт
-- **Anonymous-серверы**: event handles недоступны (только режим polling)
-- **Число слотов Multi-client**: жёсткий предел 256 одновременных клиентов (ограничивает перебор слотов клиентом; каждые 21 слот — ещё один worker-поток) — используйте Dispatch-режим, если нужно больше
+- **Размер сообщения**: от 1 до `max_message_size` кольца, не больше `capacity / 2 − 8` байт (по умолчанию 65 535); для больших сообщений нужно большее кольцо (фрагментации нет)
+- **Anonymous-серверы**: event handles недоступны (только режим polling, без async API)
+- **Число слотов Multi-client**: жёсткий предел 256 одновременных клиентов (ограничивает перебор слотов клиентом) — используйте Dispatch-режим, если нужно больше. Все слоты делят один поток-диспетчер: медленный `on_message` одного клиента задерживает остальных
+- **Нативные пиры**: обязаны реализовать контракт 0.10 — формат `0x00020000`, PAD-кадры и рукопожатие ревизии 3 ([`INTEROP.md`](INTEROP.md))
 - **Таймеры переподключения**: `AutoClient` / `MultiClient` *без подключения* (сервера нет, нет свободного слота) повторяет попытку раз в `reconnect_delay` / `retry_delay`; подключённые каналы в простое не просыпаются. Для обнаружения сервера целиком по событиям — `Beacon`
 - **Разграничение доступа, а не аутентификация**: по умолчанию именованные объекты открыты только пользователю-создателю и SYSTEM (`ObjectSecurity::CurrentUser`); любой процесс того же пользователя открыть их всё равно может, а `ObjectSecurity::Everyone` возвращает NULL DACL ≤ 0.9 — не передавайте секреты
 
@@ -784,40 +1004,48 @@ if let Some(handles) = server.get_event_handles() {
 
 ```
 xshm/
-├── .cargo/
-│   └── config.toml     # Конфигурация статической линковки CRT
 ├── src/
-│   ├── lib.rs          # Корневой модуль, публичные реэкспорты
-│   ├── ntapi/          # Слой прямого NT API (без внешних зависимостей)
-│   │   ├── mod.rs      # Реэкспорт модуля
-│   │   ├── types.rs    # NT-типы (HANDLE, NTSTATUS, OBJECT_ATTRIBUTES...)
-│   │   ├── funcs.rs    # Объявления NT-функций (#[link(name = "ntdll")])
-│   │   └── helpers.rs  # UNICODE_STRING, NtName, конвертация путей
-│   ├── win.rs          # Высокоуровневые обёртки (EventHandle, Mapping, is_process_alive)
-│   ├── thread_hook.rs  # Хук старта рабочих потоков (set_thread_start_hook, 0.9)
-│   ├── server.rs       # Endpoint SharedServer
-│   ├── client.rs       # Endpoint SharedClient
-│   ├── ring.rs          # Lock-free SPSC кольцевой буфер
-│   ├── layout.rs       # Структуры shared memory
-│   ├── events.rs       # Синхронизация на событиях
-│   ├── error.rs        # Типы ошибок
-│   ├── constants.rs    # Константы протокола
-│   ├── naming.rs       # Именование kernel-объектов
-│   ├── namespace.rs    # PrivateNamespace (дескриптор границы, 0.10)
-│   ├── shared.rs       # SharedView для mapped-памяти
+│   ├── lib.rs             # Корневой модуль, публичные реэкспорты
+│   ├── ntapi/             # Слой прямого NT API (без внешних зависимостей)
+│   │   ├── mod.rs         # Реэкспорт модуля
+│   │   ├── types.rs       # NT-типы (HANDLE, NTSTATUS, OBJECT_ATTRIBUTES...)
+│   │   ├── funcs.rs       # NT-импорты (#[link(name = "ntdll", kind = "raw-dylib")])
+│   │   └── helpers.rs     # UNICODE_STRING, NtName, конвертация путей, NT-таймауты
+│   ├── win.rs             # Обёртки: EventHandle, NamedMutex, Mapping, ProcessWatch, wait_any
+│   ├── security.rs        # ObjectSecurity -> дескрипторы безопасности (0.10)
+│   ├── namespace.rs       # PrivateNamespace (дескриптор границы, 0.10)
+│   ├── reactor.rs         # Реактор IOCP + CompletionPort (0.10)
+│   ├── asynch.rs          # Async future поверх реактора (0.10)
+│   ├── sync_ext.rs        # Блокировки без отравления, join worker-а с отчётом о панике (0.10)
+│   ├── thread_hook.rs     # Хук старта рабочих потоков (set_thread_start_hook, 0.9)
+│   ├── server.rs          # Endpoint SharedServer, ChannelConfig
+│   ├── client.rs          # Endpoint SharedClient
+│   ├── handshake_model.rs # Исчерпывающая модель рукопожатия ревизии 3 (только тесты)
+│   ├── ring.rs            # Lock-free SPSC кольцо, PAD-кадры, FreeSpace, SpinPolicy
+│   ├── layout.rs          # ControlBlock, LayoutBlock, RingHeader, RingConfig, ChannelLayout
+│   ├── shared.rs          # SharedView над отображённым сегментом (initialize / attach)
+│   ├── events.rs          # События канала
+│   ├── beacon.rs          # Beacon, ProcessExit, Waitable
+│   ├── error.rs           # Типы ошибок
+│   ├── constants.rs       # Константы протокола
+│   ├── naming.rs          # Именование kernel-объектов
+│   ├── peer_tests.rs      # Тесты совместимости с пирами без обмена PID
 │   ├── auto/
-│   │   └── mod.rs      # Auto-режим с фоновыми worker'ами
+│   │   └── mod.rs         # Auto-режим с фоновыми worker'ами
 │   ├── multi/
-│   │   └── mod.rs      # MultiServer/MultiClient — фикс. слоты, конкурентный захват
+│   │   ├── mod.rs         # MultiServer/MultiClient — фикс. слоты, конкурентный захват, диспетчер
+│   │   └── tests.rs       # Unit-тесты Multi
 │   └── dispatch/
-│       ├── mod.rs      # DispatchServer/DispatchClient — лобби + динамические каналы
-│       └── protocol.rs # Бинарный протокол регистрации в лобби
-├── tests/
-│   ├── stress.rs       # Стресс-тесты
-│   ├── ordering.rs     # Тесты memory ordering
-│   └── multi.rs        # Тесты Multi-client
+│       ├── mod.rs         # DispatchServer/DispatchClient — лобби + динамические каналы
+│       └── protocol.rs    # Бинарный протокол регистрации в лобби
+├── tests/                 # async, backpressure, hostile, layout, multi, namespace, ordering,
+│                          # peer_death, security, stress, wakeup, zero_copy
+├── examples/
+│   └── bench.rs           # Бенчмарк пропускной способности и задержки (только std)
+├── INTEROP.md             # Контракт совместимости для нативных пиров
+├── CHANGELOG.md
 ├── Cargo.toml
-└── build.rs            # линкует ntdll
+└── build.rs               # только rerun-if-changed (ntdll — raw-dylib)
 ```
 
 ## Лицензия

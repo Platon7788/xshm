@@ -7,9 +7,9 @@
 Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT API calls. A pure Rust crate — no C/C++ FFI.
 
 <p>
-  <img alt="version" src="https://img.shields.io/badge/version-0.9.0-blue">
+  <img alt="version" src="https://img.shields.io/badge/version-0.10.0-blue">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white">
-  <img alt="rust" src="https://img.shields.io/badge/rust-1.82%2B-orange?logo=rust&logoColor=white">
+  <img alt="rust" src="https://img.shields.io/badge/rust-1.99%2B-orange?logo=rust&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-MIT-green">
   <img alt="status" src="https://img.shields.io/badge/status-production--ready-brightgreen">
 </p>
@@ -23,7 +23,94 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ---
 
-## 🆕 What's New in v0.9.0
+## 🆕 What's New in v0.10.0
+
+> **Breaking:** new shared-memory format `0x00020000`. 0.9 peers (and native
+> peers written against the 0.9 contract) are rejected by version with
+> `ShmError::VersionMismatch` — upgrade both sides. The full list of API changes
+> is the *Migration from 0.9* table in [`CHANGELOG.md`](CHANGELOG.md); the
+> wire contract for native peers is [`INTEROP.md`](INTEROP.md) (in Russian).
+
+- ✅ **Per-direction channel layout** — `RingConfig { capacity, max_messages,
+  max_message_size }` for each direction, combined in `ChannelLayout
+  { server_to_client, client_to_server }`. Capacity is a power of two from
+  4 KiB to 1 GiB, a message may be up to `capacity / 2 − 8` bytes (far beyond the
+  old 64 KiB). The server picks the layout and writes it into the segment
+  (`LayoutBlock`); the client reads it from there and checks it against the real
+  mapping size. `SharedServer::start_with(name, &ChannelConfig)`, `layout` fields
+  in `AutoOptions`/`MultiOptions`, `channel_layout`/`lobby_layout` in
+  `DispatchOptions`. The default layout is the 0.9 one (2 × 2 MiB, 500 messages,
+  65 535 bytes).
+- ✅ **Object security** — named objects are no longer created with a NULL DACL:
+  `ObjectSecurity::CurrentUser` (token user + SYSTEM) by default,
+  `CurrentUserAllowLowIntegrity`, `Everyone` (the ≤ 0.9 behavior) or your own
+  `Descriptor`. A denied open is `ShmError::AccessDenied`. See
+  [Object Security](#object-security-010).
+- ✅ **Private namespaces** — `PrivateNamespace` puts channels, lobbies, Multi slots
+  and beacons into a boundary-descriptor directory that other users cannot see or
+  squat. See [Private Namespace](#private-namespace-010).
+- ✅ **Zero-copy** — a frame never wraps around the ring end any more (a PAD frame
+  fills the tail), so the payload is always contiguous: `send_with(len, |buf| ..)`
+  fills the message in place (safe), `unsafe receive_with(|msg| ..)` reads it in
+  place (`ShmError::Overrun` if the writer overwrote it meanwhile); Auto can deliver
+  `on_message` straight from the ring via `unsafe AutoOptions::zero_copy_delivery`.
+  See [Zero-copy](#zero-copy-010).
+- ✅ **Async API** — `accept_async`/`connect_async`/`recv_async`/`send_async` on
+  `SharedServer`/`SharedClient`, executor-agnostic (`core::task` only), driven by one
+  process-wide IOCP reactor thread instead of a thread per channel. See
+  [Async API](#async-api-010).
+- ✅ **Adaptive spin** — `SpinPolicy { iterations }` re-checks the ring before going
+  to sleep (`poll_*_spin`, `wait_for_space_spin`, `spin` fields in the options).
+  Off by default (zero idle wake-ups stay); with `--spin 2000` the 16-byte
+  round-trip p50 drops by about an order of magnitude (≈ 6.8 → 0.6 µs on an idle machine). See [Spin](#spin-before-waiting-010).
+- ✅ **Multi-client on one thread** — the server serves all slots (up to 256) from a
+  single dispatcher thread on its own I/O completion port instead of a worker per
+  21 slots. Draining a departed client is bounded, and a panicking callback is isolated
+  to its slot (`on_error(Some(slot), WorkerPanicked)`).
+- ✅ **Exclusive single-client claim (handshake revision 3)** — a client takes the
+  channel by CAS on `slot_claim`; a second client gets `ShmError::AlreadyConnected` at
+  once instead of overwriting the first one's request. A crashed holder is released by
+  the server (immediately on confirmed death, or `RESERVE_TIMEOUT` after a losing client's
+  nudge) — still no idle timers. Proven by an exhaustive model of two clients and a
+  server (`handshake_model`, ≈1.9 M states).
+- ✅ **Dispatch admission** — `DispatchHandler::admit` → `Admission::{Accept,
+  AcceptWithLayout, Reject}` runs before a channel is created; `max_clients` (64);
+  the lobby protocol is strict (bad length, trailing bytes, invalid UTF-8 → `Corrupted`).
+- 🔒 **Hardening** — PID-reuse-proof peer identity (process creation time stored next to
+  each PID), only `SEC_COMMIT` sections are accepted, every value from the peer is
+  bounds-checked (fuzzed `attach`, hostile-peer tests), beacons remember their server
+  (`<name>_beacon_state`, `clear_if_stale` never lowers a live server's beacon),
+  `SharedServer`/`SharedClient` are `!Sync` (concurrent `&self` calls raced on one side
+  of an SPSC ring).
+- 🐛 **Lost `DATA` signal fixed** — the writer now decides by ring positions with a
+  re-check, and the reader confirms "empty" after a full fence; previously a message
+  could sit unread until the next one.
+
+**Migrating from 0.9** — typical changes:
+
+```rust
+use xshm::{AutoOptions, ChannelLayout, ClientRegistration, ObjectSecurity, RingConfig};
+
+// 0.9: ClientRegistration { pid, revision, name }  (a new field was added)
+let registration = ClientRegistration::new(std::process::id(), 1, "my_app");
+
+// 0.9: struct literals of options without `..Default::default()` no longer compile
+let options = AutoOptions {
+    // service in session 0 <-> user process over Global\: restore the 0.9 NULL DACL
+    security: ObjectSecurity::Everyone,
+    // optional: large server-to-client snapshots, small commands back
+    layout: ChannelLayout {
+        server_to_client: RingConfig::new(32 << 20).max_message_size(4 << 20),
+        client_to_server: RingConfig::new(64 << 10),
+    },
+    ..Default::default()
+};
+
+// 0.9: xshm::MAX_MESSAGE_SIZE (now a deprecated alias of the default)
+// 0.10: the limit of a live channel, e.g. `server.free_space().max_message_size`
+```
+
+## Previously in v0.9.0
 
 - ✅ **Fully event-driven Auto/Dispatch workers** (breaking: `poll_timeout` is now
   `Option<Duration>`, default `None`) — every worker, lobby and pending-connect
@@ -122,16 +209,19 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 
 ## Features
 
-- Cross-process channel with two ring buffers (server→client and client→server), each 2 MB
-- Lock-free concurrent access: independent read/write, automatic overwrite on overflow, torn-read-safe under overflow (seqlock-style copy)
-- Event-based synchronization via NT API for data/space/connection notifications
-- Clean start guarantee: buffers reset on each new connection with generation tracking
+- Cross-process channel with two ring buffers (server→client and client→server), sized **per direction** (`ChannelLayout`, 4 KiB – 1 GiB each, 2 MiB by default); the layout is self-described in the segment
+- Lock-free SPSC rings: independent read/write, overwrite-oldest or lossless (`try_send*`) writes, torn-read-safe under overflow (seqlock-style copy), frames never wrap — zero-copy `send_with` / `receive_with`
+- Event-based synchronization via NT API for data/space/connection notifications — zero wake-ups while idle; optional adaptive spin (`SpinPolicy`)
+- Executor-agnostic async API on a process-wide IOCP reactor
+- Clean start guarantee: buffers reset on each new connection with generation tracking; exclusive claim of a single-client channel (`AlreadyConnected`)
+- Object security by creator policy (`ObjectSecurity`, current user + SYSTEM by default) and private namespaces (`PrivateNamespace`)
+- Peer liveness via process handles verified by process creation time (PID reuse cannot fool it)
 - Handler traits instead of callback structs: `AutoHandler`, `MultiHandler`, `MultiClientHandler`, `DispatchHandler`, `DispatchClientHandler`
 - **Auto-mode**: background message processing with callbacks (`on_message`/`on_overflow`), automatic reconnect
-- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (256) clients via lock-free concurrent slot claim
-- **Dispatch mode**: single lobby + dynamic per-client channel, no fixed slot count at all
-- **Direct NT API**: static linking with ntdll.dll, no external dependencies
-- **Static CRT**: TLS and CRT statically linked, no runtime DLL dependencies
+- **Multi-client mode**: single server handles up to `MAX_MULTI_CLIENTS` (256) clients via lock-free concurrent slot claim, all slots on one dispatcher thread
+- **Dispatch mode**: single lobby + dynamic per-client channel, admission control (`admit`, `max_clients`)
+- **Direct NT API**: `ntdll.dll` imported via `raw-dylib` (no `ntdll.lib`, no `GetProcAddress`), no external dependencies
+- **Static CRT**: CRT statically linked, no runtime DLL dependencies
 
 ## Architecture
 
@@ -139,18 +229,26 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
 flowchart TD
     App["Your Rust application"]
     App --> Auto["Auto — auto/mod.rs<br/>worker thread + reconnect"]
-    App --> Multi["Multi-client — multi/mod.rs<br/>fixed slots, lock-free claim"]
+    App --> Multi["Multi-client — multi/mod.rs<br/>fixed slots, lock-free claim,<br/>one dispatcher thread"]
     App --> Dispatch["Dispatch — dispatch/mod.rs<br/>lobby + dynamic channels"]
+    App --> Async["Async API — asynch.rs<br/>recv/send/accept/connect futures"]
     App --> Endpoint
 
     Dispatch -. reuses .-> Auto
 
     Auto --> Endpoint["Endpoint — server.rs / client.rs<br/>SharedServer / SharedClient"]
     Multi --> Endpoint
+    Async --> Endpoint
+    Async --> Reactor["reactor.rs<br/>IOCP + wait completion packets<br/>(one xsr thread per process)"]
+    Multi --> Port["own CompletionPort<br/>(reactor.rs)"]
 
-    Endpoint --> Ring["ring.rs<br/>lock-free SPSC ring buffer"]
-    Ring --> Layout["layout.rs / shared.rs<br/>ControlBlock + RingHeader"]
-    Layout --> Platform["win.rs + ntapi/<br/>direct NT API (ntdll.dll)"]
+    Endpoint --> Ring["ring.rs<br/>lock-free SPSC ring, PAD frames"]
+    Ring --> Layout["layout.rs / shared.rs<br/>ControlBlock + LayoutBlock + RingHeader"]
+    Endpoint --> Security["security.rs / namespace.rs<br/>ObjectSecurity, PrivateNamespace"]
+    Layout --> Platform["win.rs + ntapi/<br/>direct NT API (ntdll.dll, raw-dylib)"]
+    Security --> Platform
+    Reactor --> Platform
+    Port --> Platform
 ```
 
 ## Memory Layout
@@ -159,46 +257,78 @@ Each channel is a single Named (or anonymous) Section, mapped into both processe
 
 ```mermaid
 flowchart LR
-    CB["ControlBlock<br/>64 B<br/>magic · version · generation<br/>server_state · client_state"]
-    RHA["RingHeader A<br/>64 B"]
-    RBA["RingBuffer A<br/>2 MB<br/>Server → Client"]
-    RHB["RingHeader B<br/>64 B"]
-    RBB["RingBuffer B<br/>2 MB<br/>Client → Server"]
-    CB --> RHA --> RBA --> RHB --> RBB
+    CB["ControlBlock @0<br/>64 B<br/>magic · version · generation<br/>states · slot_claim · PIDs<br/>process start times · slot_count"]
+    LB["LayoutBlock @64<br/>64 B<br/>segment_size · flags<br/>s2c / c2s descriptors"]
+    RHA["RingHeader S2C @128<br/>64 B"]
+    RBA["ring S2C @192<br/>cap_s2c<br/>Server → Client"]
+    RHB["RingHeader C2S<br/>@192 + cap_s2c<br/>64 B"]
+    RBB["ring C2S<br/>cap_c2s<br/>Client → Server"]
+    CB --> LB --> RHA --> RBA --> RHB --> RBB
 ```
 
-Total: ~4 MB + headers, computed by `shared_mapping_size()`.
+Format `SHARED_VERSION = 0x00020000`. The segment size is
+`256 + cap_s2c + cap_c2s` (4 194 560 bytes with the default 2 × 2 MiB,
+`ChannelLayout::segment_size()`). Ring offsets are written explicitly in
+`LayoutBlock` (each descriptor: `offset`, `capacity`, `max_messages`,
+`max_message_size`), and the client only checks bounds, so a server may lay the
+rings out differently. `magic` is published last.
+
+A frame is `u32 len` + `u32 flags` + payload, padded to 8 bytes. A frame never
+crosses the ring end: when it does not fit, the writer fills the tail with a PAD
+frame (`flags = FRAME_PAD`) and puts the frame at offset 0, publishing both with one
+`write_pos` store — that is why a message is limited to `capacity / 2 − 8`:
+
+```text
+ index 0                                              capacity
+ |  frame N+1 (len, 0, payload...)  | ... free ... | frame N | PAD (len = tail − 8) |
+                                                             ^ write_pos before PAD
+```
 
 ## How a Connection Is Established
+
+Handshake revision 3 (normative steps C1–C10 / S1–S7 — `INTEROP.md` §d.2,
+rules R15, R16, R18):
 
 ```mermaid
 sequenceDiagram
     participant S as Server
+    participant M as Segment (ControlBlock)
     participant C as Client
 
-    S->>S: NtCreateSection + NtMapViewOfSection
-    S->>S: ControlBlock::reset()
-    S->>S: wait_for_client() — blocks on connect_req
+    S->>M: create section, ControlBlock + LayoutBlock + ring headers, magic last
+    S->>S: wait_for_client() — sleeps on CONNECT_REQ
 
-    C->>C: NtOpenSection, verify magic/version
-    C->>S: client_state = CLIENT_HELLO
-    C->>S: signal connect_req
+    C->>M: open, check magic / version / LayoutBlock vs mapping size
+    C->>M: C1: CAS slot_claim 0 → token
+    Note over C,M: lost? nudge CONNECT_REQ (if server not READY) → AlreadyConnected
+    C->>M: C2: owner_start, slot_owner_pid
+    C->>M: C3: g0 = generation · C4: reset S2C_CONNECT
+    C->>M: C5: client_start, client_pid
+    C->>M: C6: CAS client_state IDLE → CLIENT_HELLO
+    C->>S: C9: signal CONNECT_REQ
 
-    S->>S: sees CLIENT_HELLO → reset ring headers
-    S->>S: generation += 1
-    S->>C: server_state = SERVER_READY
-    S->>C: signal connect_ack
+    S->>M: S1: read claim + client PID/start (no consume), open client process
+    Note over S,M: S2: claimant confirmed dead → withdraw its HELLO, no generation bump
+    S->>M: S3: reset rings, generation + 1, server_state = SERVER_READY
+    S->>S: S4: reset S2C_DISCONNECT (before commit)
+    S->>M: S5: commit CAS client_state CLIENT_HELLO → SERVER_READY
+    S->>M: S6: consume client_pid / client_start, take the session claim
+    S->>C: S7: signal S2C_CONNECT
 
-    C->>C: verify SERVER_READY, adopt generation
-    Note over S,C: connection established — both sides build ring buffers
+    C->>M: C10: accepted if client_state == SERVER_READY (or IDLE with generation ≠ g0)
+    Note over S,C: connected — leaving: state IDLE, then DISCONNECT, slot_claim released last
 ```
+
+A client that times out withdraws its request by `CAS CLIENT_HELLO → IDLE` and
+releases the claim; losing that CAS with a changed `generation` means it was
+accepted after all (it then drains the ring and leaves).
 
 ## Choosing a Mode
 
 | | Single-client | Auto | Multi-client | Dispatch |
 |---|:---:|:---:|:---:|:---:|
 | Clients per server | 1 | 1 | up to 256 (fixed slots) | unbounded |
-| Threading | none — caller-driven | background worker | background worker per slot | lobby worker + per-client worker |
+| Threading | none — caller-driven (or async futures on the shared reactor) | background worker | one dispatcher thread for all slots (server), worker per client | lobby worker + per-client worker |
 | Reconnect | manual | automatic | automatic (re-claim) | automatic |
 | Connect cost | 1 handshake | 1 handshake | 1 CAS + 1 handshake | 1 lobby round-trip + 1 handshake |
 | Best for | simplest pairwise IPC, driver integration | one peer, needs resilience | known/bounded fleet size | fleet size unknown ahead of time |
@@ -299,10 +429,11 @@ a namespace (different SIDs); use `Global\` + `ObjectSecurity` there.
 thiserror = "2"
 ```
 
-NT API calls are made directly via static linking with `ntdll.dll`:
+NT API calls are imported directly from `ntdll.dll` with
+`#[link(name = "ntdll", kind = "raw-dylib")]`:
+- No `ntdll.lib` from the Windows SDK needed
 - No SSN dependency
 - No GetProcAddress at runtime
-- No TLS (Thread Local Storage)
 
 ## Build
 
@@ -321,7 +452,15 @@ cargo build --release --target i686-pc-windows-msvc     # x86 MSVC
 cargo test -- --test-threads=1   # sequential: tests share named-object namespaces
 ```
 
-The crate builds as an `rlib` only. `build.rs` does one thing — `cargo:rustc-link-lib=ntdll` — so `ntdll` is linked into whatever binary consumes the crate.
+The crate builds as an `rlib` only. `build.rs` only emits `rerun-if-changed`; the
+`ntdll` imports are `raw-dylib`, so no import library is needed in the consuming
+binary's build either.
+
+```bash
+cargo run --release --example bench -- throughput 4096 5          # SharedServer -> SharedClient
+cargo run --release --example bench -- latency 16 5 --spin 2000    # ping-pong RTT with spin
+cargo run --release --example bench -- throughput 1048576 5 --zero-copy
+```
 
 ## Rust Usage
 
@@ -401,12 +540,12 @@ sequenceDiagram
     participant S1 as Slot 1 (shared memory)
 
     par Client A claims a slot
-        A->>S0: CAS reserved[CLAIM]: FREE → token_A
+        A->>S0: CAS slot_claim: FREE → token_A
         S0-->>A: success — slot 0 claimed
     and Client B claims a slot
-        B->>S0: CAS reserved[CLAIM]: FREE → token_B
+        B->>S0: CAS slot_claim: FREE → token_B
         S0-->>B: fail — already token_A
-        B->>S1: CAS reserved[CLAIM]: FREE → token_B
+        B->>S1: CAS slot_claim: FREE → token_B
         S1-->>B: success — slot 1 claimed
     end
 
@@ -553,10 +692,13 @@ Semantics:
 - A message is either written **whole** into free space or rejected with
   `ShmError::QueueFull`; unread data is never touched (`overwritten` is always 0).
   Atomicity is the same as for regular sends — the reader sees the whole message or nothing.
-- `FreeSpace { bytes, messages }` (+ `fits(len)`, `max_payload()`) is a **lower bound**
-  when taken on the writer side: if `fits(n)`, the next `try_send*` of `n` bytes succeeds.
-  Every message costs `MESSAGE_HEADER_SIZE` (4) + payload bytes; at most `MAX_MESSAGES` (500)
-  messages and `RING_CAPACITY` (2 MiB) bytes per ring. A 65 535-byte message always fits an empty ring.
+- `FreeSpace` (`bytes`, `max_frame`, `messages`, `max_message_size`; `fits(len)`,
+  `max_payload()`) is a **lower bound** when taken on the writer side: if `fits(n)`, the
+  next `try_send*` of `n` bytes succeeds. Every message costs `frame_size(len)` = 8-byte
+  header + payload rounded up to 8, plus a PAD frame when it does not fit before the ring
+  end — `fits` decides by `max_frame` (the largest frame that fits contiguously now), not by
+  `bytes`. Limits are per direction (`RingConfig`, default 500 messages / 2 MiB); a message of
+  `max_message_size` (≤ `capacity / 2 − 8`) always fits an empty ring.
 - `wait_for_space` sleeps on the channel's `SPACE` event: the reader wakes the writer only
   once enough space is freed. Since 0.9 it is a single kernel wait on `[SPACE, DISCONNECT,
   peer process]` (no 50 ms slices): a dead reader → `Err(PeerDied)`, a graceful disconnect →
@@ -594,8 +736,9 @@ fn stream(server: &SharedServer, blocks: &[Vec<u8>]) -> xshm::Result<()> {
 }
 ```
 
-The layout is unchanged: the wake-up request lives in a previously reserved
-`RingHeader` word, so `SHARED_VERSION` stays the same and 0.7.0 peers interoperate.
+The wake-up request lives in `RingHeader::space_waiter`: the number of free bytes
+the waiting writer needs (frame plus a possible PAD), cleared by the reader that
+frees enough space before it signals `SPACE`.
 
 ### Async API (0.10)
 
@@ -653,6 +796,65 @@ async fn main() -> xshm::Result<()> {
 }
 ```
 
+### Zero-copy (0.10)
+
+Frames never wrap around the ring end (PAD frames, see
+[Memory Layout](#memory-layout)), so a payload is one contiguous slice in the
+shared memory:
+
+```rust
+use xshm::{SharedClient, SharedServer};
+
+fn send_in_place(server: &mut SharedServer, frame: &[u8]) -> xshm::Result<()> {
+    // Lossless write (like try_send_to_client): fill the slice right in the ring.
+    server.send_with(frame.len(), |buf| buf.copy_from_slice(frame))?;
+    Ok(())
+}
+
+fn checksum_in_place(client: &mut SharedClient) -> xshm::Result<u32> {
+    // SAFETY (caller's contract): the server is trusted and writes this
+    // direction without overwrite (try_send*/send_with/wait_for_space),
+    // so nobody modifies the slice while the closure runs.
+    unsafe { client.receive_with(|msg| msg.iter().map(|&b| u32::from(b)).sum()) }
+}
+```
+
+- `send_with` is safe: the slice is the not-yet-published part of the ring.
+- `receive_with` is `unsafe`: the slice points into memory another process can
+  write. If an overwrite is detected after the closure returns, the result is
+  dropped and `ShmError::Overrun` is returned (defence in depth, not a guarantee).
+  For untrusted peers keep the copying `receive_from_*`.
+- Both take `&mut self`: a nested or concurrent second read/write of the same
+  direction does not compile.
+- Auto copies by default; `unsafe { AutoOptions::default().zero_copy_delivery() }`
+  hands `on_message` the slice straight from the ring under the same contract.
+- Max message: `capacity / 2 − 8` (`max_payload_for(capacity)`).
+
+### Spin before waiting (0.10)
+
+`SpinPolicy { iterations }` re-checks the ring by positions up to `iterations`
+times (`std::hint::spin_loop` in between) before sleeping in the kernel. One
+budget per sleep: an idle thread spins once, then sleeps without a timeout — zero
+idle wake-ups are kept. A successful spin is always followed by a zero-timeout
+check of the events, so `DISCONNECT`, `SPACE` and peer death are still noticed.
+
+```rust
+use std::time::Duration;
+use xshm::{AutoOptions, SharedClient, SpinPolicy};
+
+fn poll_fast(client: &SharedClient) -> xshm::Result<bool> {
+    client.poll_server_spin(Some(Duration::from_millis(10)), SpinPolicy::new(2000))
+}
+
+let options = AutoOptions { spin: SpinPolicy::new(2000), ..Default::default() };
+```
+
+Also `poll_client_spin`, `wait_for_space_spin` and the `spin` fields of
+`MultiOptions`, `MultiClientOptions`, `DispatchOptions`, `DispatchClientOptions`
+(client channels only, the lobby never spins). `SpinPolicy::NONE` (default) is the
+0.9 behavior. The price is a busy CPU core while spinning. Measure it on your
+machine: `cargo run --release --example bench -- latency 16 5 --spin 2000`.
+
 ### Peer liveness
 
 Graceful disconnects are signalled by the `DISCONNECT` event, but a crashed or
@@ -667,7 +869,7 @@ cannot fool it (re-opening by PID cannot tell "gone" from "access denied").
 | Single-client | `poll_client` / `poll_server` / `wait_for_space` return `Err(ShmError::PeerDied)` right away; `is_peer_alive() -> Option<bool>`, `peer_pid()` |
 | Auto | the peer's process handle is in the worker's wait set → `AutoHandler::on_disconnect_reason(DisconnectReason::PeerDied)`; `is_peer_alive()`, `peer_pid()` |
 | Dispatch | `DispatchHandler::on_client_disconnect_reason(id, PeerDied)`, `DispatchClientHandler::on_disconnect_reason(PeerDied)`; `DispatchServer::is_client_alive(id)`, `DispatchClient::{is_peer_alive, server_pid, disconnect_reason}` |
-| Multi-client | the client's process handle is in the server worker's wait set → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, slot freed; `MultiServer::is_client_alive(id)`; the client sees server death → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
+| Multi-client | the client's process handle is bound to the server dispatcher's completion port → `MultiHandler::on_client_disconnect_reason(id, PeerDied)`, slot freed; `MultiServer::is_client_alive(id)`; the client sees server death → `MultiClientHandler::on_disconnect_reason(PeerDied)` |
 
 - The new callbacks are **default methods** that forward to `on_disconnect` /
   `on_client_disconnect`, so existing handlers keep working. The library calls only
@@ -680,10 +882,13 @@ cannot fool it (re-opening by PID cannot tell "gone" from "access denied").
 - Measured on Windows 11 (`tests/peer_death.rs`, `TerminateProcess` of the peer):
   1–5 ms from kill to callback / error in all modes.
 
-Protocol extension (no layout or `SHARED_VERSION` change): the server writes its PID
-to `ControlBlock.reserved[2]` at creation; the client writes its PID to
-`reserved[3]` before `CLIENT_HELLO`, and the server consumes it with `swap(0)`. A PID
-whose process is already dead at handshake time is ignored.
+Protocol: the server writes its PID to `ControlBlock::server_pid` (and its process
+creation time to `server_start_lo/hi`) at creation; the client writes its creation
+time and PID to `client_start_lo/hi` and `client_pid` before `CLIENT_HELLO`, and the
+server consumes them after committing the handshake (revision 3, step S6). The
+observer opens the process by PID and compares its creation time: a different time
+means the PID was reused — not the peer. A PID whose process is already dead at
+handshake time is ignored.
 
 ### Server discovery
 
@@ -729,17 +934,26 @@ that server process exits — still without polling.
 
 ## Constants
 
-The ring limits below are re-exported from the crate root
-(`xshm::RING_CAPACITY`, `MAX_MESSAGES`, `MAX_MESSAGE_SIZE`, `MIN_MESSAGE_SIZE`, `MESSAGE_HEADER_SIZE`).
+Re-exported from the crate root. Ring sizes are per channel and per direction
+(`RingConfig`); the `DEFAULT_*` values are what `RingConfig::DEFAULT` /
+`ChannelLayout::DEFAULT` use. `RING_CAPACITY`, `MAX_MESSAGES` and
+`MAX_MESSAGE_SIZE` remain as `#[deprecated]` aliases of the defaults;
+`MESSAGE_HEADER_SIZE` is gone (use `frame_size(len)`).
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `RING_CAPACITY` | 2 MB | Size of each ring buffer |
-| `MAX_MESSAGES` | 500 | Max messages in queue |
-| `MAX_MESSAGE_SIZE` | 65535 | Max message size (bytes) |
-| `MIN_MESSAGE_SIZE` | 2 | Min message size (bytes) |
-| `DEFAULT_MAX_CLIENTS` | 20 | Default slot count for `MultiServer` |
-| `MAX_MULTI_CLIENTS` | 256 | Hard cap for `MultiServer`, set by the slot-scan cost (clients scan slots `0..256` until the first missing one; the server also writes `slot_count` into every slot as a hint, clients never bound the scan by it), not by the 64-handle wait limit — workers are split per 21 slots (256 slots = 13 threads) |
+| `SHARED_VERSION` | `0x00020000` | Shared-memory format (`VersionMismatch` otherwise) |
+| `DEFAULT_RING_CAPACITY` | 2 MiB | Default ring size per direction |
+| `MIN_RING_CAPACITY` / `MAX_RING_CAPACITY` | 4 KiB / 1 GiB | Ring capacity range (power of two) |
+| `DEFAULT_MAX_MESSAGES` | 500 | Default limit of unread messages per ring |
+| `DEFAULT_MAX_MESSAGE_SIZE` | 65 535 | Default max payload; the hard limit is `max_payload_for(capacity)` = `capacity / 2 − 8` |
+| `MIN_MESSAGE_SIZE` | 1 | Min payload (bytes) |
+| `FRAME_HEADER_SIZE` / `FRAME_ALIGN` | 8 / 8 | Frame header (`u32 len` + `u32 flags`) and frame alignment |
+| `FRAME_PAD` | 1 | `flags` bit of a PAD frame |
+| `RECOUNT_MAX` | 64 | Up to this `max_messages` the writer recounts frames for an exact limit; above it the ring may briefly hold `max_messages + 1` |
+| `DEFAULT_LOBBY_LAYOUT` | 2 × 16 KiB, 16 msgs, 1 KiB | Default Dispatch lobby layout |
+| `multi::DEFAULT_MAX_CLIENTS` | 20 | Default slot count for `MultiServer` |
+| `multi::MAX_MULTI_CLIENTS` | 256 | Hard cap for `MultiServer`, set by the slot-scan cost (clients scan slots `0..256` until the first missing one; the server also writes `slot_count` into every slot as a hint, clients never bound the scan by it); all slots are served by one dispatcher thread |
 
 ## Event Handles for Kernel Drivers
 
@@ -767,9 +981,10 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **SPSC**: Strictly one producer and one consumer per channel
 - **Overwrite on overflow** (default): New messages evict oldest when queue is full — use `try_send*` for lossless backpressure
 - **Windows only**: Uses direct NT API calls, relies on x86/x86_64 TSO memory ordering (not portable to ARM/RISC-V without rework)
-- **Message size**: 2 to 65535 bytes
-- **Anonymous servers**: No event handles available (polling mode only)
-- **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan; every 21 slots add a worker thread) — use Dispatch mode if you need more
+- **Message size**: 1 to `max_message_size` of the ring, at most `capacity / 2 − 8` bytes (65 535 by default); larger messages need a larger ring (no fragmentation)
+- **Anonymous servers**: No event handles available (polling mode only, no async API)
+- **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan) — use Dispatch mode if you need more. All slots share one dispatcher thread: a slow `on_message` of one client delays the others
+- **Native peers**: must implement the 0.10 contract — format `0x00020000`, PAD frames and handshake revision 3 ([`INTEROP.md`](INTEROP.md))
 - **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* (no server, no free slot) retries every `reconnect_delay` / `retry_delay`; connected channels never wake while idle. Use `Beacon` for fully event-driven discovery
 - **Access control, not authentication**: by default named objects are open only to the creating user and SYSTEM (`ObjectSecurity::CurrentUser`); any process of that same user can still open them, and `ObjectSecurity::Everyone` restores the ≤ 0.9 NULL DACL — do not send secrets
 
@@ -777,40 +992,48 @@ returns `None` — no named events are created. Use polling mode in that case.
 
 ```
 xshm/
-├── .cargo/
-│   └── config.toml     # Static CRT linking configuration
 ├── src/
-│   ├── lib.rs          # Main module, public exports
-│   ├── ntapi/          # Direct NT API layer (no external deps)
-│   │   ├── mod.rs      # Module exports
-│   │   ├── types.rs    # NT types (HANDLE, NTSTATUS, OBJECT_ATTRIBUTES...)
-│   │   ├── funcs.rs    # NT function declarations (#[link(name = "ntdll")])
-│   │   └── helpers.rs  # UNICODE_STRING, NtName, path conversion
-│   ├── win.rs          # High-level wrappers (EventHandle, Mapping, is_process_alive)
-│   ├── thread_hook.rs  # Worker thread start hook (set_thread_start_hook, 0.9)
-│   ├── server.rs       # SharedServer endpoint
-│   ├── client.rs       # SharedClient endpoint
-│   ├── ring.rs         # Lock-free SPSC ring buffer
-│   ├── layout.rs       # Shared memory structures
-│   ├── events.rs       # Event synchronization
-│   ├── error.rs        # Error types
-│   ├── constants.rs    # Protocol constants
-│   ├── naming.rs       # Kernel object naming
-│   ├── namespace.rs    # PrivateNamespace (boundary descriptor, 0.10)
-│   ├── shared.rs       # SharedView for mapped memory
+│   ├── lib.rs             # Main module, public exports
+│   ├── ntapi/             # Direct NT API layer (no external deps)
+│   │   ├── mod.rs         # Module exports
+│   │   ├── types.rs       # NT types (HANDLE, NTSTATUS, OBJECT_ATTRIBUTES...)
+│   │   ├── funcs.rs       # NT imports (#[link(name = "ntdll", kind = "raw-dylib")])
+│   │   └── helpers.rs     # UNICODE_STRING, NtName, path conversion, NT timeouts
+│   ├── win.rs             # Wrappers: EventHandle, NamedMutex, Mapping, ProcessWatch, wait_any
+│   ├── security.rs        # ObjectSecurity -> security descriptors (0.10)
+│   ├── namespace.rs       # PrivateNamespace (boundary descriptor, 0.10)
+│   ├── reactor.rs         # IOCP reactor + CompletionPort (0.10)
+│   ├── asynch.rs          # Async futures over the reactor (0.10)
+│   ├── sync_ext.rs        # Poison-free locks, worker join with panic reporting (0.10)
+│   ├── thread_hook.rs     # Worker thread start hook (set_thread_start_hook, 0.9)
+│   ├── server.rs          # SharedServer endpoint, ChannelConfig
+│   ├── client.rs          # SharedClient endpoint
+│   ├── handshake_model.rs # Exhaustive model of handshake revision 3 (tests only)
+│   ├── ring.rs            # Lock-free SPSC ring buffer, PAD frames, FreeSpace, SpinPolicy
+│   ├── layout.rs          # ControlBlock, LayoutBlock, RingHeader, RingConfig, ChannelLayout
+│   ├── shared.rs          # SharedView over the mapped segment (initialize / attach)
+│   ├── events.rs          # Channel events
+│   ├── beacon.rs          # Beacon, ProcessExit, Waitable
+│   ├── error.rs           # Error types
+│   ├── constants.rs       # Protocol constants
+│   ├── naming.rs          # Kernel object naming
+│   ├── peer_tests.rs      # Compatibility tests with peers that skip PID exchange
 │   ├── auto/
-│   │   └── mod.rs      # Auto-mode with background workers
+│   │   └── mod.rs         # Auto-mode with background workers
 │   ├── multi/
-│   │   └── mod.rs      # MultiServer/MultiClient — fixed slots, concurrent claim
+│   │   ├── mod.rs         # MultiServer/MultiClient — fixed slots, concurrent claim, dispatcher
+│   │   └── tests.rs       # Multi unit tests
 │   └── dispatch/
-│       ├── mod.rs      # DispatchServer/DispatchClient — lobby + dynamic channels
-│       └── protocol.rs # Binary lobby registration protocol
-├── tests/
-│   ├── stress.rs       # Stress tests
-│   ├── ordering.rs     # Memory ordering tests
-│   └── multi.rs        # Multi-client tests
+│       ├── mod.rs         # DispatchServer/DispatchClient — lobby + dynamic channels
+│       └── protocol.rs    # Binary lobby registration protocol
+├── tests/                 # async, backpressure, hostile, layout, multi, namespace, ordering,
+│                          # peer_death, security, stress, wakeup, zero_copy
+├── examples/
+│   └── bench.rs           # Throughput / latency benchmark (std only)
+├── INTEROP.md             # Wire contract for native peers (in Russian)
+├── CHANGELOG.md
 ├── Cargo.toml
-└── build.rs            # links ntdll
+└── build.rs               # rerun-if-changed only (ntdll is raw-dylib)
 ```
 
 ## License

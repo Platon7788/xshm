@@ -60,21 +60,21 @@ Rust-потребителей), протокол профайлера повер
 
 | # | Изменение (код) | Видимость | C/C++ | Совместимость со старыми пирами |
 |---|---|---|---|---|
-| 1 | `poll_timeout: Duration` (50 мс) → `Option<Duration>`, по умолчанию `None`: worker-ы Auto/Dispatch, поток лобби, чтение регистрации, ожидание подключения к каналу ждут **только события** (`src/auto/mod.rs:63-70,98-107`, `src/dispatch/mod.rs:115-168`) | тайминг | Требования к пиру — **ОБЯЗАТЕЛЬНО** (§e.4). Самой ждать без таймаута — ЖЕЛАТЕЛЬНО | Rust 0.8 сигналит всё, что нужно — ок в обе стороны. Нативный/старый пир, который не сигналит `DATA`/`SPACE`/`CONNECT_REQ`/`DISCONNECT` по правилам §e.4, **повиснет** против Rust 0.9 (раньше — работал с задержкой ≤ 50 мс) |
-| 2 | Безымянное событие `wake` (автосброс) в наборе ожидания worker-а Auto; `send`/`try_send`/`stop`/`Drop` его взводят (`src/auto/mod.rs:286-327`, `:463-491`) | внутр. | Не нужно (синхронной реализации нечего будить); при фоновом потоке — ЖЕЛАТЕЛЬНО | Нет влияния |
-| 3 | На `SPACE` worker сначала дописывает очередь в кольцо, потом зовёт `on_space_available` (`src/auto/mod.rs:622-628`, `:984-988`) | внутр. | ЖЕЛАТЕЛЬНО, если у вас есть очередь и колбэк места | Нет |
-| 4 | Штатный `DISCONNECT`: **сначала дочитать кольцо**, потом `on_disconnect_reason(Graceful)` (`src/auto/mod.rs:604-619`, `:968-983`) | тайминг (семантика приёма) | **ОБЯЗАТЕЛЬНО** для приёмника (иначе теряется прощальное сообщение, см. prof-shm `BYE`) | Rust 0.8 как приёмник теряет последние сообщения, если `DATA` и `DISCONNECT` взведены одновременно (NT отдаёт меньший индекс = `DISCONNECT`) |
-| 5 | При остановке worker дописывает в кольцо принятое до `stop()`, сколько влезет, и только потом закрывает канал (`src/auto/mod.rs:654-668`, `:920-935`) | тайминг | **ОБЯЗАТЕЛЬНО**: писать все сообщения ДО сигнала `DISCONNECT` | Старый отправитель 0.8 мог не дописать очередь |
-| 6 | `DispatchServer::start` создаёт лобби **синхронно**: занятое имя → ошибка `start` (`src/dispatch/mod.rs:224-266`) | ядро (лобби существует сразу после `start`) | **ОБЯЗАТЕЛЬНО** для сервера лобби: создание без `OBJ_OPENIF`, коллизия имени — ошибка | 0.8-сервер на занятом имени возвращал `Ok` и тихо повторял раз в 50 мс |
-| 7 | `on_client_connect` вызывается в worker-е канала при handshake канала, **строго до** первого `on_message` этого клиента (`src/dispatch/mod.rs:742-774`) | внутр. (серверное поведение) | **ОБЯЗАТЕЛЬНО**, если вы реализуете Dispatch-сервер (протоколы поверх, например prof-shm, на это опираются) | Пир этого не видит |
-| 8 | Сообщения/ошибки/события места клиента пересылаются обработчику только между `on_client_connect` и `on_client_disconnect_reason` (`is_active`, `src/dispatch/mod.rs:737-740`, `:815-832`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
-| 9 | Безымянное событие остановки сервера Dispatch (ручной сброс); `stop()` возвращается сразу (`src/dispatch/mod.rs:388-414`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
-| 10 | Остановка: каналы останавливаются и джойнятся вне лога карты клиентов; `on_client_disconnect_reason(Local)` — после join (`src/dispatch/mod.rs:500-517`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
-| 11 | `lobby_register` ждёт ответ на `S2C_DATA` без нарезки по 50 мс; чтение регистрации сервером — на `C2S_DATA` без нарезки (`src/dispatch/mod.rs:1055-1103`, `:535-572`) | тайминг | **ОБЯЗАТЕЛЬНО**: пишущая сторона лобби сигналит `DATA` (§d, §e.4) | Пир, писавший в лобби без сигнала `DATA`, раньше обслуживался опросом; теперь — `Timeout` через `lobby_timeout`/`response_timeout` |
-| 12 | Новый объект: маяк `Beacon` — именованное **NotificationEvent** `<имя>_beacon`, `OBJ_OPENIF`, NULL DACL (`src/beacon.rs:76-162`, `src/win.rs:164-193`) | ядро | **ОБЯЗАТЕЛЬНО**, если участвуете в обнаружении сервера (prof-shm) | 0.8 маяка не знает: клиент 0.9, спящий на маяке, **никогда** не проснётся от сервера 0.8 (тот не взводит маяк) |
-| 13 | `Beacon::unnamed()` — безымянное NotificationEvent (`src/beacon.rs:106-110`, `src/win.rs:195-223`) | внутр. | ЖЕЛАТЕЛЬНО (для собственных сигналов остановки — вместо предсказуемых имён) | Нет |
-| 14 | `ProcessExit` + `xshm::wait_any(&[&dyn Waitable])` — handle процесса в общем ожидании (`src/beacon.rs:37-59`, `:170-202`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
-| 15 | `DispatchClient::lobby_exists(name)` = `NtOpenSection` + проверка размера (`src/dispatch/mod.rs:988-990`) | ядро (только чтение) | ЖЕЛАТЕЛЬНО (нужно для алгоритма маяка, §b.3) | Нет |
+| 1 | `poll_timeout: Duration` (50 мс) → `Option<Duration>`, по умолчанию `None`: worker-ы Auto/Dispatch, поток лобби, чтение регистрации, ожидание подключения к каналу ждут **только события** (`AutoOptions::poll_timeout` в `src/auto/mod.rs`, `DispatchOptions`/`DispatchClientOptions` в `src/dispatch/mod.rs`) | тайминг | Требования к пиру — **ОБЯЗАТЕЛЬНО** (§e.4). Самой ждать без таймаута — ЖЕЛАТЕЛЬНО | Rust 0.8 сигналит всё, что нужно — ок в обе стороны. Нативный/старый пир, который не сигналит `DATA`/`SPACE`/`CONNECT_REQ`/`DISCONNECT` по правилам §e.4, **повиснет** против Rust 0.9 (раньше — работал с задержкой ≤ 50 мс) |
+| 2 | Безымянное событие `wake` (автосброс) в наборе ожидания worker-а Auto; `send`/`try_send`/`stop`/`Drop` его взводят (`enqueue`, `Endpoint::stop`, `Drop for Endpoint` в `src/auto/mod.rs`) | внутр. | Не нужно (синхронной реализации нечего будить); при фоновом потоке — ЖЕЛАТЕЛЬНО | Нет влияния |
+| 3 | На `SPACE` worker сначала дописывает очередь в кольцо, потом зовёт `on_space_available` (`Worker::on_space` в `src/auto/mod.rs`) | внутр. | ЖЕЛАТЕЛЬНО, если у вас есть очередь и колбэк места | Нет |
+| 4 | Штатный `DISCONNECT`: **сначала дочитать кольцо**, потом `on_disconnect_reason(Graceful)` (`Worker::drain_remaining` перед `Worker::notify_disconnect` в `server_worker`/`client_worker`, `src/auto/mod.rs`) | тайминг (семантика приёма) | **ОБЯЗАТЕЛЬНО** для приёмника (иначе теряется прощальное сообщение, см. prof-shm `BYE`) | Rust 0.8 как приёмник теряет последние сообщения, если `DATA` и `DISCONNECT` взведены одновременно (NT отдаёт меньший индекс = `DISCONNECT`) |
+| 5 | При остановке worker дописывает в кольцо принятое до `stop()`, сколько влезет, и только потом закрывает канал (хвост `server_worker`/`client_worker` — `Worker::flush`, `src/auto/mod.rs`) | тайминг | **ОБЯЗАТЕЛЬНО**: писать все сообщения ДО сигнала `DISCONNECT` | Старый отправитель 0.8 мог не дописать очередь |
+| 6 | `DispatchServer::start` создаёт лобби **синхронно**: занятое имя → ошибка `start` (`DispatchServer::start`) | ядро (лобби существует сразу после `start`) | **ОБЯЗАТЕЛЬНО** для сервера лобби: создание без `OBJ_OPENIF`, коллизия имени — ошибка | 0.8-сервер на занятом имени возвращал `Ok` и тихо повторял раз в 50 мс |
+| 7 | `on_client_connect` вызывается в worker-е канала при handshake канала, **строго до** первого `on_message` этого клиента (`AutoProxyHandler::on_connect`, `src/dispatch/mod.rs`) | внутр. (серверное поведение) | **ОБЯЗАТЕЛЬНО**, если вы реализуете Dispatch-сервер (протоколы поверх, например prof-shm, на это опираются) | Пир этого не видит |
+| 8 | Сообщения/ошибки/события места клиента пересылаются обработчику только между `on_client_connect` и `on_client_disconnect_reason` (`AutoProxyHandler::is_active` и колбэки `AutoProxyHandler`, `src/dispatch/mod.rs`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
+| 9 | Безымянное событие остановки сервера Dispatch (ручной сброс); `stop()` возвращается сразу (`DispatchCore::stop`, `src/dispatch/mod.rs`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
+| 10 | Остановка: каналы останавливаются и джойнятся вне лога карты клиентов; `on_client_disconnect_reason(Local)` — после join (`DispatchCore::shutdown`, `src/dispatch/mod.rs`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
+| 11 | `lobby_register` ждёт ответ на `S2C_DATA` без нарезки по 50 мс; чтение регистрации сервером — на `C2S_DATA` без нарезки (`lobby_register`, `DispatchCore::handle_lobby_client`, `src/dispatch/mod.rs`) | тайминг | **ОБЯЗАТЕЛЬНО**: пишущая сторона лобби сигналит `DATA` (§d, §e.4) | Пир, писавший в лобби без сигнала `DATA`, раньше обслуживался опросом; теперь — `Timeout` через `lobby_timeout`/`response_timeout` |
+| 12 | Новый объект: маяк `Beacon` — именованное **NotificationEvent** `<имя>_beacon`, `OBJ_OPENIF`, NULL DACL (`Beacon::open`, `EventHandle::open_or_create_notification`) | ядро | **ОБЯЗАТЕЛЬНО**, если участвуете в обнаружении сервера (prof-shm) | 0.8 маяка не знает: клиент 0.9, спящий на маяке, **никогда** не проснётся от сервера 0.8 (тот не взводит маяк) |
+| 13 | `Beacon::unnamed()` — безымянное NotificationEvent (`Beacon::unnamed`, `EventHandle::create_unnamed`) | внутр. | ЖЕЛАТЕЛЬНО (для собственных сигналов остановки — вместо предсказуемых имён) | Нет |
+| 14 | `ProcessExit` + `xshm::wait_any(&[&dyn Waitable])` — handle процесса в общем ожидании (`ProcessExit`, `wait_any` в `src/beacon.rs`) | внутр. | ЖЕЛАТЕЛЬНО | Нет |
+| 15 | `DispatchClient::lobby_exists(name)` = `NtOpenSection` + проверка размера (`DispatchClient::lobby_exists`) | ядро (только чтение) | ЖЕЛАТЕЛЬНО (нужно для алгоритма маяка, §b.3) | Нет |
 | 16 | `DispatchHandler::on_space_available(client_id)`, `DispatchClientHandler::on_space_available()` | внутр. | ЖЕЛАТЕЛЬНО | Нет |
 | 17 | Multi-client переведён на события (§i): `MultiOptions`/`MultiClientOptions::poll_timeout: Option<Duration>` = `None`, новое `MultiClientOptions::retry_delay` (250 мс, только вне подключения); worker-ы сервера по 21 слоту; смерть клиента — по handle процесса; протухший захват — по дедлайну | тайминг | Требования к пиру-клиенту Multi — **ОБЯЗАТЕЛЬНО** (§i.4, R13) | Клиент 0.8 без PID в handshake наблюдается по PID владельца claim-а (`reserved[1]`); без обоих — только на пробуждениях (§i.5) |
 | 18 | `SharedServer/SharedClient::wait_for_space`: одно ожидание `[SPACE, DISCONNECT, процесс пира]` на весь таймаут вместо срезов по 50 мс; штатное отключение пира → `Err(NotConnected)` (§i.6) | тайминг | ЖЕЛАТЕЛЬНО (для своей реализации ожидания места) | Читатель без заявки (≤ 0.7) будит только опустошив кольцо (R2) — задержка, не зависание |
@@ -101,7 +101,7 @@ Rust-потребителей), протокол профайлера повер
 ### b.1 Имена
 
 Базовое имя `B` (строка вызывающего) превращается в имена так
-(`src/naming.rs:29-58`, `src/ntapi/helpers.rs`, функция `to_nt_path`):
+(`ObjectPath::scoped`, `has_explicit_namespace`, `scoped_name` в `src/naming.rs`; `to_nt_path` в `src/ntapi/helpers.rs`):
 
 - «явный namespace» — `B` начинается с `Global\`, `Local\` или `\`;
 - секция: явный namespace → `B`, иначе `Local\B`;
@@ -156,33 +156,33 @@ handle пространства и относительное имя, §b.4).
 | Объект | Имя | Тип | Нач. состояние | Создаёт (флаги, доступ) | Открывает | Кто сигналит | Кто ждёт |
 |---|---|---|---|---|---|---|---|
 | Секция канала | `Local\B` / `B` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, размер `LayoutBlock.segment_size` (0.10; по умолчанию `4 194 560`) | нули | сервер: `NtCreateSection(SECTION_ALL_ACCESS=0x000F001F)`, **без** `OBJ_OPENIF` — существующее имя = ошибка (`STATUS_OBJECT_NAME_COLLISION`) (`Mapping::create`) | клиент: `NtOpenSection(SECTION_ALL_ACCESS)` + проверка типа `NtQuerySection` = `SEC_COMMIT` (0.10) + отображение целиком + проверки §c.5 (`magic`/`version`/`LayoutBlock` против размера view; `SharedView::attach`) | — | — |
-| `P S2C_DATA` | | SynchronizationEvent (автосброс, `1`) | FALSE | сервер: `NtCreateEvent(EVENT_ALL_ACCESS=0x001F0003)`, без `OBJ_OPENIF` (`src/win.rs:135-161`) | клиент: `NtOpenEvent(EVENT_ALL_ACCESS)` + проверка типа `NtQueryEvent` = SynchronizationEvent (0.10, `EventHandle::open_auto_reset`) | писатель-сервер | читатель-клиент |
+| `P S2C_DATA` | | SynchronizationEvent (автосброс, `1`) | FALSE | сервер: `NtCreateEvent(EVENT_ALL_ACCESS=0x001F0003)`, без `OBJ_OPENIF` (`EventHandle::create`) | клиент: `NtOpenEvent(EVENT_ALL_ACCESS)` + проверка типа `NtQueryEvent` = SynchronizationEvent (0.10, `EventHandle::open_auto_reset`) | писатель-сервер | читатель-клиент |
 | `P C2S_DATA` | | SynchronizationEvent | FALSE | сервер | клиент | писатель-клиент | читатель-сервер |
 | `P S2C_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-клиент** | писатель-сервер |
 | `P C2S_SPACE` | | SynchronizationEvent | FALSE | сервер | клиент | **читатель-сервер** | писатель-клиент |
 | `P S2C_CONNECT` (connect_ack) | | SynchronizationEvent | FALSE | сервер | клиент | сервер (после handshake, только при удачном CAS фиксации — R16; ревизия 3: `S2C_DISCONNECT` сброшен **до** фиксации, S4); клиент делает `NtResetEvent` до своей заявки (R15) | клиент |
 | `P C2S_CONNECT_REQ` | | SynchronizationEvent | FALSE | сервер | клиент | клиент (после `CLIENT_HELLO`); ревизия 3 — и клиент, проигравший захват claim-а, если `server_state != SERVER_READY` («толчок», R18, §i.3) | сервер |
 | `P S2C_DISCONNECT` | | SynchronizationEvent | FALSE | сервер | клиент | **обе** стороны при штатном закрытии (одно событие на оба направления, несмотря на `S2C` в имени) | обе стороны |
-| **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`src/win.rs:164-193`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
+| **Маяк (0.9)** | `Local\B_beacon` / `B_beacon` | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового; у существующего не трогается | **любая** сторона: `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF=0x80, NotificationEvent, InitialState=FALSE)`; успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS` (`0x40000000`) (`EventHandle::open_or_create_notification`) | тем же вызовом | сервер: `NtSetEvent` (raise, 0.10 — после публикации в `_beacon_state`) / `NtResetEvent` (lower); клиент — только `clear_if_stale` (§b.3, 0.10) | клиенты |
 | **Состояние маяка (0.10)** | `Local\B_beacon_state` / `B_beacon_state` | Section, `SEC_COMMIT`, `PAGE_READWRITE`, 4096 байт | нули | **любая** сторона (вместе с маяком): сначала `NtOpenSection(SECTION_ALL_ACCESS)` существующей (открытие не требует `SeCreateGlobalPrivilege`); только при `STATUS_OBJECT_NAME_NOT_FOUND` — `NtCreateSection(SECTION_ALL_ACCESS, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, MaximumSize=4096, SEC_COMMIT)`, дескриптор — политика создателя маяка (та же, что у `_beacon`; 0.10, до 0.10 — NULL DACL); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; у существующей — проверка `NtQuerySection` = `SEC_COMMIT` и view ≥ 4096, иначе ошибка (`Mapping::open`/`Mapping::open_or_create`); затем CAS `magic: 0 → 0x4E434258`. Отказ `STATUS_PRIVILEGE_NOT_HELD (0xC0000061)` или `STATUS_ACCESS_DENIED (0xC0000022)` (и только они; второй — в том числе DACL чужой секции не включает этого пользователя) — маяк **без состояния** (§b.3); любой другой отказ (другой тип объекта, `SEC_RESERVE`, мал) — ошибка `Beacon::open` | тем же вызовом | — (пишет сервер в `raise`, раскладка §b.3) | клиенты (`clear_if_stale`) |
 | **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | 0.10: **сервер** в `start` (после секции лобби, держит до остановки, не захватывает; дескриптор — политика лобби) и **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, дескриптор — политика создателя (до 0.10 — NULL DACL, создавал только клиент); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс только держит открытым (0.10) |
-| Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`src/win.rs:195-223`) | не открывается по имени | свой процесс | свой процесс |
-| Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`src/win.rs:615-652`) | ядро (при завершении процесса) | сторона, открывшая handle |
+| Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`EventHandle::create_unnamed`) | не открывается по имени | свой процесс | свой процесс |
+| Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`ProcessWatch::open`, `ProcessWatch::open_peer`) | ядро (при завершении процесса) | сторона, открывшая handle |
 
-Константы: `src/ntapi/types.rs:209-243`, суффиксы — `src/constants.rs`
+Константы: `src/ntapi/types.rs`, суффиксы — `src/constants.rs`
 (`DATA`, `SPACE`, `CONNECT`, `CONNECT_REQ`, `DISCONNECT`), направления —
-`S2C`/`C2S` (`src/naming.rs:15-21`).
+`S2C`/`C2S` (`Direction::as_str`, `src/naming.rs`).
 
 Порядок создания объектов сервером: секция → `ControlBlock` (PID в
 `server_pid`), `LayoutBlock`, заголовки колец, `magic` последним (0.10, §c.5) → 7 событий в порядке `S2C_DATA`,
 `S2C_SPACE`, `C2S_DATA`, `C2S_SPACE`, `S2C_CONNECT`, `C2S_CONNECT_REQ`,
-`S2C_DISCONNECT` (`src/server.rs:31-66`, `src/events.rs`). Любая ошибка
+`S2C_DISCONNECT` (`SharedEvents::create`, `src/events.rs`). Любая ошибка
 создания события (в т.ч. коллизия имени) — ошибка `start`.
 
 Ожидание: `NtWaitForMultipleObjects(n, handles, WaitAny=1, Alertable=FALSE,
 timeout)`; `timeout = NULL` — без конца; иначе относительное значение в
 100-нс единицах со знаком минус, ненулевая длительность короче 100 нс
-округляется до `-1` (`src/win.rs:537-575`, `src/ntapi/helpers.rs`). Результат
+округляется до `-1` (`wait_any` в `src/win.rs`, `duration_to_nt_timeout` в `src/ntapi/helpers.rs`). Результат
 `STATUS_TIMEOUT (0x102)` проверяется **до** диапазона индексов. При
 одновременном срабатывании NT возвращает **наименьший** индекс — на этом
 построены приоритеты наборов ожидания (§e).
@@ -389,6 +389,25 @@ A+64   кольцо S2C           ┘ ёмкость s2c.capacity
 B      RingHeader C2S (64)   ┐ B = LayoutBlock.c2s.offset   (канонически A+64+cap_s2c)
 B+64   кольцо C2S           ┘ ёмкость c2s.capacity
 ```
+
+**Проверка тестами.** Каждое число этого раздела закреплено unit-тестом
+модуля `src/layout.rs` (`cargo test --lib layout::tests`); размеры и
+смещения wire-типов вдобавок проверяются `const`-утверждениями при каждой
+сборке (в том числе у потребителя):
+
+| Таблица / значение | Тест |
+|---|---|
+| размеры блоков (64/64/64/16), `SEGMENT_HEADER_SIZE = 128`, `segment_size` по умолчанию | `layout::tests::layout_sizes_are_exact` |
+| §c.1 смещения `ControlBlock` | `layout::tests::control_block_offsets_are_stable` |
+| §c.2 смещения `LayoutBlock` и дескриптора кольца | `layout::tests::layout_block_offsets_are_stable` |
+| §c.3 смещения `RingHeader` | `layout::tests::ring_header_offsets_are_stable` |
+| §c.1–§c.3 байты сегмента по смещениям таблиц (LE `u32`, канонические дескрипторы, `connection_gen = 1`) | `layout::tests::initialized_segment_bytes_match_interop` |
+| `SHARED_MAGIC`/`SHARED_VERSION`, константы кадра §c.4 (`8`, `FRAME_PAD = 1`, `frame_size`), пределы ёмкости, состояния рукопожатия, `CLAIM_FREE`, `RECOUNT_MAX = 64` (§c.5) | `layout::tests::wire_constants_are_stable` |
+| §c.2 ограничения ёмкости и `max_message_size ≤ capacity / 2 − 8` | `layout::tests::ring_config_validation` |
+| §c.2 раскладка по умолчанию, лобби по умолчанию, каноническая раскладка (`128`, `A + 64 + cap_s2c`, `256 + cap_s2c + cap_c2s`) | `layout::tests::default_and_canonical_layouts_match_interop` |
+
+Отказы клиента по §c.2/§c.5 (п. 2–4) проверяют `shared::tests::attach_*`
+(в том числе фаззер `attach_fuzz_never_panics`).
 
 ### c.1 `ControlBlock` (смещение 0, 64 байта)
 
@@ -669,12 +688,12 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 
 ### d.2 Последовательность подключения (0.9)
 
-1. **Сервер `start`** (синхронно, `src/dispatch/mod.rs:224-266`): `SharedServer::start(B)` —
+1. **Сервер `start`** (синхронно, `DispatchServer::start`): `SharedServer::start(B)` —
    секция лобби и 7 событий; ошибка (имя занято) → `start` возвращает ошибку,
    поток не создаётся. Затем безымянное событие остановки, поток лобби.
    Только после `Ok` сервер вправе взвести маяк (§b.3).
 2. **Поток лобби** ждёт `{C2S_CONNECT_REQ, стоп}` без таймаута
-   (`src/dispatch/mod.rs:479-499`, `src/server.rs:178-210`); `CONNECT_REQ`
+   (`DispatchCore::worker_loop`, `SharedServer::wait_for_client_or`); `CONNECT_REQ`
    первым индексом. `CONNECT_REQ` без `CLIENT_HELLO` (клиент откатил заявку)
    — 0.9: просто игнорируется, лобби **не** пересоздаётся; 0.10: сигнал
    поглощается внутри ожидания, оно продолжается (§«Изменения 0.10» п. 15).
@@ -816,10 +835,10 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
    - **S7:** `NtSetEvent(S2C_CONNECT)`, подключён.
 5. **Клиент** записывает `RegistrationRequest` в кольцо B. Rust сигналит
    `C2S_DATA` дважды: из `send_to_server` (если кольцо было пусто) и явно
-   (`src/dispatch/mod.rs:1069-1072`). **Нативный клиент ОБЯЗАН сигналить
+   (`lobby_register`). **Нативный клиент ОБЯЗАН сигналить
    `C2S_DATA` после записи запроса**: сервер 0.9 ждёт `{C2S_DATA, стоп}` с
    дедлайном `lobby_timeout` и **не перечитывает** кольцо по таймеру
-   (`src/dispatch/mod.rs:535-572`); без сигнала — `Timeout` и отказ через 5 с.
+   (`DispatchCore::handle_lobby_client`); без сигнала — `Timeout` и отказ через 5 с.
    0.9: в том же наборе — handle процесса клиента (если PID получен): клиент,
    умерший до запроса, освобождает лобби сразу, а не через `lobby_timeout`.
 6. **Сервер** декодирует запрос, выдаёт `client_id` (счётчик с 1) и имя канала
@@ -892,11 +911,11 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 | Гарантия | Как обеспечена | Видно ли пиру |
 |---|---|---|
 | Лобби существует к возврату `start`; занятое имя — ошибка | `SharedServer::start` в `start`, а не в фоне | Да, косвенно: второй сервер падает, маяк первого не трогается |
-| `on_client_connect` строго до первого `on_message` клиента | Регистрация — в `on_connect` worker-а канала; тот же поток затем читает кольцо (`process_receive_queue` идёт после `on_connect`, `src/auto/mod.rs:530-534`) | **Нет** — чисто серверное поведение. Нативный Dispatch-сервер ОБЯЗАН дать ту же гарантию своим обработчикам |
+| `on_client_connect` строго до первого `on_message` клиента | Регистрация — в `on_connect` worker-а канала; тот же поток затем читает кольцо (`process_receive_queue` идёт после `on_connect`, `server_worker` в `src/auto/mod.rs`) | **Нет** — чисто серверное поведение. Нативный Dispatch-сервер ОБЯЗАН дать ту же гарантию своим обработчикам |
 | После отключения клиента его сообщения обработчику не доставляются | `disconnected` общий у прокси и карты; `is_active()` | Нет |
 | Последние сообщения пира (например, `BYE`) читаются **до** колбэка разрыва | `drain_remaining` перед `on_disconnect_reason` и при `DISCONNECT`, и при смерти процесса (`src/auto/mod.rs`, `server_worker`/`client_worker`) | Да, семантически: отправитель может рассчитывать, что «последнее слово» дойдёт, если оно записано **до** `DISCONNECT`. Ревизия 2: в том числе когда сервер отключает клиента **сразу после рукопожатия** (из `on_client_connect`) — клиент засчитывает рукопожатие по `generation` (R15) и дочитывает кольцо |
 | `stop()` из колбэка обработчика не блокируется (ревизия 2) | Метка потока сервера (thread-local): вызов из потока лобби/колбэка канала — отложенная остановка без join | Нет |
-| Очередь, принятая до `stop()`/`disconnect_client`, дописывается в кольцо до закрытия канала (сколько влезет, без ожидания места) | Хвост `server_worker`/`client_worker` (`src/auto/mod.rs:654-668`, `:920-935`), потом Drop → `NtSetEvent(S2C_DISCONNECT)` | Да: порядок «данные → `DISCONNECT`» в памяти |
+| Очередь, принятая до `stop()`/`disconnect_client`, дописывается в кольцо до закрытия канала (сколько влезет, без ожидания места) | Хвост `server_worker`/`client_worker` (`Worker::flush`, `src/auto/mod.rs`), потом Drop → `NtSetEvent(S2C_DISCONNECT)` | Да: порядок «данные → `DISCONNECT`» в памяти |
 | `stop()` не ждёт `channel_connect_timeout` зависших клиентов | Событие остановки в наборах лобби/ожидания | Нет |
 
 ---
@@ -907,13 +926,13 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 
 | Поток | Набор `NtWaitForMultipleObjects` (индекс: объект) | Таймаут |
 |---|---|---|
-| Auto-сервер, **подключён** (`src/auto/mod.rs:602`) | 0 `S2C_DISCONNECT` · 1 `C2S_DATA` · 2 `S2C_SPACE` · 3 процесс клиента (если PID получен и процесс открыт) · последний — `wake` (безымянный) | `poll_timeout` (`None`) |
-| Auto-клиент, подключён (`src/auto/mod.rs:966`) | 0 `S2C_DISCONNECT` · 1 `S2C_DATA` · 2 `C2S_SPACE` · 3 процесс сервера (если есть) · последний — `wake` | `None` |
-| Auto-сервер, **не подключён** (`src/auto/mod.rs:530`) | 0 `C2S_CONNECT_REQ` · 1 `wake` | `None` |
-| Auto-клиент, между попытками (`src/auto/mod.rs:904`, `:1017`) | `wake` | `reconnect_delay` (250 мс) — **намеренно периодически** |
-| Лобби Dispatch (`src/dispatch/mod.rs:479-499`) | 0 `C2S_CONNECT_REQ` · 1 стоп сервера | `None` |
-| Чтение регистрации (`src/dispatch/mod.rs:561`) | 0 `C2S_DATA` лобби · 1 стоп | остаток `lobby_timeout` (5 с) |
-| Ожидание подключения к каналу (`src/dispatch/mod.rs:661`) | 0 «зарегистрирован» · 1 стоп | `channel_connect_timeout` (30 с) |
+| Auto-сервер, **подключён** (`server_worker` → `Worker::handle_wait`) | 0 `S2C_DISCONNECT` · 1 `C2S_DATA` · 2 `S2C_SPACE` · 3 процесс клиента (если PID получен и процесс открыт) · последний — `wake` (безымянный) | `poll_timeout` (`None`) |
+| Auto-клиент, подключён (`client_worker` → `Worker::handle_wait`) | 0 `S2C_DISCONNECT` · 1 `S2C_DATA` · 2 `C2S_SPACE` · 3 процесс сервера (если есть) · последний — `wake` | `None` |
+| Auto-сервер, **не подключён** (`server_worker`) | 0 `C2S_CONNECT_REQ` · 1 `wake` | `None` |
+| Auto-клиент, между попытками (`client_worker`) | `wake` | `reconnect_delay` (250 мс) — **намеренно периодически** |
+| Лобби Dispatch (`DispatchCore::worker_loop`) | 0 `C2S_CONNECT_REQ` · 1 стоп сервера | `None` |
+| Чтение регистрации (`DispatchCore::handle_lobby_client`) | 0 `C2S_DATA` лобби · 1 стоп | остаток `lobby_timeout` (5 с) |
+| Ожидание подключения к каналу (`DispatchCore::handle_lobby_client`) | 0 «зарегистрирован» · 1 стоп | `channel_connect_timeout` (30 с) |
 | Клиент лобби, ответ (`lobby_register`, `src/dispatch/mod.rs`) | 0 `S2C_DATA` лобби · 1 `S2C_DISCONNECT` лобби (0.10) · 2 процесс сервера (0.10, если есть) | остаток `response_timeout` (5 с) |
 | Worker канала Dispatch | как Auto (сервер/клиент) | `None` |
 | Чтение регистрации (0.9 дополнение) | + 2 процесс клиента лобби (если PID получен) | остаток `lobby_timeout` |
@@ -998,7 +1017,7 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 3. **Событие «место освободилось» для колбэков** (`on_space_available`) — это
    тот же ядерный `SPACE`. Worker Auto на `SPACE` **сначала** дописывает свою
    очередь в освободившееся место (`process_send_queue`), и **только потом**
-   зовёт `on_space_available` (`src/auto/mod.rs:622-628`, `:984-988`). В
+   зовёт `on_space_available` (`Worker::on_space` в `src/auto/mod.rs`). В
    Dispatch это пробрасывается как `DispatchClientHandler::on_space_available()`
    / `DispatchHandler::on_space_available(client_id)`.
    Важно: `try_send` Auto отвечает `QueueFull` по **очереди** worker-а
@@ -1037,7 +1056,7 @@ DACL): при `write_pos − read_pos` больше ёмкости, `read_pos` �
 
 ### e.3 Новые события отправки (send wake) — внутренние
 
-`wake` Auto (`src/auto/mod.rs:325-327`) — безымянное SynchronizationEvent,
+`wake` Auto (`Endpoint::spawn` создаёт, `enqueue`/`Endpoint::stop` взводят; `src/auto/mod.rs`) — безымянное SynchronizationEvent,
 взводится после постановки команды в канал (`enqueue`), в `stop` и `Drop`.
 Стоп Dispatch-сервера и «зарегистрирован» — безымянные NotificationEvent.
 Другому процессу они не видны и по имени не открываются. Нативной синхронной
@@ -1097,7 +1116,7 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
   `channel_timeout` Dispatch и `slot_timeout` Multi) прерывается `wake`
   остановки — `stop`/Drop не ждут таймаута рукопожатия.
 - **`DispatchServer`**: `LOBBY_RETRY_DELAY = 250 мс` — только после ошибки
-  пересоздания лобби (`src/dispatch/mod.rs:174`); дедлайны `lobby_timeout`
+  пересоздания лобби (`DispatchCore::worker_loop`); дедлайны `lobby_timeout`
   (5 с), `channel_connect_timeout` (30 с); клиент — `lobby_timeout` (5 с),
   `response_timeout` (5 с), `channel_timeout` (10 с).
 - **Single-client канал (ревизия 3, R18)**: таймера нет — протухший
