@@ -744,22 +744,36 @@ impl ConnectFuture {
         }
     }
 
-    fn step(&mut self, waker: &Waker) -> Poll<Result<SharedClient>> {
+    /// Снять все регистрации набора и отпустить наблюдение за сервером --
+    /// на КАЖДОМ готовом исходе ДО `Hello::finish`/`Hello::withdraw`
+    /// (Task 4 надёжности). `withdraw` последним шагом отпускает claim:
+    /// живая к этому моменту регистрация на автосбросном `S2C_CONNECT`
+    /// потребила бы подтверждение СЛЕДУЮЩЕГО клиента (он сбрасывает событие
+    /// на C4 и ждёт его сам), и тот ждал бы до таймаута -- сколь угодно
+    /// долго, если исполнитель держит future после `Ready`.
+    ///
+    /// Потреблённый `S2C_CONNECT` не возвращается: пока claim наш (снятие
+    /// идёт до его отпуска), любой `S2C_CONNECT` адресован нам -- claim
+    /// исключителен, а следующий заявитель сбрасывает событие до своей
+    /// заявки (C4); `DISCONNECT` набор не регистрирует, процесс сервера --
+    /// уведомление (остаётся взведённым).
+    fn release(&mut self) {
+        self.waits.clear(None, None);
+        self.server = None;
+    }
+
+    fn step(&mut self, waker: &Waker) -> Step {
         if !self.started {
             self.started = true;
             let posted = Hello::post(self.namespace.as_deref(), &self.name, true, ClaimMode::Take);
             let hello = match posted {
                 Ok(hello) => hello,
-                Err(err) => return Poll::Ready(Err(err)),
+                Err(err) => return Step::Failed(err),
             };
             if let Err(err) = hello.events.connect_req.set() {
                 // Как синхронный путь: отзыв, проигравший CAS сервера, --
                 // всё же подключение.
-                return Poll::Ready(if hello.withdraw() {
-                    Ok(hello.finish())
-                } else {
-                    Err(err)
-                });
+                return Step::Abandon(hello, err);
             }
             let control = hello.view.control_block();
             let (pid, start) = (
@@ -775,36 +789,26 @@ impl ConnectFuture {
             // откатом, как при таймауте. Иначе future ждал бы вечно.
             // Двусмысленность (нет прав, PID 0) -- без наблюдения, как раньше.
             if self.server.is_none() && crate::win::is_process_gone(pid, start) {
-                return Poll::Ready(if hello.withdraw() {
-                    Ok(hello.finish())
-                } else {
-                    Err(ShmError::PeerDied)
-                });
+                return Step::Abandon(hello, ShmError::PeerDied);
             }
             self.hello = Some(hello);
         }
         let Some(hello) = self.hello.as_ref() else {
             // Повторный опрос завершённого future.
-            return Poll::Ready(Err(ShmError::NotReady));
+            return Step::Failed(ShmError::NotReady);
         };
         let fired = self.waits.harvest(waker);
         // Как `Hello::wait_ack` (C10): подтверждение -- `S2C_CONNECT` при
         // фиксации своей заявки (`accepted_on_signal`); иначе сигнал
         // устаревший, поглощён.
         if fired[OP] && hello.accepted() {
-            return match self.hello.take() {
-                Some(hello) => Poll::Ready(Ok(hello.finish())),
-                None => Poll::Ready(Err(ShmError::NotReady)),
-            };
+            return self.take_hello(Step::Accepted);
         }
         if fired[PEER] {
             // Сервер умер, не ответив: откат, как у синхронного таймаута
             // (CAS `CLIENT_HELLO -> IDLE`). Отзыв проиграл -- сервер успел
             // зафиксировать рукопожатие: подключены, смерть увидит приём.
-            return Poll::Ready(match self.hello.take() {
-                Some(hello) if hello.withdraw() => Ok(hello.finish()),
-                _ => Err(ShmError::PeerDied),
-            });
+            return self.take_hello(|hello| Step::Abandon(hello, ShmError::PeerDied));
         }
         let registered = self
             .waits
@@ -814,31 +818,70 @@ impl ConnectFuture {
                 None => Ok(()),
             });
         match registered {
-            Ok(()) => Poll::Pending,
-            Err(err) => {
-                // Ждать нельзя -- заявку отзываем, как при ошибке ожидания.
-                Poll::Ready(match self.hello.take() {
-                    Some(hello) if hello.withdraw() => Ok(hello.finish()),
-                    _ => Err(err),
-                })
-            }
+            Ok(()) => Step::Pending,
+            // Ждать нельзя -- заявку отзываем, как при ошибке ожидания.
+            Err(err) => self.take_hello(|hello| Step::Abandon(hello, err)),
         }
     }
+
+    /// Готовый исход с заявкой (`hello` есть -- проверено в `step`).
+    fn take_hello(&mut self, outcome: impl FnOnce(Hello) -> Step) -> Step {
+        match self.hello.take() {
+            Some(hello) => outcome(hello),
+            None => Step::Failed(ShmError::NotReady),
+        }
+    }
+}
+
+/// Исход опроса `ConnectFuture::step`: регистрации на готовых исходах ещё
+/// стоят -- их снимает `poll` (`release`) до `finish`/`withdraw`.
+enum Step {
+    /// Ждём `S2C_CONNECT` (регистрации живы).
+    Pending,
+    /// Сервер зафиксировал нашу заявку.
+    Accepted(Hello),
+    /// Заявку отзывать (W) с этой ошибкой; проигранный отзыв -- подключены.
+    Abandon(Hello, ShmError),
+    /// Заявки нет (не выставилась или future уже завершён).
+    Failed(ShmError),
 }
 
 impl Future for ConnectFuture {
     type Output = Result<SharedClient>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.get_mut().step(cx.waker())
+        let this = self.get_mut();
+        // Порядок «снять регистрации -> только потом finish/withdraw
+        // (отпуск claim-а)» -- см. `ConnectFuture::release`.
+        match this.step(cx.waker()) {
+            Step::Pending => Poll::Pending,
+            Step::Accepted(hello) => {
+                this.release();
+                Poll::Ready(Ok(hello.finish()))
+            }
+            Step::Abandon(hello, err) => {
+                this.release();
+                Poll::Ready(if hello.withdraw() {
+                    Ok(hello.finish())
+                } else {
+                    Err(err)
+                })
+            }
+            Step::Failed(err) => {
+                this.release();
+                Poll::Ready(Err(err))
+            }
+        }
     }
 }
 
 impl Drop for ConnectFuture {
     fn drop(&mut self) {
-        // `S2C_CONNECT` не возвращаем: заявка отзывается, а следующий клиент
-        // всё равно сбрасывает событие до своей заявки.
-        self.waits.clear(None, None);
+        // Сначала регистрации, потом отзыв (отпуск claim-а) -- как на
+        // готовых исходах (`release`). `S2C_CONNECT` не возвращаем: заявка
+        // отзывается, а следующий клиент всё равно сбрасывает событие до
+        // своей заявки.
+        self.release();
         // Заявка без ответа -- откат, как у синхронного таймаута. Отзыв
         // опоздал (CAS сервера выиграл) -- мы подключены, но владельца нет:
         // уходим штатно через `Drop` клиента (CAS `SERVER_READY -> IDLE`,
@@ -1700,6 +1743,146 @@ mod tests {
                 .unwrap()
         );
         assert!(Endpoint::peer_left(&server));
+    }
+
+    // ─── Task 4 надёжности: регистрации `connect_async` до отпуска claim-а ──
+
+    /// Опрос future до готовности (пауза 5 мс, не дольше 2 с); future не
+    /// бросается -- исполнитель вправе держать его и после `Ready`.
+    fn poll_until_ready(future: &mut ConnectFuture) -> Result<SharedClient> {
+        let mut cx = Context::from_waker(Waker::noop());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Poll::Ready(result) = Pin::new(&mut *future).poll(&mut cx) {
+                return result;
+            }
+            assert!(Instant::now() < deadline, "future не завершился за 2 с");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Следующий клиент (заявка C1-C9 вручную) получает своё
+    /// подтверждение `S2C_CONNECT`: ни одна чужая регистрация не потребила
+    /// его. Иначе `wait_ack` -- `Timeout` при уже зафиксированной сервером
+    /// сессии.
+    fn next_client_gets_ack(server: &mut SharedServer, name: &str) {
+        let hello = Hello::post(None, name, true, ClaimMode::Take).unwrap();
+        std::thread::scope(|s| {
+            let accepting = s.spawn(|| server.wait_for_client(Some(Duration::from_secs(5))));
+            hello.events.connect_req.set().unwrap();
+            let waited = hello.wait_ack(Duration::from_secs(2), None);
+            accepting.join().unwrap().unwrap();
+            match waited {
+                AckWait::Accepted => {}
+                AckWait::Abandoned(err) => panic!(
+                    "подтверждение следующего клиента съедено брошенной регистрацией: {err:?}"
+                ),
+            }
+        });
+        drop(hello.finish());
+    }
+
+    /// Сервер умер во время рукопожатия (`fired[PEER]`): future отвечает
+    /// `PeerDied` и отпускает claim -- регистрация на `S2C_CONNECT` к этому
+    /// моменту уже снята, иначе она съела бы подтверждение следующего
+    /// клиента (автосброс), даже если future держат после `Ready`.
+    #[test]
+    fn connect_async_peer_death_frees_ack_before_claim() {
+        let name = unique("APEERACK");
+        let mut server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let real = (
+            control.server_pid.load(Ordering::Acquire),
+            control.server_start_lo.load(Ordering::Acquire),
+            control.server_start_hi.load(Ordering::Acquire),
+        );
+
+        // «Сервер» -- живой дочерний процесс (ждёт stdin).
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "pause"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = ProcessWatch::open(pid).unwrap().start_time().unwrap();
+        let (lo, hi) = crate::layout::split_time(start);
+        control.server_start_lo.store(lo, Ordering::Release);
+        control.server_start_hi.store(hi, Ordering::Release);
+        control.server_pid.store(pid, Ordering::Release);
+
+        let mut future = ConnectFuture::new(None, &name);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        match poll_until_ready(&mut future) {
+            Err(ShmError::PeerDied) => {}
+            other => panic!("ожидался PeerDied: {:?}", other.map(drop)),
+        }
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+
+        // Настоящий сервер снова «жив»; future всё ещё не брошен.
+        control.server_start_lo.store(real.1, Ordering::Release);
+        control.server_start_hi.store(real.2, Ordering::Release);
+        control.server_pid.store(real.0, Ordering::Release);
+        next_client_gets_ack(&mut server, &name);
+        assert!(future.waits.is_empty(), "регистрации пережили Ready");
+        drop(future);
+    }
+
+    /// Отказ регистрации процесса сервера (инъекция): заявка отозвана на
+    /// первом опросе, регистрация `S2C_CONNECT` снята до отпуска claim-а.
+    #[test]
+    fn connect_async_register_failure_frees_ack_before_claim() {
+        let name = unique("AREGACK");
+        let mut server = SharedServer::start(&name).unwrap();
+        crate::asynch::FAIL_REGISTER.with(|fail| fail.set(Some(PEER)));
+        let mut future = ConnectFuture::new(None, &name);
+        let mut cx = Context::from_waker(Waker::noop());
+        let polled = Pin::new(&mut future).poll(&mut cx);
+        crate::asynch::FAIL_REGISTER.with(|fail| fail.set(None));
+        match polled {
+            Poll::Ready(Err(ShmError::WindowsError {
+                context: "register (injected)",
+                ..
+            })) => {}
+            Poll::Ready(other) => panic!("ожидался отказ регистрации: {:?}", other.map(drop)),
+            Poll::Pending => panic!("инъекция отказа не сработала"),
+        }
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            CLAIM_FREE
+        );
+        next_client_gets_ack(&mut server, &name);
+        assert!(future.waits.is_empty(), "регистрации пережили Ready");
+        drop(future);
+    }
+
+    /// Успешное подключение: после `Ready(Ok)` в наборе нет регистраций
+    /// (процесс сервера в том числе), наблюдение за сервером отпущено.
+    #[test]
+    fn connect_async_ready_clears_all_registrations() {
+        let name = unique("AREADY");
+        let mut server = SharedServer::start(&name).unwrap();
+        let mut future = ConnectFuture::new(None, &name);
+        let client = std::thread::scope(|s| {
+            let accepting = s.spawn(|| server.wait_for_client(Some(Duration::from_secs(5))));
+            let client = poll_until_ready(&mut future).unwrap();
+            accepting.join().unwrap().unwrap();
+            client
+        });
+        assert!(future.waits.is_empty(), "регистрации пережили Ready");
+        assert!(
+            future.server.is_none(),
+            "handle процесса сервера не отпущен"
+        );
+        drop(future);
+        drop(client);
     }
 
     /// Сервер записал два кадра и ушёл (`disconnect_local`: состояния ->

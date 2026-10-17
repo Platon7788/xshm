@@ -72,6 +72,13 @@
 //! начатого пробуждения его `Waker` (контракт реактора, ложное пробуждение
 //! допустимо).
 //!
+//! - `connect_async`: регистрации снимаются ДО отзыва заявки на каждом
+//!   исходе (подключение, смерть сервера, отказ регистрации или сигнала,
+//!   `Drop`) -- отзыв последним шагом отпускает claim, и живая регистрация
+//!   на автосбросном `S2C_CONNECT` съела бы подтверждение следующего
+//!   клиента. Готовый future регистраций не держит, даже если исполнитель
+//!   не бросает его после `Ready`.
+//!
 //! # Не «fused»
 //!
 //! `recv_async`/`send_async` выполняют операцию на каждом опросе: после
@@ -143,6 +150,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Тесты (Task 4 надёжности): одноразовая инъекция отказа регистрации
+    /// -- `WaitSet::ensure` для этого индекса набора возвращает
+    /// `WindowsError { context: "register (injected)", .. }` (и сбрасывает
+    /// инъекцию).
+    pub(crate) static FAIL_REGISTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Вызвать тестовый хук `BEFORE_RECHECK` (если задан) -- в release его нет.
 #[cfg(test)]
 fn before_recheck(waits: &WaitSet) {
@@ -193,6 +210,14 @@ impl WaitSet {
         if let Some(slot) = self.regs.get_mut(index)
             && slot.is_none()
         {
+            #[cfg(test)]
+            if FAIL_REGISTER.with(std::cell::Cell::get) == Some(index) {
+                FAIL_REGISTER.with(|fail| fail.set(None));
+                return Err(ShmError::WindowsError {
+                    code: 0xC000_0001,
+                    context: "register (injected)",
+                });
+            }
             *slot = Some(Reactor::global()?.register(handle, waker.clone())?);
         }
         Ok(())
@@ -229,6 +254,12 @@ impl WaitSet {
                 }
             }
         }
+    }
+
+    /// Тесты: в наборе нет ни одной регистрации.
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.regs.iter().all(Option::is_none)
     }
 
     /// Снять всё: событие операции `op` и `DISCONNECT` -- с возвратом
