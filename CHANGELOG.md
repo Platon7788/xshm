@@ -219,7 +219,18 @@
   `FAIL`), ошибки и причины печатаются именами вариантов. Только публичный
   API, без зависимостей. Оркестраторы и матрица разрядностей живут в
   xhook (`tests_static/test_ipc_interop_*`, `scripts/run_interop.ps1`);
-  INTEROP §g.
+  INTEROP §g. Сценарии Multi и межъязыковых сессий (b7fb341):
+  `multi-server` (`kick=` — `disconnect_client`), `multi-client`
+  (`mode=echo|ping`), `server-sessions` (передача claim-а между языками),
+  `*-stall-leave`/`*-fill-wait`, `client-hello-die`, `client-echo busy=1`.
+
+- **`SharedServer::disconnect()`** (решение T): отключить текущего клиента
+  штатно — `IDLE`, затем `S2C_DISCONNECT`; данные в кольце клиент
+  дочитывает, claim снимает сам клиент (R18), сервер снова принимает
+  следующего. `Err(NotConnected)` — клиента нет. Раньше отключение клиента
+  было только внутренним (`disconnect_local`) — синхронному серверу
+  приходилось ронять канал целиком. Тест
+  `server::disconnect_tests::disconnect_kicks_client_and_accepts_next`.
 
 - **Маяк присутствия у каждого сервера** (надёжность, 17.10.2026, Task 11;
   INTEROP **R19**, «Изменения 0.10» п. 34). Каждый именованный сервер

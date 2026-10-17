@@ -1242,6 +1242,31 @@ impl SharedServer {
         self.signal_disconnect();
     }
 
+    /// Отключить текущего клиента штатно (0.10, решение T): состояния
+    /// рукопожатия -> `IDLE`, затем `S2C_DISCONNECT` (R14; клиент, спящий в
+    /// своём наборе ожидания, просыпается сразу). Данные, уже записанные
+    /// клиенту, остаются в кольце -- клиент дочитывает их до
+    /// `Err(NotConnected)` (`poll_server`, worker-ы Auto/Multi).
+    ///
+    /// Claim сессии сервер НЕ освобождает (R18): его снимает сам клиент,
+    /// получив `DISCONNECT` (уход L, последним шагом), -- иначе следующий
+    /// клиент мог бы захватить канал раньше, чем прежний заметил разрыв.
+    /// Клиента, умершего, так и не заметив разрыва, сервер освобождает по
+    /// подтверждённой смерти его процесса на первом толчке `CONNECT_REQ`
+    /// (Task 7). После возврата сервер снова принимает клиента
+    /// (`wait_for_client`, `accept_async`), как только прежний уйдёт.
+    ///
+    /// # Errors
+    ///
+    /// `NotConnected` -- клиента нет (не подключался или уже отключён).
+    pub fn disconnect(&mut self) -> Result<()> {
+        if !self.connected {
+            return Err(ShmError::NotConnected);
+        }
+        self.disconnect_local();
+        Ok(())
+    }
+
     /// `CONNECT_REQ` без заявки у неподключённого сервера single-client
     /// канала (ревизия 3, §2.3 дизайна): толчок проигравшего клиента --
     /// повод проверить протухший захват (см. `observe_idle_claim`).
@@ -2692,5 +2717,74 @@ mod presence_tests {
             client.send_to_server(b"late").err(),
             Some(ShmError::NotConnected)
         );
+    }
+}
+
+#[cfg(test)]
+mod disconnect_tests {
+    //! Решение T: публичное штатное отключение клиента сервером.
+
+    use super::*;
+    use crate::client::SharedClient;
+
+    fn accept(server: &mut SharedServer, name: &str) -> SharedClient {
+        let client = {
+            let name = name.to_owned();
+            std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)))
+        };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        client.join().unwrap().unwrap()
+    }
+
+    #[test]
+    fn disconnect_kicks_client_and_accepts_next() {
+        let name = format!("SRV_KICK_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        assert_eq!(server.disconnect(), Err(ShmError::NotConnected));
+        let mut first = accept(&mut server, &name);
+        server.send_to_client(b"last-word").unwrap();
+        let claim = server
+            .view()
+            .control_block()
+            .slot_claim
+            .load(Ordering::Acquire);
+        assert_ne!(claim, CLAIM_FREE);
+
+        assert_eq!(server.disconnect(), Ok(()));
+        assert!(!server.is_connected());
+        assert_eq!(server.disconnect(), Err(ShmError::NotConnected), "повтор");
+        // Claim живого клиента сервер не снимает (R18).
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            claim
+        );
+        // Клиент дочитывает и видит штатный разрыв.
+        assert_eq!(first.poll_server(Some(Duration::from_secs(1))), Ok(true));
+        let mut buffer = Vec::new();
+        let len = first.receive_from_server(&mut buffer).unwrap();
+        assert_eq!(&buffer[..len], b"last-word");
+        assert_eq!(
+            first.poll_server(Some(Duration::from_secs(1))),
+            Err(ShmError::NotConnected)
+        );
+        drop(first);
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            CLAIM_FREE,
+            "claim снял ушедший клиент"
+        );
+        let second = accept(&mut server, &name);
+        assert!(second.is_connected());
+        drop(second);
     }
 }

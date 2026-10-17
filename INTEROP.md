@@ -1552,6 +1552,18 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
 32-битного пира), запуск из своих тестов, проверки — на своей стороне. Так
 устроены оркестраторы xhook/xipc (`tests_static/test_ipc_interop_*.c`,
 `scripts/run_interop.ps1` — все четыре пары разрядностей C ↔ Rust).
+Сценарии Multi и межъязыковых сессий (b7fb341): `multi-server n=<слотов>
+ends=<k> [kick=<слот>]` (эхо XOR, `INFO connect=`/`disconnect=<слот>:<причина>`,
+`kick` — `disconnect_client` после первого кадра слота); `multi-client
+count=<k> mode=echo|ping` (`INFO slot=`/`reason=`); `server-sessions
+sessions=<k>` (повторное принятие на одном канале — передача claim-а между
+языками, `INFO handshake=HandshakeFailed` на брошенной заявке умершего);
+`*-stall-leave`, `*-fill-wait` (ожидание места, разбуженное `DISCONNECT`
+пира); `client-hello-die` (смерть со стоящей заявкой); `client-echo busy=1`
+(повтор `AlreadyConnected` до снятия протухшего захвата по толчку, `INFO
+busy_ms=`). Отключение клиента single-client сервером — с 0.10 публичный
+`SharedServer::disconnect()` (`IDLE`, затем `S2C_DISCONNECT`; claim снимает
+клиент, R18).
 
 ---
 
