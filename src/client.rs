@@ -865,15 +865,15 @@ impl Endpoint for SharedClient {
 }
 
 impl SharedClient {
-    /// Сессия всё ещё наша: `generation` не сменился (ревизия 2). Сменился
-    /// -- сервер уже провёл рукопожатие с другим клиентом этого канала/слота
-    /// (а наш `DISCONNECT` мог быть сброшен его `complete_handshake`).
     /// Тесты: токен claim-а этого клиента (`CLAIM_FREE` -- без claim).
     #[cfg(test)]
     pub(crate) const fn claim(&self) -> u32 {
         self.claim
     }
 
+    /// Сессия всё ещё наша: `generation` не сменился (ревизия 2). Сменился
+    /// -- сервер уже провёл рукопожатие с другим клиентом этого канала/слота
+    /// (а наш `DISCONNECT` мог быть сброшен его `complete_handshake`).
     pub(crate) fn is_session_current(&self) -> bool {
         self.view.control_block().generation.load(Ordering::Acquire) == self.generation
     }
