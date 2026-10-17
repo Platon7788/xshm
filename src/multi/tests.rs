@@ -617,7 +617,7 @@ fn denied_squatter_slot_does_not_disable_nudge() {
     thread::sleep(Duration::from_millis(100));
     assert!(try_claim_slot(None, &format!("{name}_0"), 0xC1A1_0003).unwrap());
     assert_eq!(
-        claim_free_slot(None, &name).unwrap_err(),
+        claim_free_slot(None, &name, 0).unwrap_err(),
         ShmError::AccessDenied
     );
 
@@ -873,12 +873,12 @@ fn corrupted_slot_count_is_ignored() {
         }
     }
     assert_eq!(
-        claim_free_slot(None, &name).unwrap_err(),
+        claim_free_slot(None, &name, 0).unwrap_err(),
         ShmError::NoFreeSlot
     );
     nudge_stale_claims(None, &name); // не паникует на испорченном числе
     assert_eq!(
-        claim_free_slot(None, &unique("NO_SERVER")).unwrap_err(),
+        claim_free_slot(None, &unique("NO_SERVER"), 0).unwrap_err(),
         ShmError::NotConnected
     );
     server.stop();
@@ -2572,5 +2572,62 @@ fn multi_client_finds_beaconless_server_by_fallback() {
         "подключение через {took:?}"
     );
     drop(client);
+    server.stop();
+}
+
+/// T11b (поведение клиента C): рукопожатие на слоте 0 не удаётся (его
+/// `client_state` испорчен -- C6 проваливается, `HandshakeFailed`), слот 1
+/// свободен -- клиент переходит к нему, а не повторяет слот 0 вечно.
+#[test]
+fn failed_handshake_moves_to_next_slot() {
+    let name = unique("NEXT_SLOT");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    {
+        let slots = server.slots.read().unwrap();
+        let slot0 = slots[0].lock().unwrap();
+        slot0
+            .server
+            .view()
+            .control_block()
+            .client_state
+            .store(0xDEAD_BEEF, Ordering::Release);
+    }
+    let recorder = Arc::new(PresenceRecorder::default());
+    let client = MultiClient::connect(
+        &name,
+        recorder.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_millis(50),
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("client connect");
+    wait_for(
+        "подключение к слоту 1",
+        Duration::from_secs(3),
+        || client.is_connected(),
+    );
+    assert_eq!(client.slot_id(), 1);
+    assert_eq!(
+        recorder.errors.lock().unwrap().clone(),
+        vec![ShmError::HandshakeFailed]
+    );
+    drop(client);
+    server.stop();
+}
+
+/// Перебор с `start` по кругу: со слота за последним -- снова с нуля.
+#[test]
+fn claim_scan_wraps_around() {
+    let name = unique("WRAP");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    let (slot, slot_name, token) = claim_free_slot(None, &name, 1).unwrap();
+    assert_eq!(slot, 1);
+    release_claim(None, &slot_name, token);
+    let (slot, slot_name, token) = claim_free_slot(None, &name, 2).unwrap();
+    assert_eq!(slot, 0, "за последним слотом -- снова с нуля");
+    release_claim(None, &slot_name, token);
     server.stop();
 }

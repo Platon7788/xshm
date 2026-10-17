@@ -2460,10 +2460,14 @@ fn client_worker(
         reported: Reported::default(),
     };
 
+    // Слот, с которого начинать перебор: после неудачного рукопожатия --
+    // следующий за неудачным (T11b, как клиент C), иначе -- с нуля.
+    let mut next_slot = 0;
+
     while running.load(Ordering::Acquire) {
         report_evicted(outbox, handler);
         // Шаг 1: атомарно захватываем свободный слот (без централизованного lobby).
-        let (slot_id, slot_name, token) = match claim_free_slot(namespace, base_name) {
+        let (slot_id, slot_name, token) = match claim_free_slot(namespace, base_name, next_slot) {
             Ok(v) => v,
             Err(err) => {
                 // Возможно, слот держит захват упавшего клиента: толкаем
@@ -2525,6 +2529,10 @@ fn client_worker(
                 // Не подключились — освобождаем захваченный слот (best-effort;
                 // иначе сервер вернёт его в оборот по RESERVE_TIMEOUT).
                 release_claim(namespace, &slot_name, token);
+                // Следующая попытка -- со следующего слота (T11b): слот, чьё
+                // рукопожатие не удаётся (испорчен, сервер его не обслуживает),
+                // не держит клиента, пока остальные свободны.
+                next_slot = slot_id.saturating_add(1);
                 // Task 11: процесс сервера слота завершился (слоты держит
                 // кто-то ещё) -- сервера нет, сон на маяке базы; прочее --
                 // прежняя пауза, одинаковая ошибка подряд -- один раз.
@@ -2541,6 +2549,7 @@ fn client_worker(
             }
         };
         waiter.reported.clear();
+        next_slot = 0;
 
         let layout = *client.layout();
         outbox
@@ -2902,20 +2911,30 @@ fn nudge_stale_claims(namespace: Option<&PrivateNamespace>, base_name: &str) {
 /// (слоты есть, все заняты) > `NotConnected` (ни одного слота -- сервер не
 /// запущен). Иначе клиент пользователя против службы SYSTEM с политикой по
 /// умолчанию видел бы вечный `NotConnected` -- неотличимо от «сервера нет».
+///
+/// `start` (T11b, поведение клиента C): перебор начинается со слота `start`
+/// и по кругу возвращается к `0..start` -- клиент, чьё рукопожатие на слоте
+/// `k` не удалось, следующей попыткой берёт `k + 1`, а не снова `k` (иначе
+/// испорченный слот 0 держал бы клиента вечно, хотя остальные свободны).
+/// Отсутствующий слот завершает только свою часть круга.
 fn claim_free_slot(
     namespace: Option<&PrivateNamespace>,
     base_name: &str,
+    start: u32,
 ) -> Result<(u32, String, u32)> {
     let token = crate::shared::claim_token();
     let mut saw_slot = false;
     let mut denied = false;
-    for slot_id in 0..MAX_MULTI_CLIENTS {
-        let slot_name = format!("{base_name}_{slot_id}");
-        match try_claim_slot(namespace, &slot_name, token) {
-            Ok(true) => return Ok((slot_id, slot_name, token)),
-            Ok(false) => saw_slot = true,
-            Err(ShmError::AccessDenied) => denied = true,
-            Err(_) => break, // слотов больше нет
+    let start = start.min(MAX_MULTI_CLIENTS);
+    for range in [start..MAX_MULTI_CLIENTS, 0..start] {
+        for slot_id in range {
+            let slot_name = format!("{base_name}_{slot_id}");
+            match try_claim_slot(namespace, &slot_name, token) {
+                Ok(true) => return Ok((slot_id, slot_name, token)),
+                Ok(false) => saw_slot = true,
+                Err(ShmError::AccessDenied) => denied = true,
+                Err(_) => break, // слотов дальше нет
+            }
         }
     }
     if denied {
