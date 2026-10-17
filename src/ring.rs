@@ -1308,9 +1308,20 @@ impl RingBuffer {
                     self.disarm_space_waiter();
                     return Err(err);
                 }
-                // SPACE или конец таймаута: верх цикла перепроверит место и
-                // дедлайн.
-                Ok(Some(0) | None) => {}
+                // Конец таймаута: верх цикла перепроверит место и дедлайн.
+                Ok(None) => {}
+                // SPACE: верх цикла перепроверит место. Места нет -- сигнал
+                // пустой; процесс читателя стоит в наборе после `SPACE`, и
+                // поток пустых сигналов скрывал бы его смерть до таймаута
+                // (Task 10 N1, П1): одна проверка -- нулевое ожидание.
+                Ok(Some(0)) => {
+                    if !self.free_space().fits(payload_len)
+                        && peer.is_some_and(ProcessWatch::has_exited)
+                    {
+                        self.disarm_space_waiter();
+                        return Err(ShmError::PeerDied);
+                    }
+                }
                 Ok(Some(i)) if Some(i) == disconnect_index => {
                     if let Some(d) = disconnect
                         && (d.peer_left)()
@@ -1322,7 +1333,15 @@ impl RingBuffer {
                         self.disarm_space_waiter();
                         return Err(ShmError::NotConnected);
                     }
-                    // Устаревший сигнал прошлой сессии -- поглощён, ждём дальше.
+                    // Устаревший сигнал прошлой сессии -- поглощён, ждём
+                    // дальше. Процесс читателя -- за ним в наборе: смерть,
+                    // скрытая потоком устаревших сигналов, видна здесь (N1).
+                    if !self.free_space().fits(payload_len)
+                        && peer.is_some_and(ProcessWatch::has_exited)
+                    {
+                        self.disarm_space_waiter();
+                        return Err(ShmError::PeerDied);
+                    }
                 }
                 Ok(Some(i)) => {
                     debug_assert_eq!(Some(i), peer_index);
@@ -1517,7 +1536,16 @@ impl RingBuffer {
             #[cfg(test)]
             DATA_KERNEL_WAITS.with(|c| c.set(c.get() + 1));
             match wait_any(&handles[..count], remaining)? {
-                Some(0) => return Ok(true),
+                Some(0) => {
+                    // Пустой `DATA` (кольцо пусто): процесс писателя стоит в
+                    // наборе после него, и поток пустых сигналов скрывал бы
+                    // его смерть (Task 10 N1, П1) -- одна проверка, только
+                    // на пустом сигнале (на сигнале с данными -- ни одной).
+                    if self.is_empty() && peer.is_some_and(ProcessWatch::has_exited) {
+                        return self.left_outcome(ShmError::PeerDied);
+                    }
+                    return Ok(true);
+                }
                 None => return Ok(false),
                 Some(i) if Some(i) == disconnect_index => {
                     if let Some(d) = disconnect
@@ -1529,8 +1557,13 @@ impl RingBuffer {
                         let _ = d.event.set();
                         return self.left_outcome(ShmError::NotConnected);
                     }
-                    // Устаревший сигнал прошлой сессии -- поглощён. Дедлайн
+                    // Устаревший сигнал прошлой сессии -- поглощён. Процесс
+                    // писателя -- за ним в наборе: смерть, скрытая потоком
+                    // устаревших сигналов, видна здесь (Task 10 N1). Дедлайн
                     // истёк -- таймаут без лишнего ожидания в ядре.
+                    if peer.is_some_and(ProcessWatch::has_exited) {
+                        return self.left_outcome(ShmError::PeerDied);
+                    }
                     if deadline.is_some_and(|at| Instant::now() >= at) {
                         return Ok(false);
                     }
@@ -3681,5 +3714,122 @@ mod lagging_count_tests {
             let per_write = started.elapsed() / WRITES;
             println!("max_messages {limit}: {per_write:?} на запись");
         }
+    }
+}
+
+#[cfg(test)]
+mod stale_flood_tests {
+    //! Task 10 N1 (перенесено в Task 11): объект пира, стоящий в наборе
+    //! ПОСЛЕ поглощаемого события, проверяется на каждом пустом сигнале.
+    //! «Поток» пустых сигналов моделирует событие с ручным сбросом: оно
+    //! взведено на каждом ожидании, и без проверки процесс писателя/читателя
+    //! (следующий индекс) не был бы виден до таймаута.
+
+    use super::overflow_race_tests::make_ring;
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+
+    /// Процесс, который уже завершился (handle держит `ProcessWatch`).
+    fn dead_peer() -> ProcessWatch {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .unwrap();
+        let watch = ProcessWatch::open(child.id()).unwrap();
+        child.wait().unwrap();
+        assert!(watch.has_exited());
+        watch
+    }
+
+    #[test]
+    fn data_flood_does_not_hide_writer_death() {
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(true).unwrap();
+        data.set().unwrap();
+        let peer = dead_peer();
+        assert_eq!(
+            ring.wait_for_data(
+                &data,
+                Some(&peer),
+                None,
+                Some(Duration::from_secs(2)),
+                SpinPolicy::NONE
+            ),
+            Err(ShmError::PeerDied)
+        );
+    }
+
+    #[test]
+    fn stale_disconnect_flood_does_not_hide_writer_death() {
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let disconnect = EventHandle::create_unnamed(true).unwrap();
+        disconnect.set().unwrap();
+        let left = AtomicBool::new(false);
+        let peer_left = || left.load(O::Acquire);
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+        let peer = dead_peer();
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(
+                &data,
+                Some(&peer),
+                Some(&watch),
+                Some(Duration::from_secs(2)),
+                SpinPolicy::NONE
+            ),
+            Err(ShmError::PeerDied)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn space_and_disconnect_floods_do_not_hide_reader_death() {
+        let (ring, _mem) = make_ring();
+        const LEN: usize = 60_000;
+        while ring.try_write_message(&vec![0u8; LEN]).is_ok() {}
+        let peer = dead_peer();
+        let left = AtomicBool::new(false);
+        let peer_left = || left.load(O::Acquire);
+        // Пустой SPACE.
+        let space = EventHandle::create_unnamed(true).unwrap();
+        space.set().unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                Some(&peer),
+                None,
+                Some(Duration::from_secs(2)),
+                SpinPolicy::NONE
+            ),
+            Err(ShmError::PeerDied)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // Устаревший DISCONNECT.
+        let space = EventHandle::create_unnamed(false).unwrap();
+        let disconnect = EventHandle::create_unnamed(true).unwrap();
+        disconnect.set().unwrap();
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_space(
+                LEN,
+                Some(&space),
+                Some(&peer),
+                Some(&watch),
+                Some(Duration::from_secs(2)),
+                SpinPolicy::NONE
+            ),
+            Err(ShmError::PeerDied)
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }

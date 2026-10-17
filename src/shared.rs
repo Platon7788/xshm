@@ -199,6 +199,27 @@ impl SharedView {
         published.then_some(control)
     }
 
+    /// PID и время создания сервера из `ControlBlock` чужого сегмента ЛЮБОЙ
+    /// версии формата (0.10, маяк присутствия: клиент, отвергнутый
+    /// несовместимым сервером, ждёт выхода его процесса). Поля
+    /// `server_pid`/`server_start_*` с 0.9 на прежних смещениях (INTEROP
+    /// §c.1). `None` -- заголовок не отображён, сегмент не опубликован
+    /// (`magic`) или PID не указан.
+    pub(crate) fn peek_server(mapping: &crate::win::Mapping) -> Option<(u32, u64)> {
+        if mapping.size() < SEGMENT_HEADER_SIZE {
+            return None;
+        }
+        // SAFETY: отображение не меньше заголовка (проверено), адрес view
+        // выровнен на гранулу выделения; ссылка живёт не дольше `mapping`;
+        // поля атомарные (данные пира -- только читаются).
+        let control = unsafe { &*mapping.as_ptr().cast::<ControlBlock>() };
+        if control.magic.load(Ordering::Acquire) != SHARED_MAGIC {
+            return None;
+        }
+        let pid = control.server_pid.load(Ordering::Acquire);
+        (pid != 0).then(|| (pid, control.server_start_time()))
+    }
+
     /// Раскладка канала (проверенная копия).
     pub const fn layout(&self) -> &ChannelLayout {
         &self.layout

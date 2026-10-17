@@ -46,6 +46,11 @@ Bidirectional messaging over lock-free SPSC ring buffers, backed by direct NT AP
   `CurrentUserAllowLowIntegrity`, `Everyone` (the ≤ 0.9 behavior) or your own
   `Descriptor`. A denied open is `ShmError::AccessDenied`. See
   [Object Security](#object-security-010).
+- ✅ **Presence beacon** — every named server (single-client, Auto, Dispatch lobby,
+  Multi base) raises `<name>_beacon` once it is ready and lowers it first on
+  shutdown; `AutoClient`/`MultiClient` without a server sleep on it instead of
+  retrying every 250 ms and connect as soon as the server appears;
+  `SharedClient::wait_for_server`. See [Server discovery](#server-discovery).
 - ✅ **Private namespaces** — `PrivateNamespace` puts channels, lobbies, Multi slots
   and beacons into a boundary-descriptor directory that other users cannot see or
   squat. See [Private Namespace](#private-namespace-010).
@@ -892,8 +897,56 @@ handshake time is ignored.
 
 ### Server discovery
 
-A client that waits for a server (e.g. a profiler waiting for its viewer)
-should not poll for it. `Beacon` is a named manual-reset event:
+**Presence beacon (0.10).** Every named server keeps a presence beacon for its
+name: `SharedServer::start*`, `AutoServer` and the Dispatch lobby hold
+`<name>_beacon`, a `MultiServer` holds one `<base>_beacon` (not one per slot);
+Dispatch's per-client channels have none. The beacon lives in the channel's
+namespace (including a `PrivateNamespace`) with the channel's security policy.
+It is raised only after the section and all 7 events are published (Multi:
+after all slots) and lowered as the very first step of `Drop`/`stop`, so
+"beacon raised, no channel" only ever means "the server crashed".
+
+Clients use it on their own — nothing to write:
+
+- `AutoClient` / `MultiClient` that find **no server** sleep in the kernel on
+  `[wake, beacon]` and connect right after the server raises it (no
+  `reconnect_delay`/`retry_delay` polling, zero wake-ups while the server is
+  absent). A beacon left raised by a crashed server is cleared with
+  `clear_if_stale` and the client keeps sleeping. A server that **refuses** the
+  client (other memory format, corruption, access denied) is waited out:
+  the client sleeps until that server process exits.
+- `on_error` reports the same error once per out-of-connection episode
+  (`AlreadyConnected` / `NoFreeSlot` are still reported on every attempt).
+- The old pause remains for a busy channel, after a `Timeout`, once after a
+  session ends (not after `PeerDied`) and as a fallback when the beacon is
+  unusable (no access, no `SeCreateGlobalPrivilege` for `Global\`).
+- A client that starts first creates the beacon with its own policy
+  (`AutoOptions::security`, `MultiClientOptions::security`): the first creator
+  sets the DACL, so a `Global\` service with `ObjectSecurity::Everyone` needs
+  the same policy on its clients (or must start first).
+
+Synchronous code can wait the same way:
+
+```rust
+use std::time::Duration;
+use xshm::SharedClient;
+
+if SharedClient::wait_for_server("MyChannel", Some(Duration::from_secs(30)))? {
+    let client = SharedClient::connect("MyChannel", Duration::from_secs(2))?;
+    // ...
+}
+```
+
+(`wait_for_server_in(&ns, name, timeout)` for a private namespace.)
+
+Native peers acting as a server must follow the same rule (INTEROP R19);
+otherwise a Rust client that started first sleeps until a server with a
+beacon appears.
+
+**Your own discovery loop.** A client that waits for a server (e.g. a profiler
+waiting for its viewer) should not poll for it. `Beacon` is a named
+manual-reset event — the Dispatch lobby raises it automatically since 0.10;
+a manual `raise` is harmless:
 
 ```rust
 use xshm::{Beacon, DispatchClient};
@@ -925,8 +978,9 @@ loop {
 }
 ```
 
-Server order: create the lobby first (`DispatchServer::start` is synchronous),
-then `raise()`; on shutdown `lower()` first, then stop. Clients never call
+Server order: create the lobby first (`DispatchServer::start` is synchronous
+and, since 0.10, raises the beacon itself), then `raise()` if you still do it;
+on shutdown `lower()` first, then stop. Clients never call
 `raise`/`lower` on the named beacon: `raise` publishes the caller as the
 server in `<name>_beacon_state`. `ProcessExit::open(pid)`
 plus `xshm::wait_any` lets a client that was refused by a server sleep until

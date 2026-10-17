@@ -309,11 +309,15 @@ fn multi_client_reports_access_denied() {
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while errors.0.lock().unwrap().len() < 2 {
+    while errors.0.lock().unwrap().is_empty() {
         assert!(Instant::now() < deadline, "нет on_error");
         thread::sleep(Duration::from_millis(5));
     }
+    // 0.10 (Task 11): о той же ошибке вне подключения -- один раз за
+    // эпизод; повторы (`retry_delay` = 20 мс) идут молча.
+    thread::sleep(Duration::from_millis(200));
     client.stop();
+    assert_eq!(errors.0.lock().unwrap().len(), 1);
     let seen = errors.0.lock().unwrap().clone();
     assert!(
         seen.iter().all(|e| *e == ShmError::AccessDenied),
@@ -370,4 +374,82 @@ fn foreign_user_is_denied() {
 fn hold_channel_for_foreign_user() {
     let _server = SharedServer::start("Local\\XSHM_SECURITY_FOREIGN").unwrap();
     thread::sleep(Duration::from_secs(120));
+}
+
+/// Task 11 (R19): маяк присутствия создаётся с политикой канала (Auto,
+/// база Multi, лобби Dispatch). Клиент, которому DACL сервера отказал и в
+/// канале, и в маяке, переходит на резервный повтор по таймеру (решение
+/// R-M) и сообщает `AccessDenied` один раз, а не на каждой попытке.
+#[test]
+fn presence_objects_use_channel_policy() {
+    #[derive(Default)]
+    struct Errors(Mutex<Vec<ShmError>>);
+    impl AutoHandler for Errors {
+        fn on_error(&self, err: ShmError) {
+            self.0.lock().unwrap().push(err);
+        }
+    }
+
+    let name = unique_name("PRESENCE_DENIED");
+    let server = AutoServer::start(
+        &name,
+        Arc::new(Quiet),
+        AutoOptions {
+            security: deny_all(),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(Beacon::open(&name).err(), Some(ShmError::AccessDenied));
+
+    let errors = Arc::new(Errors::default());
+    let client = xshm::AutoClient::connect(
+        &name,
+        errors.clone(),
+        AutoOptions {
+            reconnect_delay: Duration::from_millis(20),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while errors.0.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "нет on_error");
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Около 50 резервных попыток за секунду -- и ни одной новой ошибки.
+    thread::sleep(Duration::from_secs(1));
+    client.stop();
+    assert_eq!(
+        errors.0.lock().unwrap().clone(),
+        vec![ShmError::AccessDenied]
+    );
+    server.stop();
+
+    let multi = unique_name("PRESENCE_MULTI");
+    let multi_server = MultiServer::start(
+        &multi,
+        Arc::new(Quiet),
+        MultiOptions {
+            max_clients: 1,
+            security: deny_all(),
+            ..MultiOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(Beacon::open(&multi).err(), Some(ShmError::AccessDenied));
+    multi_server.stop();
+
+    let lobby = unique_name("PRESENCE_LOBBY");
+    let dispatch = DispatchServer::start(
+        &lobby,
+        Arc::new(Quiet),
+        DispatchOptions {
+            security: deny_all(),
+            ..DispatchOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(Beacon::open(&lobby).err(), Some(ShmError::AccessDenied));
+    dispatch.stop();
 }

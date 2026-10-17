@@ -484,3 +484,78 @@ fn creator_drop_keeps_namespace_for_peers() {
         .unwrap();
     client.join().unwrap().unwrap();
 }
+
+/// Task 11 (R19): маяк присутствия канала в пространстве -- относительное
+/// имя в нём: клиент снаружи его не видит (ждёт впустую), клиент внутри
+/// дожидается сервера без опроса -- и синхронно (`wait_for_server_in`), и
+/// `AutoClient`, стартовавший раньше сервера (`reconnect_delay` = 10 с).
+#[test]
+fn presence_inside_private_namespace() {
+    let boundary = unique("B_PRESENCE");
+    let name = unique("PRESENCE");
+
+    let waiter = {
+        let (ns, name) = (namespace(&boundary), name.clone());
+        thread::spawn(move || {
+            let waited =
+                SharedClient::wait_for_server_in(&ns, &name, Some(Duration::from_secs(10)));
+            (waited, std::time::Instant::now())
+        })
+    };
+    let (connected, connects) = mpsc::channel();
+    struct Connected(mpsc::Sender<std::time::Instant>);
+    impl AutoHandler for Connected {
+        fn on_connect(&self) {
+            self.0.send(std::time::Instant::now()).ok();
+        }
+    }
+    let client = AutoClient::connect(
+        &name,
+        Arc::new(Connected(connected)),
+        AutoOptions {
+            namespace: Some(namespace(&boundary)),
+            reconnect_delay: Duration::from_secs(10),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    thread::sleep(Duration::from_millis(300));
+
+    let started = std::time::Instant::now();
+    let server_ns = namespace(&boundary);
+    let server = AutoServer::start(
+        &name,
+        Arc::new(Inbox(mpsc::channel().0)),
+        AutoOptions {
+            namespace: Some(Arc::clone(&server_ns)),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+
+    let (waited, woke_at) = waiter.join().unwrap();
+    assert_eq!(waited, Ok(true));
+    assert!(woke_at - started <= Duration::from_millis(300));
+    let connected_at = connects.recv_timeout(Duration::from_secs(15)).unwrap();
+    assert!(
+        connected_at - started <= Duration::from_millis(300),
+        "AutoClient в пространстве подключился через {:?}",
+        connected_at - started
+    );
+
+    // Маяк -- в пространстве: внутри взведён, снаружи -- другой объект.
+    let inside = Beacon::open_in(&server_ns, &name, &ObjectSecurity::default()).unwrap();
+    assert!(inside.is_raised().unwrap());
+    let outside = Beacon::open(&name).unwrap();
+    assert!(!outside.is_raised().unwrap());
+    assert_eq!(
+        SharedClient::wait_for_server(&name, Some(Duration::from_millis(100))),
+        Ok(false),
+        "снаружи пространства сервера нет"
+    );
+
+    client.stop();
+    server.stop();
+    drop(server);
+    assert!(!inside.is_raised().unwrap(), "маяк остался после остановки");
+}

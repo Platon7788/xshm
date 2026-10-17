@@ -17,6 +17,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
+use crate::presence::{Presence, ServerPresence};
 use crate::ring::{
     DisconnectWatch, DrainBound, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome,
     deadline_of, spin_until,
@@ -370,6 +371,10 @@ pub struct SharedServer {
     lingering: Option<Lingering>,
     /// Срок протухшего захвата (`RESERVE_TIMEOUT`; тесты подменяют).
     reserve_timeout: Duration,
+    /// Маяк присутствия `<имя>_beacon` (0.10, R19): взведён после публикации
+    /// канала, сбрасывается первым шагом `Drop`. `None` -- anonymous,
+    /// выделенный канал Dispatch, слот Multi (маяк у базы).
+    presence: Option<ServerPresence>,
     /// Тесты: пробуждения ожиданий `wait_for_client*` (включая внутренние
     /// повторы после `CONNECT_REQ` без заявки).
     #[cfg(test)]
@@ -415,6 +420,17 @@ impl SharedServer {
     /// let server = SharedServer::start_with("Global\\MyService", &config)?;
     /// # Ok::<(), xshm::ShmError>(())
     /// ```
+    ///
+    /// **Маяк присутствия** (0.10, INTEROP R19): рядом с каналом сервер
+    /// держит маяк `<имя>_beacon` (событие-уведомление + секция состояния
+    /// `<имя>_beacon_state`, см. [`Beacon`](crate::Beacon)) в том же
+    /// пространстве имён и с той же политикой `config.security`. Он
+    /// взводится после публикации секции и всех событий и сбрасывается
+    /// первым шагом `Drop`: клиент, стартовавший раньше сервера
+    /// (`AutoClient`, `MultiClient`, [`SharedClient::wait_for_server`](
+    /// crate::SharedClient::wait_for_server)), спит на нём в ядре, а не
+    /// опрашивает. Маяк уже занят объектом другого типа или с чужим DACL --
+    /// ошибка старта, как занятое имя секции.
     pub fn start_with(name: &str, config: &ChannelConfig) -> Result<Self> {
         Self::start_slot(
             config.namespace.as_ref(),
@@ -422,19 +438,23 @@ impl SharedServer {
             config.layout,
             0,
             &config.security.attributes()?,
+            Presence::On,
         )
     }
 
     /// Сервер канала `name`, публикующий в `ControlBlock::slot_count` число
     /// `slot_count` (Multi: `max_clients`; `0` -- не Multi). Дескриптор
-    /// `security` -- общий для секции и всех событий канала (Multi строит его
-    /// один раз на все слоты).
+    /// `security` -- общий для секции, всех событий канала и маяка
+    /// присутствия (Multi строит его один раз на все слоты). `presence` --
+    /// держать ли маяк присутствия `<имя>_beacon` (R19; слоты Multi и
+    /// выделенные каналы Dispatch -- `Off`).
     pub(crate) fn start_slot(
         namespace: Option<&Arc<PrivateNamespace>>,
         name: &str,
         layout: ChannelLayout,
         slot_count: u32,
         security: &SecurityAttributes,
+        presence: Presence,
     ) -> Result<Self> {
         layout.validate()?;
         let root = namespace.map(Arc::as_ref);
@@ -448,6 +468,14 @@ impl SharedServer {
         server.exclusive = slot_count == 0;
         server.events = Some(SharedEvents::create(root, name, security)?);
         server._namespace = namespace.cloned();
+        if presence == Presence::On {
+            let beacon = ServerPresence::create(namespace, name, security)?;
+            // R19: взвод -- строго ПОСЛЕ публикации секции (`magic` в
+            // `from_mapping`) и всех 7 событий: клиент, проснувшийся по
+            // маяку, не получает `NOT_FOUND`.
+            beacon.raise()?;
+            server.presence = Some(beacon);
+        }
         Ok(server)
     }
 
@@ -513,6 +541,7 @@ impl SharedServer {
             claim_seen: None,
             lingering: None,
             reserve_timeout: crate::constants::RESERVE_TIMEOUT,
+            presence: None,
             #[cfg(test)]
             wait_wakeups: Arc::default(),
             _namespace: None,
@@ -1733,6 +1762,12 @@ impl Drop for AcceptFuture<'_> {
 
 impl Drop for SharedServer {
     fn drop(&mut self) {
+        // R19: маяк присутствия -- ПЕРВЫМ шагом, до `IDLE` и закрытия
+        // объектов: «маяк взведён, канала нет» остаётся признаком падения
+        // сервера, а не его штатного ухода.
+        if let Some(presence) = self.presence.take() {
+            presence.lower();
+        }
         let control = self.view.control_block();
         control
             .server_state
@@ -1859,20 +1894,7 @@ mod handshake_tests {
         HANDSHAKE_HOOK.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
     }
 
-    /// PID и время создания уже завершившегося процесса.
-    fn dead_process() -> (u32, u64) {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "exit"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let watch = ProcessWatch::open(pid).unwrap();
-        let start = watch.start_time().unwrap();
-        child.wait().unwrap();
-        drop(watch);
-        drop(child);
-        (pid, start)
-    }
+    use crate::test_support::dead_process;
 
     /// G2 (§7.1 п. 5): между публикацией `generation` (S3) и фиксацией (S5)
     /// клиент P отозвал заявку, а A выставил свою -- уже при новом
@@ -2577,5 +2599,76 @@ mod poll_tests {
             Err(ShmError::NotConnected)
         );
         assert!(!server.is_connected());
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    //! Task 11 надёжности (R19): маяк присутствия сервера взводится после
+    //! публикации секции и всех событий и сбрасывается первым в `Drop`.
+
+    use super::*;
+    use crate::beacon::Beacon;
+    use crate::client::SharedClient;
+    use crate::events::SharedEvents;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "SRV_PRES_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// Клиент, проснувшийся по маяку, застаёт секцию и все 7 событий (ни
+    /// одного `NOT_FOUND`); после `drop(server)` маяк сброшен, а клиент
+    /// подключённой сессии видит `NotConnected`, а не исчезнувший канал.
+    #[test]
+    fn presence_raised_after_publish_lowered_first_in_drop() {
+        for round in 0..200 {
+            let name = unique(&format!("ORDER{round}"));
+            let waiter = {
+                let name = name.clone();
+                std::thread::spawn(move || {
+                    let beacon = Beacon::open(&name).unwrap();
+                    assert!(
+                        beacon.wait(Some(Duration::from_secs(5))).unwrap(),
+                        "маяк не взведён"
+                    );
+                    Mapping::open(ObjectPath::mapping(None, &name)).expect("секция");
+                    SharedEvents::open_in(None, &name).expect("события");
+                    beacon
+                })
+            };
+            // Дать ждущему открыть маяк раньше сервера (порядок любой).
+            if round % 2 == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let server = SharedServer::start(&name).unwrap();
+            let beacon = waiter.join().unwrap();
+            assert!(beacon.is_raised().unwrap());
+            drop(server);
+            assert!(!beacon.is_raised().unwrap(), "маяк остался после Drop");
+        }
+
+        let name = unique("SESSION");
+        let mut server = SharedServer::start(&name).unwrap();
+        let client = {
+            let name = name.clone();
+            std::thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)))
+        };
+        server
+            .wait_for_client(Some(Duration::from_secs(5)))
+            .unwrap();
+        let client = client.join().unwrap().unwrap();
+        let beacon = Beacon::open(&name).unwrap();
+        assert!(beacon.is_raised().unwrap());
+        drop(server);
+        assert!(!beacon.is_raised().unwrap());
+        assert_eq!(
+            client.send_to_server(b"late").err(),
+            Some(ShmError::NotConnected)
+        );
     }
 }

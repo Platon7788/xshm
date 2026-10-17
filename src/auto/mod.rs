@@ -10,6 +10,7 @@ use crate::constants::{FRAME_ALIGN, MAX_RING_CAPACITY, MIN_MESSAGE_SIZE};
 use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
+use crate::presence::{self, Failure, Presence, PresenceWait, PresenceWatch, Reported};
 use crate::ring::{FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -83,13 +84,15 @@ pub trait AutoHandler: Send + Sync + 'static {
     /// — `try_send`, получивший `QueueFull`, стоит повторить.
     fn on_space_available(&self, _direction: ChannelKind) {}
     /// Ошибка worker-а. Клиент (`AutoClient::connect`): неудачная попытка
-    /// подключения приходит сюда и повторяется через `reconnect_delay`. В
-    /// том числе `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал
-    /// занят другим клиентом -- повтор, пока канал не освободится, но с
-    /// растущим отступом: пауза удваивается от `reconnect_delay` до 2 с
-    /// (`BUSY_RECONNECT_CAP`; больший `reconnect_delay` -- без роста), любой
-    /// другой исход попытки её сбрасывает. Выделенный канал Dispatch не
-    /// повторяет: `AlreadyConnected` там -- канал занят чужим.
+    /// подключения приходит сюда (0.10, Task 11: одна и та же ошибка --
+    /// один раз за эпизод вне подключения, кроме `AlreadyConnected`), а
+    /// следующая попытка -- по событию (см. `AutoOptions::reconnect_delay`).
+    /// `AlreadyConnected` (0.10, ревизия 3 рукопожатия): канал занят другим
+    /// клиентом -- о каждой попытке, повтор с растущим отступом: пауза
+    /// удваивается от `reconnect_delay` до 2 с (`BUSY_RECONNECT_CAP`;
+    /// больший `reconnect_delay` -- без роста), любой другой исход попытки
+    /// её сбрасывает. Выделенный канал Dispatch не повторяет:
+    /// `AlreadyConnected` там -- канал занят чужим.
     fn on_error(&self, _err: ShmError) {}
 }
 
@@ -106,6 +109,20 @@ pub struct AutoOptions {
     /// использует). Канал занят другим клиентом (`AlreadyConnected`) --
     /// пауза удваивается с каждой неудачей до 2 с (или остаётся этой, если
     /// она больше); первый повтор -- через `reconnect_delay`.
+    ///
+    /// 0.10 (Task 11, INTEROP R19): **сервера нет** (секции или событий нет,
+    /// сегмент не опубликован, процесс сервера завершился) -- клиент НЕ
+    /// опрашивает раз в `reconnect_delay`, а спит в ядре на маяке
+    /// присутствия канала `<имя>_beacon` (его держит каждый именованный
+    /// сервер) и подключается сразу, как сервер его взведёт; маяк,
+    /// оставленный упавшим сервером, клиент гасит (`Beacon::clear_if_stale`)
+    /// и спит дальше. **Сервер есть, но подключиться нельзя** (другой формат
+    /// памяти, порча, отказ в доступе) -- клиент спит до выхода процесса
+    /// этого сервера. Пауза `reconnect_delay` остаётся: разовая после конца
+    /// сессии (после смерти сервера -- без неё), при занятом канале и как
+    /// резерв (решение R-M) -- сервер не ответил за `connect_timeout`, маяк
+    /// недоступен (нет прав или привилегии `Global\`), процесс сервера не
+    /// открылся.
     pub reconnect_delay: Duration,
     /// Сколько `AutoClient` ждёт ответа сервера на одну попытку
     /// подключения (`AutoServer` не использует).
@@ -122,9 +139,16 @@ pub struct AutoOptions {
     /// направлению). Использует только `AutoServer`: клиент получает её из
     /// сегмента (`AutoClient::layout`).
     pub layout: ChannelLayout,
-    /// Политика безопасности объектов канала (0.10; до 0.10 -- NULL DACL).
-    /// Использует только `AutoServer`: клиент объекты открывает, а не
-    /// создаёт. По умолчанию -- `ObjectSecurity::CurrentUser`.
+    /// Политика безопасности объектов канала (0.10; до 0.10 -- NULL DACL):
+    /// `AutoServer` -- секции, 7 событий и маяка присутствия `<имя>_beacon`
+    /// (R19). `AutoClient` объекты канала открывает, а не создаёт, но маяк
+    /// присутствия создаёт сам, если пришёл раньше сервера (Task 11), -- с
+    /// этой политикой. DACL маяка задаёт тот, кто создал его первым
+    /// (решение R-L): служба на `Global\` с `ObjectSecurity::Everyone`
+    /// требует той же политики у клиентов (или старта службы первой), иначе
+    /// клиенты другого пользователя получат отказ в доступе к маяку и
+    /// перейдут на резервный повтор `reconnect_delay`. По умолчанию --
+    /// `ObjectSecurity::CurrentUser`.
     pub security: ObjectSecurity,
     /// Частное пространство имён канала (0.10): `AutoServer` создаёт объекты
     /// в нём, `AutoClient` в нём же их ищет (при каждом переподключении).
@@ -713,6 +737,78 @@ impl Worker {
         self.running.load(Ordering::Acquire)
     }
 
+    /// `on_error` -- если в этом эпизоде вне подключения о такой ошибке
+    /// ещё не сообщали (Task 11).
+    fn report_once(&self, reported: &mut Reported, err: ShmError) {
+        if reported.first(&err) {
+            self.handler.on_error(err);
+        }
+    }
+
+    /// Пауза `delay`, прерываемая остановкой (`wake`); возврат из неё --
+    /// пробуждение worker-а. `false` -- остановка.
+    fn pause(&self, delay: Duration) -> bool {
+        let go_on = wait_delay_or(&self.running, &self.wake, delay);
+        self.stats.wake();
+        go_on
+    }
+
+    /// Клиент вне подключения после неудачи `failure` (Task 11, R19): сон в
+    /// ядре на маяке присутствия канала `name` или на процессе сервера
+    /// (`presence::PresenceWatch::wait`), без опроса. `wake` -- индекс 0:
+    /// `stop` прерывает сразу, `send` -- отчёт о вытесненных и снова сон.
+    /// Ждать нечего (маяк недоступен -- нет прав или привилегии `Global\`,
+    /// процесс сервера не открылся, состояние маяка испорчено) -- резерв:
+    /// пауза `reconnect_delay` (решение R-M), ошибка маяка -- один раз.
+    /// `false` -- остановка.
+    fn await_server(
+        &self,
+        name: &str,
+        failure: Failure,
+        presence: &mut Option<PresenceWatch>,
+        reported: &mut Reported,
+    ) -> bool {
+        loop {
+            if !self.running() {
+                return false;
+            }
+            if presence.is_none() {
+                match PresenceWatch::open(
+                    self.options.namespace.as_deref(),
+                    self.options.namespace.as_ref(),
+                    name,
+                    &self.options.security,
+                ) {
+                    Ok(watch) => *presence = Some(watch),
+                    Err(err) => {
+                        self.report_once(reported, err);
+                        return self.pause(self.options.reconnect_delay);
+                    }
+                }
+            }
+            let Some(watch) = presence.as_mut() else {
+                return self.pause(self.options.reconnect_delay);
+            };
+            let waited = watch.wait(
+                failure,
+                Some(self.wake.as_handle()),
+                self.options.poll_timeout,
+                &|| self.stats.wake(),
+            );
+            match waited {
+                Ok(PresenceWait::Retry | PresenceWait::TimedOut) => return self.running(),
+                Ok(PresenceWait::Woken) => self.report_evicted(),
+                Ok(PresenceWait::Unavailable) => {
+                    return self.pause(self.options.reconnect_delay);
+                }
+                Err(err) => {
+                    self.report_once(reported, err);
+                    return self.pause(self.options.reconnect_delay);
+                }
+            }
+        }
+    }
+
     /// Сервер, конец сессии (Ruling S надёжности): очередь отправки
     /// предназначалась ушедшему клиенту -- сбросить её, а не отдать
     /// следующему. Возвращает число сброшенных; сообщает о них вызывающий
@@ -900,13 +996,29 @@ pub struct AutoServer {
 impl AutoServer {
     /// Поднять канал `name` (раскладка -- `options.layout`) и worker,
     /// который принимает клиентов и обслуживает их по событиям.
+    ///
+    /// Канал держит маяк присутствия `<имя>_beacon` (0.10, INTEROP R19; см.
+    /// `SharedServer::start_with`): `AutoClient`, стартовавший раньше
+    /// сервера, спит на нём, а не опрашивает раз в `reconnect_delay`.
     pub fn start(name: &str, handler: Arc<dyn AutoHandler>, options: AutoOptions) -> Result<Self> {
+        Self::start_with_presence(name, handler, options, Presence::On)
+    }
+
+    /// `start` с выбором маяка присутствия (выделенные каналы Dispatch --
+    /// без маяка, R19).
+    pub(crate) fn start_with_presence(
+        name: &str,
+        handler: Arc<dyn AutoHandler>,
+        options: AutoOptions,
+        presence: Presence,
+    ) -> Result<Self> {
         let mut server = SharedServer::start_slot(
             options.namespace.as_ref(),
             name,
             options.layout,
             0,
             &options.security.attributes()?,
+            presence,
         )?;
         let layout = *server.layout();
         let endpoint = Endpoint::spawn(
@@ -1186,7 +1298,8 @@ pub struct AutoClient {
 
 impl AutoClient {
     /// Клиент канала `name`: worker подключается и переподключается сам
-    /// (раз в `reconnect_delay`), раскладку канала берёт из сегмента.
+    /// (сервера нет -- ждёт его маяк присутствия без опроса, см.
+    /// `AutoOptions::reconnect_delay`), раскладку канала берёт из сегмента.
     ///
     /// Канал занят другим клиентом -- `on_error(AlreadyConnected)` на каждой
     /// попытке, с отступом, удваивающимся от `reconnect_delay` до 2 с, пока
@@ -1292,7 +1405,8 @@ impl AutoClient {
 
 /// Режим клиентского worker-а.
 enum ClientMode {
-    /// `AutoClient::connect`: переподключаться раз в `reconnect_delay`.
+    /// `AutoClient::connect`: переподключаться (сервера нет -- ждать его
+    /// маяк присутствия, Task 11).
     Reconnect,
     /// Выделенный канал Dispatch: одно подключение; PID сервера -- сюда.
     Dedicated(Arc<AtomicU32>),
@@ -1372,6 +1486,10 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
     let gauge = &worker.gauge;
     let dedicated = matches!(mode, ClientMode::Dedicated(_));
     let mut busy_backoff = BusyBackoff::default();
+    // Маяк присутствия сервера (Task 11): открывается при первой нужде,
+    // один раз на жизнь worker-а.
+    let mut presence: Option<PresenceWatch> = None;
+    let mut reported = Reported::default();
 
     while worker.running() {
         // Ревизия 2: ожидание `S2C_CONNECT` прерывается `wake` -- `stop`/Drop
@@ -1393,27 +1511,50 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
         let mut client = match connected {
             Ok(client) => client,
             Err(_) if !worker.running() => break,
-            Err(err) => {
-                let busy = err == ShmError::AlreadyConnected;
+            Err(err) if dedicated => {
+                // Выделенный канал не поднялся -- повторять не к чему
+                // (сервер его уже снёс или не дождался нас).
                 worker.handler.on_error(err);
-                if dedicated {
-                    // Выделенный канал не поднялся -- повторять не к чему
-                    // (сервер его уже снёс или не дождался нас).
-                    worker.notify_disconnect(DisconnectReason::Error);
-                    break;
+                worker.notify_disconnect(DisconnectReason::Error);
+                break;
+            }
+            Err(err) => {
+                // Task 11 (R19): сервера нет или он отверг нас -- сон в ядре
+                // на маяке присутствия / процессе сервера, о каждой ошибке --
+                // один раз за эпизод.
+                if let Some(failure) =
+                    presence::classify(&err, worker.options.namespace.as_deref(), Some(name))
+                {
+                    busy_backoff.reset();
+                    worker.report_once(&mut reported, err);
+                    worker.report_evicted();
+                    if !worker.await_server(name, failure, &mut presence, &mut reported) {
+                        break;
+                    }
+                    continue;
+                }
+                // Канал занят (`AlreadyConnected`, до Task 12) -- о каждой
+                // попытке, отступ растёт (final review M4). Таймаут ответа
+                // сервера и прочее -- прежняя пауза `reconnect_delay`
+                // (решение R-M), ошибка -- один раз за эпизод.
+                let busy = err == ShmError::AlreadyConnected;
+                if busy {
+                    worker.handler.on_error(err);
+                } else {
+                    worker.report_once(&mut reported, err);
                 }
                 worker.report_evicted();
                 // Отступ перед новой попыткой; остановка прерывает его сразу
-                // (событие `wake`), без сна-циклов. Канал занят
-                // (`AlreadyConnected`) -- отступ растёт (final review M4).
+                // (событие `wake`), без сна-циклов.
                 let delay = busy_backoff.next(busy, worker.options.reconnect_delay);
-                if !wait_delay_or(&worker.running, &worker.wake, delay) {
+                if !worker.pause(delay) {
                     break;
                 }
                 continue;
             }
         };
         busy_backoff.reset();
+        reported.clear();
 
         gauge.set_layout(*client.layout(), worker.tx);
         gauge.peer_connected(client.peer_pid());
@@ -1506,11 +1647,13 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
         if dedicated || !worker.running() {
             break;
         }
-        if !wait_delay_or(
-            &worker.running,
-            &worker.wake,
-            worker.options.reconnect_delay,
-        ) {
+        // Пауза после конца сессии -- разовая реакция (иначе клиент,
+        // отключённый сервером, возвращался бы мгновенно). Сервер умер --
+        // паузы нет: возвращаться не к кому, следующая попытка уводит в сон
+        // на маяке присутствия (Task 11), и новый сервер принимается сразу.
+        if reason != Some(DisconnectReason::PeerDied)
+            && !worker.pause(worker.options.reconnect_delay)
+        {
             break;
         }
     }
@@ -2902,6 +3045,202 @@ mod claim_tests {
         control.slot_claim.store(0x1D1E_C1A1, Ordering::Release);
         thread::sleep(Duration::from_secs(1));
         assert_eq!(server.wakeups() - s0, 0, "сервер просыпался в простое");
+        drop(server);
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    //! Task 11 надёжности (R19): клиент вне подключения ждёт появления
+    //! сервера на маяке присутствия, а не опрашивает раз в
+    //! `reconnect_delay`.
+
+    use super::*;
+    use crate::beacon::Beacon;
+    use crate::test_support::{LiveChild, dead_process};
+    use std::time::Instant;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "AUTO_PRES_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn wait_until(what: &str, limit: Duration, mut cond: impl FnMut() -> bool) {
+        let deadline = Instant::now() + limit;
+        while !cond() {
+            assert!(Instant::now() < deadline, "таймаут: {what}");
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[derive(Default)]
+    struct Log {
+        connected: AtomicBool,
+        connected_at: Mutex<Option<Instant>>,
+        errors: Mutex<Vec<ShmError>>,
+    }
+
+    impl AutoHandler for Log {
+        fn on_connect(&self) {
+            *self.connected_at.lock().unwrap() = Some(Instant::now());
+            self.connected.store(true, Ordering::Release);
+        }
+        fn on_error(&self, err: ShmError) {
+            self.errors.lock().unwrap().push(err);
+        }
+    }
+
+    impl Log {
+        fn errors(&self) -> Vec<ShmError> {
+            self.errors.lock().unwrap().clone()
+        }
+    }
+
+    /// Сервера нет: клиент спит в ядре на маяке -- ни пробуждений, ни
+    /// повторных `on_error` (до Task 11: попытка и ошибка каждые 250 мс).
+    #[test]
+    fn absent_server_client_sleeps_without_wakeups() {
+        let name = unique("ABSENT");
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let w0 = client.wakeups();
+        thread::sleep(Duration::from_secs(1));
+        let woke = client.wakeups() - w0;
+        assert!(woke <= 1, "пробуждений без сервера: {woke}");
+        let errors = log.errors();
+        assert!(errors.len() <= 1, "ошибки без сервера: {errors:?}");
+        drop(client);
+    }
+
+    /// Клиент стартовал раньше сервера: подключение сразу после взвода
+    /// маяка, а не через `reconnect_delay` (10 с).
+    #[test]
+    fn client_connects_promptly_when_server_appears() {
+        let name = unique("PROMPT");
+        let log = Arc::new(Log::default());
+        let options = AutoOptions {
+            reconnect_delay: Duration::from_secs(10),
+            ..AutoOptions::default()
+        };
+        let client = AutoClient::connect(&name, log.clone(), options).unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        wait_until("подключение", Duration::from_secs(15), || {
+            log.connected.load(Ordering::Acquire)
+        });
+        let took = log.connected_at.lock().unwrap().unwrap() - started;
+        assert!(
+            took <= Duration::from_millis(300),
+            "подключение через {took:?}"
+        );
+        drop(client);
+        drop(server);
+    }
+
+    /// Маяк упавшего сервера (взведён, секции нет): клиент гасит его
+    /// (`clear_if_stale`) и спит на нём, а новый сервер принимается сразу.
+    #[test]
+    fn stale_beacon_of_dead_server_is_cleared_then_sleeps() {
+        let name = unique("STALE");
+        let (pid, start) = dead_process();
+        let stale = Beacon::open(&name).unwrap();
+        stale.raise_as(pid, start).unwrap();
+        let log = Arc::new(Log::default());
+        let options = AutoOptions {
+            reconnect_delay: Duration::from_secs(10),
+            ..AutoOptions::default()
+        };
+        let client = AutoClient::connect(&name, log.clone(), options).unwrap();
+        wait_until(
+            "маяк упавшего сброшен",
+            Duration::from_secs(2),
+            || !stale.is_raised().unwrap(),
+        );
+        thread::sleep(Duration::from_millis(50));
+        let w0 = client.wakeups();
+        thread::sleep(Duration::from_secs(1));
+        let woke = client.wakeups() - w0;
+        assert!(woke <= 2, "пробуждений после сброса: {woke}");
+        let started = Instant::now();
+        let server =
+            AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+        wait_until("подключение", Duration::from_secs(15), || {
+            log.connected.load(Ordering::Acquire)
+        });
+        let took = log.connected_at.lock().unwrap().unwrap() - started;
+        assert!(
+            took <= Duration::from_millis(300),
+            "подключение через {took:?}"
+        );
+        drop(client);
+        drop(server);
+    }
+
+    fn version_errors(log: &Log) -> usize {
+        log.errors()
+            .iter()
+            .filter(|e| matches!(e, ShmError::VersionMismatch { .. }))
+            .count()
+    }
+
+    /// Под именем -- сервер другого формата памяти: клиент сообщает
+    /// `VersionMismatch` один раз и спит до выхода процесса этого сервера
+    /// (PID и время -- из `ControlBlock`), а не повторяет раз в 250 мс.
+    #[test]
+    fn incompatible_server_waits_for_its_exit() {
+        let name = unique("VERSION");
+        let server = SharedServer::start(&name).unwrap();
+        let mut child = LiveChild::spawn();
+        let control = server.view().control_block();
+        control.version.store(0x0001_0000, Ordering::Release);
+        let [l0, l1, l2, l3, h0, h1, h2, h3] = child.start.to_le_bytes();
+        control
+            .server_start_lo
+            .store(u32::from_le_bytes([l0, l1, l2, l3]), Ordering::Release);
+        control
+            .server_start_hi
+            .store(u32::from_le_bytes([h0, h1, h2, h3]), Ordering::Release);
+        control.server_pid.store(child.pid, Ordering::Release);
+
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        wait_until("VersionMismatch", Duration::from_secs(2), || {
+            log.errors()
+                .iter()
+                .any(|e| matches!(e, ShmError::VersionMismatch { .. }))
+        });
+        thread::sleep(Duration::from_millis(100));
+        let w0 = client.wakeups();
+        thread::sleep(Duration::from_secs(1));
+        let woke = client.wakeups() - w0;
+        assert!(woke <= 2, "пробуждений при несовместимом сервере: {woke}");
+        assert_eq!(version_errors(&log), 1, "{:?}", log.errors());
+
+        let w1 = client.wakeups();
+        child.kill();
+        wait_until(
+            "попытка после выхода сервера",
+            Duration::from_millis(500),
+            || client.wakeups() > w1,
+        );
+        thread::sleep(Duration::from_millis(300));
+        let after = client.wakeups() - w1;
+        assert!(after <= 2, "пробуждений после выхода: {after}");
+        assert_eq!(
+            version_errors(&log),
+            1,
+            "ошибка повторена: {:?}",
+            log.errors()
+        );
+        assert_eq!(log.errors().len(), 1, "{:?}", log.errors());
+        drop(client);
         drop(server);
     }
 }

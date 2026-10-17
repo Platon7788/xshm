@@ -40,6 +40,7 @@
 | Допуск Dispatch | любой зарегистрировавшийся клиент получал канал | `DispatchHandler::admit` → `Admission::{Accept, AcceptWithLayout, Reject}` (по умолчанию `Accept`), `DispatchOptions::max_clients = 64` | Больше 64 клиентов — поднять `max_clients` |
 | `MAX_MULTI_CLIENTS` | 31 | 256 (каждый слот — своя секция; 256 × 4 МиБ ≈ 1 ГиБ) | Для больших `max_clients` — маленький `MultiOptions::layout` |
 | Маяк | клиент сбрасывал маяк сам (`lower`) | `clear_if_stale` (секция `<имя>_beacon_state`, живой сервер не трогается); `lower` — только сервер | Клиенту — `clear_if_stale` вместо `lower` |
+| Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер и база Multi держат `<имя>_beacon` сами; клиенты без сервера спят на нём, `on_error` — раз за эпизод; `SharedClient::wait_for_server*`; `MultiClientOptions::security` | Ручной `raise` лобби можно убрать; литерал `MultiClientOptions` — с `..Default::default()`; не называть канал и базу Multi одинаково; нативный сервер — R19 (INTEROP §e.4) |
 
 Потребители, проверенные на этой ветке (Task 19, `cargo check --workspace
 --all-targets`):
@@ -220,6 +221,35 @@
   xhook (`tests_static/test_ipc_interop_*`, `scripts/run_interop.ps1`);
   INTEROP §g.
 
+- **Маяк присутствия у каждого сервера** (надёжность, 17.10.2026, Task 11;
+  INTEROP **R19**, «Изменения 0.10» п. 34). Каждый именованный сервер
+  single-client канала (`SharedServer::start`/`start_with`, `AutoServer`,
+  лобби `DispatchServer`) держит маяк `<имя>_beacon` (+ `<имя>_beacon_state`,
+  тот же `Beacon`), база `MultiServer` — один `<база>_beacon` (не слоты);
+  без маяка — только выделенные каналы Dispatch. Тот же namespace (в том
+  числе `PrivateNamespace`) и та же политика, что у секции канала. `raise` —
+  после публикации секции и всех 7 событий (Multi — всех слотов), `lower` —
+  первым шагом `Drop`/`stop`; маяк занят объектом другого типа или с чужим
+  DACL — ошибка старта (как занятое имя секции). Лобби Dispatch взводит маяк
+  само: ручной `raise` приложения (prof-shm) больше не нужен и безвреден.
+  Внутреннее: `src/presence.rs` (`ServerPresence`, `PresenceWatch`,
+  `Failure`, `classify`), `SharedServer::start_slot(.., presence)`,
+  `Beacon::open_at`/`generation`/`server_identity`,
+  `SharedView::peek_server` (PID сервера из `ControlBlock` любой версии).
+- **`SharedClient::wait_for_server(name, timeout)` и
+  `wait_for_server_in(ns, name, timeout)`** -> `Result<bool>`: дождаться
+  сервера канала без опроса (сон на маяке присутствия; маяк упавшего
+  сервера гасится `clear_if_stale`, ожидание продолжается). `Ok(true)` —
+  секция опубликована, 7 событий на месте, процесс сервера не завершился;
+  `Ok(false)` — таймаут; сервер есть, но подключиться нельзя, — его ошибка
+  (`VersionMismatch`, `AccessDenied`, …). Маяк недоступен — резервная
+  проверка раз в 250 мс внутри вызова.
+- `MultiClientOptions::security` — политика маяка базы, если его создаёт
+  клиент (пришёл раньше сервера; по умолчанию `CurrentUser`). У `AutoClient`
+  ту же роль играет `AutoOptions::security`. DACL маяка задаёт первый
+  создатель (решение R-L): служба на `Global\` с `Everyone` требует той же
+  политики у клиентов (или старта службы первой).
+
 ### Изменено (несовместимо)
 
 - **`SharedServer::poll_client`/`poll_client_spin` и
@@ -327,6 +357,50 @@
   отвергают (`Corrupted`) `name_len > 64`, хвостовые байты и невалидный
   UTF-8 (раньше хвост отбрасывался, UTF-8 чинился через U+FFFD). Пир-видимо:
   `INTEROP.md` §d.1, «Изменения 0.10» п. 18.
+- **`AutoClient`/`MultiClient` без сервера не опрашивают** (надёжность,
+  17.10.2026, Task 11; решения J, K, M; INTEROP R19, п. 34). Было: вне
+  подключения попытка раз в `reconnect_delay`/`retry_delay` (250 мс) — 4
+  пробуждения и 4 `on_error` в секунду, пока сервера нет, до 250 мс лишней
+  задержки, когда он появился. Стало: **сервера нет** (секции/событий нет,
+  сегмент не опубликован, Multi — нет слота 0, процесс сервера завершился —
+  `PeerDied`) — сон в ядре `[wake, маяк присутствия]` без таймаута,
+  подключение сразу после взвода; маяк упавшего сервера клиент гасит
+  (`clear_if_stale`) и спит дальше; маяк взведён живым сервером, а канала нет,
+  — одна повторная попытка на поколение взвода, затем сон до выхода его
+  процесса. **Сервер отверг** (`VersionMismatch`, `Corrupted`, `AccessDenied`,
+  `InvalidConfig`; Auto) — сон до выхода процесса этого сервера (PID из
+  `ControlBlock` или из состояния маяка). Пауза осталась: при занятом канале
+  (`AlreadyConnected`, Multi `NoFreeSlot`/`AccessDenied` — до уведомления
+  «claim освобождён»), после `Timeout`/ошибки рукопожатия, разово после
+  конца сессии и как **резерв** (решение R-M: маяк недоступен — нет прав или
+  привилегии `Global\`; процесс сервера не открылся; состояние маяка
+  испорчено). После `PeerDied` паузы нет. `on_error` — **один раз на эпизод
+  вне подключения** для одинаковой ошибки (кроме `AlreadyConnected` и
+  `NoFreeSlot` — о каждой попытке, как раньше); эпизод кончается
+  подключением. Счётчики пробуждений (`wakeups()`, тесты) считают и эти
+  ожидания. Клиент, стартовавший раньше сервера **без** маяка (нативный пир
+  без R19), ждёт до появления сервера с маяком — резерва нет. Тесты
+  `auto::presence_tests::{absent_server_client_sleeps_without_wakeups,
+  client_connects_promptly_when_server_appears,
+  stale_beacon_of_dead_server_is_cleared_then_sleeps,
+  incompatible_server_waits_for_its_exit}`,
+  `multi::tests::{absent_server_multi_client_sleeps,
+  multi_client_connects_when_server_appears}`,
+  `server::presence_tests::presence_raised_after_publish_lowered_first_in_drop`,
+  `dispatch::tests::lobby_raises_beacon_automatically`,
+  `client::presence_tests::wait_for_server_returns_on_start`,
+  `tests/peer_death.rs::auto_client_reconnects_after_server_crash_without_polling`,
+  `tests/namespace.rs::presence_inside_private_namespace`,
+  `tests/security.rs::presence_objects_use_channel_policy`;
+  `tests/security.rs::multi_client_reports_access_denied` теперь ждёт ровно
+  одну ошибку. Миграция: литерал `MultiClientOptions { .. }` — с
+  `..Default::default()` (новое поле `security`); обработчик, считавший
+  повторы `on_error` как признак «сервера всё ещё нет», — ждать `on_connect`;
+  имена каналов и баз Multi не должны совпадать (`X` и база `X` делят маяк
+  `X_beacon`).
+- Dispatch: мьютекс лобби `<лобби>_lock` сервер создаёт **до** секции лобби
+  (было — после): лобби взводит маяк присутствия, и разбуженный им клиент
+  застаёт мьютекс с политикой сервера. INTEROP §b.2.
 
 ### Исправлено (аудит 16.10.2026)
 
@@ -890,6 +964,26 @@
   сверяет все слоты, handle отключённых клиентов не ждут события своего
   слота (`multi::tests::lost_wake_post_closes_retired_on_next_pass`).
   Пир-невидимо (INTEROP §i.2, §i.3).
+- **Minor** Поток пустых сигналов скрывал смерть пира в синхронных
+  ожиданиях (ревью Task 10, N1). `poll_client`/`poll_server`
+  (`RingBuffer::wait_for_data`), `wait_for_space` и ответ лобби
+  (`lobby_register`) поглощали пустой `DATA`/`SPACE` и устаревший
+  `DISCONNECT`, а процесс пира стоял в наборе после них: пир, взводящий их
+  непрерывно, держал вызов до таймаута (`poll_*` — отвечал `Ok(true)` на
+  каждый пустой `DATA`). Теперь на каждом пустом сигнале — одна проверка
+  процесса пира нулевым ожиданием (сигнал с данными или местом её не
+  стоит): процесс завершился — `PeerDied` (после дочитывания кольца). Тесты
+  `ring::stale_flood_tests::{data_flood_does_not_hide_writer_death,
+  stale_disconnect_flood_does_not_hide_writer_death,
+  space_and_disconnect_floods_do_not_hide_reader_death}` (каждая из четырёх
+  проверок подтверждена мутацией). INTEROP §e.1 П1 (формулировка теперь
+  верна для всех перечисленных наборов).
+- **Minor** `AutoClient` сообщал `on_error(PeerDied)` каждые
+  `reconnect_delay` (250 мс), когда секцию мёртвого сервера держал кто-то
+  ещё (ревью Task 10, N2: после решения U `PeerDied` приходит сразу, а не
+  через `connect_timeout`). Теперь `PeerDied` вне подключения — «сервера
+  нет»: одна ошибка за эпизод и сон на маяке присутствия до взвода нового
+  сервера (п. 34).
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

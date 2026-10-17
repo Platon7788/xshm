@@ -2443,3 +2443,72 @@ fn lost_wake_post_closes_retired_on_next_pass() {
     );
     server.stop();
 }
+
+/// Обработчик клиента Multi, записывающий ошибки и момент подключения
+/// (Task 11 надёжности).
+#[derive(Default)]
+struct PresenceRecorder {
+    connected_at: Mutex<Option<Instant>>,
+    errors: Mutex<Vec<ShmError>>,
+}
+
+impl MultiClientHandler for PresenceRecorder {
+    fn on_connect(&self, _slot_id: u32) {
+        *self.connected_at.lock().unwrap() = Some(Instant::now());
+    }
+    fn on_disconnect(&self) {}
+    fn on_message(&self, _data: &[u8]) {}
+    fn on_error(&self, err: ShmError) {
+        self.errors.lock().unwrap().push(err);
+    }
+}
+
+/// Task 11 (R19): сервера нет -- клиент Multi спит на маяке базы: ни
+/// пробуждений, ни повторных `on_error(NotConnected)` (до Task 11 --
+/// попытка раз в `retry_delay`).
+#[test]
+fn absent_server_multi_client_sleeps() {
+    let name = unique("ABSENT");
+    let recorder = Arc::new(PresenceRecorder::default());
+    let client = MultiClient::connect(&name, recorder.clone(), MultiClientOptions::default())
+        .expect("client connect");
+    thread::sleep(Duration::from_millis(200));
+    let w0 = client.wakeups();
+    thread::sleep(Duration::from_secs(1));
+    let woke = client.wakeups() - w0;
+    assert!(woke <= 1, "пробуждений без сервера: {woke}");
+    let errors = recorder.errors.lock().unwrap().clone();
+    assert!(errors.len() <= 1, "ошибки без сервера: {errors:?}");
+    drop(client);
+}
+
+/// Task 11 (R19): клиент Multi стартовал раньше сервера -- подключается
+/// сразу после взвода маяка базы, а не через `retry_delay` (10 с).
+#[test]
+fn multi_client_connects_when_server_appears() {
+    let name = unique("PROMPT");
+    let recorder = Arc::new(PresenceRecorder::default());
+    let client = MultiClient::connect(
+        &name,
+        recorder.clone(),
+        MultiClientOptions {
+            retry_delay: Duration::from_secs(10),
+            ..MultiClientOptions::default()
+        },
+    )
+    .expect("client connect");
+    thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(2)).expect("start");
+    wait_for("подключение", Duration::from_secs(15), || {
+        recorder.connected_at.lock().unwrap().is_some()
+    });
+    let took = recorder.connected_at.lock().unwrap().unwrap() - started;
+    assert!(
+        took <= Duration::from_millis(300),
+        "подключение через {took:?}"
+    );
+    drop(client);
+    server.stop();
+}

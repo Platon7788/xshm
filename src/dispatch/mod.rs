@@ -37,6 +37,7 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, RingConfig};
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
+use crate::presence::Presence;
 use crate::ring::{FreeSpace, SpinPolicy};
 use crate::security::ObjectSecurity;
 use crate::server::SharedServer;
@@ -494,9 +495,16 @@ impl DispatchServer {
     /// Запускает dispatch-сервер с лобби на заданном базовом имени.
     ///
     /// Лобби создаётся **синхронно**: после `Ok` клиенты уже могут
-    /// регистрироваться (сервер может взводить маяк), а занятое имя (другой
-    /// сервер с тем же лобби) -- ошибка здесь, а не молчаливые повторы в
-    /// фоне.
+    /// регистрироваться, а занятое имя (другой сервер с тем же лобби) --
+    /// ошибка здесь, а не молчаливые повторы в фоне.
+    ///
+    /// Маяк лобби `<лобби>_beacon` (0.10, INTEROP R19) сервер взводит сам --
+    /// после публикации лобби (и его мьютекса), сбрасывает -- первым шагом
+    /// остановки лобби; приложению взводить его больше не нужно (прежний
+    /// ручной [`Beacon::raise`](crate::Beacon::raise) безвреден: взвод
+    /// идемпотентен). Выделенные каналы клиентов маяка не имеют: их клиент
+    /// подключается один раз, по имени из ответа лобби. Маяк уже занят
+    /// объектом другого типа или с чужим DACL -- ошибка `start`.
     ///
     /// # Errors
     ///
@@ -519,16 +527,22 @@ impl DispatchServer {
         }
         options.channel_layout.validate()?;
         let security = options.security.attributes()?;
+        // Мьютекс лобби -- ДО лобби (0.10, R19): лобби взводит маяк
+        // присутствия, и разбуженный им клиент должен застать мьютекс с
+        // политикой сервера, а не создать свой.
+        let lobby_lock = NamedMutex::open_or_create(
+            lobby_lock_path(options.namespace.as_deref(), name),
+            &security,
+        )?;
+        // Лобби держит маяк присутствия `<лобби>_beacon` (R19): прежний
+        // ручной `raise` приложения безвреден -- взвод идемпотентен.
         let lobby = SharedServer::start_slot(
             options.namespace.as_ref(),
             name,
             options.lobby_layout,
             0,
             &security,
-        )?;
-        let lobby_lock = NamedMutex::open_or_create(
-            lobby_lock_path(options.namespace.as_deref(), name),
-            &security,
+            Presence::On,
         )?;
 
         let stop_event = Arc::new(EventHandle::create_unnamed(true)?);
@@ -851,6 +865,7 @@ impl DispatchCore {
                         self.options.lobby_layout,
                         0,
                         &security,
+                        Presence::On,
                     )
                 }) {
                     Ok(s) => s,
@@ -1097,7 +1112,14 @@ impl DispatchCore {
         // подключении клиента (клиент подключится только после ответа
         // лобби, но порядок гарантируем явно).
         let mut slot_guard = slot.lock_clean();
-        match AutoServer::start(&channel_name, proxy_handler, auto_options) {
+        // Выделенный канал -- без маяка присутствия (R19): его клиент
+        // подключается один раз, по имени из ответа лобби.
+        match AutoServer::start_with_presence(
+            &channel_name,
+            proxy_handler,
+            auto_options,
+            Presence::Off,
+        ) {
             Ok(s) => *slot_guard = Some(s),
             Err(err) => {
                 drop(slot_guard);
@@ -1793,9 +1815,16 @@ fn lobby_register(
                     None => 2,
                 };
                 match win::wait_any(&handles[..count], Some(remaining))? {
-                    // `DISCONNECT` устаревший (сессия жива) -- поглощён, ждём дальше.
                     Some(1) if client.server_left() => gone = Some(ShmError::NotConnected),
                     Some(2) => gone = Some(ShmError::PeerDied),
+                    // Пустой `S2C_DATA` (кольцо проверит следующий круг) или
+                    // устаревший `DISCONNECT` (сессия жива) -- поглощён.
+                    // Процесс сервера стоит в наборе после них, и поток таких
+                    // сигналов скрывал бы его смерть до `response_timeout`
+                    // (Task 10 N1, П1): одна проверка -- нулевое ожидание.
+                    Some(_) if client.is_peer_alive() == Some(false) => {
+                        gone = Some(ShmError::PeerDied);
+                    }
                     _ => {}
                 }
             }
@@ -1922,6 +1951,26 @@ mod tests {
         drop(server);
         // Сервера нет -- мьютекс закрыт, клиент создаёт свой.
         assert!(NamedMutex::open_or_create(lobby_lock_name(&name), &client_policy).is_ok());
+    }
+
+    /// Task 11 (R19): лобби взводит свой маяк `<лобби>_beacon` само, без
+    /// участия приложения, и сбрасывает его при остановке; выделенные
+    /// каналы маяка не имеют.
+    #[test]
+    fn lobby_raises_beacon_automatically() {
+        let name = format!("TEST_DISPATCH_PRESENCE_{}", std::process::id());
+        let beacon = crate::beacon::Beacon::open(&name).unwrap();
+        assert!(!beacon.is_raised().unwrap());
+        let server = DispatchServer::start(
+            &name,
+            Arc::new(TestServerHandler::new()),
+            DispatchOptions::default(),
+        )
+        .unwrap();
+        assert!(beacon.is_raised().unwrap(), "лобби не взвело маяк");
+        server.stop();
+        assert!(!beacon.is_raised().unwrap(), "маяк остался после stop()");
+        drop(server);
     }
 
     struct TestClientHandler {

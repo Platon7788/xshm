@@ -1208,3 +1208,95 @@ fn auto_server_client_dying_after_error_frees_channel_at_once() {
     drop(client);
     drop(server);
 }
+
+/// Обработчик `AutoClient` для Task 11: подключения (моменты), причины
+/// отключения и ошибки.
+#[derive(Default)]
+struct PresenceLog {
+    connects: Mutex<Vec<Instant>>,
+    reasons: Mutex<Vec<DisconnectReason>>,
+    errors: Mutex<Vec<ShmError>>,
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "тестовый помощник: паника -- провал теста"
+)]
+impl AutoHandler for PresenceLog {
+    fn on_connect(&self) {
+        self.connects.lock().unwrap().push(Instant::now());
+    }
+    fn on_disconnect_reason(&self, reason: DisconnectReason) {
+        self.reasons.lock().unwrap().push(reason);
+    }
+    fn on_error(&self, err: ShmError) {
+        self.errors.lock().unwrap().push(err);
+    }
+}
+
+/// Task 11 (R19, Task 10 N2): сервер -- дочерний процесс; его убивают.
+/// Клиент (`reconnect_delay` = 10 с) получает `PeerDied`, гасит маяк
+/// упавшего сервера (`clear_if_stale`) и спит на нём: за секунду -- ни
+/// одной ошибки (до Task 11 -- попытка и `on_error` раз в
+/// `reconnect_delay`), а новый сервер принимается сразу (≤ 300 мс), а не
+/// через `reconnect_delay`. Счётчик пробуждений -- `cfg(test)`, снаружи не
+/// виден: отсутствие опроса здесь доказывают ошибки и задержка, а
+/// пробуждения -- модульные тесты `auto::presence_tests`.
+#[test]
+fn auto_client_reconnects_after_server_crash_without_polling() {
+    let name = unique_name("AU_PRES");
+    let mut peer = Peer::spawn("auto_server", &name);
+    let log = Arc::new(PresenceLog::default());
+    let client = AutoClient::connect(
+        &name,
+        log.clone(),
+        AutoOptions {
+            reconnect_delay: Duration::from_secs(10),
+            ..AutoOptions::default()
+        },
+    )
+    .unwrap();
+    // Дочерний сервер мог подняться позже клиента -- клиент ждёт его маяк.
+    wait_until(
+        "подключение к дочернему",
+        Duration::from_secs(20),
+        || client.is_peer_alive() == Some(true),
+    );
+    let beacon = Beacon::open(&name).unwrap();
+    assert!(beacon.is_raised().unwrap(), "сервер не взвёл маяк");
+
+    peer.kill();
+    wait_until("PeerDied", Duration::from_secs(10), || {
+        log.reasons
+            .lock()
+            .unwrap()
+            .contains(&DisconnectReason::PeerDied)
+    });
+    wait_until(
+        "маяк упавшего сброшен",
+        Duration::from_secs(2),
+        || !beacon.is_raised().unwrap(),
+    );
+    let errors_before = log.errors.lock().unwrap().len();
+    thread::sleep(Duration::from_secs(1));
+    let errors = log.errors.lock().unwrap().clone();
+    assert!(
+        errors.len() == errors_before,
+        "ошибки без сервера: {errors:?}"
+    );
+
+    let started = Instant::now();
+    let server = AutoServer::start(&name, Arc::new(Noop), AutoOptions::default()).unwrap();
+    wait_until(
+        "подключение к новому серверу",
+        Duration::from_secs(15),
+        || log.connects.lock().unwrap().len() == 2,
+    );
+    let took = log.connects.lock().unwrap()[1] - started;
+    assert!(
+        took <= Duration::from_millis(300),
+        "подключение через {took:?}"
+    );
+    drop(client);
+    drop(server);
+}

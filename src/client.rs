@@ -236,6 +236,44 @@ impl SharedClient {
         Self::connect_impl(Some(ns), name, timeout, true, ClaimMode::Take, None)
     }
 
+    /// Дождаться сервера канала `name` (0.10, INTEROP R19), не подключаясь:
+    /// `Ok(true)` -- секция канала опубликована, все 7 событий на месте и
+    /// процесс сервера не завершился (дальше -- [`SharedClient::connect`]);
+    /// `Ok(false)` -- истёк `timeout` (`None` -- ждать без ограничения).
+    ///
+    /// Без опроса: пока сервера нет, вызов спит в ядре на маяке присутствия
+    /// `<имя>_beacon`, который каждый именованный сервер взводит после
+    /// публикации канала (клиент создаёт маяк сам, если пришёл первым, --
+    /// политика по умолчанию, `ObjectSecurity::CurrentUser`; DACL задаёт
+    /// первый создатель). Маяк, оставленный упавшим сервером, гасится
+    /// (`Beacon::clear_if_stale`), и ожидание продолжается. Маяк недоступен
+    /// (нет прав, нет привилегии `Global\`) -- резервная проверка раз в
+    /// 250 мс.
+    ///
+    /// # Errors
+    ///
+    /// Сервер есть, но подключиться к нему нельзя -- его ошибка открытия
+    /// (`VersionMismatch`, `Corrupted`, `AccessDenied`, `InvalidConfig`),
+    /// ошибка ОС ожидания.
+    pub fn wait_for_server(name: &str, timeout: Option<Duration>) -> Result<bool> {
+        crate::presence::wait_for_server(None, name, timeout)
+    }
+
+    /// [`SharedClient::wait_for_server`] для канала в частном пространстве
+    /// имён `ns` (сервер -- `ChannelConfig::namespace` с той же границей;
+    /// маяк -- относительное имя в пространстве).
+    ///
+    /// # Errors
+    ///
+    /// Как у [`SharedClient::wait_for_server`].
+    pub fn wait_for_server_in(
+        ns: &PrivateNamespace,
+        name: &str,
+        timeout: Option<Duration>,
+    ) -> Result<bool> {
+        crate::presence::wait_for_server(Some(ns), name, timeout)
+    }
+
     /// Раскладка канала, выбранная сервером.
     #[must_use]
     pub const fn layout(&self) -> &ChannelLayout {
@@ -2625,5 +2663,69 @@ mod tests {
         assert!(elapsed <= Duration::from_secs(1), "{elapsed:?}");
         assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    //! Task 11 надёжности (R19): синхронное ожидание сервера на маяке.
+
+    use super::*;
+    use crate::presence::PRESENCE_KERNEL_WAITS;
+    use crate::server::SharedServer;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "CLI_PRES_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    fn kernel_waits() -> u32 {
+        PRESENCE_KERNEL_WAITS.with(std::cell::Cell::get)
+    }
+
+    /// Ждущий просыпается по взводу маяка сервера (≤ 100 мс), без сервера
+    /// -- `Ok(false)` по таймауту после ОДНОГО ожидания в ядре.
+    #[test]
+    fn wait_for_server_returns_on_start() {
+        let name = unique("START");
+        let waiter = {
+            let name = name.clone();
+            std::thread::spawn(move || {
+                let waited = SharedClient::wait_for_server(&name, Some(Duration::from_secs(5)));
+                (waited, Instant::now(), kernel_waits())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let server = SharedServer::start(&name).unwrap();
+        let (waited, woke_at, waits) = waiter.join().unwrap();
+        assert_eq!(waited, Ok(true));
+        let took = woke_at - started;
+        assert!(
+            took <= Duration::from_millis(100),
+            "проснулся через {took:?}"
+        );
+        assert_eq!(waits, 1, "ожиданий в ядре: {waits}");
+        // Сервер на месте -- сразу.
+        assert_eq!(
+            SharedClient::wait_for_server(&name, Some(Duration::ZERO)),
+            Ok(true)
+        );
+        drop(server);
+
+        let absent = unique("ABSENT");
+        let before = kernel_waits();
+        let started = Instant::now();
+        assert_eq!(
+            SharedClient::wait_for_server(&absent, Some(Duration::from_millis(200))),
+            Ok(false)
+        );
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(190), "{took:?}");
+        assert_eq!(kernel_waits() - before, 1, "одно ожидание в ядре");
     }
 }

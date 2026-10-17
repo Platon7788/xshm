@@ -14,6 +14,15 @@
 //! проснувшийся по маяку, застаёт сервер, а «маяк взведён, сервера нет»
 //! бывает только после падения сервера.
 //!
+//! **0.10 (INTEROP R19)**: маяк своего имени держит САМ каждый именованный
+//! сервер — `SharedServer::start*`, `AutoServer`, лобби `DispatchServer` и
+//! база `MultiServer` (`<база>_beacon`, не слоты), в том же пространстве
+//! имён и с той же политикой, что канал; `AutoClient`/`MultiClient` и
+//! [`SharedClient::wait_for_server`](crate::SharedClient::wait_for_server)
+//! ждут на нём появления сервера без опроса. Ручной `raise` приложения
+//! больше не нужен (и безвреден); `Beacon` остаётся для своих сценариев
+//! (ожидание нескольких серверов в одном [`wait_any`]).
+//!
 //! **Сервер упал, не сбросив маяк**: маяк остаётся взведённым. Клиент,
 //! которому при взведённом маяке не удалось подключиться, потому что лобби
 //! нет, вызывает [`Beacon::clear_if_stale`] (НЕ [`Beacon::lower`]): рядом с
@@ -273,13 +282,30 @@ impl Beacon {
         name: &str,
         security: &ObjectSecurity,
     ) -> Result<Self> {
-        let security = security.attributes()?;
-        let root = namespace.map(Arc::as_ref);
-        let event = EventHandle::open_or_create_notification(beacon_path(root, name), &security)?;
+        Self::open_at(
+            namespace.map(Arc::as_ref),
+            namespace.cloned(),
+            name,
+            &security.attributes()?,
+        )
+    }
+
+    /// Открыть (или создать) маяк `name` в пространстве `root` с готовым
+    /// дескриптором `security` (0.10, маяк присутствия сервера и клиента --
+    /// `presence`). `keep` -- ссылка на пространство, которую маяк держит,
+    /// пока жив (`None` -- пространство держит вызывающий всё время жизни
+    /// маяка, например на время синхронного ожидания).
+    pub(crate) fn open_at(
+        root: Option<&PrivateNamespace>,
+        keep: Option<Arc<PrivateNamespace>>,
+        name: &str,
+        security: &SecurityAttributes,
+    ) -> Result<Self> {
+        let event = EventHandle::open_or_create_notification(beacon_path(root, name), security)?;
         let beacon = Self {
             event,
-            state: open_state(root, name, &security)?,
-            _namespace: namespace.cloned(),
+            state: open_state(root, name, security)?,
+            _namespace: keep,
         };
         // Новая секция -- нули: `magic` ставит первый открывший (CAS 0 ->
         // MAGIC). Не ноль и не MAGIC -- порча: CAS не проходит, состоянию не
@@ -392,6 +418,31 @@ impl Beacon {
                 None => Ok(false),
             },
         }
+    }
+
+    /// Поколение взводов из состояния маяка (0.10, `presence`): меняется при
+    /// каждом [`Beacon::raise`]. `None` -- маяк без состояния или состояние
+    /// испорчено.
+    pub(crate) fn generation(&self) -> Option<u32> {
+        self.trusted_word(STATE_GENERATION_OFFSET)
+            .map(|generation| generation.load(Ordering::SeqCst))
+    }
+
+    /// Личность сервера, взводившего маяк последним (PID и время создания
+    /// процесса; 0.10, `presence`). `None` -- маяк без состояния, состояние
+    /// испорчено или сервер ушёл штатно ([`Beacon::lower`] обнулил PID).
+    pub(crate) fn server_identity(&self) -> Option<(u32, u64)> {
+        self.snapshot()
+            .filter(|snapshot| snapshot.server_pid != 0)
+            .map(|snapshot| (snapshot.server_pid, snapshot.server_start))
+    }
+
+    /// Тесты: взвести маяк от имени процесса `(pid, start)` -- «сервер
+    /// взвёл и упал».
+    #[cfg(test)]
+    pub(crate) fn raise_as(&self, pid: u32, start: u64) -> Result<()> {
+        self.publish(pid, start);
+        self.event.set()
     }
 
     /// Слово состояния по смещению; `None` -- безымянный маяк или смещение
@@ -596,20 +647,7 @@ mod tests {
         )
     }
 
-    /// PID и время создания процесса, который уже завершился (дочерний
-    /// `cmd`, handle закрыт): «упавший сервер». Даже если PID успеют
-    /// переиспользовать, время создания не совпадёт.
-    fn dead_process() -> (u32, u64) {
-        let mut child = std::process::Command::new("cmd")
-            .args(["/C", "exit", "0"])
-            .spawn()
-            .expect("cmd");
-        let pid = child.id();
-        let start = crate::win::process_start_time(pid).expect("время создания");
-        drop(child.wait());
-        drop(child);
-        (pid, start)
-    }
+    use crate::test_support::dead_process;
 
     /// Находка 11: детерминированная интерлиния «клиент гасит маяк нового
     /// сервера». Старый сервер взвёл маяк и упал; клиент A прочитал

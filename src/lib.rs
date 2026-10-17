@@ -8,6 +8,7 @@ pub mod events;
 mod layout;
 mod namespace;
 mod naming;
+mod presence;
 #[cfg_attr(
     not(test),
     expect(
@@ -34,6 +35,9 @@ pub(crate) mod ntapi;
 
 #[cfg(test)]
 mod peer_tests;
+
+#[cfg(test)]
+mod test_support;
 
 #[cfg(test)]
 mod handshake_model;
