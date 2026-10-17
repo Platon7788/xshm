@@ -620,17 +620,26 @@
   сначала дочитать кольцо (`Ok(true)`), потом `Err(NotConnected)` и пометка
   отключения; событие возвращается взведённым; устаревший `DISCONNECT`
   поглощается, ожидание продолжается остатком таймаута. Пир, ушедший до
-  вызова, распознаётся по памяти без ожидания. Anonymous-сервер: при пустом
+  вызова, распознаётся по памяти без ожидания и без спина. Anonymous-сервер: при пустом
   кольце и `client_state != SERVER_READY` — `Err(NotConnected)`. Простой —
   по-прежнему одно ожидание в ядре. Тесты:
-  `ring::try_write_tests::wait_for_data_wakes_on_disconnect_and_ignores_stale_signal`,
+  `ring::try_write_tests::{wait_for_data_wakes_on_disconnect_and_ignores_stale_signal,
+  wait_for_data_blocked_reader_wakes_on_leave}`,
+  `ring::tests::departed_peer_skips_spin`,
   `server::poll_tests::{poll_client_sees_graceful_leave_after_drain,
+  blocked_poll_client_wakes_on_client_leave,
   poll_client_idle_is_single_kernel_wait, anonymous_poll_sees_client_state_idle}`,
   `client::tests::{poll_server_sees_server_leave,
-  poll_server_spin_sees_server_leave}`,
+  poll_server_spin_sees_server_leave, blocked_poll_server_wakes_on_server_leave}`,
   `tests/peer_death.rs::shared_server_sees_client_death` (после `PeerDied`
   канал принимает нового клиента). Новых обязанностей у пира нет — только
-  R14 (состояние `IDLE` до `DISCONNECT`); INTEROP §e.1, §i.6, §f.
+  R14 (состояние `IDLE` до `DISCONNECT`); INTEROP §e.1, §i.6, §f, R14.
+- **Minor** Сервер, сбрасывая сессию (`mark_disconnected`), писал
+  `handshake_state = IDLE` в оба заголовка колец безусловно и мог затереть
+  `CLIENT_HELLO` (шаг C7) следующего клиента, вошедшего сразу после ухода
+  прежнего. Теперь — CAS `SERVER_READY → IDLE`, как у `client_state`. Поле
+  информационное (Rust его не читает, следующий S3 перезаписывает), на
+  рукопожатие не влияло. INTEROP §e.2 п. 5.
 
 ### Сборка
 

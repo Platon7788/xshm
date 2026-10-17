@@ -1415,9 +1415,9 @@ impl RingBuffer {
     /// `peer_left`) и всё, что он записал, прочитано.
     ///
     /// Порядок: `is_empty` (с барьером, Dekker-пара с `publish`), затем
-    /// `spin` -- один бюджет на вызов с проверкой по позициям, затем
     /// проверка ухода по разделяемой памяти (`peer_left`: пир, ушедший до
-    /// вызова, не требует ожидания), затем ожидание в ядре по `[DATA,
+    /// вызова, не требует ни спина, ни ожидания), затем `spin` -- один
+    /// бюджет на вызов с проверкой по позициям, затем ожидание в ядре по `[DATA,
     /// DISCONNECT, процесс писателя]` (меньший индекс важнее: при
     /// одновременном сигнале последние данные ушедшего пира не теряются).
     /// Спин, увидевший кадр, возвращает `Ok(true)` без ядра; `DATA`,
@@ -1444,16 +1444,17 @@ impl RingBuffer {
         if !self.is_empty() {
             return Ok(true);
         }
-        let deadline = deadline_of(timeout);
-        if timeout != Some(Duration::ZERO) && spin_until(spin, deadline, || self.has_unread()) {
-            return Ok(true);
-        }
         // Пир уже ушёл (его сигнал мог достаться другому ждущему, который
         // вернул его, или ещё в пути): решаем по памяти, событие не трогаем.
+        // До спина -- ушедший пир ничего не допишет, бюджет спина не тратим.
         if let Some(d) = disconnect
             && (d.peer_left)()
         {
             return self.left_outcome(ShmError::NotConnected);
+        }
+        let deadline = deadline_of(timeout);
+        if timeout != Some(Duration::ZERO) && spin_until(spin, deadline, || self.has_unread()) {
+            return Ok(true);
         }
 
         // Индекс 0 -- данные, затем отключение, затем смерть. Хвост массива
@@ -2676,6 +2677,53 @@ mod try_write_tests {
         assert_eq!(data_waits() - before, 0);
     }
 
+    /// Главный путь: читатель УЖЕ спит в ядре (без таймаута-страховки),
+    /// когда пир уходит (R14: состояние, потом `DISCONNECT`). Одно ожидание
+    /// в ядре, `NotConnected` сразу после сигнала, событие возвращено
+    /// взведённым для остальных ждущих.
+    #[test]
+    fn wait_for_data_blocked_reader_wakes_on_leave() {
+        let data_waits = || DATA_KERNEL_WAITS.with(std::cell::Cell::get);
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let disconnect = EventHandle::create_unnamed(false).unwrap();
+        let left = AtomicBool::new(false);
+        let peer_left = || left.load(O::Acquire);
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+        let delay = Duration::from_millis(100);
+        thread::scope(|scope| {
+            let leaver = scope.spawn(|| {
+                thread::sleep(delay);
+                left.store(true, O::Release);
+                disconnect.set().unwrap();
+            });
+            let before = data_waits();
+            let started = Instant::now();
+            assert_eq!(
+                ring.wait_for_data(
+                    &data,
+                    None,
+                    Some(&watch),
+                    Some(Duration::from_secs(10)),
+                    SpinPolicy::NONE
+                ),
+                Err(ShmError::NotConnected)
+            );
+            let elapsed = started.elapsed();
+            assert!(elapsed >= delay - Duration::from_millis(10), "{elapsed:?}");
+            assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+            assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
+            leaver.join().unwrap();
+        });
+        assert!(
+            disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "сигнал отключения возвращён остальным ждущим"
+        );
+    }
+
     /// Писатель быстрее читателя: try_write упирается в QueueFull, но ни одно
     /// сообщение не теряется, не переставляется и не рвётся; после того как
     /// читатель разгребает кольцо, запись продолжается.
@@ -2905,6 +2953,36 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(data_waits() - before, 1);
         assert_eq!(ring.read_message(&mut out), Ok(16));
+    }
+
+    /// Пир уже ушёл: ответ из памяти до спина -- длинный бюджет не
+    /// тратится, ожидания в ядре нет, событие не тронуто.
+    #[test]
+    fn departed_peer_skips_spin() {
+        let (ring, _mem) = make_ring();
+        let data = EventHandle::create_unnamed(false).unwrap();
+        let disconnect = EventHandle::create_unnamed(false).unwrap();
+        let peer_left = || true;
+        let watch = DisconnectWatch {
+            event: &disconnect,
+            peer_left: &peer_left,
+        };
+        let before = data_waits();
+        let started = Instant::now();
+        assert_eq!(
+            ring.wait_for_data(
+                &data,
+                None,
+                Some(&watch),
+                Some(Duration::from_secs(5)),
+                LONG_SPIN
+            ),
+            Err(ShmError::NotConnected)
+        );
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_millis(50), "{elapsed:?}");
+        assert_eq!(data_waits() - before, 0);
+        assert!(!disconnect.wait(Some(Duration::ZERO)).unwrap());
     }
 
     /// Бюджет исчерпан без данных -- одно обычное ожидание в ядре (не

@@ -985,13 +985,20 @@ impl SharedServer {
             Ordering::Acquire,
         );
 
+        // Заголовки -- тоже CAS `SERVER_READY -> IDLE` (только значение
+        // своей сессии, его поставил S3): ушедший клиент уже перевёл их в
+        // `IDLE`, а следующий мог успеть записать `CLIENT_HELLO` (C7) --
+        // безусловный store затёр бы его. Поле информационное (Rust его не
+        // читает), следующий S3 всё равно перезапишет оба заголовка.
         let (header_a, header_b) = self.view.headers();
-        header_a
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        header_b
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
+        for header in [header_a, header_b] {
+            let _ = header.handshake_state.compare_exchange(
+                HANDSHAKE_SERVER_READY,
+                HANDSHAKE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
 
         // Ревизия 3 (R18): клиент умер в сессии (handle процесса с
         // подтверждённым временем создания сигнален) -- сам он claim уже не
@@ -2176,6 +2183,38 @@ mod poll_tests {
                 .slot_claim
                 .load(Ordering::Acquire),
             client.claim()
+        );
+    }
+
+    /// Главный путь: сервер уже спит в `poll_client(None)` (без таймаута),
+    /// когда клиент уходит штатно. Одно ожидание в ядре, `NotConnected`,
+    /// сторона помечена, `DISCONNECT` возвращён взведённым.
+    #[test]
+    fn blocked_poll_client_wakes_on_client_leave() {
+        let name = unique("BLOCKED");
+        let server = SharedServer::start(&name).unwrap();
+        let (mut server, client) = accept(server, &name);
+        let poller = std::thread::spawn(move || {
+            let before = data_waits();
+            let result = server.poll_client(None);
+            (result, data_waits() - before, Instant::now(), server)
+        });
+        std::thread::sleep(Duration::from_millis(100)); // сервер уже спит
+        let left_at = Instant::now();
+        drop(client); // L: IDLE, потом DISCONNECT
+        let (result, waits, woke, server) = poller.join().unwrap();
+        assert_eq!(result, Err(ShmError::NotConnected));
+        assert_eq!(waits, 1, "одно ожидание в ядре");
+        assert!(woke.duration_since(left_at) < Duration::from_secs(1));
+        assert!(!server.is_connected());
+        assert!(
+            server
+                .events()
+                .unwrap()
+                .disconnect
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "сигнал отключения возвращён взведённым"
         );
     }
 

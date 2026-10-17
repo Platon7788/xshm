@@ -1663,6 +1663,46 @@ mod tests {
         assert!(!events.disconnect.wait(Some(Duration::ZERO)).unwrap());
     }
 
+    /// Главный путь: клиент уже спит в `poll_server(None)`, когда сервер
+    /// уходит (`disconnect_local`). Одно ожидание в ядре, `NotConnected`,
+    /// сторона помечена, `DISCONNECT` возвращён взведённым, `Drop` --
+    /// без ответного сигнала.
+    #[test]
+    fn blocked_poll_server_wakes_on_server_leave() {
+        let name = unique("POLL_BLOCKED");
+        let server = SharedServer::start(&name).unwrap();
+        let (mut server, mut client) = accept(server, &name);
+        let poller = std::thread::spawn(move || {
+            let waits = || crate::ring::DATA_KERNEL_WAITS.with(std::cell::Cell::get);
+            let before = waits();
+            let result = client.poll_server(None);
+            (result, waits() - before, Instant::now(), client)
+        });
+        std::thread::sleep(Duration::from_millis(100)); // клиент уже спит
+        let left_at = Instant::now();
+        server.disconnect_local();
+        let (result, waits, woke, client) = poller.join().unwrap();
+        assert_eq!(result, Err(ShmError::NotConnected));
+        assert_eq!(waits, 1, "одно ожидание в ядре");
+        assert!(woke.duration_since(left_at) < Duration::from_secs(1));
+        assert!(!client.is_connected());
+        drop(client);
+        let disconnect = &server.events().unwrap().disconnect;
+        assert!(
+            disconnect.wait(Some(Duration::ZERO)).unwrap(),
+            "сигнал отключения возвращён взведённым"
+        );
+        assert!(!disconnect.wait(Some(Duration::ZERO)).unwrap());
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            CLAIM_FREE
+        );
+    }
+
     #[test]
     fn poll_server_sees_server_leave() {
         poll_server_sees_server_leave_with(SpinPolicy::NONE);
