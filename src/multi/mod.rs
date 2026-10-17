@@ -327,7 +327,9 @@ pub struct MultiClientOptions {
     /// `AutoOptions::discovery_fallback`): пока сервера нет и клиент спит на
     /// маяке базы или процессе сервера, попытка захвата -- не реже этого
     /// интервала. Подключённый клиент по нему не просыпается. По умолчанию
-    /// -- `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с); `None` -- только события.
+    /// -- `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с); `None` -- только события;
+    /// `Some(Duration::ZERO)` -- `MultiClient::connect` отказывает
+    /// `ShmError::InvalidConfig`.
     pub discovery_fallback: Option<Duration>,
     /// Количество сообщений за один цикл
     pub recv_batch: usize,
@@ -2202,6 +2204,7 @@ impl MultiClient {
         handler: Arc<dyn MultiClientHandler>,
         options: MultiClientOptions,
     ) -> Result<Self> {
+        presence::validate_fallback(options.discovery_fallback)?;
         let outbox = Arc::new(ClientOutbox::default());
         let wake = Arc::new(EventHandle::create_unnamed(false)?);
         let running = Arc::new(AtomicBool::new(true));

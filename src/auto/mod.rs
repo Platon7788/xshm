@@ -135,6 +135,9 @@ pub struct AutoOptions {
     /// клиент по нему не просыпается. По умолчанию --
     /// `Some(DEFAULT_DISCOVERY_FALLBACK)` (10 с: не больше 0,1 пробуждения в
     /// секунду, пока сервера нет); `None` -- только события.
+    /// `Some(Duration::ZERO)` -- `AutoClient::connect` отказывает
+    /// `ShmError::InvalidConfig` (каждое ожидание стало бы немедленной
+    /// попыткой -- цикл без сна).
     pub discovery_fallback: Option<Duration>,
     /// Сколько `AutoClient` ждёт ответа сервера на одну попытку
     /// подключения (`AutoServer` не использует).
@@ -295,6 +298,10 @@ struct AutoStats {
     /// Возвраты worker-а из ожидания в ядре (0.9) -- тесты доказывают по
     /// нему отсутствие пробуждений в простое. В снимок не входит.
     wakeups: AtomicU64,
+    /// Тесты (C1 повторного ревью Task 11): попытки подключения клиента --
+    /// горячий цикл попыток без ожиданий в ядре счётчик `wakeups` не видит.
+    #[cfg(test)]
+    attempts: AtomicU64,
 }
 
 impl AutoStats {
@@ -1385,6 +1392,7 @@ impl AutoClient {
         options: AutoOptions,
         mode: ClientMode,
     ) -> Result<Self> {
+        presence::validate_fallback(options.discovery_fallback)?;
         let name_owned = name.to_owned();
         let endpoint = Endpoint::spawn(
             handler,
@@ -1453,6 +1461,12 @@ impl AutoClient {
     #[cfg(test)]
     pub(crate) fn wakeups(&self) -> u64 {
         self.endpoint.stats.wakeups.load(Ordering::Relaxed)
+    }
+
+    /// Число попыток подключения (тесты: нет горячего цикла попыток).
+    #[cfg(test)]
+    pub(crate) fn attempts(&self) -> u64 {
+        self.endpoint.stats.attempts.load(Ordering::Relaxed)
     }
 }
 
@@ -1548,6 +1562,8 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
         // Ревизия 2: ожидание `S2C_CONNECT` прерывается `wake` -- `stop`/Drop
         // не ждут `connect_timeout`; `send` ожидание не прерывает.
         let mut should_stop = || !worker.running();
+        #[cfg(test)]
+        worker.stats.attempts.fetch_add(1, Ordering::Relaxed);
         let connected = SharedClient::connect_interruptible(
             worker.options.namespace.as_deref(),
             name,
@@ -3516,5 +3532,141 @@ mod presence_tests {
         assert_eq!(timeouts(&log), 2, "{:?}", log.errors());
         drop(client);
         drop(second);
+    }
+
+    /// Маяк с личностью упавшего сервера в состоянии и сброшенным событием
+    /// -- ровно то, что оставляет `clear_if_stale` после падения сервера.
+    fn dead_identity_beacon(name: &str) -> Beacon {
+        let (pid, start) = dead_process();
+        let beacon = Beacon::open(name).unwrap();
+        beacon.raise_as(pid, start).unwrap();
+        let clearer = Beacon::open(name).unwrap();
+        assert!(clearer.clear_if_stale().unwrap(), "маяк упавшего сброшен");
+        assert!(!beacon.is_raised().unwrap());
+        beacon
+    }
+
+    /// Секунда работы клиента против отвергающего сервера: попыток
+    /// подключения -- считанные (до исправления C1 -- десятки тысяч в секунду
+    /// при `wakeups() == 0`).
+    fn assert_no_attempt_storm(client: &AutoClient, log: &Log) {
+        wait_until("первая ошибка", Duration::from_secs(5), || {
+            !log.errors().is_empty()
+        });
+        let a0 = client.attempts();
+        thread::sleep(Duration::from_secs(1));
+        let attempts = client.attempts() - a0;
+        assert!(attempts <= 3, "попыток подключения за 1 с: {attempts}");
+    }
+
+    /// Self-relative дескриптор с пустым DACL (доступа нет никому).
+    fn deny_all() -> ObjectSecurity {
+        let mut sd = vec![1u8, 0, 0x04, 0x80];
+        sd.extend_from_slice(&[0; 12]);
+        sd.extend_from_slice(&20u32.to_le_bytes());
+        sd.extend_from_slice(&[2, 0, 8, 0, 0, 0, 0, 0]);
+        ObjectSecurity::Descriptor(sd)
+    }
+
+    /// C1 повторного ревью: секция отвергает (`AccessDenied` -- личность
+    /// секции не читается, `Refused(None)`), а в состоянии маяка -- личность
+    /// упавшего сервера. До исправления: личность маяка -> процесс завершился
+    /// -> немедленный `Retry` -> та же ошибка -- горячий цикл без единого
+    /// ожидания в ядре.
+    #[test]
+    fn refused_with_dead_beacon_identity_does_not_spin() {
+        let name = unique("DEAD_REFUSE");
+        let beacon = dead_identity_beacon(&name);
+        let server = SharedServer::start_slot(
+            None,
+            &name,
+            ChannelLayout::DEFAULT,
+            0,
+            &deny_all().attributes().unwrap(),
+            Presence::Off,
+        )
+        .unwrap();
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        assert_no_attempt_storm(&client, &log);
+        assert_eq!(log.errors(), vec![ShmError::AccessDenied]);
+        drop(client);
+        drop(server);
+        drop(beacon);
+    }
+
+    /// C1 + m2: секция другого формата с недоверенной личностью (живой PID,
+    /// время 0), маяк -- с личностью упавшего сервера: ни горячего цикла, ни
+    /// доверия маяку (PID секции другой).
+    #[test]
+    fn refused_untrusted_section_with_dead_beacon_does_not_spin() {
+        let name = unique("DEAD_VERSION");
+        let server = SharedServer::start(&name).unwrap();
+        let beacon = dead_identity_beacon(&name);
+        let child = LiveChild::spawn();
+        let control = server.view().control_block();
+        control.version.store(0x0001_0000, Ordering::Release);
+        control.server_start_lo.store(0, Ordering::Release);
+        control.server_start_hi.store(0, Ordering::Release);
+        control.server_pid.store(child.pid, Ordering::Release);
+        let log = Arc::new(Log::default());
+        let client = AutoClient::connect(&name, log.clone(), AutoOptions::default()).unwrap();
+        assert_no_attempt_storm(&client, &log);
+        assert_eq!(version_errors(&log), 1, "{:?}", log.errors());
+        drop(client);
+        drop(server);
+        drop(beacon);
+    }
+
+    /// m1 повторного ревью: нулевая резервная проверка -- цикл без сна,
+    /// отвергается при подключении.
+    #[test]
+    fn zero_discovery_fallback_is_rejected() {
+        let options = AutoOptions {
+            discovery_fallback: Some(Duration::ZERO),
+            ..AutoOptions::default()
+        };
+        assert!(matches!(
+            AutoClient::connect(&unique("ZERO"), Arc::new(Log::default()), options).err(),
+            Some(ShmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            crate::multi::MultiClient::connect(
+                &unique("ZERO_MULTI"),
+                Arc::new(ZeroMulti),
+                crate::multi::MultiClientOptions {
+                    discovery_fallback: Some(Duration::ZERO),
+                    ..crate::multi::MultiClientOptions::default()
+                },
+            )
+            .err(),
+            Some(ShmError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            SharedClient::wait_for_server_with(
+                &unique("ZERO_WAIT"),
+                Some(Duration::from_millis(10)),
+                &crate::DiscoveryOptions::default().fallback(Some(Duration::ZERO)),
+            ),
+            Err(ShmError::InvalidConfig(_))
+        ));
+        // `None` -- только события, допустимо.
+        let client = AutoClient::connect(
+            &unique("NONE"),
+            Arc::new(Log::default()),
+            AutoOptions {
+                discovery_fallback: None,
+                ..AutoOptions::default()
+            },
+        )
+        .unwrap();
+        drop(client);
+    }
+
+    struct ZeroMulti;
+    impl crate::multi::MultiClientHandler for ZeroMulti {
+        fn on_connect(&self, _slot_id: u32) {}
+        fn on_disconnect(&self) {}
+        fn on_message(&self, _data: &[u8]) {}
     }
 }

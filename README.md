@@ -900,7 +900,8 @@ handshake time is ignored.
 **Presence beacon (0.10).** Every named server keeps a presence beacon for its
 name: `SharedServer::start*`, `AutoServer` and the Dispatch lobby hold
 `<name>_beacon`, a `MultiServer` holds one `<base>_multi_beacon` (not one per
-slot, and never shared with a channel named `<base>`);
+slot, and never shared with a channel named `<base>`; a channel literally
+named `<base>_multi` would share it, so do not name channels that way);
 Dispatch's per-client channels have none. The beacon lives in the channel's
 namespace (including a `PrivateNamespace`) with the channel's security policy.
 It is raised only after the section and all 7 events are published (Multi:
@@ -928,7 +929,8 @@ Clients use it on their own — nothing to write:
   only): a beacon that is squatted and never raised, a server without a
   beacon (native peer without R19, best-effort failure above) or a spoofed
   server identity costs at most one wake-up per interval while no server is
-  found — a connected client never wakes for it. Server identities in the
+  found — a connected client never wakes for it. `Some(Duration::ZERO)` is
+  rejected with `ShmError::InvalidConfig`. Server identities in the
   segment and in the beacon state are untrusted: identities without a
   creation time or naming the client itself are ignored, and the segment's
   identity must match the beacon's.

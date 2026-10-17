@@ -599,7 +599,9 @@ impl DispatchCore {
     /// `SharedServer::presence`): `Unavailable` -- лобби работает без
     /// маяка (занят объектом другого типа, DACL маяка, созданного клиентом
     /// другого пользователя, не включает сервер): клиенты, ждущие маяк,
-    /// находят лобби только своей резервной проверкой.
+    /// находят лобби только своей резервной проверкой. `Disabled` -- лобби
+    /// нет: после `stop()` и пока пересоздание лобби после ошибки не
+    /// удалось.
     #[must_use]
     pub fn presence(&self) -> crate::PresenceStatus {
         self.presence_status.lock_clean().clone()
@@ -935,7 +937,17 @@ impl DispatchCore {
                     }
                 }
             }
+            // Лобби уходит (пересоздание или остановка): его маяк сброшен в
+            // `Drop` -- статус больше не `Active` (m4 повторного ревью Task 11;
+            // неудачное пересоздание оставляет `Disabled`, как Multi после
+            // `stop`).
+            drop(lobby_server);
+            *self.presence_status.lock_clean() = crate::PresenceStatus::Disabled;
         }
+        // Остановка до первого витка (поток лобби стартовал уже после
+        // `stop()`): лобби из `start` так и не принималось -- уходит здесь.
+        drop(first);
+        *self.presence_status.lock_clean() = crate::PresenceStatus::Disabled;
 
         // Остановка: закрываем все клиентские каналы. Карту опустошаем под
         // логом, а каналы останавливаем и дропаем (join их worker-ов) уже без
@@ -1986,8 +1998,11 @@ mod tests {
         )
         .unwrap();
         assert!(beacon.is_raised().unwrap(), "лобби не взвело маяк");
+        assert_eq!(server.presence(), crate::PresenceStatus::Active);
         server.stop();
         assert!(!beacon.is_raised().unwrap(), "маяк остался после stop()");
+        // m4 повторного ревью: статус не залипает в `Active`.
+        assert_eq!(server.presence(), crate::PresenceStatus::Disabled);
         drop(server);
     }
 

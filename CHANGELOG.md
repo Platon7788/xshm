@@ -40,7 +40,7 @@
 | Допуск Dispatch | любой зарегистрировавшийся клиент получал канал | `DispatchHandler::admit` → `Admission::{Accept, AcceptWithLayout, Reject}` (по умолчанию `Accept`), `DispatchOptions::max_clients = 64` | Больше 64 клиентов — поднять `max_clients` |
 | `MAX_MULTI_CLIENTS` | 31 | 256 (каждый слот — своя секция; 256 × 4 МиБ ≈ 1 ГиБ) | Для больших `max_clients` — маленький `MultiOptions::layout` |
 | Маяк | клиент сбрасывал маяк сам (`lower`) | `clear_if_stale` (секция `<имя>_beacon_state`, живой сервер не трогается); `lower` — только сервер | Клиенту — `clear_if_stale` вместо `lower` |
-| Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер держит `<имя>_beacon`, база Multi — `<база>_multi_beacon` (лучшее усилие: ошибка маяка старт не отказывает, `presence()`); клиенты без сервера спят на нём не дольше `discovery_fallback` (10 с), одинаковая ошибка подряд — один раз; `SharedClient::wait_for_server*`, `DiscoveryOptions`; `MultiClientOptions::{security, discovery_fallback}`, `AutoOptions::discovery_fallback` | Ручной `raise` лобби можно убрать; литералы `AutoOptions`/`MultiClientOptions` — с `..Default::default()`; одинаковая `ObjectSecurity` у сервера и клиентов; нативный сервер — R19 (INTEROP §e.4) |
+| Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер держит `<имя>_beacon`, база Multi — `<база>_multi_beacon` (лучшее усилие: ошибка маяка старт не отказывает, `presence()`); клиенты без сервера спят на нём не дольше `discovery_fallback` (10 с), одинаковая ошибка подряд — один раз; `SharedClient::wait_for_server*`, `DiscoveryOptions`; `MultiClientOptions::{security, discovery_fallback}`, `AutoOptions::discovery_fallback` | Ручной `raise` лобби можно убрать; литералы `AutoOptions`/`MultiClientOptions` — с `..Default::default()`; одинаковая `ObjectSecurity` у сервера и клиентов; `discovery_fallback` — `None` или ненулевой; не называть канал `<база>_multi` рядом с базой Multi `<база>`; нативный сервер — R19 (INTEROP §e.4) |
 
 Потребители, проверенные на этой ветке (Task 19, `cargo check --workspace
 --all-targets`):
@@ -1022,7 +1022,28 @@
   squatted_beacon_does_not_fail_start, different_hung_servers_are_each_reported}`,
   `multi::tests::{multi_base_beacon_is_distinct_from_channel_beacon,
   multi_client_finds_beaconless_server_by_fallback}` (ключевые проверки
-  подтверждены мутацией).
+  подтверждены мутацией). Имя канала `<база>_multi` даёт тот же маяк, что у
+  базы Multi `<база>`, — так каналы не называть.
+- **Critical** (повторное ревью Task 11, решение Y) Горячий цикл попыток
+  `AutoClient` на пути отказа: секция отвергает (`AccessDenied`, другой
+  формат), а единственная личность сервера — личность уже завершившегося
+  процесса в состоянии маяка (её оставляет `clear_if_stale` после падения
+  сервера, или подмена). `wait_server` отвечал немедленным `Retry`, попытка
+  снова отвергалась — около 50–100 тыс. попыток в секунду при нулевом
+  счётчике пробуждений. Теперь такая личность — «личности нет»: ожидание
+  маяка (если не взведён) и резервной проверки. PID секции с недоверенной
+  личностью (время 0) сверяется с маяком (m2). `discovery_fallback =
+  Some(Duration::ZERO)` — `ShmError::InvalidConfig` при подключении (m1).
+  `DispatchServer::presence()` — `Disabled` после `stop()` и неудачного
+  пересоздания лобби (m4). Тесты
+  `auto::presence_tests::{refused_with_dead_beacon_identity_does_not_spin
+  (считает попытки подключения: без исправления — 100 821 за 1 с),
+  refused_untrusted_section_with_dead_beacon_does_not_spin,
+  zero_discovery_fallback_is_rejected}`,
+  `presence::tests::{refused_dead_identity_waits_instead_of_retry,
+  untrusted_section_pid_still_cross_checks_beacon}`,
+  `dispatch::tests::lobby_raises_beacon_automatically` (статус после
+  `stop`); исправления C1 и m2 подтверждены мутацией.
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

@@ -86,6 +86,18 @@ pub(crate) fn multi_beacon_name(base: &str) -> String {
     format!("{base}{MULTI_BEACON_SUFFIX}")
 }
 
+/// Проверка `discovery_fallback` (m1 повторного ревью): нулевой интервал
+/// превратил бы каждое ожидание обнаружения в немедленную попытку -- цикл
+/// без сна. `None` (только события) и любой ненулевой -- допустимы.
+pub(crate) fn validate_fallback(fallback: Option<Duration>) -> Result<()> {
+    if fallback == Some(Duration::ZERO) {
+        return Err(ShmError::InvalidConfig(
+            "discovery_fallback must be non-zero (None disables it)",
+        ));
+    }
+    Ok(())
+}
+
 /// Меньший из двух необязательных таймаутов (`None` -- без ограничения).
 pub(crate) fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     match (a, b) {
@@ -307,9 +319,18 @@ impl PresenceWatch {
     ) -> Result<PresenceWait> {
         match failure {
             Failure::Absent => self.wait_absent(wake, timeout, wakeup),
+            // C1 повторного ревью: личность, чей процесс уже завершился,
+            // -- не «отвергнувший сервер» (обычно -- личность упавшего
+            // сервера, которую `clear_if_stale` оставил в состоянии маяка, или
+            // подмена). Ждать её выхода нечего, а немедленный `Retry` при
+            // секции, которая снова отвергнет, -- горячий цикл попыток без
+            // единого ожидания. Без личности -- набор ожидания: маяк (если не
+            // взведён) и резервная проверка.
             Failure::Refused(section) => match self.cross_checked(section) {
-                Some(server) => self.wait_server(server, wake, timeout, wakeup),
-                None => self.wait_set(wake, None, timeout, wakeup),
+                Some(server) if !is_process_gone(server.0, server.1) => {
+                    self.wait_server(server, wake, timeout, wakeup)
+                }
+                _ => self.wait_set(wake, None, timeout, wakeup),
             },
         }
     }
@@ -318,8 +339,17 @@ impl PresenceWatch {
     /// секции и из состояния маяка, только доверенные; обе есть и
     /// расходятся -- не верим ни одной.
     fn cross_checked(&self, section: Option<(u32, u64)>) -> Option<(u32, u64)> {
-        let section = section.filter(trusted);
         let beacon = self.beacon.server_identity().filter(trusted);
+        // m2 повторного ревью: PID секции сверяется с маяком и тогда, когда
+        // её личность недоверенная (время 0 -- сервер 0.9 или подмена):
+        // секция указывает на другой процесс -- маяку тоже не верим.
+        if let (Some((section_pid, _)), Some((beacon_pid, _))) = (section, beacon)
+            && section_pid != 0
+            && section_pid != beacon_pid
+        {
+            return None;
+        }
+        let section = section.filter(trusted);
         match (section, beacon) {
             (Some(section), Some(beacon)) if section != beacon => None,
             (Some(section), _) => Some(section),
@@ -373,7 +403,11 @@ impl PresenceWatch {
     ) -> Result<PresenceWait> {
         match ProcessWatch::open_peer(pid, start) {
             Some(server) => self.wait_set(wake, Some(&server), timeout, wakeup),
-            // Сервер успел завершиться -- попытка, затем маяк.
+            // Сервер успел завершиться -- попытка, затем маяк. Только путь
+            // «сервера нет» (маяк взведён живым по состоянию сервером): там
+            // следующий круг гасит маяк (`clear_if_stale`) и засыпает на нём
+            // -- повторов без ожидания не больше одного. Путь отказа сюда
+            // мёртвую личность не передаёт (C1).
             None if is_process_gone(pid, start) => Ok(PresenceWait::Retry),
             // Не открылся (права, служба в другой сессии) -- без подмены
             // источника личности: резервный повтор (решение W(2)).
@@ -482,7 +516,8 @@ pub struct DiscoveryOptions {
     pub security: ObjectSecurity,
     /// Резервная проверка (решение W(3)): пока сервер не найден, проверять
     /// канал не реже этого интервала, даже если маяк молчит. `None` --
-    /// только события.
+    /// только события; `Some(Duration::ZERO)` -- `ShmError::InvalidConfig`
+    /// (цикл без сна).
     pub fallback: Option<Duration>,
     /// Частное пространство имён канала (`None` -- `\BaseNamedObjects`).
     pub namespace: Option<Arc<PrivateNamespace>>,
@@ -552,6 +587,7 @@ pub(crate) fn wait_for_server(
     timeout: Option<Duration>,
     options: &DiscoveryOptions,
 ) -> Result<bool> {
+    validate_fallback(options.fallback)?;
     let deadline = crate::ring::deadline_of(timeout);
     let mut watch: Option<PresenceWatch> = None;
     loop {
@@ -812,5 +848,63 @@ mod tests {
         assert!(reported.presence_first(&ShmError::AccessDenied));
         assert!(!reported.presence_first(&ShmError::AccessDenied));
         assert!(!reported.first(&ShmError::Timeout), "ряды независимы");
+    }
+
+    /// m2 повторного ревью: личность секции без времени (сервер 0.9 или
+    /// подмена) -- её PID всё равно сверяется с маяком: другой процесс --
+    /// маяку не верим (не ждём B, даже когда он завершается во время
+    /// ожидания).
+    #[test]
+    fn untrusted_section_pid_still_cross_checks_beacon() {
+        let (mut watch, server) = pair("PIDCHECK");
+        let a = LiveChild::spawn();
+        let mut b = LiveChild::spawn();
+        server.raise_as(b.pid, b.start).unwrap();
+        let killer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            b.kill();
+        });
+        let started = Instant::now();
+        assert_eq!(
+            watch
+                .wait(
+                    Failure::Refused(Some((a.pid, 0))),
+                    None,
+                    Some(Duration::from_millis(200)),
+                    &|| {}
+                )
+                .unwrap(),
+            PresenceWait::TimedOut
+        );
+        assert!(started.elapsed() >= Duration::from_millis(190));
+        killer.join().unwrap();
+        drop(a);
+    }
+
+    /// C1: отказ, единственная личность (маяка) -- завершившийся процесс:
+    /// не немедленный `Retry`, а набор ожидания (маяк не взведён --
+    /// ожидание в ядре до таймаута).
+    #[test]
+    fn refused_dead_identity_waits_instead_of_retry() {
+        let (mut watch, server) = pair("DEADID");
+        let (pid, start) = dead_process();
+        server.raise_as(pid, start).unwrap();
+        // Как после `clear_if_stale`: событие сброшено, личность осталась.
+        assert!(server.clear_if_stale().unwrap());
+        assert_eq!(server.server_identity(), Some((pid, start)));
+        let (started, before) = (Instant::now(), waits());
+        assert_eq!(
+            watch
+                .wait(
+                    Failure::Refused(None),
+                    None,
+                    Some(Duration::from_millis(150)),
+                    &|| {}
+                )
+                .unwrap(),
+            PresenceWait::TimedOut
+        );
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        assert_eq!(waits() - before, 1, "ожидание маяка в ядре");
     }
 }
