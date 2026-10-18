@@ -119,6 +119,48 @@ impl Drop for Owned {
 #[derive(Debug)]
 pub struct Client(Owned);
 impl Client {
+    /// Дождаться доступного канала через C discovery/claim-free события.
+    /// При исчерпании бюджета возвращается последняя ошибка попытки C.
+    pub fn connect_when_available(
+        name: &str,
+        options: super::ClientConnectOptions,
+        budget: super::ConnectBudget,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Self> {
+        let name = CString::new(name)?;
+        let timeout = budget.milliseconds()?;
+        let security = options.security.raw();
+        let fallback = match options.discovery_fallback {
+            None => u32::MAX,
+            Some(duration) if duration.is_zero() => return Err(Error::InvalidConfig),
+            Some(duration) => Wait::For(duration).milliseconds()?,
+        };
+        let raw = xipc_sys::ClientWaitOptions {
+            handshake_timeout_ms: Wait::For(options.handshake_timeout).milliseconds()?,
+            retry_delay_ms: Wait::For(options.retry_delay).milliseconds()?,
+            discovery_fallback_ms: fallback,
+            security: &raw const security,
+            ns: options
+                .namespace
+                .as_ref()
+                .map_or(std::ptr::null(), PrivateNamespace::raw),
+        };
+        let mut conn = Owned::new(options.namespace)?;
+        // SAFETY: нулевой уникальный conn, параметры/строка/токен живы весь
+        // вызов, namespace удерживается conn; discovery выполняет только C.
+        let code = unsafe {
+            xipc_sys::xipc_client_connect_wait(
+                conn.ptr.as_ptr(),
+                name.as_ptr(),
+                &raw const raw,
+                timeout,
+                CancellationToken::handle(cancel),
+            )
+        };
+        conn.status(code)?;
+        Ok(Self(conn))
+    }
+
     /// Зарегистрироваться в Dispatch и получить выделенное соединение.
     /// Имя клиента C сокращает до 64 байт на границе символа UTF-8.
     pub fn connect_dispatch(
@@ -321,6 +363,47 @@ impl Drop for Session<'_> {
 
 macro_rules! channel_methods {
     () => {
+        /// Известное C-ядру состояние текущей сессии.
+        pub fn is_connected(&mut self) -> bool {
+            // SAFETY: эксклюзивное обращение к живому C-объекту.
+            unsafe { xipc_sys::xipc_is_connected(self.0.ptr.as_ptr()) }
+        }
+        /// Собственная копия раскладки; None, когда C уже освободил канал.
+        pub fn layout(&mut self) -> Option<super::Layout> {
+            // SAFETY: C возвращает свой layout либо NULL; &mut не допускает
+            // изменения conn до завершения копирования простой repr(C)-структуры.
+            let ptr = unsafe { xipc_sys::xipc_conn_layout(self.0.ptr.as_ptr()) };
+            // SAFETY: непустой указатель C валиден весь этот эксклюзивный вызов.
+            unsafe { ptr.as_ref() }.copied()
+        }
+        /// PID пира из C-ядра (сам по себе не является аутентификацией).
+        pub fn peer_pid(&mut self) -> Option<u32> {
+            // SAFETY: эксклюзивный живой C-объект; возвращается число по значению.
+            let pid = unsafe { xipc_sys::xipc_peer_pid(self.0.ptr.as_ptr()) };
+            (pid != 0).then_some(pid)
+        }
+        /// Дождаться места для конкретного сообщения без таймерного опроса.
+        /// При уходе пира его последние входящие кадры ещё можно прочитать.
+        pub fn wait_for_space(
+            &mut self,
+            payload_len: usize,
+            wait: Wait,
+            cancel: Option<&CancellationToken>,
+        ) -> Result<()> {
+            let len = u32::try_from(payload_len).map_err(|_| Error::LengthTooLarge)?;
+            let timeout = wait.milliseconds()?;
+            // SAFETY: уникальный conn; заимствованный token удерживает HANDLE
+            // всё ожидание. Arm/recheck/Dekker выполняет единое C-ядро.
+            let code = unsafe {
+                xipc_sys::xipc_wait_for_space(
+                    self.0.ptr.as_ptr(),
+                    len,
+                    timeout,
+                    CancellationToken::handle(cancel),
+                )
+            };
+            self.0.status(code)
+        }
         /// Отправить без потери старых сообщений; Full означает отсутствие места.
         pub fn try_send(&mut self, message: &[u8]) -> Result<()> {
             self.0.try_send(message)

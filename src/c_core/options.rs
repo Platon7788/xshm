@@ -167,6 +167,34 @@ impl Default for MultiClientOptions {
     }
 }
 
+/// Настройки ожидания доступного одиночного канала.
+#[derive(Debug, Clone)]
+pub struct ClientConnectOptions {
+    /// Срок рукопожатия одной попытки, ограничиваемый также общим бюджетом.
+    pub handshake_timeout: Duration,
+    /// Задержка повторов при недоступных уведомлениях.
+    pub retry_delay: Duration,
+    /// Положительный страхующий срок либо None для ожидания только событий.
+    pub discovery_fallback: Option<Duration>,
+    /// Безопасность впервые создаваемых объектов обнаружения.
+    pub security: Security,
+    /// Пространство имён удерживается соединением до закрытия.
+    pub namespace: Option<PrivateNamespace>,
+}
+impl Default for ClientConnectOptions {
+    fn default() -> Self {
+        // SAFETY: функция без предусловий, возвращает параметры по значению.
+        let raw = unsafe { xipc_sys::xipc_client_wait_options_default() };
+        Self {
+            handshake_timeout: Duration::from_millis(u64::from(raw.handshake_timeout_ms)),
+            retry_delay: Duration::from_millis(u64::from(raw.retry_delay_ms)),
+            discovery_fallback: Some(Duration::from_millis(u64::from(raw.discovery_fallback_ms))),
+            security: Security::default(),
+            namespace: None,
+        }
+    }
+}
+
 /// Параметры лобби и выделенных каналов Dispatch.
 #[derive(Debug, Clone)]
 pub struct DispatchOptions {

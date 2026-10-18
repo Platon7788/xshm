@@ -11,6 +11,7 @@ mod error;
 mod multi;
 mod options;
 mod resources;
+mod wait;
 mod worker;
 
 pub use cancel::CancellationToken;
@@ -20,10 +21,12 @@ pub use dispatch::{
 };
 pub use error::{DisconnectReason, Error, Result};
 pub use multi::{MultiEvent, MultiPeer, MultiServer, MultiWake};
+pub use options::ClientConnectOptions;
 pub use options::{
     ChannelConfig, ConnectBudget, Layout, MultiClientOptions, MultiOptions, RingConfig, Security,
     Wait,
 };
 pub use options::{DispatchClientOptions, DispatchOptions};
 pub use resources::{Beacon, PrivateNamespace};
+pub use wait::{ProcessExit, wait_any};
 pub use worker::{CommandCompletion, DispatchSender, DispatchWorker, QueueLimits};

@@ -147,6 +147,16 @@ pub struct MultiClientOptions {
     pub discovery_fallback_ms: u32,
     pub security: *const Security,
 }
+/// Поиск доступного одиночного канала через уведомления C-ядра.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ClientWaitOptions {
+    pub handshake_timeout_ms: u32,
+    pub retry_delay_ms: u32,
+    pub discovery_fallback_ms: u32,
+    pub security: *const Security,
+    pub ns: *const Namespace,
+}
 
 const _: () = {
     assert!(size_of::<Layout>() == 24);
@@ -164,6 +174,8 @@ const _: () = {
         assert!(size_of::<DispatchOptions>() == 112);
         assert!(size_of::<DispatchClientOptions>() == 48);
         assert!(size_of::<DispatchEvent>() == 32);
+        assert!(size_of::<ClientWaitOptions>() == 32);
+        assert!(std::mem::offset_of!(ClientWaitOptions, security) == 16);
         assert!(std::mem::offset_of!(DispatchOptions, admit) == 96);
         assert!(std::mem::offset_of!(DispatchEvent, reg) == 24);
     } else {
@@ -175,6 +187,8 @@ const _: () = {
         assert!(size_of::<DispatchOptions>() == 84);
         assert!(size_of::<DispatchClientOptions>() == 28);
         assert!(size_of::<DispatchEvent>() == 24);
+        assert!(size_of::<ClientWaitOptions>() == 20);
+        assert!(std::mem::offset_of!(ClientWaitOptions, security) == 12);
         assert!(std::mem::offset_of!(DispatchOptions, admit) == 76);
         assert!(std::mem::offset_of!(DispatchEvent, reg) == 20);
     }
@@ -183,6 +197,23 @@ const _: () = {
 // SAFETY: объявления соответствуют public-заголовкам xipc ABI 2;
 // размеры repr(C)-структур проверены и rustc, и C-компилятором при сборке.
 unsafe extern "C" {
+    pub fn xipc_client_wait_options_default() -> ClientWaitOptions;
+    pub fn xipc_client_connect_wait(
+        conn: *mut Conn,
+        name: *const c_char,
+        options: *const ClientWaitOptions,
+        timeout: u32,
+        cancel: *mut c_void,
+    ) -> i32;
+    pub fn xipc_wait_for_space(
+        conn: *mut Conn,
+        payload_len: u32,
+        timeout: u32,
+        cancel: *mut c_void,
+    ) -> i32;
+    pub fn xipc_conn_layout(conn: *const Conn) -> *const Layout;
+    pub fn xipc_process_exit_open(pid: u32, handle: *mut *mut c_void) -> i32;
+    pub fn xipc_process_exit_close(handle: *mut c_void);
     pub fn xipc_dispatch_options_default() -> DispatchOptions;
     pub fn xipc_dispatch_client_options_default() -> DispatchClientOptions;
     pub fn xipc_dispatch_server_alloc(count: u32, slots: *mut *mut DispatchSlot) -> *mut Dispatch;
