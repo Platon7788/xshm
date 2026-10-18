@@ -1,9 +1,9 @@
 [package]
 name = "xshm"
-version = "0.10.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.99"
-description = "High-performance cross-process shared memory IPC using direct NT API calls"
+description = "Safe Rust IPC over the shared xipc C core for Windows"
 authors = ["Platon"]
 license = "MIT"
 repository = "https://github.com/Platon7788/xshm"
@@ -22,15 +22,7 @@ crate-type = ["rlib"]
 
 [dependencies]
 thiserror = "2.0.21"
-xipc-sys = { path = "crates/xipc-sys", optional = true }
-
-# Без внешних зависимостей для NT API!
-# Используем прямую линковку с ntdll.dll через #[link(name = "ntdll")]
-
-[features]
-default = []
-# Временный вход для проверяемой миграции; не постоянный второй backend.
-c-core = ["dep:xipc-sys"]
+xipc-sys = { path = "crates/xipc-sys" }
 
 # Политика линтов живёт в манифесте (Cargo 1.74+), а не в атрибутах крейта:
 # так она распространяется на все таргеты (lib, tests) единообразно и видна

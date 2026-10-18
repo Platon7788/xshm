@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  XIPC_SOURCE_DIR: ${{ github.workspace }}/xhook/ipc
   # .cargo/config.toml в .gitignore -- статический CRT задаём здесь, как локально
   CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
   CARGO_TARGET_I686_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
@@ -22,6 +23,14 @@ jobs:
         target: [x86_64-pc-windows-msvc, i686-pc-windows-msvc]
     steps:
       - uses: actions/checkout@v4
+
+      - name: Checkout shared C core
+        uses: actions/checkout@v4
+        with:
+          repository: Platon7788/xhook
+          ref: d7563de
+          path: xhook
+          token: ${{ secrets.XHOOK_READ_TOKEN || github.token }}
 
       - name: Установка toolchain 1.99.0
         uses: dtolnay/rust-toolchain@master
@@ -51,19 +60,19 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --all-targets --target ${{ matrix.target }} -- -D warnings
 
       # Release-профиль даёт свои предупреждения (cfg(debug_assertions),
       # LTO-специфичный код): потребитель видел предупреждение только в release
       - name: cargo clippy --release
-        run: cargo clippy --release --all-targets --target ${{ matrix.target }} -- -D warnings
+        run: cargo clippy --workspace --release --all-targets --target ${{ matrix.target }} -- -D warnings
 
       # Тесты делят имена объектов в \BaseNamedObjects -- только последовательно
       - name: cargo test
-        run: cargo test --target ${{ matrix.target }} -- --test-threads=1
+        run: cargo test --workspace --target ${{ matrix.target }} -- --test-threads=1
 
       - name: cargo doc
         if: matrix.target == 'x86_64-pc-windows-msvc'
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps
+        run: cargo doc --workspace --no-deps
