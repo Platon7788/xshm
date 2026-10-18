@@ -33,6 +33,60 @@ pub struct Multi {
 pub struct MultiSlot {
     _private: [u8; 0],
 }
+/// Непрозрачный Dispatch-сервер и его заимствованные слоты.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Dispatch {
+    _private: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct DispatchSlot {
+    _private: [u8; 0],
+}
+
+/// Декодированная регистрация; имя содержит name_len байт, включая возможные NUL.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Registration {
+    pub pid: u32,
+    pub revision: u16,
+    pub name_len: u8,
+    pub name: [u8; 65],
+}
+pub type AdmitFn = unsafe extern "C" fn(*mut c_void, *const Registration) -> bool;
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchOptions {
+    pub max_clients: u32,
+    pub lobby_timeout_ms: u32,
+    pub channel_connect_timeout_ms: u32,
+    pub lobby_layout: Layout,
+    pub channel_layout: Layout,
+    pub security: Security,
+    pub ns: *const Namespace,
+    pub admit: Option<AdmitFn>,
+    pub admit_ctx: *mut c_void,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchClientOptions {
+    pub lobby_timeout_ms: u32,
+    pub response_timeout_ms: u32,
+    pub channel_timeout_ms: u32,
+    pub security: Security,
+    pub ns: *const Namespace,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct DispatchEvent {
+    pub kind: i32,
+    pub client_id: u32,
+    pub len: u32,
+    pub reason: i32,
+    pub error: i32,
+    pub reg: *const Registration,
+}
 
 /// Параметры одного кольца, стабильная публичная структура C.
 #[repr(C)]
@@ -97,6 +151,9 @@ pub struct MultiClientOptions {
 const _: () = {
     assert!(size_of::<Layout>() == 24);
     assert!(size_of::<MultiEvent>() == 20);
+    assert!(size_of::<Registration>() == 72);
+    assert!(std::mem::offset_of!(Registration, name) == 7);
+    assert!(std::mem::offset_of!(DispatchOptions, channel_layout) == 36);
     assert!(std::mem::offset_of!(ChannelConfig, security) == 24);
     if cfg!(target_pointer_width = "64") {
         assert!(size_of::<Security>() == 24 && size_of::<ChannelConfig>() == 56);
@@ -104,18 +161,66 @@ const _: () = {
         assert!(size_of::<MultiOptions>() == 64);
         assert!(size_of::<MultiClientOptions>() == 32);
         assert!(std::mem::offset_of!(MultiClientOptions, security) == 24);
+        assert!(size_of::<DispatchOptions>() == 112);
+        assert!(size_of::<DispatchClientOptions>() == 48);
+        assert!(size_of::<DispatchEvent>() == 32);
+        assert!(std::mem::offset_of!(DispatchOptions, admit) == 96);
+        assert!(std::mem::offset_of!(DispatchEvent, reg) == 24);
     } else {
         assert!(size_of::<Security>() == 12 && size_of::<ChannelConfig>() == 40);
         assert!(std::mem::offset_of!(ChannelConfig, ns) == 36);
         assert!(size_of::<MultiOptions>() == 44);
         assert!(size_of::<MultiClientOptions>() == 20);
         assert!(std::mem::offset_of!(MultiClientOptions, security) == 16);
+        assert!(size_of::<DispatchOptions>() == 84);
+        assert!(size_of::<DispatchClientOptions>() == 28);
+        assert!(size_of::<DispatchEvent>() == 24);
+        assert!(std::mem::offset_of!(DispatchOptions, admit) == 76);
+        assert!(std::mem::offset_of!(DispatchEvent, reg) == 20);
     }
 };
 
 // SAFETY: объявления соответствуют public-заголовкам xipc ABI 2;
 // размеры repr(C)-структур проверены и rustc, и C-компилятором при сборке.
 unsafe extern "C" {
+    pub fn xipc_dispatch_options_default() -> DispatchOptions;
+    pub fn xipc_dispatch_client_options_default() -> DispatchClientOptions;
+    pub fn xipc_dispatch_server_alloc(count: u32, slots: *mut *mut DispatchSlot) -> *mut Dispatch;
+    pub fn xipc_dispatch_server_free(server: *mut Dispatch);
+    pub fn xipc_dispatch_server_start(
+        server: *mut Dispatch,
+        slots: *mut DispatchSlot,
+        count: u32,
+        lobby: *const c_char,
+        options: *const DispatchOptions,
+    ) -> i32;
+    pub fn xipc_dispatch_server_next(
+        server: *mut Dispatch,
+        buffer: *mut c_void,
+        capacity: u32,
+        timeout: u32,
+        event: *mut DispatchEvent,
+    ) -> i32;
+    pub fn xipc_dispatch_try_send(
+        server: *mut Dispatch,
+        id: u32,
+        data: *const c_void,
+        len: u32,
+    ) -> i32;
+    pub fn xipc_dispatch_send(server: *mut Dispatch, id: u32, data: *const c_void, len: u32)
+    -> i32;
+    pub fn xipc_dispatch_disconnect_client(server: *mut Dispatch, id: u32) -> i32;
+    pub fn xipc_dispatch_wake(server: *mut Dispatch) -> i32;
+    pub fn xipc_dispatch_connect(
+        lobby: *const c_char,
+        revision: u16,
+        name: *const c_char,
+        options: *const DispatchClientOptions,
+        cancel: *mut c_void,
+        conn: *mut Conn,
+        id: *mut u32,
+        channel_name: *mut c_char,
+    ) -> i32;
     pub fn xipc_conn_alloc() -> *mut Conn;
     pub fn xipc_conn_free(conn: *mut Conn);
     pub fn xipc_channel_config_default() -> ChannelConfig;

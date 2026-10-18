@@ -167,6 +167,68 @@ impl Default for MultiClientOptions {
     }
 }
 
+/// Параметры лобби и выделенных каналов Dispatch.
+#[derive(Debug, Clone)]
+pub struct DispatchOptions {
+    /// Максимум одновременно допущенных клиентов, включая ожидающих канал.
+    /// Сервер выделяет столько же слотов; диапазон 1..=256.
+    pub max_clients: u32,
+    /// Срок получения запроса после рукопожатия лобби.
+    pub lobby_timeout: Duration,
+    /// Срок подключения клиента к выданному каналу.
+    pub channel_connect_timeout: Duration,
+    /// Раскладка канала регистрации.
+    pub lobby_layout: Layout,
+    /// Параметры выделенных каналов, безопасность всех объектов и namespace.
+    pub channel: ChannelConfig,
+}
+impl Default for DispatchOptions {
+    fn default() -> Self {
+        // SAFETY: функция без предусловий, возвращает параметры по значению.
+        let raw = unsafe { xipc_sys::xipc_dispatch_options_default() };
+        Self {
+            max_clients: raw.max_clients,
+            lobby_timeout: Duration::from_millis(u64::from(raw.lobby_timeout_ms)),
+            channel_connect_timeout: Duration::from_millis(u64::from(
+                raw.channel_connect_timeout_ms,
+            )),
+            lobby_layout: raw.lobby_layout,
+            channel: ChannelConfig {
+                layout: raw.channel_layout,
+                ..ChannelConfig::default()
+            },
+        }
+    }
+}
+
+/// Отдельные сроки этапов регистрации Dispatch; каждый этап прерывается отменой.
+#[derive(Debug, Clone)]
+pub struct DispatchClientOptions {
+    /// Ожидание мьютекса и рукопожатие лобби, каждое с этим сроком.
+    pub lobby_timeout: Wait,
+    /// Ожидание ответа на регистрацию.
+    pub response_timeout: Wait,
+    /// Рукопожатие выделенного канала.
+    pub channel_timeout: Wait,
+    /// Политика мьютекса, если клиент создаёт его первым.
+    pub security: Security,
+    /// Пространство имён сохраняется до закрытия клиентского канала.
+    pub namespace: Option<PrivateNamespace>,
+}
+impl Default for DispatchClientOptions {
+    fn default() -> Self {
+        // SAFETY: функция без предусловий, возвращает параметры по значению.
+        let raw = unsafe { xipc_sys::xipc_dispatch_client_options_default() };
+        Self {
+            lobby_timeout: Wait::For(Duration::from_millis(u64::from(raw.lobby_timeout_ms))),
+            response_timeout: Wait::For(Duration::from_millis(u64::from(raw.response_timeout_ms))),
+            channel_timeout: Wait::For(Duration::from_millis(u64::from(raw.channel_timeout_ms))),
+            security: Security::default(),
+            namespace: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

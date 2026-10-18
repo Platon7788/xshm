@@ -34,6 +34,11 @@ impl From<i32> for DisconnectReason {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Admission-обработчик запаниковал при panic=unwind; сервер отказывает
+    /// в регистрации и больше не вызывает этот обработчик. При panic=abort
+    /// действует обычная политика завершения процесса, перехват невозможен.
+    #[error("паника обработчика допуска клиентов")]
+    AdmissionPanicked,
     /// Неверный аргумент C API.
     #[error("неверный аргумент")]
     InvalidArgument,

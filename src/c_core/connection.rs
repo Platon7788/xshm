@@ -119,6 +119,64 @@ impl Drop for Owned {
 #[derive(Debug)]
 pub struct Client(Owned);
 impl Client {
+    /// Зарегистрироваться в Dispatch и получить выделенное соединение.
+    /// Имя клиента C сокращает до 64 байт на границе символа UTF-8.
+    pub fn connect_dispatch(
+        lobby: &str,
+        revision: u16,
+        client_name: &str,
+        options: super::DispatchClientOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(Self, super::DispatchConnectionInfo)> {
+        let lobby = CString::new(lobby)?;
+        let client_name = CString::new(client_name)?;
+        let raw = xipc_sys::DispatchClientOptions {
+            lobby_timeout_ms: options.lobby_timeout.milliseconds()?,
+            response_timeout_ms: options.response_timeout.milliseconds()?,
+            channel_timeout_ms: options.channel_timeout.milliseconds()?,
+            security: options.security.raw(),
+            ns: options
+                .namespace
+                .as_ref()
+                .map_or(std::ptr::null(), PrivateNamespace::raw),
+        };
+        let mut conn = Owned::new(options.namespace)?;
+        let mut id = 0;
+        let mut channel_name = [0_u8; 65];
+        // SAFETY: нулевой уникальный conn, живые C-строки/параметры/токен;
+        // выходной массив имеет требуемые C 65 байт. C не сохраняет указатели.
+        let code = unsafe {
+            xipc_sys::xipc_dispatch_connect(
+                lobby.as_ptr(),
+                revision,
+                client_name.as_ptr(),
+                &raw const raw,
+                CancellationToken::handle(cancel),
+                conn.ptr.as_ptr(),
+                &raw mut id,
+                channel_name.as_mut_ptr().cast(),
+            )
+        };
+        conn.status(code)?;
+        let end = channel_name
+            .iter()
+            .position(|&b| b == 0)
+            .ok_or(Error::InvalidCoreResult)?;
+        if id == 0 || end == 0 {
+            return Err(Error::InvalidCoreResult);
+        }
+        let channel_name = std::str::from_utf8(&channel_name[..end])
+            .map_err(|_| Error::InvalidCoreResult)?
+            .to_owned();
+        Ok((
+            Self(conn),
+            super::DispatchConnectionInfo {
+                client_id: id,
+                channel_name,
+            },
+        ))
+    }
+
     /// Занять свободный слот Multi. Полученный клиент владеет заявкой до Drop.
     /// Возвращённый номер слота служит диагностике, а не идентификатором сессии.
     pub fn connect_multi(

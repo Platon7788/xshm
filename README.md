@@ -1,7 +1,7 @@
 > **C-core migration preview (`feat/c-core`).** The experimental `c-core`
 > feature exposes `xshm::c_core` backed by the shared xipc C implementation.
-> Single channels, namespace/beacon ownership and the caller-driven Multi loop
-> are implemented; Dispatch and background modes are still being migrated.
+> Single channels, namespace/beacon ownership and caller-driven Multi/Dispatch
+> loops are implemented; background modes are still being migrated.
 > This is not the complete replacement release. The default 0.10 API below
 > remains a temporary reference.
 > API compatibility is secondary to ownership and safety. The final migration
