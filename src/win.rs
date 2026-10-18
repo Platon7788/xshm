@@ -373,6 +373,45 @@ impl EventHandle {
         })
     }
 
+    /// Безымянное автосбросное событие (SynchronizationEvent) с дескриптором
+    /// `security` (Task 13): события anonymous-канала. Вид -- тот же, что у
+    /// именованных событий канала (`create`), дескриптор -- тот же, что у
+    /// anonymous-секции: по имени объект не открыть, но ядро (драйвер,
+    /// `ObReferenceObjectByHandle`) и дубликаты handle видят один дескриптор
+    /// у всех объектов канала.
+    pub(crate) fn create_unnamed_secured(security: &SecurityAttributes) -> Result<Self> {
+        let mut obj_attr = OBJECT_ATTRIBUTES::new(null_mut(), 0, security.as_ptr());
+        let mut handle: HANDLE = null_mut();
+        // SAFETY: `handle` -- валидный out-параметр на стеке; `obj_attr`
+        // без имени (`ObjectName = NULL` -- безымянный объект) живёт до конца
+        // вызова, дескриптор `security` заимствован на весь вызов.
+        let status = unsafe {
+            NtCreateEvent(
+                &raw mut handle,
+                EVENT_ALL_ACCESS,
+                &raw mut obj_attr,
+                SYNCHRONIZATION_EVENT,
+                0, // InitialState = FALSE
+            )
+        };
+        if status != STATUS_SUCCESS || handle.is_null() {
+            return Err(status_to_error(status, "NtCreateEvent(unnamed, secured)"));
+        }
+        Ok(EventHandle {
+            handle: Handle(handle),
+        })
+    }
+
+    /// Тесты: событие по чужому сырому handle (как его видит драйвер, §b.5
+    /// INTEROP) -- без владения: `ManuallyDrop` не даёт закрыть handle,
+    /// которым владеет сервер.
+    #[cfg(test)]
+    pub(crate) const fn borrow_raw(raw: isize) -> core::mem::ManuallyDrop<Self> {
+        core::mem::ManuallyDrop::new(EventHandle {
+            handle: Handle(core::ptr::without_provenance_mut(raw.cast_unsigned())),
+        })
+    }
+
     /// Сброс в несигнальное состояние через NtResetEvent
     pub fn reset(&self) -> Result<()> {
         let mut previous_state: i32 = 0;
@@ -944,6 +983,46 @@ impl Mapping {
 
     pub const fn as_ptr(&self) -> *mut u8 {
         self.view
+    }
+
+    /// Тесты: второе отображение секции по её сырому handle (`section`,
+    /// handle владельца не закрывается) -- «драйвер» anonymous-канала,
+    /// отображающий секцию, полученную по handle (§b.5 INTEROP). Отображение
+    /// снимается в `Drop`; поле handle -- NULL (его `Drop` пропускает).
+    #[cfg(test)]
+    pub(crate) fn map_section_handle(section: isize, size: usize) -> Result<Self> {
+        let mut base_address: PVOID = null_mut();
+        let mut view_size: usize = 0;
+        // SAFETY: `section` -- живой handle секции вызывающего (тесты держат
+        // сервер-владельца всё время жизни отображения); `base_address` и
+        // `view_size` -- валидные out-параметры на стеке.
+        let status = unsafe {
+            NtMapViewOfSection(
+                core::ptr::without_provenance_mut(section.cast_unsigned()),
+                NT_CURRENT_PROCESS,
+                &raw mut base_address,
+                0,
+                0,
+                null_mut(),
+                &raw mut view_size,
+                VIEW_UNMAP,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        if status != STATUS_SUCCESS {
+            return Err(status_to_error(status, "NtMapViewOfSection (by handle)"));
+        }
+        let mapping = Mapping {
+            _handle: Handle(null_mut()),
+            view: base_address.cast::<u8>(),
+            size: view_size,
+        };
+        // Секция меньше ожидаемого сегмента -- не та секция.
+        if view_size < size {
+            return Err(ShmError::Corrupted);
+        }
+        Ok(mapping)
     }
 }
 

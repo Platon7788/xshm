@@ -41,6 +41,7 @@
 | `MAX_MULTI_CLIENTS` | 31 | 256 (каждый слот — своя секция; 256 × 4 МиБ ≈ 1 ГиБ) | Для больших `max_clients` — маленький `MultiOptions::layout` |
 | Маяк | клиент сбрасывал маяк сам (`lower`) | `clear_if_stale` (секция `<имя>_beacon_state`, живой сервер не трогается); `lower` — только сервер | Клиенту — `clear_if_stale` вместо `lower` |
 | Маяк присутствия (R19) | маяк взводило приложение лобби; `AutoClient`/`MultiClient` без сервера опрашивали раз в 250 мс | каждый именованный сервер держит `<имя>_beacon`, база Multi — `<база>_multi_beacon` (лучшее усилие: ошибка маяка старт не отказывает, `presence()`); клиенты без сервера спят на нём не дольше `discovery_fallback` (10 с), одинаковая ошибка подряд — один раз; `SharedClient::wait_for_server*`, `DiscoveryOptions`; `MultiClientOptions::{security, discovery_fallback}`, `AutoOptions::discovery_fallback` | Ручной `raise` лобби можно убрать; литералы `AutoOptions`/`MultiClientOptions` — с `..Default::default()`; одинаковая `ObjectSecurity` у сервера и клиентов; `discovery_fallback` — `None` или ненулевой; не называть канал `<база>_multi` рядом с базой Multi `<база>`; нативный сервер — R19 (INTEROP §e.4) |
+| Anonymous-сервер (`start_anonymous*`) | событий нет: `get_event_handles() -> Option<EventHandles>` = `None`, `EventHandles` — `s2c_data`/`c2s_data`; ожидание клиента — `wait_for_client_noevent` (опрос 1 мс); `poll_client` — без ожидания, `wait_for_space` — опрос 1 мс, async — `InvalidConfig` | секция всегда с 7 безымянными событиями: `get_event_handles() -> EventHandles` (все 7, `#[non_exhaustive]`), `events() -> &SharedEvents`; `wait_for_client_noevent` удалён; все ожидания — в ядре | `wait_for_client_noevent` → `wait_for_client`; `get_event_handles()` без `Option`; драйвер ОБЯЗАН сигналить `CONNECT_REQ`/`DATA`/`SPACE`/`DISCONNECT` по INTEROP §b.5 (иначе сервер ждёт до таймаута) |
 
 Потребители, проверенные на этой ветке (Task 19, `cargo check --workspace
 --all-targets`):
@@ -197,7 +198,8 @@
     сервера (PID и время создания из сегмента): сервер умер, не ответив, —
     `Err(PeerDied)` с тем же откатом заявки. Повторно опрашивать future
     после `Ready` нельзя: recv/send выполнили бы ещё одну операцию.
-  - Anonymous-сервер (без событий) — `Err(InvalidConfig)`.
+  - Anonymous-сервер — так же (Task 13: безымянные события, см.
+    «Изменено (несовместимо)»; до него — `Err(InvalidConfig)`).
   - `SharedClient::connect_async_in(ns: Arc<PrivateNamespace>, name)`
     (надёжность, 17.10.2026) — async-подключение к каналу в частном
     пространстве имён: тот же future, что `connect_async` (заявка,
@@ -233,7 +235,8 @@
   `server::disconnect_tests::disconnect_kicks_client_and_accepts_next`.
   Rustdoc (M4 ревью T11b): живой клиент, не заметивший разрыва, держит
   claim до отъёма по `RESERVE_TIMEOUT` от первого толчка; непрочитанное
-  клиент → сервер сбрасывает S3 следующей сессии; anonymous — без сигнала.
+  клиент → сервер сбрасывает S3 следующей сессии (anonymous — с Task 13
+  тоже с сигналом: безымянные события).
 
 - **Маяк присутствия у каждого сервера** (надёжность, 17.10.2026, Task 11;
   INTEROP **R19**, «Изменения 0.10» п. 34). Каждый именованный сервер
@@ -293,6 +296,30 @@
   считается и канал без claim-а с заявкой или сессией.
 
 ### Изменено (несовместимо)
+
+- **Anonymous-сервер всегда с 7 безымянными событиями** (надёжность,
+  18.10.2026, Task 13; решения J (D), R-P; INTEROP §b.5, «Изменения 0.10»
+  п. 40). `start_anonymous*` создаёт вместе с секцией 7 безымянных
+  SynchronizationEvent (тот же вид, что у именованного канала) с тем же
+  дескриптором, что у секции. API:
+  - `SharedServer::get_event_handles()` возвращает `EventHandles` (было
+    `Option<EventHandles>`, у anonymous — `None`);
+  - `EventHandles` — все 7 handle-ов (`s2c_data`, `c2s_data`, `s2c_space`,
+    `c2s_space`, `connect_ack`, `connect_req`, `disconnect`; было — только
+    `s2c_data`/`c2s_data`), `#[non_exhaustive]`, derive `PartialEq`/`Eq`;
+  - `SharedServer::events()` возвращает `&SharedEvents` (было
+    `Option<&SharedEvents>`);
+  - **`SharedServer::wait_for_client_noevent` удалён** (опрос `client_state`
+    раз в 1 мс) — anonymous-сервер ждёт драйвер `wait_for_client`/
+    `accept_async`, как именованный;
+  - `is_anonymous()` — по флагу канала, а не по отсутствию событий.
+
+  Пир-видимо: драйвер (роль клиента) ОБЯЗАН сигналить `C2S_CONNECT_REQ`
+  после `CLIENT_HELLO`, `DATA`/`SPACE` по §e.2 п. 1–2 и уходить `IDLE` →
+  `DISCONNECT` при выгрузке — процесса у него нет, смерть сервер не
+  наблюдает. Миграция: `wait_for_client_noevent(t)` → `wait_for_client(t)`,
+  `get_event_handles().unwrap()` → `get_event_handles()`. Потребители
+  (поиск по `D:\GitHub`): API anonymous-канала не использует никто.
 
 - **`SharedServer::poll_client`/`poll_client_spin` и
   `SharedClient::poll_server`/`poll_server_spin` берут `&mut self`** (было
@@ -787,15 +814,16 @@
   сначала дочитать кольцо (`Ok(true)`), потом `Err(NotConnected)` и пометка
   отключения; событие возвращается взведённым; устаревший `DISCONNECT`
   поглощается, ожидание продолжается остатком таймаута. Пир, ушедший до
-  вызова, распознаётся по памяти без ожидания и без спина. Anonymous-сервер: при пустом
-  кольце и `client_state != SERVER_READY` — `Err(NotConnected)`. Простой —
+  вызова, распознаётся по памяти без ожидания и без спина. Anonymous-сервер
+  (с Task 13) — тот же набор на безымянных событиях. Простой —
   по-прежнему одно ожидание в ядре. Тесты:
   `ring::try_write_tests::{wait_for_data_wakes_on_disconnect_and_ignores_stale_signal,
   wait_for_data_blocked_reader_wakes_on_leave}`,
   `ring::tests::departed_peer_skips_spin`,
   `server::poll_tests::{poll_client_sees_graceful_leave_after_drain,
   blocked_poll_client_wakes_on_client_leave,
-  poll_client_idle_is_single_kernel_wait, anonymous_poll_sees_client_state_idle}`,
+  poll_client_idle_is_single_kernel_wait}` (`anonymous_poll_sees_client_state_idle`
+  заменён `server::anonymous_tests::anonymous_driver_leave_is_seen`, Task 13),
   `client::tests::{poll_server_sees_server_leave,
   poll_server_spin_sees_server_leave, blocked_poll_server_wakes_on_server_leave}`,
   `tests/peer_death.rs::shared_server_sees_client_death` (после `PeerDied`
@@ -1323,6 +1351,31 @@
   уведомления на `raise`/`lower`, откате C6, S2 и `abort_session` (m7);
   INTEROP §d.2 C8, §h п. 12 (переносы, сброс события захватчиком) (m8);
   лишнее пробуждение ждущих при своём откате C6 задокументировано (m9).
+- **Major** (Task 13, решения J (D), R-P) Anonymous-канал жил опросом:
+  событий не было, и `wait_for_client_noevent` будил поток раз в 1 мс,
+  `wait_for_space` спал по `SPACE_POLL_INTERVAL` (1 мс), `poll_client`
+  возвращал `Ok(false)` сразу (ждать было нечего: вызывающий крутил его
+  сам), async API отвечал `InvalidConfig`, а драйвер не мог ни разбудить
+  сервер, ни дождаться его (`get_event_handles()` — `None`). Теперь секция
+  создаётся вместе с 7 безымянными событиями (`SharedEvents::create_unnamed`,
+  `EventHandle::create_unnamed_secured` — дескриптор секции), все пути
+  опроса удалены (`SPACE_POLL_INTERVAL`, ветки «нет событий» в
+  `wait_for_client`, `poll_client`, `wait_for_space`, async, worker-е Auto,
+  диспетчере Multi, лобби Dispatch): рукопожатие — одно пробуждение по
+  `CONNECT_REQ`, `poll_client`/`wait_for_space` — одно ожидание в ядре на
+  весь таймаут, уход сервера драйвер видит по `DISCONNECT`. Тесты (до
+  исправления — не компилировались или падали: ноль ожиданий в ядре, возврат
+  `poll_client` через 3,5 мкс, `InvalidConfig`):
+  `server::anonymous_tests::{anonymous_server_exposes_all_events,
+  anonymous_handshake_signalled_by_driver,
+  anonymous_poll_client_sleeps_in_kernel,
+  anonymous_wait_for_space_is_single_kernel_wait,
+  anonymous_driver_leave_is_seen, anonymous_server_leave_signals_driver}`,
+  `tests/async.rs::anonymous_accept_and_recv_async`,
+  `tests/security.rs::anonymous_events_share_section_descriptor`;
+  `ring::tests::wait_for_space_polls_without_event` заменён
+  `wait_for_space_timeout_clears_waiter`. Пир-видимо: INTEROP §b.2, §b.5,
+  §e.5, §i.6, «Изменения 0.10» п. 40.
 
 ### Изменено (надёжность, внутреннее, 17.10.2026)
 

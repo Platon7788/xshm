@@ -472,7 +472,7 @@ fn dropped_future_keeps_consumed_data_signal() {
             state.wakes.load(Ordering::SeqCst) >= 1
         });
     }
-    let data = &server.events().unwrap().c2s.data;
+    let data = &server.events().c2s.data;
     assert!(
         data.wait(Some(Duration::ZERO)).unwrap(),
         "потреблённый сигнал DATA не возвращён событию"
@@ -639,14 +639,147 @@ fn futures_are_send() {
     assert_send(&client.send_async(b"x1"));
 }
 
-/// Anonymous-канал без событий: async API -- явная ошибка конфигурации.
+// ─── anonymous-канал и «драйвер» (Task 13) ──────────────────────────────────
+
+#[cfg_attr(
+    target_arch = "x86",
+    link(
+        name = "kernel32",
+        kind = "raw-dylib",
+        import_name_type = "undecorated"
+    )
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "kernel32", kind = "raw-dylib"))]
+unsafe extern "system" {
+    fn MapViewOfFile(
+        section: *mut std::ffi::c_void,
+        access: u32,
+        offset_high: u32,
+        offset_low: u32,
+        bytes: usize,
+    ) -> *mut std::ffi::c_void;
+    fn UnmapViewOfFile(base: *const std::ffi::c_void) -> i32;
+    fn WaitForSingleObject(handle: *mut std::ffi::c_void, millis: u32) -> u32;
+}
+
+/// `FILE_MAP_ALL_ACCESS` (`SECTION_ALL_ACCESS`).
+const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
+
+/// Сырой handle из `EventHandles`/`section_handle` -- указатель для kernel32.
+const fn raw_handle(handle: isize) -> *mut std::ffi::c_void {
+    std::ptr::without_provenance_mut(handle.cast_unsigned())
+}
+
+/// Атомарное `u32`-поле сегмента по смещению `offset` (INTEROP §c).
+///
+/// # Safety
+/// `base` -- живое отображение сегмента не короче `offset + 4` байт,
+/// `offset` кратно 4; ссылка не переживает отображение.
+unsafe fn word<'a>(base: *mut u8, offset: usize) -> &'a std::sync::atomic::AtomicU32 {
+    // SAFETY: контракт функции -- `base + offset` внутри отображения.
+    let field = unsafe { base.add(offset) };
+    // SAFETY: контракт функции -- адрес выровнен и живёт дольше ссылки;
+    // поле разделяемой памяти читается и пишется только атомарно.
+    unsafe { &*field.cast::<std::sync::atomic::AtomicU32>() }
+}
+
+/// Task 13: anonymous-сервер с «драйвером» (поток теста, говорящий с
+/// каналом только через handle-ы `section_handle`/`get_event_handles`,
+/// раскладку INTEROP §c и сигналы §b.5/§e.2) -- `accept_async` и
+/// `recv_async` спят в реакторе на безымянных событиях и работают (до
+/// 0.10 -- `InvalidConfig`): заявка, кадр, уход.
 #[test]
-fn anonymous_server_rejects_async() {
+fn anonymous_accept_and_recv_async() {
+    use std::sync::atomic::fence;
     let mut server = SharedServer::start_anonymous().unwrap();
-    assert!(matches!(
-        block_on(server.accept_async()),
-        Err(ShmError::InvalidConfig(_))
-    ));
+    let section = server.section_handle();
+    let events = server.get_event_handles();
+    let (leave_tx, leave_rx) = mpsc::channel::<()>();
+    let driver = thread::spawn(move || {
+        // SAFETY: handle секции живёт, пока жив сервер, а сервер ждёт
+        // `join` этого потока; отображение целиком.
+        let view = unsafe { MapViewOfFile(raw_handle(section), FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+        assert!(!view.is_null(), "MapViewOfFile по handle секции");
+        let base = view.cast::<u8>();
+        // SAFETY: (здесь и ниже) смещения -- поля `ControlBlock`/
+        // `LayoutBlock`/`RingHeader` внутри сегмента, отображение живо до
+        // `UnmapViewOfFile` в конце потока.
+        let client_state = unsafe { word(base, 16) };
+        // SAFETY: см. выше (`LayoutBlock.s2c.offset`).
+        let s2c = unsafe { word(base, 72) }.load(Ordering::Acquire) as usize;
+        // SAFETY: см. выше (`LayoutBlock.c2s.offset`).
+        let c2s = unsafe { word(base, 88) }.load(Ordering::Acquire) as usize;
+        // SAFETY: см. выше (`LayoutBlock.c2s.capacity`).
+        let capacity = unsafe { word(base, 92) }.load(Ordering::Acquire);
+
+        // Заявка без claim (C6/C7) и `CONNECT_REQ` (R4).
+        thread::sleep(Duration::from_millis(50));
+        client_state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap();
+        for header in [s2c, c2s] {
+            // SAFETY: см. выше (`RingHeader.handshake_state`).
+            unsafe { word(base, header + 24) }.store(1, Ordering::Release);
+        }
+        // SAFETY: handle-ы событий живут, пока жив сервер (см. выше).
+        assert_ne!(unsafe { SetEvent(raw_handle(events.connect_req)) }, 0);
+        // SAFETY: см. выше.
+        let acked = unsafe { WaitForSingleObject(raw_handle(events.connect_ack), 5_000) };
+        assert_eq!(acked, 0, "S2C_CONNECT не взведён");
+
+        // Кадр «ping» в кольцо драйвер -> сервер (§c.4) и `DATA` (§e.2 п. 1).
+        // SAFETY: см. выше (`RingHeader.write_pos`).
+        let write_pos = unsafe { word(base, c2s) };
+        // SAFETY: см. выше (`RingHeader.read_pos`).
+        let read_pos = unsafe { word(base, c2s + 4) };
+        // SAFETY: см. выше (`RingHeader.message_count`).
+        let message_count = unsafe { word(base, c2s + 8) };
+        let w = write_pos.load(Ordering::Acquire);
+        let index = (w & (capacity - 1)) as usize;
+        assert!(
+            capacity as usize - index >= 16,
+            "кадр не помещается до конца"
+        );
+        let mut frame = [0u8; 16];
+        frame[..4].copy_from_slice(&4u32.to_le_bytes());
+        frame[8..12].copy_from_slice(b"ping");
+        // SAFETY: данные кольца -- сразу за его заголовком (64 байта),
+        // `index` < ёмкости: адрес внутри отображения.
+        let slot = unsafe { base.add(c2s + 64 + index) };
+        // SAFETY: 16 байт с `index` -- внутри данных кольца (проверено
+        // выше), область за `write_pos` читатель не трогает до публикации.
+        unsafe { std::ptr::copy_nonoverlapping(frame.as_ptr(), slot, 16) };
+        message_count.fetch_add(1, Ordering::AcqRel);
+        write_pos.store(w.wrapping_add(16), Ordering::Release);
+        fence(Ordering::SeqCst);
+        if read_pos.load(Ordering::Acquire) == w {
+            // SAFETY: см. выше.
+            assert_ne!(unsafe { SetEvent(raw_handle(events.c2s_data)) }, 0);
+        }
+
+        // Уход R14: сначала `IDLE`, потом `DISCONNECT`.
+        leave_rx.recv().unwrap();
+        client_state
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+            .unwrap();
+        // SAFETY: см. выше.
+        assert_ne!(unsafe { SetEvent(raw_handle(events.disconnect)) }, 0);
+        // SAFETY: `view` получен от `MapViewOfFile` выше, снимается один раз.
+        assert_ne!(unsafe { UnmapViewOfFile(view) }, 0);
+    });
+
+    block_on(server.accept_async()).unwrap();
+    assert!(server.is_connected());
+    let mut buf = Vec::new();
+    assert_eq!(block_on(server.recv_async(&mut buf)), Ok(4));
+    assert_eq!(buf, b"ping");
+    leave_tx.send(()).unwrap();
+    assert_eq!(
+        block_on(server.recv_async(&mut buf)),
+        Err(ShmError::NotConnected)
+    );
+    assert!(!server.is_connected());
+    driver.join().unwrap();
 }
 
 // ─── поток пустых CONNECT_REQ (Task 10) ─────────────────────────────────────

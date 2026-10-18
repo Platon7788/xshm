@@ -103,18 +103,13 @@ use crate::reactor::{CancelOutcome, Reactor, Registration};
 use crate::ring::RingBuffer;
 use crate::win::EventHandle;
 
-/// Ошибка async API на канале без событий (anonymous-сервер): ждать в
-/// реакторе нечего.
-pub(crate) const ANONYMOUS: ShmError =
-    ShmError::InvalidConfig("anonymous channel has no events: async API needs a named channel");
-
 /// Сторона канала глазами async API (реализуют `SharedServer` и
 /// `SharedClient`).
 pub(crate) trait Endpoint {
     /// `Err(NotConnected)` вне подключения.
     fn ensure_connected(&self) -> Result<()>;
-    /// События канала (`None` -- anonymous).
-    fn channel_events(&self) -> Option<&SharedEvents>;
+    /// События канала (anonymous-канал -- безымянные, Task 13).
+    fn channel_events(&self) -> &SharedEvents;
     /// `DATA` входящего кольца.
     fn rx_data(events: &SharedEvents) -> &EventHandle;
     /// `SPACE` исходящего кольца.
@@ -296,9 +291,7 @@ impl Gone {
 /// сигнал, поглощён.
 fn observe_gone<E: Endpoint>(endpoint: &E, fired: [bool; 3], gone: &mut Option<Gone>) {
     if fired[DISCONNECT] && endpoint.peer_left() {
-        if let Some(events) = endpoint.channel_events() {
-            let _ = events.disconnect.set();
-        }
+        let _ = endpoint.channel_events().disconnect.set();
         gone.get_or_insert(Gone::Disconnected);
     }
     if fired[PEER] {
@@ -308,9 +301,7 @@ fn observe_gone<E: Endpoint>(endpoint: &E, fired: [bool; 3], gone: &mut Option<G
 
 /// Зарегистрировать `DISCONNECT` и процесс пира (если наблюдается).
 fn ensure_session<E: Endpoint>(endpoint: &E, waits: &mut WaitSet, waker: &Waker) -> Result<()> {
-    let Some(events) = endpoint.channel_events() else {
-        return Err(ANONYMOUS);
-    };
+    let events = endpoint.channel_events();
     waits.ensure_handle(DISCONNECT, events.disconnect.as_handle(), waker)?;
     if let Some(peer) = endpoint.peer_process() {
         waits.ensure_handle(PEER, peer, waker)?;
@@ -344,9 +335,7 @@ impl<'a, E: Endpoint> RecvFuture<'a, E> {
         if let Err(err) = self.endpoint.ensure_connected() {
             return Poll::Ready(Err(err));
         }
-        let Some(events) = self.endpoint.channel_events() else {
-            return Poll::Ready(Err(ANONYMOUS));
-        };
+        let events = self.endpoint.channel_events();
         let data = raw(E::rx_data(events).as_handle());
         // Сначала разбор сработавшего, потом чтение: пир пишет данные до
         // `DISCONNECT`/выхода, поэтому замеченный уход не обгонит его
@@ -384,10 +373,8 @@ impl<'a, E: Endpoint> RecvFuture<'a, E> {
     /// Снять регистрации с возвратом потреблённых сигналов.
     fn finish(&mut self) {
         let events = self.endpoint.channel_events();
-        self.waits.clear(
-            events.map(E::rx_data),
-            events.map(|events| &events.disconnect),
-        );
+        self.waits
+            .clear(Some(E::rx_data(events)), Some(&events.disconnect));
     }
 }
 
@@ -439,9 +426,7 @@ impl<'a, E: Endpoint> SendFuture<'a, E> {
         if let Err(err) = self.endpoint.ensure_connected() {
             return Poll::Ready(Err(err));
         }
-        let Some(events) = self.endpoint.channel_events() else {
-            return Poll::Ready(Err(ANONYMOUS));
-        };
+        let events = self.endpoint.channel_events();
         let space = raw(E::tx_space(events).as_handle());
         let fired = self.waits.harvest(waker);
         observe_gone(&*self.endpoint, fired, &mut self.gone);
@@ -486,10 +471,8 @@ impl<'a, E: Endpoint> SendFuture<'a, E> {
             self.armed = false;
         }
         let events = self.endpoint.channel_events();
-        self.waits.clear(
-            events.map(E::tx_space),
-            events.map(|events| &events.disconnect),
-        );
+        self.waits
+            .clear(Some(E::tx_space(events)), Some(&events.disconnect));
     }
 }
 

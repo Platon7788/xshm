@@ -1292,14 +1292,13 @@ fn stale_completion_is_not_delivered_to_new_session() {
     let disconnect_set = || {
         let slots = server.slots.read().unwrap();
         let slot = slots[0].lock().unwrap();
-        slot.server.events().unwrap().disconnect.set().unwrap();
+        slot.server.events().disconnect.set().unwrap();
     };
     let disconnect_signalled = || {
         let slots = server.slots.read().unwrap();
         let slot = slots[0].lock().unwrap();
         slot.server
             .events()
-            .unwrap()
             .disconnect
             .wait(Some(Duration::ZERO))
             .unwrap()
@@ -2156,7 +2155,6 @@ fn departure_drain_corruption_keeps_graceful_reason() {
         !slot
             .server
             .events()
-            .unwrap()
             .disconnect
             .wait(Some(Duration::ZERO))
             .unwrap(),

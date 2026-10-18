@@ -1387,8 +1387,8 @@ impl Endpoint for SharedClient {
         Self::ensure_connected(self)
     }
 
-    fn channel_events(&self) -> Option<&SharedEvents> {
-        Some(&self.events)
+    fn channel_events(&self) -> &SharedEvents {
+        &self.events
     }
 
     fn rx_data(events: &SharedEvents) -> &EventHandle {
@@ -1648,7 +1648,7 @@ impl SharedClient {
         };
         self.ring_tx.wait_for_space(
             payload_len,
-            Some(&self.events.c2s.space),
+            &self.events.c2s.space,
             self.peer.as_ref(),
             Some(&disconnect),
             timeout,
@@ -1998,7 +1998,7 @@ mod tests {
         let name = unique("LOSER");
         let server = SharedServer::start(&name).unwrap();
         let control = server.view().control_block();
-        let req = &server.events().unwrap().connect_req;
+        let req = &server.events().connect_req;
         let holder = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
         let before = claim_fields(control);
         assert!(
@@ -2106,7 +2106,6 @@ mod tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -2276,7 +2275,6 @@ mod tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -2525,7 +2523,6 @@ mod tests {
         assert!(
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap()
@@ -2743,7 +2740,7 @@ mod tests {
         assert!(woke.duration_since(left_at) < Duration::from_secs(1));
         assert!(!client.is_connected());
         drop(client);
-        let disconnect = &server.events().unwrap().disconnect;
+        let disconnect = &server.events().disconnect;
         assert!(
             disconnect.wait(Some(Duration::ZERO)).unwrap(),
             "сигнал отключения возвращён взведённым"
@@ -3516,7 +3513,6 @@ mod exited_server_tests {
         assert!(
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -3557,7 +3553,6 @@ mod stale_leave_tests {
         let disconnect_fired = |server: &SharedServer| {
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap()
@@ -3622,7 +3617,6 @@ mod reclaimed_leave_tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -3652,7 +3646,6 @@ mod reclaimed_leave_tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap()
@@ -3683,7 +3676,6 @@ mod reclaimed_leave_tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),

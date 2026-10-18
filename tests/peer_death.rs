@@ -447,7 +447,7 @@ fn shared_graceful_disconnect_is_not_peer_death() {
     server
         .wait_for_client(Some(Duration::from_secs(20)))
         .unwrap();
-    let events = server.events().unwrap();
+    let events = server.events();
     // Штатный Drop клиента сигналит DISCONNECT до выхода процесса.
     assert!(
         events

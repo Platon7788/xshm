@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
-use crate::asynch::{ANONYMOUS, Endpoint, OP, RecvFuture, SendFuture, WaitSet};
+use crate::asynch::{Endpoint, OP, RecvFuture, SendFuture, WaitSet};
 use crate::constants::{
     CLAIM_FREE, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY,
 };
@@ -20,7 +20,6 @@ use crate::naming::ObjectPath;
 use crate::presence::{FreeNotifier, Presence, ServerPresence, release_claim_notify};
 use crate::ring::{
     DisconnectWatch, DrainBound, FreeSpace, RingBuffer, SpinPolicy, UnreadProbe, WriteOutcome,
-    deadline_of, spin_until,
 };
 use crate::security::{ObjectSecurity, SecurityAttributes};
 use crate::shared::SharedView;
@@ -421,7 +420,12 @@ pub struct SharedServer {
     // Порядок полей важен для Drop: кольца и view ссылаются на память
     // `_mapping`, поэтому он объявлен последним и размапливается последним.
     view: SharedView,
-    events: Option<SharedEvents>, // None для anonymous режима
+    /// 7 событий канала: именованные или (anonymous, Task 13) безымянные --
+    /// есть всегда, путей опроса нет.
+    events: SharedEvents,
+    /// Канал без имени (`start_anonymous*`): секция и события доступны пиру
+    /// (драйверу) только по handle-ам.
+    anonymous: bool,
     ring_tx: RingBuffer,
     ring_rx: RingBuffer,
     connected: bool,
@@ -551,10 +555,11 @@ impl SharedServer {
             layout.segment_size(),
             security,
         )?;
-        let mut server = Self::from_mapping(mapping, layout, slot_count)?;
+        let mut server = Self::from_mapping(mapping, layout, slot_count, || {
+            SharedEvents::create(root, name, security)
+        })?;
         // Ревизия 3: не Multi-слот (claim слота ведёт диспетчер Multi).
         server.exclusive = slot_count == 0;
-        server.events = Some(SharedEvents::create(root, name, security)?);
         server._namespace = namespace.cloned();
         if presence == Presence::On {
             // R19: взвод -- строго ПОСЛЕ публикации секции (`magic` в
@@ -595,12 +600,21 @@ impl SharedServer {
         self.presence_status.clone()
     }
 
-    /// Создание anonymous сервера без имени (только через handle)
+    /// Anonymous-сервер: секция без имени (`ObjectName = NULL`) и 7
+    /// безымянных событий канала -- для kernel driver, которому handle-ы
+    /// передаются IOCTL-ом (INTEROP §b.5).
     ///
-    /// Anonymous сервер создает section без имени в глобальном namespace.
-    /// Доступ к section возможен только через handle, что идеально для
-    /// передачи handle в kernel driver. Events не создаются, используется
-    /// polling-based handshake через `wait_for_client_noevent()`.
+    /// События создаются всегда (0.10, Task 13; до этого их не было, и
+    /// ожидания опрашивали память раз в 1 мс): SynchronizationEvent, как у
+    /// именованного канала, с тем же дескриптором, что у секции. Handle-ы
+    /// -- [`SharedServer::get_event_handles`], секция --
+    /// [`SharedServer::section_handle`]; все принадлежат серверу и живут, пока
+    /// жив он. Все ожидания (`wait_for_client`, `poll_client`,
+    /// `wait_for_space`, async API) спят в ядре на этих событиях: драйвер
+    /// (роль клиента) ОБЯЗАН сигналить по правилам §e.2 INTEROP --
+    /// `CONNECT_REQ` после `CLIENT_HELLO`, `DATA`/`SPACE` по позициям,
+    /// `DISCONNECT` после `IDLE` при уходе, в том числе при выгрузке
+    /// (процесса у драйвера нет, его смерть сервер не наблюдает).
     ///
     /// **ВАЖНО:** Это НЕ то же самое, что `start("")` (пустая строка).
     /// Windows NT API требует именно `ObjectName = NULL` в `OBJECT_ATTRIBUTES`
@@ -614,21 +628,30 @@ impl SharedServer {
     /// Anonymous-сервер с заданной раскладкой (см. `start_anonymous`).
     /// Драйвер читает раскладку из `LayoutBlock` сегмента (INTEROP §c).
     ///
-    /// 0.10: дескриптор секции -- политика по умолчанию
-    /// (`ObjectSecurity::CurrentUser`) вместо NULL DACL. По имени секцию не
+    /// 0.10: дескриптор секции и событий -- политика по умолчанию
+    /// (`ObjectSecurity::CurrentUser`) вместо NULL DACL. По имени объекты не
     /// открыть; дубликат handle получает права исходного handle без
     /// проверки DACL, поэтому политика здесь не настраивается.
     pub fn start_anonymous_with_layout(layout: ChannelLayout) -> Result<Self> {
         layout.validate()?;
         let security = ObjectSecurity::default().attributes()?;
         let mapping = Mapping::create_anonymous(layout.segment_size(), &security)?;
-        Self::from_mapping(mapping, layout, 0)
+        let mut server = Self::from_mapping(mapping, layout, 0, || {
+            SharedEvents::create_unnamed(&security)
+        })?;
+        server.anonymous = true;
+        Ok(server)
     }
 
     /// Инициализация свежей секции: сегмент публикуется (`magic`) до
-    /// создания событий -- клиент, открывший секцию раньше событий, получит
-    /// ошибку открытия событий и повторит попытку.
-    fn from_mapping(mapping: Mapping, layout: ChannelLayout, slot_count: u32) -> Result<Self> {
+    /// создания событий (`events`) -- клиент, открывший секцию раньше
+    /// событий, получит ошибку открытия событий и повторит попытку.
+    fn from_mapping(
+        mapping: Mapping,
+        layout: ChannelLayout,
+        slot_count: u32,
+        events: impl FnOnce() -> Result<SharedEvents>,
+    ) -> Result<Self> {
         // SAFETY: `Mapping` только что создал отображение размером не меньше
         // `layout.segment_size()` (адрес выровнен на гранулу выделения) и
         // держит его живым, пока жив сам, а он переезжает в возвращаемую
@@ -642,11 +665,13 @@ impl SharedServer {
                 slot_count,
             )
         }?;
+        let events = events()?;
         let ring_tx = view.ring_a();
         let ring_rx = view.ring_b();
         Ok(Self {
             view,
-            events: None,
+            events,
+            anonymous: false,
             ring_tx,
             ring_rx,
             connected: false,
@@ -674,24 +699,25 @@ impl SharedServer {
         self.view.layout()
     }
 
-    /// Получить handles событий для передачи в kernel driver
-    ///
-    /// Возвращает `None` если сервер создан в anonymous режиме (без событий).
-    /// В этом случае используется polling через `wait_for_client_noevent()`.
+    /// Сырые handle-ы всех 7 событий канала -- для передачи в kernel driver
+    /// вместе с [`SharedServer::section_handle`] (anonymous-канал, INTEROP
+    /// §b.5). Есть у любого сервера (0.10, Task 13: anonymous-сервер тоже
+    /// создаёт события). Handle-ы принадлежат серверу: не закрывать, живут,
+    /// пока жив сервер.
     #[must_use]
-    pub fn get_event_handles(&self) -> Option<crate::events::EventHandles> {
-        self.events.as_ref().map(|e| e.get_event_handles())
+    pub fn get_event_handles(&self) -> crate::events::EventHandles {
+        self.events.get_event_handles()
     }
 
+    /// Ждать клиента (драйвер anonymous-канала -- тоже): сон в ядре на
+    /// `C2S_CONNECT_REQ`, при заявке `CLIENT_HELLO` -- рукопожатие.
+    /// `Err(Timeout)` -- таймаут (`None` -- без таймаута),
+    /// `Err(AlreadyConnected)` -- клиент уже подключён.
     pub fn wait_for_client(&mut self, timeout: Option<Duration>) -> Result<()> {
         if self.connected {
             return Err(ShmError::AlreadyConnected);
         }
-
-        // Для anonymous режима используем polling
-        let Some(events) = self.events.as_ref() else {
-            return self.wait_for_client_noevent(timeout);
-        };
+        let events = &self.events;
 
         // Находка 21: `CONNECT_REQ` без `CLIENT_HELLO` (толчок Multi,
         // клиент, откатившийся по таймауту, чужой процесс) больше не обрывает
@@ -729,9 +755,8 @@ impl SharedServer {
     /// исполнителя: брошенный future снимает ожидание и возвращает
     /// потреблённый `CONNECT_REQ` событию (лишний сигнал протокол допускает).
     ///
-    /// `Err(AlreadyConnected)` -- клиент уже подключён; anonymous-сервер --
-    /// `Err(InvalidConfig)` (событий нет; его путь --
-    /// `wait_for_client_noevent`).
+    /// `Err(AlreadyConnected)` -- клиент уже подключён. Anonymous-сервер --
+    /// так же (безымянные события, драйвер сигналит `CONNECT_REQ`).
     ///
     /// Любой исполнитель (здесь -- минимальный `block_on` на `thread::park`;
     /// с tokio -- `tokio::time::timeout(d, server.accept_async()).await
@@ -783,7 +808,7 @@ impl SharedServer {
     /// Отключение клиента -- `Err(NotConnected)`, смерть его процесса --
     /// `Err(PeerDied)`; обе -- только когда кольцо дочитано, и после них
     /// сервер отмечен неподключённым (`is_connected() == false`, можно снова
-    /// `accept_async`). Anonymous-сервер -- `Err(InvalidConfig)`.
+    /// `accept_async`).
     ///
     /// `&mut self`: future -- `Send` (`tokio::spawn`), а приём и отправка
     /// одной стороны одновременно требуют разделения (`Mutex`, задача-
@@ -804,7 +829,6 @@ impl SharedServer {
     /// как у `try_send_to_client`; ушедший клиент -- `Err(NotConnected)`,
     /// умерший -- `Err(PeerDied)` (если места так и нет; сервер при этом НЕ
     /// отмечается отключённым -- входящее кольцо дочитывает `recv_async`).
-    /// Anonymous-сервер -- `Err(InvalidConfig)`.
     ///
     /// Future выполняет операцию на каждом опросе: после `Ready` его не
     /// опрашивают снова (повторный опрос выполнит ещё одну операцию).
@@ -837,11 +861,7 @@ impl SharedServer {
         if self.connected {
             return Err(ShmError::AlreadyConnected);
         }
-        let Some(events) = self.events.as_ref() else {
-            return Err(ShmError::InvalidConfig(
-                "anonymous server has no events to wait on",
-            ));
-        };
+        let events = &self.events;
         // Находка 21: `CONNECT_REQ` без `CLIENT_HELLO` -- не ошибка и не
         // повод вернуть управление: сигнал поглощён, ждём остаток таймаута
         // (как в `wait_for_client`). Наружу выходят только подключение,
@@ -903,37 +923,9 @@ impl SharedServer {
         self.complete_handshake()
     }
 
-    /// Ожидание клиента без событий (polling по shared memory).
-    /// Использовать когда нет доступа к именованным событиям.
-    pub fn wait_for_client_noevent(&mut self, timeout: Option<Duration>) -> Result<()> {
-        if self.connected {
-            return Err(ShmError::AlreadyConnected);
-        }
-
-        let control = self.view.control_block();
-        let start = Instant::now();
-
-        loop {
-            let client_state = control.client_state.load(Ordering::Acquire);
-            if client_state == HANDSHAKE_CLIENT_HELLO {
-                break;
-            }
-
-            if let Some(t) = timeout
-                && start.elapsed() >= t
-            {
-                return Err(ShmError::Timeout);
-            }
-
-            std::thread::sleep(Duration::from_millis(1));
-        }
-
-        self.complete_handshake()
-    }
-
-    /// Серверная сторона рукопожатия (ревизия 3, INTEROP R16/R18), общая для
-    /// событийного и polling-путей; вызывается при `client_state ==
-    /// CLIENT_HELLO` (Acquire в `hello_pending`/`wait_for_client_noevent`).
+    /// Серверная сторона рукопожатия (ревизия 3, INTEROP R16/R18);
+    /// вызывается при `client_state == CLIENT_HELLO` (Acquire в
+    /// `hello_pending`).
     ///
     /// - S1: предварительно -- claim `T`, самоописание клиента (PID, время)
     ///   и наблюдение его процесса (`open_peer`);
@@ -1045,9 +1037,7 @@ impl SharedServer {
         // сигнал прошлой сессии (никто его не дождался) иначе мгновенно
         // «отключил» бы нового клиента. ДО фиксации: после неё клиент может
         // уже уйти и взвести свой.
-        if let Some(events) = &self.events {
-            let _ = events.disconnect.reset();
-        }
+        let _ = self.events.disconnect.reset();
         #[cfg(test)]
         handshake_hook(&self.view, HandshakePoint::BeforeCommit);
 
@@ -1132,15 +1122,11 @@ impl SharedServer {
         // Новая сессия: наблюдение за клиентом прошлой (Task 7) больше не
         // нужно -- claim уже не его (новый держатель взял его свободным).
         self.lingering = None;
-        // Для anonymous-сервера событий нет -- клиент узнаёт о готовности
-        // опросом `server_state`.
         // S7, отказ сигнала (0.10, INTEROP п. 29): сессия уже
         // зафиксирована (S5) -- клиент мог засчитать её по проигранному
         // отзыву. Закрыть её с сигналом, как `disconnect_local` (`IDLE`,
         // потом `DISCONNECT`), а не оставить полуоткрытой.
-        if let Some(events) = &self.events
-            && let Err(err) = signal_connect_ack(&self.view, events)
-        {
+        if let Err(err) = signal_connect_ack(&self.view, &self.events) {
             self.disconnect_local();
             return Err(err);
         }
@@ -1175,9 +1161,7 @@ impl SharedServer {
         // очистить поля умершего владельца.
         control.forget_owner(owner);
         let _ = release_claim_notify(control, claim, self.free.as_deref());
-        if let Some(events) = &self.events {
-            let _ = events.disconnect.set();
-        }
+        let _ = self.events.disconnect.set();
         ShmError::HandshakeFailed
     }
 
@@ -1186,23 +1170,22 @@ impl SharedServer {
         self.connected
     }
 
-    /// Доступ к событиям сервера (для внутреннего использования)
-    ///
-    /// ВАЖНО: Для anonymous режима возвращает None - события не создаются.
-    /// Используйте только для named режима (SharedServer::start).
+    /// События канала (есть у любого сервера; anonymous -- безымянные).
     #[must_use]
-    pub const fn events(&self) -> Option<&SharedEvents> {
-        self.events.as_ref()
+    pub const fn events(&self) -> &SharedEvents {
+        &self.events
     }
 
-    /// Проверка, является ли сервер anonymous (без имени и events)
+    /// Сервер anonymous-канала (`start_anonymous*`): секция и события без
+    /// имён, доступны пиру только по handle-ам.
     #[must_use]
     pub const fn is_anonymous(&self) -> bool {
-        self.events.is_none()
+        self.anonymous
     }
 
-    /// Получить raw HANDLE секции для передачи в kernel driver
-    /// ВАЖНО: Handle принадлежит Mapping, не закрывать вручную!
+    /// Сырой handle секции -- для передачи в kernel driver вместе с
+    /// [`SharedServer::get_event_handles`] (INTEROP §b.5). Handle
+    /// принадлежит серверу: не закрывать, живёт, пока жив сервер.
     #[must_use]
     pub fn section_handle(&self) -> isize {
         self._mapping.section_handle()
@@ -1308,13 +1291,10 @@ impl SharedServer {
         self.lingering.take()
     }
 
-    /// Взвести `DISCONNECT` канала (anonymous -- событий нет, no-op).
-    /// Вызывающий уже перевёл состояния в `IDLE` (R14: сначала состояние,
+    /// Взвести `DISCONNECT` канала. Вызывающий уже перевёл состояния в `IDLE` (R14: сначала состояние,
     /// потом сигнал -- клиент, проснувшись, видит закрытую сессию).
     pub(crate) fn signal_disconnect(&self) {
-        if let Some(events) = &self.events {
-            let _ = events.disconnect.set();
-        }
+        let _ = self.events.disconnect.set();
     }
 
     /// Локальный разрыв сессии сервером (ошибка: порча кольца, отказ
@@ -1353,9 +1333,7 @@ impl SharedServer {
     ///   отвечают `NotConnected` (сессия по `generation` уже чужая);
     /// - **непрочитанные данные клиента** (кольцо клиент -> сервер)
     ///   отбрасывает сброс колец следующей сессии (S3): нужны -- дочитайте
-    ///   их (`poll_client`/`receive_from_client`) до `disconnect`;
-    /// - **anonymous-сервер** событий не имеет: `DISCONNECT` не взводится,
-    ///   драйвер видит отключение только по `client_state`.
+    ///   их (`poll_client`/`receive_from_client`) до `disconnect`.
     ///
     /// # Errors
     ///
@@ -1394,11 +1372,8 @@ impl SharedServer {
     pub fn send_to_client(&self, payload: &[u8]) -> Result<WriteOutcome> {
         self.ensure_connected()?;
         let result = self.ring_tx.write_message(payload)?;
-        // Сигнализируем только если events доступны
-        if let Some(ref events) = self.events
-            && result.was_empty
-        {
-            let _ = events.s2c.data.set();
+        if result.was_empty {
+            let _ = self.events.s2c.data.set();
         }
         Ok(result)
     }
@@ -1413,10 +1388,8 @@ impl SharedServer {
     pub fn try_send_to_client(&self, payload: &[u8]) -> Result<WriteOutcome> {
         self.ensure_connected()?;
         let result = self.ring_tx.try_write_message(payload)?;
-        if let Some(ref events) = self.events
-            && result.was_empty
-        {
-            let _ = events.s2c.data.set();
+        if result.was_empty {
+            let _ = self.events.s2c.data.set();
         }
         Ok(result)
     }
@@ -1453,10 +1426,8 @@ impl SharedServer {
         // `OBJ_OPENIF`) на время `f` не используется больше никем: ни
         // вложенной записи из `f`, ни другого потока.
         let result = unsafe { self.ring_tx.write_with(len, f) }?;
-        if let Some(ref events) = self.events
-            && result.was_empty
-        {
-            let _ = events.s2c.data.set();
+        if result.was_empty {
+            let _ = self.events.s2c.data.set();
         }
         Ok(result)
     }
@@ -1489,8 +1460,9 @@ impl SharedServer {
     /// - процесс клиента сигнален (клиент 0.8+ передал PID) -- `Err(PeerDied)`.
     ///
     /// Клиент без PID (старая версия), упавший без `DISCONNECT`, не будит
-    /// ничем: единственная граница тогда -- `timeout` вызывающего. Без
-    /// событий (anonymous) -- опрос с шагом 1 мс.
+    /// ничем: единственная граница тогда -- `timeout` вызывающего. Так же
+    /// драйвер anonymous-канала: процесса у него нет, уход виден только по
+    /// его `DISCONNECT` (R14, INTEROP §b.5).
     ///
     /// `wait_for_space` (по `&self`) сторону отключённой не помечает: уход
     /// клиента только сообщается (`NotConnected`, `DISCONNECT` остаётся
@@ -1513,16 +1485,15 @@ impl SharedServer {
     ) -> Result<bool> {
         self.ensure_connected()?;
         let peer_left = || self.client_left();
-        let disconnect = self.events.as_ref().map(|e| DisconnectWatch {
-            event: &e.disconnect,
+        let disconnect = DisconnectWatch {
+            event: &self.events.disconnect,
             peer_left: &peer_left,
-        });
-        let event = self.events.as_ref().map(|e| &e.s2c.space);
+        };
         self.ring_tx.wait_for_space(
             payload_len,
-            event,
+            &self.events.s2c.space,
             self.peer.as_ref(),
-            disconnect.as_ref(),
+            Some(&disconnect),
             timeout,
             spin,
         )
@@ -1597,14 +1568,12 @@ impl SharedServer {
         result
     }
 
-    /// Сигнализируем только если events доступны. SPACE -- когда кольцо
-    /// опустело (как раньше) ИЛИ когда писатель оставил заявку и места ему
-    /// теперь хватает (`try_send`/`wait_for_space` на той стороне).
+    /// SPACE -- когда кольцо опустело (как раньше) ИЛИ когда писатель
+    /// оставил заявку и места ему теперь хватает (`try_send`/
+    /// `wait_for_space` на той стороне).
     fn signal_space_after_read(&self) {
-        if let Some(ref events) = self.events
-            && (self.ring_rx.take_space_waiter() || self.ring_rx.is_empty())
-        {
-            let _ = events.c2s.space.set();
+        if self.ring_rx.take_space_waiter() || self.ring_rx.is_empty() {
+            let _ = self.events.c2s.space.set();
         }
     }
 
@@ -1613,7 +1582,7 @@ impl SharedServer {
     /// Исходы:
     /// - `Ok(true)` -- в кольце есть сообщение или сработал `C2S_DATA`
     ///   (возможно, устаревший: читать до `QueueEmpty`);
-    /// - `Ok(false)` -- таймаут (anonymous-режим без данных -- сразу);
+    /// - `Ok(false)` -- таймаут;
     /// - `Err(NotConnected)` -- клиент штатно ушёл (`DISCONNECT` при
     ///   `client_state != SERVER_READY`) и всё, что он успел записать, уже
     ///   прочитано; либо сервер не подключён;
@@ -1664,31 +1633,7 @@ impl SharedServer {
     /// (кольцо пусто, клиент ушёл/умер).
     fn wait_client_data(&self, timeout: Option<Duration>, spin: SpinPolicy) -> Result<bool> {
         let peer_left = || self.client_left();
-        // Для anonymous режима просто проверяем буфер (polling)
-        let Some(events) = self.events.as_ref() else {
-            if !self.ring_rx.is_empty()
-                || (timeout != Some(Duration::ZERO)
-                    && spin_until(spin, deadline_of(timeout), || self.ring_rx.has_unread()))
-            {
-                return Ok(true);
-            }
-            // Событий нет -- уход виден только по состоянию в памяти.
-            // Клиент пишет данные до `IDLE` (R14): перепроверка кольца
-            // после состояния не теряет его последних кадров.
-            if peer_left() {
-                return if self.ring_rx.is_empty() {
-                    Err(ShmError::NotConnected)
-                } else {
-                    Ok(true)
-                };
-            }
-            return match &self.peer {
-                Some(peer) if peer.has_exited() && self.ring_rx.is_empty() => {
-                    Err(ShmError::PeerDied)
-                }
-                _ => Ok(false), // Нет данных, но не timeout
-            };
-        };
+        let events = &self.events;
         let disconnect = DisconnectWatch {
             event: &events.disconnect,
             peer_left: &peer_left,
@@ -1809,8 +1754,8 @@ impl Endpoint for SharedServer {
         Self::ensure_connected(self)
     }
 
-    fn channel_events(&self) -> Option<&SharedEvents> {
-        self.events.as_ref()
+    fn channel_events(&self) -> &SharedEvents {
+        &self.events
     }
 
     fn rx_data(events: &SharedEvents) -> &EventHandle {
@@ -1861,9 +1806,6 @@ impl AcceptFuture<'_> {
         if self.server.connected {
             return Poll::Ready(Err(ShmError::AlreadyConnected));
         }
-        if self.server.events.is_none() {
-            return Poll::Ready(Err(ANONYMOUS));
-        }
         // Как `wait_for_client`: заявку проверяем только по сигналу
         // `CONNECT_REQ` (клиент ставит `CLIENT_HELLO` до сигнала); сигнал
         // без заявки (толчок Multi, откатившийся клиент) поглощён -- ждём
@@ -1875,9 +1817,7 @@ impl AcceptFuture<'_> {
             // Толчок без заявки (ревизия 3): проверить протухший захват.
             self.server.observe_idle();
         }
-        let Some(events) = self.server.events.as_ref() else {
-            return Poll::Ready(Err(ANONYMOUS));
-        };
+        let events = &self.server.events;
         match self
             .waits
             .ensure_handle(OP, events.connect_req.as_handle(), waker)
@@ -1890,8 +1830,8 @@ impl AcceptFuture<'_> {
     /// Снять ожидание; потреблённый, но не разобранный `CONNECT_REQ` --
     /// вернуть (заявку тогда примет следующее ожидание).
     fn finish(&mut self) {
-        let event = self.server.events.as_ref().map(|e| &e.connect_req);
-        self.waits.clear(event, None);
+        self.waits
+            .clear(Some(&self.server.events.connect_req), None);
     }
 }
 
@@ -1982,7 +1922,7 @@ mod handshake_tests {
         assert_eq!(control.server_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
         assert_ne!(control.generation.load(Ordering::Acquire), generation);
-        let ack = &server.events().unwrap().connect_ack;
+        let ack = &server.events().connect_ack;
         assert!(
             !ack.wait(Some(Duration::ZERO)).unwrap(),
             "S2C_CONNECT взведён для никого"
@@ -1997,7 +1937,7 @@ mod handshake_tests {
     fn stale_connect_ack_does_not_confirm_the_next_client() {
         let name = unique("STALEACK");
         let server = SharedServer::start(&name).unwrap();
-        server.events().unwrap().connect_ack.set().unwrap();
+        server.events().connect_ack.set().unwrap();
         let err = SharedClient::connect(&name, Duration::from_millis(100)).unwrap_err();
         assert_eq!(err, ShmError::Timeout);
         let control = server.view().control_block();
@@ -2113,7 +2053,6 @@ mod handshake_tests {
         assert!(
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -2154,7 +2093,6 @@ mod handshake_tests {
         assert!(
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -2263,7 +2201,6 @@ mod handshake_tests {
         assert!(
             !server
                 .events()
-                .unwrap()
                 .connect_ack
                 .wait(Some(Duration::ZERO))
                 .unwrap()
@@ -2495,7 +2432,7 @@ mod stray_tests {
     fn stray_connect_req_keeps_the_deadline() {
         let name = unique("STRAYDL");
         let mut server = SharedServer::start(&name).unwrap();
-        server.events().unwrap().connect_req.set().unwrap();
+        server.events().connect_req.set().unwrap();
         let started = Instant::now();
         let result = server.wait_for_client(Some(Duration::from_millis(200)));
         let elapsed = started.elapsed();
@@ -2762,7 +2699,6 @@ mod poll_tests {
         assert!(
             server
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),
@@ -2787,31 +2723,341 @@ mod poll_tests {
         assert_eq!(data_waits() - before, 1);
         assert!(server.is_connected());
     }
+}
 
-    /// Anonymous-сервер (событий нет): клиент вернул `client_state` в
-    /// `IDLE` -- при пустом кольце `poll_client` заканчивает сессию.
-    #[test]
-    fn anonymous_poll_sees_client_state_idle() {
+#[cfg(test)]
+mod anonymous_tests {
+    //! Task 13 (решения J/D, R-P): anonymous-секция всегда с 7 безымянными
+    //! событиями -- ни одного пути опроса. «Драйвер» -- поток теста: второе
+    //! отображение секции по её handle и события по сырым handle-ам
+    //! `get_event_handles` (без владения), как их видит драйвер ядра
+    //! (INTEROP §b.5).
+
+    use super::*;
+    use crate::events::EventHandles;
+    use crate::ntapi::SYNCHRONIZATION_EVENT;
+    use crate::ring::{DATA_KERNEL_WAITS, SPACE_KERNEL_WAITS};
+    use core::mem::ManuallyDrop;
+    use std::sync::mpsc;
+
+    /// Сторона драйвера: своё отображение секции и заимствованные события.
+    struct Driver {
+        view: SharedView,
+        events: [ManuallyDrop<EventHandle>; 7],
+        // Последним: кольца и view ссылаются на это отображение.
+        _mapping: Mapping,
+    }
+
+    // Индексы `Driver::events` -- порядок полей `EventHandles`.
+    const C2S_DATA: usize = 1;
+    const S2C_SPACE: usize = 2;
+    const CONNECT_ACK: usize = 4;
+    const CONNECT_REQ: usize = 5;
+    const DISCONNECT: usize = 6;
+
+    fn raw_handles(h: EventHandles) -> [isize; 7] {
+        [
+            h.s2c_data,
+            h.c2s_data,
+            h.s2c_space,
+            h.c2s_space,
+            h.connect_ack,
+            h.connect_req,
+            h.disconnect,
+        ]
+    }
+
+    /// Сырые значения, которые сервер передал бы драйверу IOCTL-ом.
+    #[derive(Clone, Copy)]
+    struct Handoff {
+        section: isize,
+        size: usize,
+        events: EventHandles,
+    }
+
+    impl Handoff {
+        fn of(server: &SharedServer) -> Self {
+            Self {
+                section: server.section_handle(),
+                size: server.layout().segment_size(),
+                events: server.get_event_handles(),
+            }
+        }
+
+        fn attach(self) -> Driver {
+            let mapping = Mapping::map_section_handle(self.section, self.size).unwrap();
+            // SAFETY: отображение живёт в `Driver` дольше view (поле
+            // последнее), адрес выровнен на гранулу выделения.
+            let view = unsafe { SharedView::attach(mapping.as_ptr(), mapping.size()) }.unwrap();
+            Driver {
+                view,
+                events: raw_handles(self.events).map(EventHandle::borrow_raw),
+                _mapping: mapping,
+            }
+        }
+    }
+
+    impl Driver {
+        /// C6/C7 без claim (anonymous-канал не исключительный) + R4.
+        fn hello(&self) {
+            let control = self.view.control_block();
+            control
+                .client_state
+                .compare_exchange(
+                    HANDSHAKE_IDLE,
+                    HANDSHAKE_CLIENT_HELLO,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .unwrap();
+            let (a, b) = self.view.headers();
+            a.handshake_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+            b.handshake_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+            self.events[CONNECT_REQ].set().unwrap();
+        }
+
+        /// Кадр в кольцо драйвер -> сервер с сигналом `DATA` по правилу
+        /// §e.2 п. 1.
+        fn send(&self, payload: &[u8]) {
+            let outcome = self.view.ring_b().try_write_message(payload).unwrap();
+            if outcome.was_empty {
+                self.events[C2S_DATA].set().unwrap();
+            }
+        }
+
+        /// Чтение кадра сервера с сигналом `SPACE` (R2/R3).
+        fn receive(&self) -> Vec<u8> {
+            let ring = self.view.ring_a();
+            let mut out = Vec::new();
+            ring.read_message(&mut out).unwrap();
+            if ring.take_space_waiter() || ring.is_empty() {
+                self.events[S2C_SPACE].set().unwrap();
+            }
+            out
+        }
+
+        /// Уход R14: сначала `IDLE`, потом `DISCONNECT`.
+        fn leave(&self) {
+            self.view
+                .control_block()
+                .client_state
+                .compare_exchange(
+                    HANDSHAKE_SERVER_READY,
+                    HANDSHAKE_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .unwrap();
+            self.events[DISCONNECT].set().unwrap();
+        }
+    }
+
+    /// Сервер с подключённым «драйвером» (заявка до ожидания: сигнал
+    /// `CONNECT_REQ` уже взведён) -- для тестов после рукопожатия.
+    fn connected() -> (SharedServer, Driver) {
         let mut server = SharedServer::start_anonymous().unwrap();
-        let control = server.view().control_block();
-        control
-            .client_state
-            .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        let driver = Handoff::of(&server).attach();
+        driver.hello();
         server
-            .wait_for_client_noevent(Some(Duration::from_secs(1)))
+            .wait_for_client(Some(Duration::from_secs(2)))
             .unwrap();
         assert!(server.is_connected());
-        assert_eq!(server.poll_client(Some(Duration::ZERO)), Ok(false));
-        server
-            .view()
-            .control_block()
-            .client_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        assert_eq!(
-            server.poll_client(Some(Duration::ZERO)),
-            Err(ShmError::NotConnected)
+        assert!(
+            driver.events[CONNECT_ACK]
+                .wait(Some(Duration::ZERO))
+                .unwrap()
         );
+        (server, driver)
+    }
+
+    fn data_waits() -> u32 {
+        DATA_KERNEL_WAITS.with(Cell::get)
+    }
+
+    fn space_waits() -> u32 {
+        SPACE_KERNEL_WAITS.with(Cell::get)
+    }
+
+    /// 7 различных ненулевых handle-ов, каждый -- SynchronizationEvent
+    /// (`NtQueryEvent`), ни один не совпадает с handle секции.
+    #[test]
+    fn anonymous_server_exposes_all_events() {
+        let server = SharedServer::start_anonymous().unwrap();
+        assert!(server.is_anonymous());
+        let handles = raw_handles(server.get_event_handles());
+        for (i, &h) in handles.iter().enumerate() {
+            assert_ne!(h, 0, "handle {i} нулевой");
+            assert_ne!(h, server.section_handle(), "handle {i} -- секция");
+            assert!(handles[..i].iter().all(|&other| other != h), "повтор {i}");
+            assert_eq!(
+                EventHandle::borrow_raw(h).event_type(),
+                Ok(SYNCHRONIZATION_EVENT),
+                "handle {i} -- не автосбросное событие"
+            );
+        }
+    }
+
+    /// Драйвер пишет `CLIENT_HELLO` и взводит `CONNECT_REQ`: сервер,
+    /// спящий в ядре, просыпается один раз и сразу принимает; `S2C_CONNECT`
+    /// у драйвера взведён.
+    #[test]
+    fn anonymous_handshake_signalled_by_driver() {
+        let mut server = SharedServer::start_anonymous().unwrap();
+        let handoff = Handoff::of(&server);
+        let wakeups = server.wait_wakeups();
+        let (tx, rx) = mpsc::channel();
+        let driver = std::thread::spawn(move || {
+            let driver = handoff.attach();
+            std::thread::sleep(Duration::from_millis(100));
+            let signalled = Instant::now();
+            driver.hello();
+            tx.send(signalled).unwrap();
+            driver.events[CONNECT_ACK].wait(Some(Duration::from_secs(2)))
+        });
+        server
+            .wait_for_client(Some(Duration::from_secs(2)))
+            .unwrap();
+        let accepted = Instant::now();
+        let signalled = rx.recv().unwrap();
+        assert!(
+            accepted.duration_since(signalled) <= Duration::from_millis(50),
+            "принят через {:?} после сигнала",
+            accepted.duration_since(signalled)
+        );
+        assert_eq!(wakeups.load(Ordering::Acquire), 1, "одно пробуждение");
+        assert_eq!(driver.join().unwrap(), Ok(true), "S2C_CONNECT взведён");
+        assert!(server.is_connected());
+    }
+
+    /// `poll_client` без данных спит в ядре весь таймаут (одно ожидание);
+    /// кадр драйвера с `C2S_DATA` будит его сразу.
+    #[test]
+    fn anonymous_poll_client_sleeps_in_kernel() {
+        let (mut server, driver) = connected();
+        let before = data_waits();
+        let started = Instant::now();
+        assert_eq!(
+            server.poll_client(Some(Duration::from_millis(200))),
+            Ok(false)
+        );
+        assert!(
+            started.elapsed() >= Duration::from_millis(190),
+            "вернулся через {:?}",
+            started.elapsed()
+        );
+        assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
+
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                let signalled = Instant::now();
+                driver.send(b"frame");
+                tx.send(signalled).unwrap();
+            });
+            assert_eq!(server.poll_client(Some(Duration::from_secs(2))), Ok(true));
+        });
+        let woke = Instant::now();
+        let signalled = rx.recv().unwrap();
+        assert!(
+            woke.duration_since(signalled) <= Duration::from_millis(20),
+            "проснулся через {:?} после сигнала",
+            woke.duration_since(signalled)
+        );
+        let mut out = Vec::new();
+        assert_eq!(server.receive_from_client(&mut out), Ok(5));
+        assert_eq!(out, b"frame");
+    }
+
+    /// Кольцо сервер -> драйвер заполнено: `wait_for_space` -- одно
+    /// ожидание в ядре на весь таймаут; чтение драйвера с `S2C_SPACE` будит
+    /// его, тоже одним ожиданием.
+    #[test]
+    fn anonymous_wait_for_space_is_single_kernel_wait() {
+        let (server, driver) = connected();
+        const LEN: usize = 60_000;
+        while server.try_send_to_client(&[7u8; LEN]).is_ok() {}
+        let before = space_waits();
+        assert_eq!(
+            server.wait_for_space(LEN, Some(Duration::from_millis(200))),
+            Ok(false)
+        );
+        assert_eq!(space_waits() - before, 1, "одно ожидание в ядре");
+
+        let before = space_waits();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                assert_eq!(driver.receive().len(), LEN);
+            });
+            assert_eq!(
+                server.wait_for_space(LEN, Some(Duration::from_secs(2))),
+                Ok(true)
+            );
+        });
+        assert_eq!(space_waits() - before, 1, "пробуждение по SPACE");
+    }
+
+    /// Уход драйвера (`IDLE`, потом `DISCONNECT`) будит `poll_client`,
+    /// спящий в ядре: `Err(NotConnected)`, сервер отключён и принимает
+    /// снова.
+    #[test]
+    fn anonymous_driver_leave_is_seen() {
+        let (mut server, driver) = connected();
+        let before = data_waits();
+        let (tx, rx) = mpsc::channel();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                let signalled = Instant::now();
+                driver.leave();
+                tx.send(signalled).unwrap();
+            });
+            assert_eq!(
+                server.poll_client(Some(Duration::from_secs(5))),
+                Err(ShmError::NotConnected)
+            );
+        });
+        let woke = Instant::now();
+        assert!(
+            woke.duration_since(rx.recv().unwrap()) <= Duration::from_millis(50),
+            "уход замечен не по сигналу"
+        );
+        assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
         assert!(!server.is_connected());
+
+        // Канал снова принимает драйвер.
+        driver.hello();
+        server
+            .wait_for_client(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(server.is_connected());
+    }
+
+    /// Обратное направление: уход сервера (`disconnect`) виден драйверу по
+    /// `DISCONNECT` после `IDLE` (R14) -- до Task 13 событий не было, и
+    /// драйвер узнавал об уходе только опросом памяти. После ухода драйвер
+    /// подключается снова.
+    #[test]
+    fn anonymous_server_leave_signals_driver() {
+        let (mut server, driver) = connected();
+        server.disconnect().unwrap();
+        assert!(
+            driver.events[DISCONNECT]
+                .wait(Some(Duration::ZERO))
+                .unwrap()
+        );
+        let control = driver.view.control_block();
+        assert_eq!(control.server_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+
+        driver.hello();
+        server
+            .wait_for_client(Some(Duration::from_secs(2)))
+            .unwrap();
+        assert!(server.is_connected());
     }
 }
 

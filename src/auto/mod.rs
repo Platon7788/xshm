@@ -1241,14 +1241,6 @@ impl AutoServer {
 
 fn server_worker(server: &mut SharedServer, worker: &Worker) {
     let mut buffer = Vec::new();
-    // Anonymous-сервер не имеет событий, а auto-mode построен на ожидании
-    // событий. Недостижимо: AutoServer::start всегда поднимает named-сервер.
-    if server.events().is_none() {
-        worker.handler.on_error(ShmError::InvalidConfig(
-            "anonymous server is not supported in auto-mode",
-        ));
-        return;
-    }
     let gauge = &worker.gauge;
     let mut connected = false;
 
@@ -1295,10 +1287,7 @@ fn server_worker(server: &mut SharedServer, worker: &Worker) {
             let timeout = worker.spin_before_wait(|| server.has_unread_from_client());
             // Набор -- заимствование событий сервера на одно ожидание
             // (`wait_for_client_or`/`mark_disconnected` требуют `&mut`).
-            let Some(events) = server.events() else {
-                // Недостижимо: события проверены на входе в worker.
-                break 'session Some(DisconnectReason::Error);
-            };
+            let events = server.events();
             let space = events.s2c.space.as_handle();
             let set = WaitSet::new(
                 [
@@ -2859,10 +2848,10 @@ mod claim_tests {
             .header_a()
             .write_pos
             .store(3, Ordering::Release);
-        server.events().unwrap().s2c.data.set().unwrap();
+        server.events().s2c.data.set().unwrap();
 
         assert!(
-            fired(&server.events().unwrap().disconnect, Duration::from_secs(3)),
+            fired(&server.events().disconnect, Duration::from_secs(3)),
             "клиент ушёл без DISCONNECT"
         );
         let control = server.view().control_block();
@@ -2992,7 +2981,7 @@ mod claim_tests {
             "устаревший клиент писал в кольцо чужой сессии"
         );
         assert!(
-            !fired(&server.events().unwrap().disconnect, Duration::ZERO),
+            !fired(&server.events().disconnect, Duration::ZERO),
             "устаревший клиент сигналил DISCONNECT чужой сессии"
         );
         assert_eq!(
@@ -4078,7 +4067,7 @@ mod stale_disconnect_tests {
         });
 
         let w0 = client.wakeups();
-        server.events().unwrap().disconnect.set().unwrap();
+        server.events().disconnect.set().unwrap();
         wait_until(
             "worker разобрал сигнал",
             Duration::from_secs(2),

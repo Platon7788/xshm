@@ -103,13 +103,45 @@ fn default_channel_works_for_same_user() {
     assert_eq!(out, b"ping");
 }
 
+/// Task 13: безымянные события anonymous-канала -- с тем же дескриптором,
+/// что секция: политика по умолчанию (владелец + SYSTEM). `GENERIC_ALL` в
+/// DACL ядро отображает в права типа (`SECTION_ALL_ACCESS` у секции,
+/// `EVENT_ALL_ACCESS` у события), поэтому байты DACL сверяются с объектами
+/// того же типа именованного канала той же политики: секция -- с секцией,
+/// каждое из 7 событий -- с событием.
+#[test]
+fn anonymous_events_share_section_descriptor() {
+    let server = SharedServer::start_anonymous().unwrap();
+    let named = SharedServer::start(&unique_name("ANON_REF")).unwrap();
+    let dacl = |handle| query_security(handle, DACL_SECURITY_INFORMATION);
+    assert_eq!(dacl_ace_count(server.section_handle()), Some(2));
+    assert_eq!(
+        dacl(server.section_handle()),
+        dacl(named.section_handle()),
+        "DACL секции"
+    );
+    let event = dacl(named.get_event_handles().s2c_data);
+    let h = server.get_event_handles();
+    for (what, handle) in [
+        ("s2c_data", h.s2c_data),
+        ("c2s_data", h.c2s_data),
+        ("s2c_space", h.s2c_space),
+        ("c2s_space", h.c2s_space),
+        ("connect_ack", h.connect_ack),
+        ("connect_req", h.connect_req),
+        ("disconnect", h.disconnect),
+    ] {
+        assert_eq!(dacl(handle), event, "DACL события {what}");
+    }
+}
+
 #[test]
 fn everyone_policy_matches_null_dacl() {
     let name = unique_name("EVERYONE");
     let config = ChannelConfig::default().security(ObjectSecurity::Everyone);
     let mut server = SharedServer::start_with(&name, &config).unwrap();
     assert_eq!(dacl_ace_count(server.section_handle()), None, "секция");
-    let events = server.get_event_handles().unwrap();
+    let events = server.get_event_handles();
     assert_eq!(dacl_ace_count(events.s2c_data), None, "событие канала");
 
     let client = thread::spawn(move || SharedClient::connect(&name, Duration::from_secs(5)));

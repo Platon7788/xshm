@@ -951,9 +951,7 @@ impl MultiCore {
             let mut slot = slot_mutex.lock_clean();
             if slot.connected {
                 slot.reset_connection(false);
-                if let Some(events) = slot.server.events() {
-                    let _ = events.disconnect.set();
-                }
+                let _ = slot.server.events().disconnect.set();
             }
             // Наблюдать «задержавшихся владельцев» больше некому.
             slot.retire_lingering();
@@ -1308,9 +1306,7 @@ impl MultiCore {
                 // Слот уже отключён локально (`disconnect_client`), а привязка
                 // диспетчера ещё стояла и поглотила сигнал, адресованный
                 // КЛИЕНТУ (событие одно на обе стороны). Возвращаем его.
-                if let Some(events) = slot.server.events() {
-                    let _ = events.disconnect.set();
-                }
+                let _ = slot.server.events().disconnect.set();
                 return;
             }
             if !slot.server.client_left() {
@@ -2046,11 +2042,7 @@ impl<'a> Dispatcher<'a> {
             let mut slot = slot_mutex.lock_clean();
             #[cfg(test)]
             core.slot_visits.fetch_add(1, Ordering::Relaxed);
-            // Слоты всегда named (`start_slot`), но на anonymous-слоте событий
-            // нет -- молча пропускаем вместо паники в диспетчере.
-            let Some(events) = slot.server.events() else {
-                return;
-            };
+            let events = slot.server.events();
             for kind in WaitKind::ALL {
                 let desired = match kind {
                     WaitKind::Connect => (!slot.connected).then(|| events.connect_req.as_handle()),
@@ -2156,9 +2148,7 @@ impl<'a> Dispatcher<'a> {
                 let Some(arm) = waits.arms.get_mut(kind.index()) else {
                     continue;
                 };
-                if arm.cancel()
-                    && let Some(events) = events
-                {
+                if arm.cancel() {
                     match kind {
                         WaitKind::Connect => {
                             let _ = events.connect_req.set();

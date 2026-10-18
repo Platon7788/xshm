@@ -23,19 +23,44 @@ pub struct SharedEvents {
     pub disconnect: EventHandle,
 }
 
-/// Raw handles событий для передачи в kernel driver
+/// Сырые handle-ы всех 7 событий канала -- для передачи в kernel driver
+/// (anonymous-канал, INTEROP §b.5).
 ///
-/// Handles представлены как `isize` для совместимости с Windows HANDLE типом.
-/// Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
-#[derive(Debug, Clone, Copy)]
+/// Handle-ы -- `isize` (Windows `HANDLE`) в таблице процесса сервера и
+/// принадлежат серверу: живут, пока жив `SharedServer`, закрываются его
+/// `Drop`. Драйвер, получив их IOCTL-ом в контексте процесса сервера, берёт
+/// свои ссылки на объекты (`ObReferenceObjectByHandle`) и управляет их
+/// временем жизни сам. Все события -- SynchronizationEvent (автосброс):
+/// не `KeResetEvent`/`KePulseEvent`; сигнал -- `KeSetEvent`, кто и когда
+/// сигналит -- §e.2 INTEROP.
+///
+/// `#[non_exhaustive]`: значения выдаёт только сервер
+/// (`SharedServer::get_event_handles`), поля читаются по имени.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EventHandles {
-    /// Server→Client data event handle (s2c.data)
-    /// User-mode сигнализирует когда данные доступны для чтения драйвером
+    /// `S2C_DATA`: сервер-писатель взводит по правилу §e.2 п. 1 (кадр лёг
+    /// в пустое по позициям кольцо); ждёт драйвер-читатель.
     pub s2c_data: isize,
-
-    /// Client→Server data event handle (c2s.data)
-    /// Driver сигнализирует когда данные доступны для чтения user-mode
+    /// `C2S_DATA`: драйвер-писатель взводит по тому же правилу; ждёт
+    /// сервер (`poll_client`, `recv_async`).
     pub c2s_data: isize,
+    /// `S2C_SPACE`: драйвер-читатель взводит, сняв заявку `space_waiter`
+    /// или опустошив кольцо сервер -> драйвер; ждёт сервер-писатель
+    /// (`wait_for_space`, `send_async`).
+    pub s2c_space: isize,
+    /// `C2S_SPACE`: сервер-читатель взводит по тому же правилу; ждёт
+    /// драйвер-писатель.
+    pub c2s_space: isize,
+    /// `S2C_CONNECT`: сервер взводит после фиксации рукопожатия (S7); ждёт
+    /// драйвер после своей заявки.
+    pub connect_ack: isize,
+    /// `C2S_CONNECT_REQ`: драйвер взводит после `CLIENT_HELLO`; ждёт сервер
+    /// (`wait_for_client`, `accept_async`).
+    pub connect_req: isize,
+    /// `S2C_DISCONNECT`: взводит уходящая сторона (сначала `IDLE`, потом
+    /// сигнал -- R14); ждут обе.
+    pub disconnect: isize,
 }
 
 impl SharedEvents {
@@ -68,18 +93,39 @@ impl SharedEvents {
         })
     }
 
-    /// Получить raw handles событий для передачи в kernel driver
-    ///
-    /// Возвращает структуру с raw handles (isize) для:
-    /// - s2c_data: Server→Client data event (user signals when data available for driver)
-    /// - c2s_data: Client→Server data event (driver signals when data available for user)
-    ///
-    /// Эти handles можно передать в драйвер через IOCTL для event-driven IPC.
+    /// 7 безымянных событий anonymous-канала (Task 13): SynchronizationEvent
+    /// -- тот же вид, что у именованных событий канала, -- с дескриптором
+    /// `security` (тем же, что у anonymous-секции). По имени их не открыть:
+    /// пир (драйвер) получает handle-ы через `get_event_handles`.
+    pub(crate) fn create_unnamed(security: &SecurityAttributes) -> Result<Self> {
+        let create = || EventHandle::create_unnamed_secured(security);
+        Ok(Self {
+            s2c: ChannelEvents {
+                data: create()?,
+                space: create()?,
+            },
+            c2s: ChannelEvents {
+                data: create()?,
+                space: create()?,
+            },
+            connect_ack: create()?,
+            connect_req: create()?,
+            disconnect: create()?,
+        })
+    }
+
+    /// Сырые handle-ы всех 7 событий -- для передачи в kernel driver (см.
+    /// `EventHandles`). Handle-ы остаются собственностью `self`.
     #[must_use]
     pub fn get_event_handles(&self) -> EventHandles {
         EventHandles {
             s2c_data: self.s2c.data.raw_handle(),
             c2s_data: self.c2s.data.raw_handle(),
+            s2c_space: self.s2c.space.raw_handle(),
+            c2s_space: self.c2s.space.raw_handle(),
+            connect_ack: self.connect_ack.raw_handle(),
+            connect_req: self.connect_req.raw_handle(),
+            disconnect: self.disconnect.raw_handle(),
         }
     }
 

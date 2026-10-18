@@ -715,7 +715,8 @@ Semantics:
   once enough space is freed. Since 0.9 it is a single kernel wait on `[SPACE, DISCONNECT,
   peer process]` (no 50 ms slices): a dead reader → `Err(PeerDied)`, a graceful disconnect →
   `Err(NotConnected)`. A 0.7 reader wakes it only when it empties the ring; a crashed reader
-  without PID exchange never wakes it — pass a timeout. Anonymous servers poll every 1 ms.
+  without PID exchange never wakes it — pass a timeout. Anonymous servers wait the same way
+  (on their unnamed events) — nothing polls.
 - Auto/Dispatch report freed space as an event: `AutoHandler::on_space_available`,
   `DispatchClientHandler::on_space_available()`, `DispatchHandler::on_space_available(id)` —
   a sender that got `QueueFull` waits for it instead of sleeping in a loop.
@@ -776,7 +777,8 @@ signal arrives.
 - Methods take `&mut self`, so the futures are `Send` (`tokio::spawn` works).
   Receiving and sending on one endpoint *concurrently* needs a split: wrap it
   in a `Mutex`, or let one task own it and feed it through a channel.
-- Anonymous servers (no events) return `Err(InvalidConfig)`.
+- Anonymous servers work the same way: their events are unnamed, the driver
+  signals them (INTEROP §b.5).
 
 ```rust,ignore
 // Example with tokio (not a dependency of xshm).
@@ -1057,24 +1059,36 @@ Re-exported from the crate root. Ring sizes are per channel and per direction
 
 ## Event Handles for Kernel Drivers
 
-Any named server can hand out its raw NT event handles so a kernel driver
-can wait on them directly (event-driven, no polling) instead of going
-through the Rust API for every notification. The handles are plain `isize`
-values — pass them to the driver via IOCTL; the driver owns their lifetime
-from that point on.
+Every server — named or anonymous — hands out the raw NT handles of its
+section and of all 7 channel events, so a kernel driver can act as the
+client of the channel and sleep on the same events (event-driven, no
+polling). An anonymous server (`SharedServer::start_anonymous()`) has no
+names at all: the section and the 7 events are reachable only through
+these handles.
 
-```rust
-use xshm::{SharedServer, EventHandles};
+```rust,no_run
+use xshm::SharedServer;
 
-let server = SharedServer::start("MyChannel")?;
-if let Some(handles) = server.get_event_handles() {
-    // handles.s2c_data - Server→Client data event
-    // handles.c2s_data - Client→Server data event
-}
+let mut server = SharedServer::start_anonymous()?;
+let section = server.section_handle();
+let events = server.get_event_handles();
+// events.connect_req, events.connect_ack, events.c2s_data, events.s2c_data,
+// events.c2s_space, events.s2c_space, events.disconnect -- pass them and
+// `section` to the driver via IOCTL, then wait for it like for any client:
+server.wait_for_client(None)?;
+# Ok::<(), xshm::ShmError>(())
 ```
 
-**Note**: For anonymous servers (`SharedServer::start_anonymous()`), this
-returns `None` — no named events are created. Use polling mode in that case.
+The handles live in the server process and belong to the server: do not
+close them; they stay valid while the server lives. The driver references
+the objects (`ObReferenceObjectByHandle(.., UserMode, ..)` in the context
+of the server process) and owns those references. All events are
+auto-reset (`SynchronizationEvent`): the driver signals with `KeSetEvent`
+only, never `KePulseEvent`/`KeResetEvent`, and MUST follow the signalling
+rules — `CONNECT_REQ` after `CLIENT_HELLO`, `DATA`/`SPACE` by ring
+positions, and on unload a graceful leave (`client_state = IDLE`, then
+`DISCONNECT`): the driver has no process, so the server cannot notice it
+vanishing. The full driver contract is [`INTEROP.md`](INTEROP.md) §b.5.
 
 ## Limitations
 
@@ -1082,7 +1096,7 @@ returns `None` — no named events are created. Use polling mode in that case.
 - **Overwrite on overflow** (default): New messages evict oldest when queue is full — use `try_send*` for lossless backpressure
 - **Windows only**: Uses direct NT API calls, relies on x86/x86_64 TSO memory ordering (not portable to ARM/RISC-V without rework)
 - **Message size**: 1 to `max_message_size` of the ring, at most `capacity / 2 − 8` bytes (65 535 by default); larger messages need a larger ring (no fragmentation)
-- **Anonymous servers**: No event handles available (polling mode only, no async API)
+- **Anonymous servers**: the peer (driver) has no process, so the server only learns that it left from its `DISCONNECT` (INTEROP §b.5); no presence beacon
 - **Multi-client slot count**: hard cap of 256 concurrent clients (bounds the client slot scan) — use Dispatch mode if you need more. All slots share one dispatcher thread: a slow `on_message` of one client delays the others
 - **Native peers**: must implement the 0.10 contract — format `0x00020000`, PAD frames and handshake revision 3 ([`INTEROP.md`](INTEROP.md))
 - **Reconnect timers**: an `AutoClient` / `MultiClient` that is *not connected* sleeps on the presence beacon (no server) or on the "claim released" event (busy channel, no free slot); `reconnect_delay` / `retry_delay` remain as a one-off pause after a session and as a fallback against peers without the beacon/`_free` objects (R19/R20). A peer that releases a claim without notifying (no R20) keeps Rust waiters asleep until the holder or server process exits

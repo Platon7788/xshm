@@ -976,10 +976,7 @@ impl DispatchCore {
     /// лишь убирает канал, если клиент не подключился до
     /// `channel_connect_timeout` или сервер остановлен.
     fn handle_lobby_client(&self, lobby: &mut SharedServer, buffer: &mut Vec<u8>) {
-        let Some(events) = lobby.events() else {
-            self.handler.on_error(None, ShmError::NotReady);
-            return;
-        };
+        let events = lobby.events();
 
         // Ожидаем данные регистрации через событие c2s.data (по событию, без
         // опроса; остановка сервера будит сразу).
@@ -1177,9 +1174,7 @@ impl DispatchCore {
         }
 
         // Сигналим о доступности данных в лобби, чтобы клиент мог их прочитать
-        if let Some(events) = lobby.events() {
-            let _ = events.s2c.data.set();
-        }
+        let _ = lobby.events().s2c.data.set();
 
         // Поток ожидания: клиент не подключился к каналу до
         // `channel_connect_timeout` (по умолчанию 30с) или сервер
@@ -1229,9 +1224,7 @@ impl DispatchCore {
             channel_name: String::new(),
         });
         let _ = lobby.send_to_client(&reject);
-        if let Some(events) = lobby.events() {
-            let _ = events.s2c.data.set();
-        }
+        let _ = lobby.events().s2c.data.set();
     }
 }
 
@@ -2016,7 +2009,7 @@ mod tests {
         assert_eq!(lobby.poll_client(Some(Duration::from_secs(5))), Ok(true));
         lobby.disconnect().unwrap();
         assert_eq!(client.join().unwrap().err(), Some(ShmError::NotConnected));
-        let events = lobby.events().unwrap();
+        let events = lobby.events();
         assert!(
             !events.disconnect.wait(Some(Duration::ZERO)).unwrap(),
             "клиент ответил DISCONNECT уже закрытой сессии"
@@ -2077,7 +2070,6 @@ mod tests {
         assert!(
             !lobby
                 .events()
-                .unwrap()
                 .disconnect
                 .wait(Some(Duration::ZERO))
                 .unwrap(),

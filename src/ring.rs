@@ -44,13 +44,6 @@ use crate::error::{Result, ShmError};
 use crate::layout::{RingConfig, RingHeader};
 use crate::win::{EventHandle, ProcessWatch, wait_any};
 
-/// Шаг опроса, когда событий нет вовсе (anonymous-сервер: секция без имени,
-/// ни одного объекта ядра, кроме самой секции). Это единственный путь
-/// `wait_for_space` с опросом -- и он действует только пока вызывающий сам
-/// блокируется в `wait_for_space`, а не в простое. Именованный канал (0.9+)
-/// ждёт события без нарезки на срезы.
-const SPACE_POLL_INTERVAL: Duration = Duration::from_millis(1);
-
 #[cfg(test)]
 thread_local! {
     /// Число ожиданий в ядре внутри `wait_for_space` на этом потоке: тесты
@@ -1243,8 +1236,9 @@ impl RingBuffer {
     ///
     /// Ожидание -- ОДНО `NtWaitForMultipleObjects` на весь остаток таймаута
     /// по набору `[SPACE, DISCONNECT, процесс читателя]`. `SPACE` читатель
-    /// сигналит, сняв заявку (`take_space_waiter`) или опустошив кольцо. Без
-    /// событий вовсе (anonymous-сервер) -- опрос с шагом `SPACE_POLL_INTERVAL`.
+    /// сигналит, сняв заявку (`take_space_waiter`) или опустошив кольцо.
+    /// Событие есть всегда (anonymous-канал -- безымянное, Task 13): путей
+    /// опроса нет.
     ///
     /// `spin` (0.10): до заявки -- один бюджет спина на вызов с
     /// перепроверкой места по позициям; заявка `space_waiter` во время спина
@@ -1254,7 +1248,7 @@ impl RingBuffer {
     pub(crate) fn wait_for_space(
         &self,
         payload_len: usize,
-        space_event: Option<&EventHandle>,
+        space_event: &EventHandle,
         peer: Option<&ProcessWatch>,
         disconnect: Option<&DisconnectWatch<'_>>,
         timeout: Option<Duration>,
@@ -1289,20 +1283,6 @@ impl RingBuffer {
                     Some(remaining)
                 }
                 None => None,
-            };
-
-            let Some(space_event) = space_event else {
-                // Anonymous: объектов ядра нет -- ждать нечего, кроме опроса.
-                std::thread::sleep(
-                    remaining.map_or(SPACE_POLL_INTERVAL, |r| r.min(SPACE_POLL_INTERVAL)),
-                );
-                if peer.is_some_and(ProcessWatch::has_exited)
-                    && !self.free_space().fits(payload_len)
-                {
-                    self.disarm_space_waiter();
-                    return Err(ShmError::PeerDied);
-                }
-                continue;
             };
 
             // Индекс 0 -- место (приоритет: при одновременном сигнале NT
@@ -2466,18 +2446,19 @@ mod try_write_tests {
         assert!(!ring.take_space_waiter());
     }
 
-    /// `wait_for_space` без события (anonymous-путь или читатель старой
-    /// версии, не знающий про заявку): заявка + опрос.
+    /// Таймаут `wait_for_space` снимает заявку; длина проверяется до
+    /// ожидания. (Пути без события нет с Task 13: anonymous-канал тоже
+    /// с событиями, читатель обязан сигналить `SPACE` по R2/R3.)
     #[test]
-    fn wait_for_space_polls_without_event() {
+    fn wait_for_space_timeout_clears_waiter() {
         let (ring, _mem) = make_ring();
-        let ring = Arc::new(ring);
+        let space = EventHandle::create_unnamed(false).unwrap();
         const LEN: usize = 60_000;
         while ring.try_write_message(&[0u8; LEN]).is_ok() {}
         assert_eq!(
             ring.wait_for_space(
                 LEN,
-                None,
+                &space,
                 None,
                 None,
                 Some(Duration::from_millis(20)),
@@ -2490,31 +2471,8 @@ mod try_write_tests {
             0,
             "таймаут снимает заявку"
         );
-
-        let reader = {
-            let ring = ring.clone();
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(30));
-                let mut out = Vec::new();
-                ring.read_message(&mut out).unwrap();
-                // «Старый» читатель: заявку не смотрит.
-            })
-        };
         assert_eq!(
-            ring.wait_for_space(
-                LEN,
-                None,
-                None,
-                None,
-                Some(Duration::from_secs(5)),
-                SpinPolicy::NONE
-            ),
-            Ok(true)
-        );
-        reader.join().unwrap();
-        ring.try_write_message(&[1u8; LEN]).unwrap();
-        assert_eq!(
-            ring.wait_for_space(0, None, None, None, None, SpinPolicy::NONE),
+            ring.wait_for_space(0, &space, None, None, None, SpinPolicy::NONE),
             Err(ShmError::MessageTooSmall),
             "длина проверяется до ожидания"
         );
@@ -2528,7 +2486,7 @@ mod try_write_tests {
         assert_eq!(
             ring.wait_for_space(
                 16,
-                None,
+                &EventHandle::create_unnamed(false).unwrap(),
                 None,
                 None,
                 Some(Duration::MAX),
@@ -2573,7 +2531,7 @@ mod try_write_tests {
         let before = kernel_waits();
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_space(LEN, Some(&space), None, None, None, SpinPolicy::NONE),
+            ring.wait_for_space(LEN, &space, None, None, None, SpinPolicy::NONE),
             Ok(true)
         );
         let waited = t0.elapsed();
@@ -2602,14 +2560,7 @@ mod try_write_tests {
         let before = kernel_waits();
         let t0 = Instant::now();
         assert_eq!(
-            ring.wait_for_space(
-                LEN,
-                Some(&space),
-                Some(&watch),
-                None,
-                None,
-                SpinPolicy::NONE
-            ),
+            ring.wait_for_space(LEN, &space, Some(&watch), None, None, SpinPolicy::NONE),
             Err(ShmError::PeerDied)
         );
         let waited = t0.elapsed();
@@ -2661,14 +2612,7 @@ mod try_write_tests {
         };
         let before = kernel_waits();
         assert_eq!(
-            ring.wait_for_space(
-                LEN,
-                Some(&space),
-                None,
-                Some(&watch),
-                None,
-                SpinPolicy::NONE
-            ),
+            ring.wait_for_space(LEN, &space, None, Some(&watch), None, SpinPolicy::NONE),
             Ok(true)
         );
         reader.join().unwrap();
@@ -2690,14 +2634,7 @@ mod try_write_tests {
         };
         let before = kernel_waits();
         assert_eq!(
-            ring.wait_for_space(
-                LEN,
-                Some(&space),
-                None,
-                Some(&watch),
-                None,
-                SpinPolicy::NONE
-            ),
+            ring.wait_for_space(LEN, &space, None, Some(&watch), None, SpinPolicy::NONE),
             Err(ShmError::NotConnected)
         );
         leaver.join().unwrap();
@@ -3138,7 +3075,7 @@ mod tests {
         assert_eq!(
             ring.wait_for_space(
                 LEN,
-                Some(&space),
+                &space,
                 None,
                 None,
                 Some(Duration::from_millis(30)),
@@ -3190,7 +3127,7 @@ mod tests {
         assert_eq!(
             ring.wait_for_space(
                 LEN,
-                Some(&space),
+                &space,
                 None,
                 None,
                 Some(Duration::from_secs(5)),
@@ -3820,7 +3757,7 @@ mod stale_flood_tests {
         assert_eq!(
             ring.wait_for_space(
                 LEN,
-                Some(&space),
+                &space,
                 Some(&peer),
                 None,
                 Some(Duration::from_secs(2)),
@@ -3841,7 +3778,7 @@ mod stale_flood_tests {
         assert_eq!(
             ring.wait_for_space(
                 LEN,
-                Some(&space),
+                &space,
                 Some(&peer),
                 Some(&watch),
                 Some(Duration::from_secs(2)),

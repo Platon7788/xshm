@@ -167,6 +167,7 @@ handle пространства и относительное имя, §b.4).
 | **«Claim освобождён» (0.10, R20, п. 39)** | `Local\B_free` / `B_free` (база Multi — `<база>_multi_free`, рядом с `<база>_multi_beacon_state`); там же, где маяк, — у каждого сервера с маяком присутствия (кроме выделенных каналов Dispatch и слотов Multi) | **NotificationEvent** (ручной сброс, `0`) | FALSE у нового | **сервер** вместе с маяком (до `raise`; Multi — до слотов): `NtCreateEvent(EVENT_ALL_ACCESS, OBJ_OPENIF, NotificationEvent)` с дескриптором канала, существующее — с проверкой типа; **лучшее усилие** (отказ старт не отказывает, клиенты — резерв) | клиент: `NtOpenEvent(EVENT_ALL_ACCESS)` + `NtQueryEvent` (не NotificationEvent — не использовать), **не создаёт**; нет — пир без R20, резерв | **освобождающий** claim (R20): `NtSetEvent` после `free_gen += 1`, только при `free_waiters != 0`; **ждущий** (R21): `NtResetEvent` только перед своей перепроверкой `free_gen`, при её провале — `NtSetEvent` обратно | ждущие занятого канала (`AutoClient`, `MultiClient` при `NoFreeSlot`, `SharedClient::wait_connectable*`, §e.1) |
 | **Мьютекс лобби (0.9)** | `Local\B_lock` / `B_lock` (только Dispatch) | **Mutant** | не захвачен | 0.10: **сервер** в `start` (**до** секции лобби — 0.10, п. 34: лобби взводит маяк присутствия, и разбуженный им клиент застаёт мьютекс сервера; держит до остановки, не захватывает; дескриптор — политика лобби) и **клиент** лобби: `NtCreateMutant(MUTANT_ALL_ACCESS=0x001F0001, OBJ_CASE_INSENSITIVE \| OBJ_OPENIF, InitialOwner=FALSE)`, дескриптор — политика создателя (до 0.10 — NULL DACL, создавал только клиент); успех = `STATUS_SUCCESS` или `STATUS_OBJECT_NAME_EXISTS`; имя занято объектом другого типа → `STATUS_OBJECT_TYPE_MISMATCH` = ошибка регистрации (`src/win.rs`, `NamedMutex`) | тем же вызовом | — (захват `NtWaitForSingleObject`: `STATUS_SUCCESS` или `STATUS_ABANDONED_WAIT_0 = 0x80` — оба «захвачен»; освобождение `NtReleaseMutant` **тем же потоком**) | клиенты лобби друг друга; сервер мьютекс только держит открытым (0.10) |
 | Безымянное событие (0.9) | нет (`ObjectAttributes = NULL`) | Notification (`Beacon::unnamed`, стоп Dispatch-сервера, «зарегистрирован») или Synchronization (`wake` Auto) | FALSE | свой процесс (`EventHandle::create_unnamed`) | не открывается по имени | свой процесс | свой процесс |
+| **Anonymous-канал (0.10, п. 40, §b.5)** | нет (`ObjectName = NULL`): секция и 7 событий | секция `SEC_COMMIT`, `PAGE_READWRITE`, размер `segment_size` + 7 × SynchronizationEvent (`1`) с ролями событий канала выше | нули / FALSE | сервер `start_anonymous*`: секция (`Mapping::create_anonymous`), затем 7 `NtCreateEvent(EVENT_ALL_ACCESS, ObjectName = NULL)` — дескриптор **тот же, что у секции** (политика по умолчанию; `SharedEvents::create_unnamed`) | не открываются по имени: драйвер берёт handle-ы процесса сервера (`section_handle`, `get_event_handles`) и ссылается на объекты (`ObReferenceObjectByHandle`, §b.5) | как у именованного канала: сервер и драйвер (роль клиента) по §e.2 | как у именованного канала |
 | Handle процесса пира (0.8+, не объект с именем) | — | Process | сигнален после выхода | — | `NtOpenProcess(PROCESS_QUERY_LIMITED_INFORMATION \| SYNCHRONIZE = 0x1000 \| 0x00100000, ObjectName=NULL, ClientId={pid,0})` (`ProcessWatch::open`, `ProcessWatch::open_peer`) | ядро (при завершении процесса) | сторона, открывшая handle |
 
 Константы: `src/ntapi/types.rs`, суффиксы — `src/constants.rs`
@@ -479,6 +480,138 @@ timeout)`; `timeout = NULL` — без конца; иначе относител
   может занять их имена заранее (§h п. 8). Сценарий служба SYSTEM ↔
   пользователь с пространством не работает (SID границ разные — разные
   пространства): для него — `Global\` + политика `ObjectSecurity` (§b.2).
+
+### b.5 Anonymous-канал и драйвер (0.10, «Изменения 0.10» п. 40)
+
+`SharedServer::start_anonymous()` / `start_anonymous_with_layout(layout)` —
+канал **без имён**: секция и события не попадают ни в какое пространство
+имён, по имени их не открыть, пир (драйвер режима ядра) получает их
+**только по handle**. До 0.10 (п. 40) событий не было вовсе, и Rust
+опрашивал память раз в 1 мс (`wait_for_client_noevent`, сон
+`SPACE_POLL_INTERVAL` в `wait_for_space`, `poll_client` без ожидания, async —
+`InvalidConfig`); теперь все ожидания сервера спят в ядре на событиях, как у
+именованного канала, — и **пир ОБЯЗАН сигналить** по правилам ниже, иначе
+Rust ждёт до таймаута вызывающего (без таймаута — вечно).
+
+**Объекты (создаёт сервер, синхронно в `start_anonymous*`).**
+
+1. Секция: `NtCreateSection(SECTION_ALL_ACCESS, ObjectAttributes =
+   {ObjectName = NULL, Attributes = OBJ_CASE_INSENSITIVE, SecurityDescriptor =
+   политика}, MaximumSize = LayoutBlock.segment_size, PAGE_READWRITE,
+   SEC_COMMIT)` (`Mapping::create_anonymous`). Раскладка, инициализация и
+   `magic` последним — как у именованного канала (§c, §c.5).
+2. Затем 7 событий: `NtCreateEvent(EVENT_ALL_ACCESS = 0x001F0003,
+   ObjectAttributes = {ObjectName = NULL, Attributes = 0, SecurityDescriptor
+   = тот же дескриптор, что у секции}, SynchronizationEvent (1),
+   InitialState = FALSE)` (`SharedEvents::create_unnamed`,
+   `EventHandle::create_unnamed_secured`). Роли — ровно роли именованных
+   событий канала (§b.2): `S2C_DATA`, `C2S_DATA`, `S2C_SPACE`, `C2S_SPACE`,
+   `S2C_CONNECT`, `C2S_CONNECT_REQ`, `S2C_DISCONNECT`. Ошибка создания
+   любого — ошибка `start_anonymous*`.
+3. Дескриптор — политика по умолчанию `ObjectSecurity::CurrentUser` (SID
+   пользователя токена + SYSTEM, `GENERIC_ALL`, §b.2); не настраивается:
+   по имени объекты не открыть, а дубликат handle (`NtDuplicateObject`)
+   получает права исходного handle без проверки DACL. `GENERIC_ALL` ядро
+   отображает в права типа: у секции — `SECTION_ALL_ACCESS`, у событий —
+   `EVENT_ALL_ACCESS` (байты DACL секции и события поэтому различаются только
+   маской).
+4. Маяка присутствия, `<B>_free` и мьютекса нет (`presence()` —
+   `PresenceStatus::Disabled`). Claim (`slot_claim`) anonymous-канал **не
+   использует**: канал не исключительный, сервер его не читает и не
+   освобождает (сервер `exclusive = false`, как слот Multi).
+
+**Handle-ы.** `SharedServer::section_handle() -> isize` и
+`SharedServer::get_event_handles() -> EventHandles` (`#[non_exhaustive]`,
+сырые `isize`: `s2c_data`, `c2s_data`, `s2c_space`, `c2s_space`,
+`connect_ack` = `S2C_CONNECT`, `connect_req` = `C2S_CONNECT_REQ`,
+`disconnect` = `S2C_DISCONNECT`). Это handle-ы **таблицы процесса сервера**:
+они действительны только в его контексте, принадлежат серверу и
+закрываются его `Drop`; закрывать их нельзя. Объекты живут, пока на них
+есть хоть одна ссылка: ссылки драйвера держат их и после выхода сервера.
+
+**Получение драйвером** (ответственность драйвера; Rust этого не видит):
+
+- handle-ы передаются IOCTL-ом, и обработчик `IRP_MJ_DEVICE_CONTROL`
+  разбирает их **в контексте процесса сервера** — в потоке вызвавшего
+  `DeviceIoControl` (драйвер верхнего уровня, синхронно в диспетчерской
+  процедуре), не в рабочем потоке, DPC или процедуре завершения;
+- события: `ObReferenceObjectByHandle(h, EVENT_MODIFY_STATE | SYNCHRONIZE,
+  *ExEventObjectType, UserMode, &event, NULL)` — `UserMode`, чтобы ядро
+  проверило права handle и отвергло подставленный handle ядра; тип —
+  событие, иначе отказ;
+- секция: `ObReferenceObjectByHandle(h, SECTION_MAP_READ |
+  SECTION_MAP_WRITE, *MmSectionObjectType, UserMode, &section, NULL)` и
+  отображение (`MmMapViewInSystemSpace`/`MmMapViewInSystemSpaceEx` —
+  системное, переживает процесс сервера) на весь `segment_size`;
+- проверить сегмент, как клиент проверяет чужой (§c.5): `magic`, `version
+  == 0x00020000`, `LayoutBlock` против размера отображения; данные сегмента
+  пишет процесс пользователя — для драйвера это **недоверенный ввод**
+  (каждое смещение и длину кадра — по §c.4/§c.5, до разыменования);
+- память секции — **подкачиваемая**: доступ — при IRQL ≤ `APC_LEVEL`; для
+  доступа на `DISPATCH_LEVEL` страницы закрепляются MDL
+  (`IoAllocateMdl` + `MmProbeAndLockPages`);
+- при выгрузке и разрыве: уход (ниже), затем `MmUnmapViewInSystemSpace`,
+  `ObDereferenceObject` секции и всех 7 событий.
+
+**Роль драйвера — клиент** (C1–C10 §d.2 без claim, правила §e.2):
+
+1. **Процесса у драйвера нет**: `client_pid = 0`, `client_start = 0`
+   (оставить нулями, C5 — без записи PID). Сервер его смерть не наблюдает
+   (`peer_pid() == None`, набора с процессом пира нет), поэтому драйвер
+   **ОБЯЗАН** уйти явно при выгрузке, остановке устройства и любом своём
+   разрыве (R7/R14): дописать данные → `CAS client_state: SERVER_READY →
+   IDLE` → `KeSetEvent(S2C_DISCONNECT, IO_NO_INCREMENT, FALSE)`. Без ухода
+   `poll_client`/`wait_for_space`/`recv_async`/`send_async` сервера ждут до
+   своего таймаута, а без таймаута — вечно. Сервер узнаёт об уходе только
+   так.
+2. **Заявка без claim**: C1/C2 пропускаются (`slot_claim` и
+   `slot_owner_pid` не трогать), C3 `g0 = generation`; C4 (ЖЕЛАТЕЛЬНО, R15)
+   — `KeClearEvent(S2C_CONNECT)` до заявки; C6 `CAS client_state: IDLE →
+   CLIENT_HELLO` (не удался — канал занят, отказ без записи); C7
+   `handshake_state = CLIENT_HELLO` обоих заголовков; **C9 —
+   `KeSetEvent(C2S_CONNECT_REQ, IO_NO_INCREMENT, FALSE)` после
+   `CLIENT_HELLO` (R4)**: сервер (`wait_for_client`, `accept_async`) спит на
+   этом событии и без сигнала заявку не увидит.
+3. **C10** — ждать `S2C_CONNECT` (`KeWaitForSingleObject(event, Executive,
+   KernelMode, FALSE, timeout)` на `PASSIVE_LEVEL`): принят, если
+   `client_state == SERVER_READY` или `IDLE` при `generation != g0`;
+   `CLIENT_HELLO` — устаревший сигнал, ждать дальше. Сессия — `G =
+   generation` после принятия. Таймаут (W) — `CAS CLIENT_HELLO → IDLE`;
+   проиграл при `SERVER_READY` — подключён (уйти по п. 1, если сессия не
+   нужна).
+4. **Данные и место** — §e.2 п. 1–2 без изменений (R1/R2/R3): писатель
+   `C2S` — кадр (§c.4) → `message_count += 1` → release-запись `write_pos`
+   (PAD + кадр одной записью) → **полный барьер** (`KeMemoryBarrier`) →
+   `read_pos == W` (позиция до кадра/PAD) ? `KeSetEvent(C2S_DATA)`;
+   читатель `S2C`, прежде чем уснуть на «пусто», — барьер и перечитать
+   `write_pos`; после чтения — снять заявку `space_waiter` CAS-ом, если
+   места хватает, или увидеть кольцо пустым → `KeSetEvent(S2C_SPACE)`;
+   писатель, ждущий места, — заявка `space_waiter = need(W, frame)`,
+   барьер, перепроверка, сон на `C2S_SPACE`.
+5. **Уход сервера** — `S2C_DISCONNECT` после `IDLE` (R14): сервер ушёл,
+   если `server_state != SERVER_READY` или `generation != G`; иначе сигнал
+   устаревший (п. 38) — поглотить и ждать дальше. `Drop` подключённого
+   сервера сигналит `DISCONNECT`; падение процесса сервера — нет: драйверу
+   **СЛЕДУЕТ** наблюдать процесс сервера (`server_pid`@28 +
+   `server_start`@36/40, §c.1; `PsLookupProcessByProcessId` + сверка времени
+   создания, объект процесса — в наборе ожидания).
+6. **Сигналы — только `KeSetEvent(event, IO_NO_INCREMENT, FALSE)`**
+   (допустим на IRQL ≤ `DISPATCH_LEVEL`). События — SynchronizationEvent
+   (автосброс; будит одного ждущего): **не `KePulseEvent`** (импульс без
+   ждущего теряется) и **не `KeResetEvent`/`KeClearEvent`** ни одного
+   события канала, кроме необязательного C4 (`S2C_CONNECT` до своей
+   заявки) — сброс съел бы сигнал пира. `DISCONNECT` — одно событие на обе
+   стороны: свой сигнал ухода драйвер не ждёт; ждущий его несколькими
+   потоками драйвер, поглотив сигнал ушедшего сервера, взводит его обратно
+   (как Rust, §i.6).
+
+Тесты-эталоны: `server::anonymous_tests::*` («драйвер» — поток теста со
+вторым отображением секции по handle и заимствованными handle-ами
+событий: рукопожатие одним пробуждением, `poll_client`/`wait_for_space` —
+одно ожидание в ядре, уход в обе стороны), `tests/async.rs::
+anonymous_accept_and_recv_async` (kernel32 `MapViewOfFile` по handle,
+кадр по раскладке §c), `tests/security.rs::
+anonymous_events_share_section_descriptor`.
 
 ---
 
@@ -1406,12 +1539,11 @@ worker-ах, лобби и отправителе prof-shm. Нативный п�
   все слоты заняты — сон на уведомлении «claim освобождён» базы, §e.2 п. 7,
   не дольше страховки `discovery_fallback`, 10 с).
 - **`SharedServer/SharedClient::wait_for_space`** (0.9, §i.6): одно ожидание
-  на весь таймаут вызывающего, без срезов. Без событий вовсе (anonymous-сервер:
-  объектов ядра нет) — сон `SPACE_POLL_INTERVAL = 1 мс`, только пока
-  вызывающий сам блокирован в `wait_for_space`.
-- **`wait_for_client_noevent`** (anonymous-сервер): опрос `client_state`
-  раз в 1 мс — единственный способ без объектов ядра, только внутри вызова
-  с таймаутом вызывающего.
+  на весь таймаут вызывающего, без срезов.
+- **Anonymous-канал** (0.10, п. 40, §b.5): опроса нет — секция всегда с 7
+  безымянными событиями, `wait_for_client`/`poll_client`/`wait_for_space`/
+  async спят в ядре, как у именованного канала (до 0.10 — опрос раз в 1 мс:
+  `wait_for_client_noevent` и `SPACE_POLL_INTERVAL`, оба удалены).
 - **`AutoClient`**: каждая попытка ждёт `S2C_CONNECT` до `connect_timeout` =
   2 с (`DispatchClient` канал не переподключает — ревизия 2: и после
   неудачного первого подключения). Ревизия 2: это ожидание (как и
@@ -2252,8 +2384,8 @@ token → 0` (R14); получив `DISCONNECT` от сервера — `CAS tok
 читатель ≤ 0.7 заявку не снимает и будит только опустошив кольцо (R2) —
 задержка, пока он читает, но не зависание; пир без PID, упавший без
 `DISCONNECT`, не будит ничем — единственная граница тогда таймаут
-вызывающего. Anonymous-сервер (нет объектов ядра) — опрос раз в 1 мс
-внутри вызова.
+вызывающего (так же драйвер anonymous-канала: процесса нет, только его
+`DISCONNECT`, §b.5).
 
 **Синхронный читатель `poll_client`/`poll_server` (0.10).** Набор
 `[DATA направления, S2C_DISCONNECT, процесс пира]`, меньший индекс важнее;
@@ -2272,8 +2404,7 @@ token → 0` (R14); получив `DISCONNECT` от сервера — `CAS tok
 сигнал, и синхронный Rust-читатель продолжит ждать до таймаута (с 0.10,
 п. 38, так же любой потребитель Rust — worker-ы, диспетчер Multi; async — с момента появления —
 до смерти процесса пира).
-Anonymous-сервер (событий нет): при пустом кольце `client_state !=
-SERVER_READY` — `Err(NotConnected)` без ожидания.
+Anonymous-канал (0.10, п. 40) — тот же набор на безымянных событиях (§b.5).
 
 ---
 
@@ -2379,6 +2510,7 @@ R1–R17), §g (фактический прогон).
 | 37 | Уход клиента — CAS пары `(client_state, slot_claim)` (надёжность, 17.10.2026, решение AB) | уход L: сверка `generation == G`, затем 32-битный CAS `client_state: SERVER_READY → IDLE`; «не заметившего» клиента сессии, закрытой сервером, сервер лишает claim-а по `RESERVE_TIMEOUT`, и если поток клиента вытеснен между сверкой и CAS дольше отъёма и целого рукопожатия следующего клиента, CAS снимал сессию следующего (`IDLE` без его ведома; с прежним правилом — ещё и чужой `DISCONNECT`) | один 64-битный CAS выровненной пары `client_state` (смещение 16) + `slot_claim` (20): `(SERVER_READY, T) → (IDLE, T)`, `T` — токен claim-а клиента (во всех режимах: `Take`, Multi `Held` — токен перебора, `TakeOverAbandoned` — новый токен после перехвата); сигнал `DISCONNECT` — только при удачном CAS (п. 35), claim — последним. Формат не меняется. Пир (сервер) обращается к полям 4-байтовыми атомарными операциями: на x86 `lock cmpxchg`/`lock cmpxchg8b` над выровненным 8-байтовым словом атомарен относительно них. Сервер в сессии claim клиента не меняет (S6 только читает; отъём по `RESERVE_TIMEOUT` — только у неподключённого сервера; `mark_disconnected` освобождает claim лишь подтверждённо умершего клиента и только после `IDLE`), поэтому для открытой сессии CAS пары эквивалентен прежнему. Допущение (не исследуется моделью): поток, вытесненный между удачным CAS и сигналом `DISCONNECT` дольше, чем сервер закроет сессию, отнимет claim по `RESERVE_TIMEOUT` и примет следующего клиента, даёт лишний `DISCONNECT` в новой сессии (с п. 38 — устаревший для любого потребителя Rust: клиент новой сессии в ней, сигнал поглощается; до п. 38 worker Auto-сервера принимал его за уход клиента, и сессия кончалась раньше), не заклинивание; переписанный враждебным писателем `slot_claim` делает уход тихим (§h п. 11). Нативному клиенту — ЖЕЛАТЕЛЬНО так же (`InterlockedCompareExchange64` над `&client_state`); модель рукопожатия проверяет поздний уход «забытого» клиента многошаговым L (окно между CAS и сигналом — вне модели, допущение A1'), с 32-битным CAS она находит нарушение I5 | R15, §d.2 шаг 7, §h п. 11 |
 | 38 | `DISCONNECT` — уход, только если пир покинул ЭТУ сессию (надёжность, 17.10.2026, T11c, решение AD) | Rust (0.10 до исправления): синхронные `poll_*`/`wait_for_space`, async и ответ лобби уже отличали устаревший сигнал по состоянию пира, но подключённые worker-ы — Auto-сервер и Auto-клиент (`Worker::handle_wait`, а значит, и выделенные каналы Dispatch), диспетчер Multi (`handle_slot_disconnect`) и `MultiClient` — считали штатным уходом **любой** `DISCONNECT`. Сигнал при живой сессии возможен: окно между удачным CAS ухода прежнего клиента и его сигналом (п. 37, допущение A1'), пир чужой реализации, посторонний процесс того же пользователя (в том числе старой версии: сам пир 0.9 отвергается ещё на C0 — `VersionMismatch`) — и живая сессия рвалась (`Graceful`, сервер Auto/Multi снова ждал клиента, клиент переподключался) | **сторона-потребитель**: `DISCONNECT` — уход, только если пир покинул ЭТУ сессию: сервер — `client_state != SERVER_READY` (`generation` меняет только сам сервер, а `SERVER_READY` при открытой сессии ставит только его фиксация S5); клиент — `server_state != SERVER_READY` или `generation != G`. Одно правило у всех потребителей Rust (клиентский `wait_for_space` сверял только `server_state` — теперь и `generation`). Иначе сигнал **устаревший**: поглощается и ожидание продолжается; возвращать его некому — пир сигналит, только уйдя (R14), а сервер Multi, закрывая слот, снимает подключённость под блокировкой слота до сигнала (сигнал при неподключённом слоте диспетчер, как и прежде, возвращает клиенту). Подключённые worker-ы Auto и `MultiClient` после поглощённого сигнала проверяют остальные объекты набора одним нулевым ожиданием (П1/П2 §e.1): поток устаревших сигналов на индексе 0 не скрывает `SPACE` и смерть пира, данные, очередь и остановку проход решает по состоянию — работа на сигнал O(1), без горячего цикла сверх самого потока; диспетчер Multi — одно завершение порта и сверка одного слота (привязки `DATA`/процесса — свои пакеты). `MultiClient`, разбуженный `DISCONNECT` при сменившемся `generation`, возвращает сигнал (он для нового клиента слота) и уходит, как прежде. Уход по-прежнему — с дочитыванием кольца и `Graceful`. Пиру формат и сигналы не меняются; R14 (состояние, потом сигнал) — ОБЯЗАН, как и прежде (без него Rust примет уход за устаревший сигнал и заметит конец сессии только по смерти процесса пира); нативному потребителю — ЖЕЛАТЕЛЬНО то же правило | §e.1, §e.2 п. 5, §e.4 R14, §i.2, §i.4, §i.6 |
 | 39 | Уведомление «claim освобождён» — занятый канал и `NoFreeSlot` без опроса (надёжность, 17.10.2026, Task 12; решения J, M, R-N, R-O) | Rust (0.10 до исправления): `AutoClient` при `AlreadyConnected` повторял попытку с отступом `BusyBackoff` (`reconnect_delay` → 2 с, ошибка на каждой), `MultiClient` при `NoFreeSlot` — раз в `retry_delay` (250 мс) с толчком всех слотов; протухший захват single-client канала отнимался только вторым толчком через `RESERVE_TIMEOUT`, то есть только благодаря опросу; claim держателя, умершего до `CLIENT_HELLO`, — тоже через `RESERVE_TIMEOUT` (10 с) | **R20**/**R21** (§e.4, §e.2 п. 7): сервер создаёт `<B>_free` (NotificationEvent; база Multi — `<B>_multi_free`, своё имя по той же причине, что маяк базы, п. 34) рядом с маяком, в `<B>_beacon_state` — `free_gen@20`, `free_waiters@24` (§b.3); каждый удавшийся `CAS slot_claim: T → 0` (единственный путь в Rust — `release_claim_notify`) и `raise`/`lower` маяка — `free_gen += 1`, при `free_waiters != 0` — `NtSetEvent`; ждущий — `[wake, <B>_free, процесс держателя, процесс сервера]` без таймаута, сброс только перед перепроверкой `free_gen`; захват без сессии — толчок раз на токен и разовый повторный через `RESERVE_TIMEOUT + 1 с` (R-N); владелец claim-а без заявки подтверждённо умер — сервер снимает claim на первом толчке (R-O). Fix round 1 (решение AE): «живой держатель окна C1–C2 получает `AlreadyConnected` и повторяет» — неверно, если его заявку успели зафиксировать: он оставался в сессии-призраке, CAS пары с отнятым токеном не проходил, канал заклинивало до выхода его процесса. Теперь: клиент очищает поля владельца перед каждым освобождением своего claim-а (§d.2 C2, R18 — ОБЯЗАН), сервер — поля умершего перед снятием его claim-а; R-O перечитывает `client_state == IDLE` и PID владельца прямо перед CAS; проигранный отзыв на C8 — возврат claim-а и уход L (§d.2 C8). Модель — свойство W (`handshake_model_rob_without_retake_leaves_ghost`, `handshake_model_rob_of_posted_hello_leaves_ghost`). Страховка ожидания — `discovery_fallback` (10 с, R21). `on_error(AlreadyConnected/NoFreeSlot)` — раз на эпизод. Новый API — `SharedClient::wait_connectable`/`wait_connectable_in`. Клиенты лобби не уведомляют (мьютекс лобби). Сервер без `<B>_free` (или подменённый тип) — прежний резерв. Нативный пир: **ОБЯЗАН** R20 в обеих ролях (иначе Rust-ждущие спят до смерти процесса держателя/сервера, §h п. 12) и создавать `<B>_free` вместе с маяком; ЖЕЛАТЕЛЬНО — R21 у клиента и быстрый путь R-O. Тесты-эталоны: `free_waiters_never_miss_release_stress`, `free_waiter_interleavings`, `busy_channel_waiter_sleeps_without_wakeups`, `busy_waiter_wakes_on_every_release_path`, `no_free_slot_waiter_sleeps_and_wakes_on_release`, `holder_dead_before_hello_reclaimed_on_first_nudge` | §b.2, §b.3, §d.2, §e.1, §e.2, §e.4, §e.5, §h, §i.3, §i.4, §g |
+| 40 | Anonymous-канал с безымянными событиями — без опроса 1 мс (надёжность, 18.10.2026, Task 13; решения J (D), R-P) | Rust (0.10 до исправления; так же 0.9): `start_anonymous*` создавал только секцию — событий не было: `wait_for_client_noevent` опрашивал `client_state` раз в 1 мс, `wait_for_space` спал по `SPACE_POLL_INTERVAL` (1 мс), `poll_client` возвращал `Ok(false)` сразу (ожидания не было вовсе), async API — `InvalidConfig`; `get_event_handles()` — `None`, драйвер не мог ни сигналить, ни ждать (до 0.10 `EventHandles` — только `s2c_data`/`c2s_data`) | секция всегда вместе с 7 безымянными SynchronizationEvent с дескриптором секции; `get_event_handles() -> EventHandles` (все 7, `#[non_exhaustive]`); `wait_for_client_noevent` и `SPACE_POLL_INTERVAL` удалены; все ожидания сервера — в ядре на событиях, как у именованного канала. **Пир (драйвер, роль клиента) ОБЯЗАН**: `KeSetEvent(C2S_CONNECT_REQ)` после `CLIENT_HELLO` (R4), `DATA`/`SPACE` по §e.2 п. 1–2 (R1–R3), уход `IDLE` → `DISCONNECT` (R7/R14) при выгрузке и любом разрыве — процесса у него нет (`client_pid = 0`), смерть не наблюдается; claim не используется. Нативного пира xipc не касается (anonymous-канала в xipc нет) | §b.2, §b.5, §e.5, §i.6 |
 
 Порядок внедрения для C/C++: (1) §c.1–§c.4 — структуры и кадр; (2) клиент —
 §c.5 (проверки раскладки и типа событий); (3) сервер — порядок инициализации
