@@ -11,18 +11,26 @@ repository = "https://github.com/Platon7788/xshm"
 # bans` у них считает path-dep «wildcard».
 publish = false
 
+[workspace]
+resolver = "3"
+members = [".", "crates/xipc-sys"]
+default-members = ["."]
+
 [lib]
 name = "xshm"
 crate-type = ["rlib"]
 
 [dependencies]
 thiserror = "2.0.21"
+xipc-sys = { path = "crates/xipc-sys", optional = true }
 
 # Без внешних зависимостей для NT API!
 # Используем прямую линковку с ntdll.dll через #[link(name = "ntdll")]
 
 [features]
 default = []
+# Временный вход для проверяемой миграции; не постоянный второй backend.
+c-core = ["dep:xipc-sys"]
 
 # Политика линтов живёт в манифесте (Cargo 1.74+), а не в атрибутах крейта:
 # так она распространяется на все таргеты (lib, tests) единообразно и видна

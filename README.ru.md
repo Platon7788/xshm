@@ -1,3 +1,17 @@
+> **Предварительный C-backend (`feat/c-core`).** Временный feature `c-core`
+> открывает `xshm::c_core` поверх единственного C-ядра xipc. Сейчас переносится
+> Single-режим; это ещё не полный выпуск замены. API 0.10 ниже пока остаётся
+> эталоном. Корректное владение важнее совместимости со старым API; по итогам
+> перехода независимая Rust-реализация протокола будет удалена.
+>
+> Задайте `XIPC_SOURCE_DIR` — путь к исходникам `xhook/ipc`, затем выполните
+> `cargo test --features c-core --test c_core -- --test-threads=1`.
+> Требуются CMake 4 и MSVC. Альтернатива: `XIPC_SDK_PREFIX` (не обе переменные)
+> для готового hosted Release SDK нужной архитектуры и CRT. Для статического
+> CRT этого репозитория SDK собирается с
+> `-DXIPC_CRT_FREE=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`.
+> Раскладка C ABI, архитектура и CRT проверяются до линковки.
+
 <div align="center">
 
 # xShm

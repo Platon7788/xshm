@@ -1,0 +1,16 @@
+[package]
+name = "xipc-sys"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+publish = false
+links = "xipc"
+build = "build.rs"
+description = "Низкоуровневый ABI единственного C-ядра xipc"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "forbid"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"

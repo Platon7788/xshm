@@ -1,6 +1,8 @@
 // Политика линтов -- в `[lints]` секции Cargo.toml (см. манифест).
 
 mod asynch;
+#[cfg(feature = "c-core")]
+pub mod c_core;
 mod client;
 mod constants;
 mod error;
