@@ -143,7 +143,7 @@ const HARD_TIMEOUT: Duration = Duration::from_secs(600);
 /// Шаг сторожевого потока.
 const WATCHDOG_STEP: Duration = Duration::from_secs(1);
 
-/// Счётчик прогресса: строки протокола и принятые кадры.
+/// Счётчик прогресса: строки протокола, отправка и приём кадров.
 static PROGRESS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Отметить прогресс (сторожевой поток `main` сверяет счётчик).
@@ -472,8 +472,8 @@ impl Side {
     }
 
     /// `connect`; `busy` -- повторять и `AlreadyConnected` (канал держит
-    /// чужой захват: каждая попытка толкает сервер `CONNECT_REQ`, и тот
-    /// снимает протухший захват через `RESERVE_TIMEOUT`), с `INFO busy_ms=`;
+    /// чужой захват: wait_connectable ждёт `_free`, толкает сервер и
+    /// подтверждает смерть держателя без периодического опроса), с `INFO busy_ms=`;
     /// `ns` -- канал в частном пространстве имён (`connect_in`).
     fn connect_with(name: &str, busy: bool, ns: Option<&PrivateNamespace>) -> Result<Self, String> {
         let started = Instant::now();
@@ -494,7 +494,15 @@ impl Side {
                     if busy && started.elapsed() < CONNECT_RETRY_BUSY_FOR =>
                 {
                     busy_seen = true;
-                    thread::sleep(Duration::from_millis(100));
+                    let left = CONNECT_RETRY_BUSY_FOR.saturating_sub(started.elapsed());
+                    let available = match ns {
+                        Some(ns) => SharedClient::wait_connectable_in(ns, name, Some(left)),
+                        None => SharedClient::wait_connectable(name, Some(left)),
+                    }
+                    .map_err(|e| format!("wait busy: {}", err_name(&e)))?;
+                    if !available {
+                        return Err("connect: Timeout".to_owned());
+                    }
                 }
                 Err(e) => return Err(format!("connect: {}", err_name(&e))),
             }
@@ -549,6 +557,7 @@ impl Side {
             Self::Server(s) => s.send_to_client(data).map(drop),
             Self::Client(c) => c.send_to_server(data).map(drop),
         }
+        .inspect(|()| progress())
     }
 
     /// Запись без перезаписи: `Err(QueueFull)` -- места нет, кольцо не
@@ -558,6 +567,7 @@ impl Side {
             Self::Server(s) => s.try_send_to_client(data).map(drop),
             Self::Client(c) => c.try_send_to_server(data).map(drop),
         }
+        .inspect(|()| progress())
     }
 
     /// Ожидание места под `len` байт (`Ok(false)` -- таймаут).
@@ -933,6 +943,7 @@ impl MultiHandler for MultiEcho {
     }
 
     fn on_message(&self, client_id: u32, data: &[u8]) {
+        progress();
         if let Some(server) = self.server.get().and_then(Weak::upgrade)
             && let Err(e) = server.send_to(client_id, &xor_reply(data, self.max))
         {
@@ -1027,6 +1038,7 @@ impl MultiClientHandler for MultiClientEcho {
     }
 
     fn on_message(&self, data: &[u8]) {
+        progress();
         if self.ping {
             let k = self
                 .replies
@@ -1157,6 +1169,7 @@ impl DispatchHandler for DispatchEcho {
     }
 
     fn on_message(&self, client_id: u32, data: &[u8]) {
+        progress();
         if let Some(server) = self.server.get().and_then(Weak::upgrade)
             && let Err(e) = server.send_to(client_id, &xor_reply(data, self.max))
         {
@@ -1312,6 +1325,7 @@ impl DispatchClientHandler for DispatchClientEcho {
     }
 
     fn on_message(&self, data: &[u8]) {
+        progress();
         if self.ping {
             let k = self
                 .replies
@@ -1508,6 +1522,7 @@ impl AutoHandler for EchoHandler {
     }
 
     fn on_message(&self, _direction: ChannelKind, payload: &[u8]) {
+        progress();
         let (sent, max) = match self.endpoint.get() {
             Some(AutoEndpoint::Server(s)) => match s.upgrade() {
                 Some(s) => {
