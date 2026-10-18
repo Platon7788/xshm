@@ -457,6 +457,50 @@ impl ControlBlock {
             self.owner_start_hi.load(Ordering::Acquire),
         )
     }
+
+    /// Держатель claim-а перед освобождением своего claim-а (Task 12 fix
+    /// round 1, решение AE, INTEROP R18): очистить свои поля владельца --
+    /// PID первым (по нему читающий решает, есть ли владелец), затем время.
+    /// Без этого личность ушедшего, если его процесс потом завершится,
+    /// оставалась бы в полях до C2 следующего держателя, и быстрый путь
+    /// сервера (R-O) в окне C1-C2 снял бы claim живого держателя.
+    /// Вызывать, пока claim ещё свой (до CAS `T -> 0`): поля держателя
+    /// пишет только он сам.
+    pub(crate) fn clear_owner(&self) {
+        self.slot_owner_pid.store(0, Ordering::Release);
+        self.owner_start_lo.store(0, Ordering::Release);
+        self.owner_start_hi.store(0, Ordering::Release);
+    }
+
+    /// Сервер перед снятием claim-а подтверждённо умершего владельца `pid`
+    /// (Task 12 fix round 1): очистить его личность в полях владельца --
+    /// только если она всё ещё там (CAS `pid -> 0`; время -- CAS каждой
+    /// половины от прочитанного значения), чтобы не затереть поля
+    /// следующего держателя, уже прошедшего C2. `true` -- поле PID очищено
+    /// этим вызовом (личность была умершего).
+    pub(crate) fn forget_owner(&self, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let lo = self.owner_start_lo.load(Ordering::Acquire);
+        let hi = self.owner_start_hi.load(Ordering::Acquire);
+        if self
+            .slot_owner_pid
+            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        // Следующий держатель пишет время ДО PID (C2): если он уже записал
+        // своё, значение отличается от прочитанного, и CAS его не тронет.
+        let _ = self
+            .owner_start_lo
+            .compare_exchange(lo, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .owner_start_hi
+            .compare_exchange(hi, 0, Ordering::AcqRel, Ordering::Acquire);
+        true
+    }
 }
 
 /// Дескриптор одного кольца в `LayoutBlock`.

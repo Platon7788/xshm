@@ -45,6 +45,20 @@ pub(crate) enum HandshakePoint {
 #[cfg(test)]
 pub(crate) type HandshakeHook = Box<dyn FnOnce(&SharedView)>;
 
+/// Тесты (Task 12 fix round 1): хук быстрого пути R-O.
+#[cfg(test)]
+type RobHook = Box<dyn FnOnce(&crate::layout::ControlBlock)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Тесты (Task 12 fix round 1, I1 (b)): одноразовый хук
+    /// `release_if_owner_gone` между проверкой смерти владельца
+    /// (системные вызовы) и перечитыванием перед CAS -- играет роль
+    /// держателя, успевшего в этом окне.
+    pub(crate) static ROB_CHECK_HOOK: core::cell::RefCell<Option<RobHook>> =
+        const { core::cell::RefCell::new(None) };
+}
+
 #[cfg(test)]
 thread_local! {
     /// Тесты (Task 22): одноразовый хук в точке `HandshakePoint` внутри
@@ -184,31 +198,63 @@ pub(crate) fn release_if_holder_dead(
     token != CLAIM_FREE
         && watch.has_exited()
         && control.slot_owner_pid.load(Ordering::Acquire) == watch.pid()
-        && release_claim_notify(control, token, free)
+        && {
+            // Fix round 1 (решение AE, I1 (b)): личность умершего -- из полей
+            // владельца до освобождения, иначе в окне C1-C2 следующего
+            // держателя она сошла бы за его (быстрый путь R-O).
+            control.forget_owner(watch.pid());
+            release_claim_notify(control, token, free)
+        }
 }
 
 /// Быстрый путь толчка (Task 12, решение R-O, INTEROP R18): claim без
-/// заявки (`client_state != CLIENT_HELLO`), а его владелец
-/// (`slot_owner_pid` + `owner_start`) подтверждённо умер -- освободить сразу,
-/// без `RESERVE_TIMEOUT`, и уведомить ждущих. `true` -- освобождён.
+/// заявки, а его владелец (`slot_owner_pid` + `owner_start`) подтверждённо
+/// умер -- освободить сразу, без `RESERVE_TIMEOUT`, и уведомить ждущих.
+/// `true` -- освобождён.
 ///
-/// ABA (окно C1-C2 нового держателя): claim уже его, а поля владельца ещё
-/// прежнего, умершего, -- живой держатель теряет claim. Двух писателей это
-/// не даёт: его C6 -- CAS из `IDLE` (заявки нет -- отъём только без
-/// `HELLO`), а C8 видит чужой claim и отвечает `AlreadyConnected`
-/// (вызывающий повторяет).
+/// Fix round 1 (решение AE, I1 (b)), порядок: claim -> `client_state` ->
+/// поля владельца -> проверка смерти (системные вызовы) -> **перечитать**
+/// `client_state == IDLE` и PID владельца прямо перед снятием ->
+/// очистить поля умершего CAS-ом (`ControlBlock::forget_owner`;
+/// изменились -- отказ) -> CAS `claim -> 0`.
+///
+/// ABA (окно C1-C2 нового держателя): claim уже его, а поля -- прежнего.
+/// Клиенты Rust очищают свои поля перед каждым освобождением claim-а, а
+/// сервер -- поля умершего перед снятием его claim-а (R18 fix round 1),
+/// поэтому устаревшая личность в полях остаётся только после пира, этого не
+/// делающего и потом умершего. Тогда живой держатель теряет claim. Двух
+/// писателей нет: его C6 -- CAS из `IDLE`, а снятие -- только при `IDLE`,
+/// перечитанном прямо перед CAS, то есть до его заявки. Его заявка после
+/// снятия может быть зафиксирована (толчок другого клиента): тогда отзыв
+/// на C8 проигран, и клиент возвращает себе claim и уходит L
+/// (`Hello::leave_robbed`), а не оставляет сессию-призрак. Доказательство
+/// -- `handshake_model` (свойство W, варианты `RobPlainLeave` и
+/// `RobAnyState`).
 pub(crate) fn release_if_owner_gone(
     control: &crate::layout::ControlBlock,
     free: Option<&FreeNotifier>,
 ) -> bool {
     let claim = control.slot_claim.load(Ordering::Acquire);
-    if claim == CLAIM_FREE || control.client_state.load(Ordering::Acquire) == HANDSHAKE_CLIENT_HELLO
-    {
+    if claim == CLAIM_FREE || control.client_state.load(Ordering::Acquire) != HANDSHAKE_IDLE {
         return false;
     }
     let owner = control.slot_owner_pid.load(Ordering::Acquire);
-    claim_holder_gone(control, owner, control.owner_start_time())
-        && release_claim_notify(control, claim, free)
+    if !claim_holder_gone(control, owner, control.owner_start_time()) {
+        return false;
+    }
+    #[cfg(test)]
+    if let Some(hook) = ROB_CHECK_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook(control);
+    }
+    // Проверка смерти заняла системные вызовы: держатель мог тем временем
+    // выставить заявку или записать свои поля (C2).
+    if control.client_state.load(Ordering::Acquire) != HANDSHAKE_IDLE
+        || control.slot_owner_pid.load(Ordering::Acquire) != owner
+        || !control.forget_owner(owner)
+    {
+        return false;
+    }
+    release_claim_notify(control, claim, free)
 }
 
 /// Протухший захват single-client канала (ревизия 3, §2.3 дизайна, R18):
@@ -260,6 +306,10 @@ fn observe_idle_claim(
                 && control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO
             {
                 // CAS: если claim успел смениться, это уже другой захват.
+                // Fix round 1: поля протухшего владельца -- очистить (CAS
+                // от прочитанного): если его процесс потом завершится, его
+                // личность не сойдёт за следующего держателя (R-O).
+                control.forget_owner(control.slot_owner_pid.load(Ordering::Acquire));
                 let _ = release_claim_notify(control, claim, free);
                 *seen = None;
             }
@@ -967,7 +1017,9 @@ impl SharedServer {
                 #[cfg(test)]
                 handshake_hook(&self.view, HandshakePoint::AfterDeadWithdraw);
                 // Claim -- последним: пока он стоит, новой заявки нет.
-                // Task 12: с уведомлением ждущих (R20).
+                // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
+                // очистить поля умершего владельца (`pid == slot_owner_pid`).
+                control.forget_owner(pid);
                 let _ = release_claim_notify(control, claim, self.free.as_deref());
             }
             return Err(ShmError::HandshakeFailed);
@@ -1067,7 +1119,7 @@ impl SharedServer {
                 watch = ProcessWatch::open_peer(pid2, start2);
                 peer_start = start2;
                 if watch.is_none() && claim_holder_gone(control, pid2, start2) {
-                    return Err(self.abort_session(claim));
+                    return Err(self.abort_session(claim, pid2));
                 }
             }
         }
@@ -1101,7 +1153,7 @@ impl SharedServer {
     /// и взвести `DISCONNECT` (на случай ложного «умер»: живой клиент,
     /// засчитавший подключение по проигранному отзыву, увидит разрыв, а не
     /// сессию без сервера). `S2C_CONNECT` не сигналится.
-    fn abort_session(&mut self, claim: u32) -> ShmError {
+    fn abort_session(&mut self, claim: u32, owner: u32) -> ShmError {
         let control = self.view.control_block();
         control
             .server_state
@@ -1119,7 +1171,9 @@ impl SharedServer {
         header_b
             .handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
-        // Task 12: с уведомлением ждущих (R20).
+        // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
+        // очистить поля умершего владельца.
+        control.forget_owner(owner);
         let _ = release_claim_notify(control, claim, self.free.as_deref());
         if let Some(events) = &self.events {
             let _ = events.disconnect.set();
@@ -1229,7 +1283,9 @@ impl SharedServer {
             return;
         }
         if self.exclusive && peer.has_exited() {
-            // Task 12: с уведомлением ждущих (R20).
+            // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
+            // очистить поля умершего владельца (если они его).
+            control.forget_owner(peer.pid());
             let _ = release_claim_notify(control, session_claim, self.free.as_deref());
             return;
         }
@@ -2133,6 +2189,58 @@ mod handshake_tests {
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
     }
 
+    /// `free_gen` канала (уведомитель «сервера»).
+    fn free_gen(name: &str) -> u32 {
+        FreeNotifier::open(None, name).unwrap().free_gen()
+    }
+
+    /// Task 12 fix round 1 (m7): S2 -- снятие заявки умершего освобождает
+    /// claim с уведомлением (R20) и очищает его поля владельца.
+    #[test]
+    fn dead_hello_release_notifies() {
+        let name = unique("DEADHELLO_FREE");
+        let mut server = SharedServer::start(&name).unwrap();
+        let dead = dead_process();
+        post_foreign_hello(&server, dead, dead);
+        let g0 = free_gen(&name);
+        assert_eq!(server.complete_handshake(), Err(ShmError::HandshakeFailed));
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(free_gen(&name).wrapping_sub(g0), 1, "S2 без уведомления");
+    }
+
+    /// Task 12 fix round 1 (m7): S6 -- зафиксирована заявка, чьё
+    /// самоописание сменилось на подтверждённо умершего держателя (G2):
+    /// `abort_session` освобождает claim с уведомлением и очищает поля.
+    #[test]
+    fn s6_dead_holder_abort_notifies() {
+        let name = unique("S6ABORT_FREE");
+        let mut server = SharedServer::start(&name).unwrap();
+        let me = (std::process::id(), crate::win::current_process_start_time());
+        post_foreign_hello(&server, me, me);
+        let dead = dead_process();
+        set_hook(HandshakePoint::BeforeCommit, move |view| {
+            // Между S1 и S5 самоописание и владелец -- уже умершего.
+            let control = view.control_block();
+            control.announce_owner_start(dead.1);
+            control.slot_owner_pid.store(dead.0, Ordering::Release);
+            control.announce_client_start(dead.1);
+            control.client_pid.store(dead.0, Ordering::Release);
+        });
+        let g0 = free_gen(&name);
+        assert_eq!(server.complete_handshake(), Err(ShmError::HandshakeFailed));
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
+        assert_eq!(
+            free_gen(&name).wrapping_sub(g0),
+            1,
+            "abort_session без уведомления"
+        );
+    }
+
     /// §7.1 п. 7 (S2): заявка подтверждённо умершего процесса, который сам
     /// и держит claim, снимается до фиксации -- без нового `generation`, без
     /// `S2C_CONNECT`, claim свободен.
@@ -2844,5 +2952,114 @@ mod disconnect_tests {
         let second = accept(&mut server, &name);
         assert!(second.is_connected());
         drop(second);
+    }
+}
+
+#[cfg(test)]
+mod rob_tests {
+    //! Task 12 fix round 1 (решение AE, I1 (b)): быстрый путь R-O
+    //! перечитывает `client_state` и поле владельца прямо перед снятием и
+    //! очищает поля умершего; освобождения claim-а умершего сервером --
+    //! с очисткой полей.
+
+    use super::*;
+    use crate::test_support::dead_process;
+
+    fn unique(tag: &str) -> String {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        format!(
+            "SRV_ROB_{tag}_{}_{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    const TOKEN: u32 = 0x0B0B_0001;
+
+    /// Канал с claim-ом `TOKEN`, чей владелец -- завершившийся процесс.
+    fn dead_owned(tag: &str) -> (SharedServer, u32) {
+        let server = SharedServer::start(&unique(tag)).unwrap();
+        let control = server.view().control_block();
+        let (pid, start) = dead_process();
+        control.announce_owner_start(start);
+        control.slot_owner_pid.store(pid, Ordering::Release);
+        control.slot_claim.store(TOKEN, Ordering::Release);
+        (server, pid)
+    }
+
+    fn set_hook(hook: impl FnOnce(&crate::layout::ControlBlock) + 'static) {
+        ROB_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Владелец мёртв, заявки нет: claim снят, поля владельца очищены.
+    #[test]
+    fn dead_owner_claim_released_and_owner_forgotten() {
+        let (server, _) = dead_owned("OK");
+        let control = server.view().control_block();
+        assert!(release_if_owner_gone(control, None));
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.owner_start_time(), 0);
+    }
+
+    /// Держатель выставил заявку, пока сервер проверял смерть прежнего
+    /// владельца: перечитанный `client_state` -- не `IDLE`, claim не снят.
+    #[test]
+    fn rob_rechecks_client_state_before_cas() {
+        let (server, _) = dead_owned("HELLO");
+        let control = server.view().control_block();
+        set_hook(|control| {
+            control
+                .client_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        });
+        assert!(!release_if_owner_gone(control, None), "снят claim заявки");
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN);
+    }
+
+    /// Держатель записал свои поля (C2), пока сервер проверял смерть
+    /// прежнего владельца: поле изменилось -- claim не снят, поля не тронуты.
+    #[test]
+    fn rob_rechecks_owner_before_cas() {
+        let (server, _) = dead_owned("C2");
+        let control = server.view().control_block();
+        let me = std::process::id();
+        set_hook(move |control| {
+            control.announce_owner_start(crate::win::current_process_start_time());
+            control.slot_owner_pid.store(me, Ordering::Release);
+        });
+        assert!(!release_if_owner_gone(control, None), "снят claim живого");
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN);
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), me);
+    }
+
+    /// Снятие claim-а «задержавшегося» умершего (Task 7) очищает его поля.
+    #[test]
+    fn holder_dead_release_forgets_owner() {
+        let server = SharedServer::start(&unique("LINGER")).unwrap();
+        let control = server.view().control_block();
+        let watch = ProcessWatch::exited(4242).unwrap();
+        control.announce_owner_start(7);
+        control.slot_owner_pid.store(4242, Ordering::Release);
+        control.slot_claim.store(TOKEN, Ordering::Release);
+        assert!(release_if_holder_dead(control, &watch, TOKEN, None));
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.owner_start_time(), 0);
+    }
+
+    /// `forget_owner` не трогает поля, уже переписанные следующим
+    /// держателем.
+    #[test]
+    fn forget_owner_keeps_next_holder_fields() {
+        let server = SharedServer::start(&unique("FORGET")).unwrap();
+        let control = server.view().control_block();
+        control.announce_owner_start(11);
+        control.slot_owner_pid.store(22, Ordering::Release);
+        assert!(!control.forget_owner(33), "чужой PID");
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 22);
+        assert_eq!(control.owner_start_time(), 11);
+        assert!(control.forget_owner(22));
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.owner_start_time(), 0);
     }
 }

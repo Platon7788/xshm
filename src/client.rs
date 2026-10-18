@@ -16,7 +16,7 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::presence::{FreeNotifier, release_claim_notify};
+use crate::presence::{FreeNotifier, release_own_claim};
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
@@ -49,6 +49,14 @@ thread_local! {
     /// (C7), до открытия процесса сервера -- играет роль сервера, успевшего
     /// зафиксировать рукопожатие и умереть в этом окне.
     pub(crate) static AFTER_HELLO: std::cell::RefCell<Option<HelloHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Тесты (fix round 1, I1 (a)): одноразовый хук `Hello::leave_robbed`
+    /// после возврата claim-а, до ухода L.
+    pub(crate) static BEFORE_ROB_LEAVE: std::cell::RefCell<Option<HelloHook>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -318,10 +326,12 @@ impl SharedClient {
     }
 
     /// Дождаться, пока канал `name` не станет свободным (0.10, Task 12,
-    /// INTEROP R21), не подключаясь: `Ok(true)` -- claim канала был свободен
-    /// в какой-то момент (дальше -- [`SharedClient::connect`]; проигравший
-    /// гонку другому клиенту получит `AlreadyConnected` и зовёт снова);
-    /// `Ok(false)` -- истёк `timeout` (`None` -- без ограничения).
+    /// INTEROP R21), не подключаясь: `Ok(true)` -- канал был свободен в
+    /// какой-то момент: claim свободен и ни заявки, ни сессии нет (дальше --
+    /// [`SharedClient::connect`]; проигравший гонку другому клиенту получит
+    /// `AlreadyConnected` и зовёт снова -- без горячего цикла: следующий
+    /// вызов снова спит); `Ok(false)` -- истёк `timeout` (`None` -- без
+    /// ограничения).
     ///
     /// Без опроса: ждущий спит в ядре на уведомлении «claim освобождён»
     /// `<имя>_free`, которое сервер создаёт вместе с маяком присутствия, а
@@ -333,6 +343,17 @@ impl SharedClient {
     /// сервер снимает протухший захват. Сервер без `_free` (пир без R20) --
     /// проверка раз в 250 мс (резерв).
     ///
+    /// Страховка (fix round 1, решение AE): каждое ожидание уведомления --
+    /// не дольше `DiscoveryOptions::fallback` (по умолчанию 10 с; свои
+    /// параметры -- [`SharedClient::wait_connectable_with`]), затем
+    /// проверка канала: держатель-пир, освободивший claim без уведомления
+    /// (нет R20), и занятость без claim-а (сессия клиента без claim)
+    /// находятся в её пределах.
+    ///
+    /// Лобби Dispatch ждать так незачем: его клиентов сериализует мьютекс
+    /// лобби, и освобождая claim, они уведомление не взводят -- ожидание
+    /// проснётся только по страховке или по выходу процесса держателя.
+    ///
     /// # Errors
     ///
     /// Канала нет или он не опубликован -- ошибка открытия
@@ -340,7 +361,29 @@ impl SharedClient {
     /// процесс сервера завершился во время ожидания -- `PeerDied`; ошибка
     /// ОС ожидания.
     pub fn wait_connectable(name: &str, timeout: Option<Duration>) -> Result<bool> {
-        crate::presence::wait_connectable(None, name, timeout)
+        Self::wait_connectable_with(name, timeout, &crate::DiscoveryOptions::default())
+    }
+
+    /// [`SharedClient::wait_connectable`] с параметрами `options`:
+    /// страховочная проверка (`fallback`, `None` -- только события; меньше
+    /// 1 мс -- `InvalidConfig`) и частное пространство имён (`namespace`;
+    /// `security` не используется -- ждущий объектов не создаёт).
+    ///
+    /// # Errors
+    ///
+    /// Как у [`SharedClient::wait_connectable`]; `InvalidConfig` --
+    /// `fallback` меньше 1 мс.
+    pub fn wait_connectable_with(
+        name: &str,
+        timeout: Option<Duration>,
+        options: &crate::DiscoveryOptions,
+    ) -> Result<bool> {
+        crate::presence::wait_connectable(
+            options.namespace.as_deref(),
+            name,
+            timeout,
+            options.fallback,
+        )
     }
 
     /// [`SharedClient::wait_connectable`] для канала в частном пространстве
@@ -354,7 +397,12 @@ impl SharedClient {
         name: &str,
         timeout: Option<Duration>,
     ) -> Result<bool> {
-        crate::presence::wait_connectable(Some(ns), name, timeout)
+        crate::presence::wait_connectable(
+            Some(ns),
+            name,
+            timeout,
+            crate::DiscoveryOptions::default().fallback,
+        )
     }
 
     /// Дождаться сервера канала `name` (0.10, INTEROP R19), не подключаясь:
@@ -662,8 +710,15 @@ impl std::fmt::Debug for Hello {
 /// Освободить свой claim (CAS `token -> CLAIM_FREE`) с уведомлением ждущих
 /// `free` (Task 12, R20): если он уже не наш (отъём по дедлайну), -- no-op.
 fn release_claim(view: &SharedView, token: u32, free: Option<&FreeNotifier>) {
-    let _ = release_claim_notify(view.control_block(), token, free);
+    let _ = release_own_claim(view.control_block(), token, free);
 }
+
+/// Сколько ждать возврата claim-а на C8-провале (fix round 1, решение AE):
+/// claim держит клиент, чей C6 упрётся в нашу зафиксированную заявку, --
+/// он откатится и освободит claim за микросекунды (допущение A2
+/// `handshake_model`). Путь редкий: только после отъёма R-O claim-а живого
+/// держателя (пир, не очищающий поля владельца, INTEROP §h п. 12).
+const ROB_LEAVE_WAIT: Duration = Duration::from_millis(100);
 
 impl Hello {
     /// Открыть канал и выставить заявку (C0-C8 ревизии 3, INTEROP R15, R18;
@@ -846,9 +901,11 @@ impl Hello {
             mapping,
         };
 
-        // C8: claim всё ещё наш? Нет -- его отняли по дедлайну (держатель
-        // завис между C1 и C6 дольше `RESERVE_TIMEOUT`, нарушение A1):
-        // отзыв, а если сервер успел зафиксировать -- немедленный уход.
+        // C8: claim всё ещё наш? Нет -- его отняли: по дедлайну (держатель
+        // завис между C1 и C6 дольше `RESERVE_TIMEOUT`, нарушение A1) или
+        // быстрым путём R-O (Task 12: поля владельца в окне C1-C2 были
+        // прежнего, умершего держателя). Отзыв; проигран -- сервер успел
+        // зафиксировать заявку: вернуть claim и уйти (`leave_robbed`).
         if token != CLAIM_FREE
             && hello
                 .view
@@ -858,7 +915,7 @@ impl Hello {
                 != token
         {
             if hello.withdraw() {
-                drop(hello.finish());
+                hello.leave_robbed();
             }
             return Err(ShmError::AlreadyConnected);
         }
@@ -869,6 +926,61 @@ impl Hello {
     #[cfg(test)]
     pub(crate) const fn claim(&self) -> u32 {
         self.claim
+    }
+
+    /// Fix round 1 (решение AE, I1 (a)): claim отняли (C8), а отзыв проигран
+    /// -- сервер зафиксировал нашу заявку. Мы в сессии без своего claim-а:
+    /// прежний `drop(finish())` уходил CAS пары `(SERVER_READY, T)`, который
+    /// при чужом claim-е не проходит, -- сессия-призрак, сервер заклинен до
+    /// выхода нашего процесса (каждый следующий клиент -- `AlreadyConnected`).
+    ///
+    /// Теперь: пока `client_state == SERVER_READY` -- вернуть свой claim (CAS
+    /// `0 -> T`; занят -- ждать не дольше `ROB_LEAVE_WAIT`), записать поля
+    /// владельца (C2) и уйти обычным L (`SharedClient::drop`: CAS пары,
+    /// `DISCONNECT`, claim последним). `IDLE` -- сервер сессию уже закрыл,
+    /// уходить не из чего.
+    ///
+    /// Почему не 32-битный CAS `client_state` при `generation == G`: после
+    /// отъёма I2 не держится -- claim у другого клиента, и между сверкой и
+    /// CAS сервер мог закрыть нашу сессию и зафиксировать его (тот же
+    /// контрпример, что у решения AB; `generation`, прочитанный в `finish`,
+    /// тогда уже его). С возвращённым claim-ом действует довод AB: новую
+    /// заявку выставляет только держатель claim-а, а он -- мы, поэтому
+    /// `SERVER_READY` при CAS пары -- наша сессия (или сессия-призрак другого
+    /// ограбленного, чей владелец уходит так же). Claim занят дольше
+    /// `ROB_LEAVE_WAIT` (держатель вытеснен на C1..C6) -- уход без записей:
+    /// остаток задокументирован (INTEROP §h п. 12), а заявка держателя на C6
+    /// упрётся в сессию и откатится.
+    pub(crate) fn leave_robbed(self) {
+        let control = self.view.control_block();
+        let deadline = Instant::now().checked_add(ROB_LEAVE_WAIT);
+        loop {
+            if control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
+                return;
+            }
+            match control.slot_claim.compare_exchange(
+                CLAIM_FREE,
+                self.claim,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(_) if deadline.is_some_and(|at| Instant::now() < at) => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return,
+            }
+        }
+        // C2 -- как при захвате: время своего процесса, затем PID.
+        control.announce_owner_start(crate::win::current_process_start_time());
+        control
+            .slot_owner_pid
+            .store(std::process::id(), Ordering::Release);
+        #[cfg(test)]
+        if let Some(hook) = BEFORE_ROB_LEAVE.with(|hook| hook.borrow_mut().take()) {
+            hook(&self.view);
+        }
+        drop(self.finish());
     }
 
     /// Сигнал `S2C_CONNECT` -- ответ на эту заявку (C10).
@@ -2936,6 +3048,163 @@ mod tests {
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
     }
 
+    /// Task 12 fix round 1 (решение AE, I1; воспроизведение ревью): claim
+    /// держателя отнят R-O между C1 и C6, а его заявку сервер зафиксировал
+    /// по чужому толчку до C8. Отзыв на C8 проигран: клиент обязан вернуть
+    /// claim и уйти L (`IDLE`, `DISCONNECT`), а не оставить сессию-призрак --
+    /// до исправления `client_state` оставался `SERVER_READY`, и каждый
+    /// следующий клиент получал `AlreadyConnected` до выхода процесса.
+    #[test]
+    fn robbed_committed_hello_leaves_no_ghost() {
+        let name = format!("XSHM_ROB_GHOST_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let hook_name = name.clone();
+        AFTER_HELLO.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |view: &SharedView| {
+                let control = view.control_block();
+                // Отъём R-O: claim снят, заявка стоит.
+                control.slot_claim.store(CLAIM_FREE, Ordering::Release);
+                // Толчок другого клиента -- сервер фиксирует заявку.
+                EventHandle::open(ObjectPath::event(
+                    None,
+                    &hook_name,
+                    crate::naming::Direction::ClientToServer,
+                    crate::constants::EVENT_CONNECT_REQ_SUFFIX,
+                ))
+                .unwrap()
+                .set()
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
+                    assert!(Instant::now() < deadline, "сервер не зафиксировал заявку");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        });
+        let acceptor = std::thread::spawn(move || {
+            let accepted = server.wait_for_client(Some(Duration::from_secs(5)));
+            (server, accepted)
+        });
+        let robbed = SharedClient::connect(&name, Duration::from_secs(2));
+        let (mut server, accepted) = acceptor.join().unwrap();
+        assert_eq!(robbed.err(), Some(ShmError::AlreadyConnected));
+        assert_eq!(accepted, Ok(()), "сервер зафиксировал заявку");
+        let control = server.view().control_block();
+        assert_eq!(
+            control.client_state.load(Ordering::Acquire),
+            HANDSHAKE_IDLE,
+            "сессия-призрак"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        // Сервер разбирает уход и принимает следующего.
+        assert_eq!(
+            server.poll_client(Some(Duration::from_secs(2))),
+            Err(ShmError::NotConnected)
+        );
+        let next_name = name;
+        let next = std::thread::spawn(move || {
+            SharedClient::connect(&next_name, Duration::from_secs(3)).map(drop)
+        });
+        server
+            .wait_for_client(Some(Duration::from_secs(3)))
+            .unwrap();
+        assert_eq!(next.join().unwrap(), Ok(()));
+    }
+
+    /// Task 12 fix round 1 (m7): откат C6 (claim свободен, а канал занят
+    /// сессией клиента без claim) освобождает взятый claim с уведомлением.
+    #[test]
+    fn c6_rollback_notifies() {
+        let name = format!("XSHM_C6_FREE_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        control
+            .client_state
+            .store(HANDSHAKE_SERVER_READY, Ordering::Release);
+        let free = FreeNotifier::open(None, &name).unwrap();
+        let g0 = free.free_gen();
+        assert_eq!(
+            Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).err(),
+            Some(ShmError::AlreadyConnected)
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(
+            free.free_gen().wrapping_sub(g0),
+            1,
+            "откат C6 без уведомления"
+        );
+    }
+
+    /// Task 12 fix round 1 (решение AE, I2): освобождающий без R20 (сырой
+    /// store `0` без уведомления) -- `wait_connectable` находит свободный
+    /// канал страховочной проверкой `fallback`; с `fallback: None` --
+    /// только события, и такого освобождения он не видит.
+    #[test]
+    fn wait_connectable_fallback_finds_silent_release() {
+        for (tag, fallback, found) in [
+            ("CAP", Some(Duration::from_millis(300)), true),
+            ("NOCAP", None, false),
+        ] {
+            let name = format!("XSHM_WAIT_SILENT_{tag}_{}", std::process::id());
+            let server = SharedServer::start(&name).unwrap();
+            let control = server.view().control_block();
+            control.slot_claim.store(0x5111_E701, Ordering::Release);
+            let waiter_name = name.clone();
+            let waiter = std::thread::spawn(move || {
+                let options = crate::DiscoveryOptions::default().fallback(fallback);
+                let started = Instant::now();
+                let result = SharedClient::wait_connectable_with(
+                    &waiter_name,
+                    Some(Duration::from_millis(1500)),
+                    &options,
+                );
+                (result, started.elapsed())
+            });
+            std::thread::sleep(Duration::from_millis(100));
+            control.slot_claim.store(CLAIM_FREE, Ordering::Release);
+            let (result, took) = waiter.join().unwrap();
+            assert_eq!(result, Ok(found), "{tag}: {took:?}");
+            if found {
+                assert!(took <= Duration::from_millis(1000), "{tag}: {took:?}");
+            }
+            drop(server);
+        }
+    }
+
+    /// Fix round 1 (R18): клиент перед освобождением своего claim-а очищает
+    /// поля владельца -- после отката, отзыва и ухода `slot_owner_pid == 0`.
+    #[test]
+    fn own_release_clears_owner_fields() {
+        let name = format!("XSHM_OWNER_CLEAR_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let owner = |server: &SharedServer| {
+            let control = server.view().control_block();
+            (
+                control.slot_owner_pid.load(Ordering::Acquire),
+                control.owner_start_time(),
+                control.slot_claim.load(Ordering::Acquire),
+            )
+        };
+        // Отзыв (заявка без ответа).
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        assert_eq!(owner(&server).0, std::process::id());
+        assert!(!hello.withdraw());
+        assert_eq!(owner(&server), (0, 0, CLAIM_FREE), "отзыв");
+        drop(hello);
+        // Уход L подключённого.
+        let client_name = name;
+        let client =
+            std::thread::spawn(move || SharedClient::connect(&client_name, Duration::from_secs(3)));
+        server
+            .wait_for_client(Some(Duration::from_secs(3)))
+            .unwrap();
+        let client = client.join().unwrap().unwrap();
+        assert_ne!(owner(&server).0, 0);
+        drop(client);
+        assert_eq!(owner(&server), (0, 0, CLAIM_FREE), "уход");
+    }
+
     /// Task 12 (R21): `wait_connectable` спит, пока канал занят, и
     /// возвращает `true` сразу после освобождения claim-а (здесь -- отзыв
     /// заявки A, уведомление R20); claim он не берёт. Занят до конца
@@ -2965,7 +3234,8 @@ mod tests {
         let (result, returned) = waiter.join().unwrap();
         assert_eq!(result, Ok(true));
         let took = returned.saturating_duration_since(released);
-        assert!(took <= Duration::from_millis(100), "{took:?}");
+        // m6: событие против страховки 10 с -- запас под нагрузкой.
+        assert!(took <= Duration::from_millis(400), "{took:?}");
         let control = server.view().control_block();
         assert_eq!(
             control.slot_claim.load(Ordering::Acquire),

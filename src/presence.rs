@@ -104,6 +104,26 @@
 //! до смерти процесса держателя/сервера -- то же, что пир без R20 (INTEROP
 //! §h).
 //!
+//! **Страховка (fix round 1, решение AE, I2)**: сон ждущего ограничен
+//! `discovery_fallback` (Auto/Multi -- опции клиента, `wait_connectable` --
+//! `DiscoveryOptions::fallback`; по умолчанию 10 с, `None` -- только
+//! события), затем попытка: держатель-пир без R20, освободивший claim без
+//! уведомления, и занятость без claim-а (`client_state != IDLE` при
+//! свободном claim-е) находятся в её пределах. Только пока клиент ждёт
+//! занятый канал -- простой подключённого клиента не задет. Своё
+//! освобождение внутри попытки (откат C6) тоже меняет `free_gen`:
+//! перепроверка возвращает сигнал, и остальные ждущие просыпаются один
+//! лишний раз (безвредно).
+//!
+//! **Поля владельца (fix round 1, I1)**: клиент очищает свои
+//! `slot_owner_pid`/`owner_start` перед каждым освобождением своего claim-а
+//! ([`release_own_claim`]), сервер -- поля умершего перед снятием его
+//! claim-а (`ControlBlock::forget_owner`); иначе быстрый путь R-O в окне
+//! C1-C2 следующего держателя принял бы личность ушедшего (и потом
+//! умершего) за его и снял бы claim живого. Ограбленный пиром без очистки
+//! держатель, чью заявку сервер уже зафиксировал, возвращает claim и уходит
+//! (`Hello::leave_robbed`), -- доказательство в `handshake_model` (W).
+//!
 //! **Толчки без опроса**: захват без сессии (`server_state !=
 //! SERVER_READY`) ждущий толкает один раз на наблюдённый токен и ставит
 //! разовый повторный толчок через `RESERVE_TIMEOUT + 1 с` (решение R-N) --
@@ -120,7 +140,7 @@ use std::time::{Duration, Instant};
 
 use crate::beacon::{Beacon, STATE_FREE_GEN_OFFSET, STATE_FREE_WAITERS_OFFSET};
 use crate::constants::{
-    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
+    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -884,6 +904,23 @@ pub(crate) fn release_claim_notify(
     release_word_notify(&control.slot_claim, token, notifier)
 }
 
+/// Освободить СВОЙ claim (откат, отзыв, уход; клиент): fix round 1 (решение
+/// AE, INTEROP R18) -- пока claim ещё наш, сначала очистить свои поля
+/// владельца (`ControlBlock::clear_owner`), затем `release_claim_notify`.
+/// Иначе личность ушедшего, если его процесс потом завершится, сошла бы
+/// за следующего держателя в окне C1-C2 (быстрый путь R-O снял бы его
+/// claim). Claim уже не наш -- поля не трогаем (они следующего).
+pub(crate) fn release_own_claim(
+    control: &ControlBlock,
+    token: u32,
+    notifier: Option<&FreeNotifier>,
+) -> bool {
+    if token != CLAIM_FREE && control.slot_claim.load(Ordering::Acquire) == token {
+        control.clear_owner();
+    }
+    release_claim_notify(control, token, notifier)
+}
+
 /// Задержка разового повторного толчка протухшего захвата (решение R-N):
 /// `RESERVE_TIMEOUT + 1 с` от первого толчка этого токена -- к повторному
 /// толчку сервер уже отсчитал свой `RESERVE_TIMEOUT` и отнимает claim.
@@ -1292,75 +1329,90 @@ impl Drop for FreeWaiter {
     }
 }
 
-/// Занятость single-client канала по удерживаемому заголовку секции и
-/// толчок `CONNECT_REQ` (ждущие `AutoClient` и `wait_connectable`).
-#[derive(Debug)]
-pub(crate) struct ChannelProbe {
-    mapping: Mapping,
-    connect_req: EventHandle,
-}
-
-impl ChannelProbe {
-    /// Открыть заголовок секции канала `name` и его `C2S_CONNECT_REQ`.
-    pub(crate) fn open(root: Option<&PrivateNamespace>, name: &str) -> Result<Self> {
-        let mapping = Mapping::open_header(ObjectPath::mapping(root, name))?;
-        if SharedView::peek_control(&mapping).is_none() {
-            return Err(ShmError::NotReady);
-        }
-        let connect_req = EventHandle::open_auto_reset(ObjectPath::event(
-            root,
-            name,
-            Direction::ClientToServer,
-            EVENT_CONNECT_REQ_SUFFIX,
-        ))?;
-        Ok(Self {
-            mapping,
-            connect_req,
-        })
-    }
-
-    /// `None` -- claim свободен; иначе -- что видит ждущий.
-    pub(crate) fn busy(&self) -> Result<Option<Busy>> {
-        let control = SharedView::peek_control(&self.mapping).ok_or(ShmError::NotReady)?;
-        let claim = control.slot_claim.load(Ordering::Acquire);
-        if claim == CLAIM_FREE {
+/// Занятость single-client канала `name` (ждущие `AutoClient` и
+/// `wait_connectable`): `None` -- канал свободен; иначе -- что видит
+/// ждущий.
+///
+/// Заголовок секции открывается на каждую попытку и закрывается сразу (fix
+/// round 1, m4): удерживаемое на всё ожидание отображение держало бы имя
+/// секции упавшего сервера, и перезапущенный сервер не смог бы создать
+/// канал заново, пока ждущий спит.
+///
+/// Занят и канал без claim-а, но с сессией или заявкой (`client_state !=
+/// IDLE`: сессия-призрак, клиент без claim, враждебный писатель; fix round
+/// 1, m2): `connect` ответил бы `AlreadyConnected`, а «свободен» вернул бы
+/// вызывающего в горячий цикл. Освобождения claim-а у такой занятости
+/// нет -- её снимает страховочная проверка `discovery_fallback`.
+pub(crate) fn channel_busy(root: Option<&PrivateNamespace>, name: &str) -> Result<Option<Busy>> {
+    let mapping = Mapping::open_header(ObjectPath::mapping(root, name))?;
+    let control = SharedView::peek_control(&mapping).ok_or(ShmError::NotReady)?;
+    let claim = control.slot_claim.load(Ordering::Acquire);
+    let server = Some((
+        control.server_pid.load(Ordering::Acquire),
+        control.server_start_time(),
+    ));
+    if claim == CLAIM_FREE {
+        if control.client_state.load(Ordering::Acquire) == HANDSHAKE_IDLE {
             return Ok(None);
         }
-        let served = control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
-        let owner = control.slot_owner_pid.load(Ordering::Acquire);
-        let server = control.server_pid.load(Ordering::Acquire);
-        Ok(Some(Busy {
-            key: if served { 0 } else { u64::from(claim) },
-            holder: Some((owner, control.owner_start_time())),
-            server: Some((server, control.server_start_time())),
-        }))
+        return Ok(Some(Busy {
+            key: 0,
+            holder: None,
+            server,
+        }));
     }
+    let served = control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY;
+    let owner = control.slot_owner_pid.load(Ordering::Acquire);
+    Ok(Some(Busy {
+        key: if served { 0 } else { u64::from(claim) },
+        holder: Some((owner, control.owner_start_time())),
+        server,
+    }))
+}
 
-    /// Толчок сервера (`CONNECT_REQ` без заявки): он назначит отсчёт
-    /// протухшему захвату или сразу снимет claim умершего держателя.
-    pub(crate) fn nudge(&self) {
-        let _ = self.connect_req.set();
+/// Толчок сервера канала `name` (`CONNECT_REQ` без заявки): он назначит
+/// отсчёт протухшему захвату или сразу снимет claim умершего держателя.
+/// Событие открывается на толчок (редкость: раз на захват), а не держится.
+pub(crate) fn nudge_channel(root: Option<&PrivateNamespace>, name: &str) {
+    if let Ok(event) = EventHandle::open_auto_reset(ObjectPath::event(
+        root,
+        name,
+        Direction::ClientToServer,
+        EVENT_CONNECT_REQ_SUFFIX,
+    )) {
+        let _ = event.set();
     }
 }
 
-/// `SharedClient::wait_connectable*`: ждать, пока claim канала `name` не
-/// окажется свободным (`Ok(true)`; захват не выполняется), не дольше
-/// `timeout` (`Ok(false)`).
+/// `SharedClient::wait_connectable*`: ждать, пока канал `name` не окажется
+/// свободным (`Ok(true)`; захват не выполняется), не дольше `timeout`
+/// (`Ok(false)`).
+///
+/// Fix round 1 (решение AE, I2): каждое ожидание уведомления -- не дольше
+/// `fallback` (`DiscoveryOptions::fallback`, по умолчанию 10 с; `None` --
+/// только события), затем проверка канала: пир без R20, освободивший claim
+/// без уведомления, и занятость без claim-а (m2) находятся в её пределах.
 pub(crate) fn wait_connectable(
     root: Option<&PrivateNamespace>,
     name: &str,
     timeout: Option<Duration>,
+    fallback: Option<Duration>,
 ) -> Result<bool> {
+    validate_fallback(fallback)?;
     let deadline = crate::ring::deadline_of(timeout);
-    let probe = ChannelProbe::open(root, name)?;
+    let left = || deadline.map(|at| at.saturating_duration_since(Instant::now()));
+    // Канала нет -- ошибка открытия сразу.
+    if channel_busy(root, name)?.is_none() {
+        return Ok(true);
+    }
     let Ok(notifier) = FreeNotifier::open(root, name) else {
         // Пир без R20 (или `_free` недоступен): резервная проверка раз в
         // `PRESENCE_RETRY_DELAY` (решение R-M).
         loop {
-            if probe.busy()?.is_none() {
+            if channel_busy(root, name)?.is_none() {
                 return Ok(true);
             }
-            let left = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+            let left = left();
             if left.is_some_and(|left| left.is_zero()) {
                 return Ok(false);
             }
@@ -1370,27 +1422,35 @@ pub(crate) fn wait_connectable(
         }
     };
     let mut waiter = FreeWaiter::new(Arc::new(notifier));
-    let waited = waiter.wait_free(
-        &mut || match probe.busy() {
-            Ok(None) => Attempt::Done(()),
-            Ok(Some(busy)) => Attempt::Busy(busy),
-            Err(err) => Attempt::Failed(err),
-        },
-        &mut || probe.nudge(),
-        &mut WaitCtl {
-            wake: None,
-            running: &|| true,
-            on_wake: &mut || {},
-            wakeup: &|| {},
-            deadline,
-            renudge: Some(renudge_delay(name)),
-        },
-    )?;
-    match waited {
-        FreeWait::Claimed(()) => Ok(true),
-        FreeWait::TimedOut | FreeWait::Stopped => Ok(false),
-        FreeWait::ServerGone => Err(ShmError::PeerDied),
-        FreeWait::Failed(err) => Err(err),
+    loop {
+        let left = left();
+        if left.is_some_and(|left| left.is_zero()) {
+            return Ok(false);
+        }
+        let waited = waiter.wait_free(
+            &mut || match channel_busy(root, name) {
+                Ok(None) => Attempt::Done(()),
+                Ok(Some(busy)) => Attempt::Busy(busy),
+                Err(err) => Attempt::Failed(err),
+            },
+            &mut || nudge_channel(root, name),
+            &mut WaitCtl {
+                wake: None,
+                running: &|| true,
+                on_wake: &mut || {},
+                wakeup: &|| {},
+                deadline: crate::ring::deadline_of(min_timeout(left, fallback)),
+                renudge: Some(renudge_delay(name)),
+            },
+        )?;
+        match waited {
+            FreeWait::Claimed(()) => return Ok(true),
+            // Страховочная проверка (`fallback`) или таймаут вызывающего --
+            // новый круг сверит остаток.
+            FreeWait::TimedOut | FreeWait::Stopped => {}
+            FreeWait::ServerGone => return Err(ShmError::PeerDied),
+            FreeWait::Failed(err) => return Err(err),
+        }
     }
 }
 
@@ -1818,7 +1878,8 @@ mod tests {
         assert!(matches!(waited, FreeWait::Claimed(())), "{waited:?}");
         let released = releaser.join().unwrap();
         let took = woke.saturating_duration_since(released);
-        assert!(took <= Duration::from_millis(50), "(в): {took:?}");
+        // m6: событие против дедлайна 5 с -- запас под нагрузкой.
+        assert!(took <= Duration::from_millis(250), "(в): {took:?}");
         assert_eq!(wakeups.load(Ordering::Relaxed), 1, "(в): одно пробуждение");
     }
 
@@ -1989,6 +2050,28 @@ mod tests {
         assert!(matches!(waited, FreeWait::Stopped), "{waited:?}");
         let took = returned.saturating_duration_since(stopped);
         assert!(took <= Duration::from_millis(100), "{took:?}");
+    }
+
+    /// Fix round 1 (m7): `raise` и `lower` маяка сервера уведомляют ждущих
+    /// (`free_gen + 1`, при ждущем -- событие взведено).
+    #[test]
+    fn raise_and_lower_notify_free() {
+        let name = unique("RAISELOWER");
+        let server = crate::server::SharedServer::start(&name).unwrap();
+        let free = Arc::new(FreeNotifier::open(None, &name).unwrap());
+        let waiter = FreeWaiter::new(Arc::clone(&free));
+        free.event.reset().unwrap();
+        let g0 = free.free_gen();
+        drop(server);
+        assert_eq!(free.free_gen().wrapping_sub(g0), 1, "lower без уведомления");
+        assert!(free.is_set(), "lower не взвёл событие при ждущем");
+        free.event.reset().unwrap();
+        // Объекты держит наш уведомитель: новый сервер того же имени.
+        let server = crate::server::SharedServer::start(&name).unwrap();
+        assert_eq!(free.free_gen().wrapping_sub(g0), 2, "raise без уведомления");
+        assert!(free.is_set(), "raise не взвёл событие при ждущем");
+        drop(waiter);
+        drop(server);
     }
 
     /// Разовый повторный толчок (R-N): захват без сессии толкается один

@@ -53,10 +53,40 @@
 //! клиенты -- разные процессы; совпадение PID одного процесса моделирует
 //! повторная попытка того же клиента).
 //!
+//! **Отъём R-O живого держателя** (Task 12 fix round 1, решение AE, I1).
+//! Быстрый путь сервера на толчке снимает claim, чей владелец
+//! (`slot_owner_pid` + `owner_start`) подтверждённо умер. Поля владельца
+//! пишет держатель на C2, поэтому в окне C1-C2 они -- прежнего держателя:
+//! если тот умер, не очистив их, живой новый держатель теряет claim. Модель
+//! держит призрачное поле владельца (`owner`): C2 -- отдельный шаг, клиент
+//! перед освобождением claim-а очищает свои поля (R18 fix round 1), сервер
+//! снимает claim умершего, очистив поле CAS-ом (`RobForget`), и только при
+//! `client_state == IDLE`, перечитанном прямо перед CAS (`RobCas`). Начальное
+//! поле -- `DEAD`: прежний держатель -- пир, не выполняющий очистку и
+//! умерший (худший случай; клиенты Rust сами устаревших полей не
+//! оставляют, поэтому отъём живого держателя -- не больше одного за
+//! прогон). Решение (чтение полей) и CAS -- разные шаги: держатель тем
+//! временем проходит C2..C6. Ветка C8 «claim отняли» теперь достижима:
+//! отзыв, а проигранный отзыв при `SERVER_READY` -- возврат claim-а
+//! (`Retake`: CAS `0 -> T`, C2) и обычный уход L с CAS пары (I1 (a));
+//! `IDLE` при сменившемся `generation` -- сервер сессию уже закрыл.
+//! Допущение A2: держатель, занявший claim, пока стоит сессия-призрак,
+//! откатывается на C6 (заявка невозможна) и освобождает claim -- в коде
+//! ожидание `Retake` ограничено (`ROB_LEAVE_WAIT`), в модели -- нет.
+//! Отъём нарушает I2 намеренно; после него I2 не проверяется, а охраняют
+//! I4 (подключение), I5, G1 и новое свойство **W** -- когда все клиенты
+//! ушли, `client_state == IDLE` (нет сессии-призрака). Остаток (только с
+//! пиром без очистки полей): ограбленный пишет `client_pid` (C5) и
+//! обнуляет его откатом поверх заявки следующего -- самоописание к S1 может
+//! быть затёрто (I3), поэтому проверки самоописания S1/S7 после отъёма
+//! сняты (INTEROP §h п. 12). Варианты `RobPlainLeave` (без возврата claim-а)
+//! и `RobAnyState` (без перепроверки `client_state`) перебор обязан
+//! опровергнуть свойством W.
+//!
 //! **Чего модель НЕ моделирует** (fix round 1, находка 3 ревью):
-//! - ветка C8 «claim отняли» недостижима: отъём есть только у «забытого»
-//!   клиента в сессии (`Conn`), а не у держателя между C1 и C6 (нарушение
-//!   A1 -- вне модели, §h п. 10 INTEROP);
+//! - отъём протухшего захвата по `RESERVE_TIMEOUT` у держателя между C1 и
+//!   C6 (нарушение A1 -- вне модели, §h п. 10 INTEROP); с Task 12 ветку C8
+//!   открывает отъём R-O (выше);
 //! - режимы `ClaimMode::Held` (Multi: claim берёт перебор) и
 //!   `TakeOverAbandoned` (лобби с брошенным мьютексом), `abort_session` S6 и
 //!   смерти процессов вообще -- S2, освобождение claim умершего в
@@ -106,11 +136,24 @@ const SERVER: u8 = 3;
 /// Предел `generation` в модели (рукопожатий за прогон не больше 2 × 2).
 const GENERATIONS: usize = 8;
 
+/// Метка поля владельца claim-а: личность прежнего держателя, уже
+/// умершего и не очистившего её (пир, не выполняющий R18 «очистить поля
+/// владельца перед освобождением»).
+const DEAD: u8 = 9;
+
 /// Вариант протокола.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Revision {
     /// Ревизия 2 (до Task 22).
     Two,
+    /// Task 12 до fix round 1 (решение AE, I1 (a)): отъём R-O есть, а ветка
+    /// C8 «отзыв проигран» уходит прежним L с отнятым токеном (CAS пары не
+    /// проходит) -- перебор обязан найти сессию-призрак (W).
+    RobPlainLeave,
+    /// Отъём R-O без перепроверки `client_state` прямо перед CAS (I1 (b)):
+    /// claim отнимается и у держателя с уже выставленной заявкой --
+    /// перебор обязан найти нарушение.
+    RobAnyState,
     /// Ревизия 3 буквально по дизайну, но C10 -- «`SERVER_READY` или
     /// `generation != g0`» (без отклонения §2.1 C10).
     DesignC10,
@@ -134,6 +177,9 @@ enum Cs {
 enum Pc {
     /// C1 (новая попытка).
     Start,
+    /// C2: поля владельца claim-а -- свои (fix round 1: отдельный шаг --
+    /// окно C1-C2, где поля ещё прежнего держателя).
+    C2,
     C3,
     C4,
     C5,
@@ -162,6 +208,10 @@ enum Pc {
     L4,
     /// Claim отнят отъёмом, пока клиент «не заметил» отключения.
     Forgotten,
+    /// Fix round 1 (решение AE, I1 (a)): отзыв на C8 проигран при сессии,
+    /// а claim отнят -- вернуть свой claim (CAS `0 -> T`), затем обычный
+    /// уход L (CAS пары).
+    Retake,
     Done,
 }
 
@@ -198,6 +248,12 @@ enum Spc {
     Conn,
     /// Отключение по инициативе сервера: `DISCONNECT` после `IDLE`.
     KickSignal,
+    /// Быстрый путь R-O (Task 12): решение принято по полям владельца
+    /// (`t` -- claim); очистить поле владельца (CAS `DEAD -> 0`; изменилось
+    /// -- отказ).
+    RobForget,
+    /// R-O: CAS `slot_claim: t -> 0` (fix round 1 (b): только при `IDLE`).
+    RobCas,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -238,6 +294,15 @@ struct State {
     commits: [u8; GENERATIONS],
     /// Призрак: кто засчитал подключение к сессии каждого `generation`.
     accepted: [u8; GENERATIONS],
+    /// Поле владельца claim-а (`slot_owner_pid` + `owner_start`): `0` --
+    /// очищено, клиент `1`/`2`, `DEAD` -- прежний держатель-пир, умерший, не
+    /// очистив его (начальное состояние модели).
+    owner: u8,
+    /// Призрак: claim текущей попытки клиента отнят R-O -- её заявка или
+    /// сессия может стоять при чужом/свободном claim-е (I2 нарушен).
+    robbed: [bool; CLIENTS],
+    /// Призрак: отъём живого держателя случился в этом прогоне.
+    any_rob: bool,
 }
 
 /// Итог перебора.
@@ -245,6 +310,10 @@ struct State {
 struct Stats {
     states: usize,
     accepts: bool,
+    /// Достигнут отъём R-O живого держателя (fix round 1).
+    robs: bool,
+    /// Достигнут возврат claim-а на C8-провале (`Retake`).
+    retakes: bool,
 }
 
 /// Токен попытки: уникален на (клиент, попытку), как у `claim_token`.
@@ -291,17 +360,44 @@ impl State {
             },
             commits: [0; GENERATIONS],
             accepted: [0; GENERATIONS],
+            owner: DEAD,
+            robbed: [false; CLIENTS],
+            any_rob: false,
         }
     }
 
-    /// Инвариант I2 (проверяется после каждого перехода, только ревизия 3).
+    /// Инвариант I2 (проверяется после каждого перехода, только ревизия 3)
+    /// -- пока в прогоне не было отъёма R-O живого держателя: отъём нарушает
+    /// I2 намеренно (заявка или сессия ограбленного стоит при чужом или
+    /// свободном claim-е, и пока она стоит, другой держатель может и
+    /// выставить, и отозвать заявку поверх неё). После отъёма охраняют I4,
+    /// I5, G1 и W.
     fn check_i2(&self) -> Result<(), String> {
         match self.cs {
-            Cs::Hello(c) | Cs::Ready(c) if self.claim == 0 || owner_of(self.claim) != c => Err(
-                format!("I2: client_state {:?} при claim {}", self.cs, self.claim),
-            ),
+            Cs::Hello(c) | Cs::Ready(c)
+                if (self.claim == 0 || owner_of(self.claim) != c) && !self.any_rob =>
+            {
+                Err(format!(
+                    "I2: client_state {:?} при claim {}",
+                    self.cs, self.claim
+                ))
+            }
             _ => Ok(()),
         }
+    }
+
+    /// Свойство W (fix round 1, I1): все клиенты закончили -- ни заявки,
+    /// ни сессии в канале (сессия-призрак заклинила бы сервер до выхода
+    /// процесса ушедшего клиента: каждый следующий -- `AlreadyConnected`).
+    fn check_no_ghost(&self) -> Result<(), String> {
+        let done = self.clients.iter().all(|c| c.pc == Pc::Done);
+        if done && self.cs != Cs::Idle {
+            return Err(format!(
+                "W: все клиенты ушли, а client_state {:?} (сессия-призрак)",
+                self.cs
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -314,6 +410,37 @@ const fn next_attempt(client: &mut Client) {
     } else {
         Pc::Start
     };
+}
+
+/// Следующая попытка клиента `i`: призрак «claim отнят» -- только у этой
+/// попытки.
+const fn next_attempt_of(n: &mut State, i: usize) {
+    n.robbed[i] = false;
+    next_attempt(&mut n.clients[i]);
+}
+
+/// Освобождение claim-а клиентом (откат, отзыв, уход): fix round 1 --
+/// сначала очистить свои поля владельца (R18), затем CAS `T -> 0`.
+const fn release_own(n: &mut State, me: u8, tok: u8) {
+    if n.claim == tok {
+        if n.owner == me {
+            n.owner = 0;
+        }
+        n.claim = 0;
+    }
+}
+
+/// Возврат claim-а на C8-провале (fix round 1, I1 (a)) есть в варианте.
+fn rob_retake(rev: Revision) -> bool {
+    matches!(rev, Revision::Three | Revision::RobAnyState)
+}
+
+/// Быстрый путь R-O (Task 12) есть в варианте.
+fn rob_enabled(rev: Revision) -> bool {
+    matches!(
+        rev,
+        Revision::Three | Revision::RobPlainLeave | Revision::RobAnyState
+    )
 }
 
 /// Все переходы клиента `i` из состояния `s`.
@@ -331,14 +458,19 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
                 if three {
                     n.claim = tok;
                 }
-                n.clients[i].pc = Pc::C3;
+                n.clients[i].pc = if three { Pc::C2 } else { Pc::C3 };
             } else {
                 // Проигрыш: толчок, если сервер не в сессии.
                 if !n.server_ready {
                     n.req = true;
                 }
-                next_attempt(&mut n.clients[i]);
+                next_attempt_of(&mut n, i);
             }
+            out.push(Ok(n));
+        }
+        Pc::C2 => {
+            n.owner = me;
+            n.clients[i].pc = Pc::C3;
             out.push(Ok(n));
         }
         Pc::C3 => {
@@ -417,7 +549,7 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
             // CAS `CLIENT_HELLO -> IDLE`.
             match n.cs {
                 Cs::Hello(owner) => {
-                    if three && owner != me {
+                    if three && owner != me && !n.any_rob {
                         out.push(Err(format!(
                             "I2: клиент {me} отзывает чужую заявку {owner}"
                         )));
@@ -426,26 +558,48 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
                     n.cs = Cs::Idle;
                     n.clients[i].pc = Pc::RollbackPid;
                 }
+                // Fix round 1 (I1 (a)): отзыв на C8 проигран при сессии --
+                // вернуть claim и уйти (`Retake`); сервер уже закрыл её
+                // (`IDLE` при `generation != g0`) -- уходить не из чего.
+                Cs::Ready(_) if c.leave_now && rob_retake(rev) => n.clients[i].pc = Pc::Retake,
+                _ if c.leave_now && rob_retake(rev) && n.generation != c.g0 => {
+                    next_attempt_of(&mut n, i);
+                }
                 Cs::Ready(_) if three => n.clients[i].pc = Pc::Accept,
                 _ if n.generation != c.g0 => n.clients[i].pc = Pc::Accept,
                 _ => n.clients[i].pc = Pc::RollbackPid,
             }
             out.push(Ok(n));
         }
+        Pc::Retake => {
+            // Сессии уже нет -- уходить не из чего. Claim свободен -- CAS
+            // `0 -> T` (свой токен), затем C2 и уход L с CAS пары. Claim
+            // занят -- ждать: его держатель на C6 упрётся в нашу сессию,
+            // откатится и освободит claim (в коде -- ожидание ограничено,
+            // допущение A2 модуля).
+            if !matches!(n.cs, Cs::Ready(_)) {
+                next_attempt_of(&mut n, i);
+                out.push(Ok(n));
+            } else if n.claim == 0 {
+                n.claim = tok;
+                n.owner = me;
+                n.robbed[i] = false;
+                n.clients[i].pc = Pc::L2;
+                out.push(Ok(n));
+            }
+        }
         Pc::RollbackPid => {
             n.client_pid = 0;
             if three {
                 n.clients[i].pc = Pc::Release;
             } else {
-                next_attempt(&mut n.clients[i]);
+                next_attempt_of(&mut n, i);
             }
             out.push(Ok(n));
         }
         Pc::Release | Pc::L4 => {
-            if n.claim == tok {
-                n.claim = 0;
-            }
-            next_attempt(&mut n.clients[i]);
+            release_own(&mut n, me, tok);
+            next_attempt_of(&mut n, i);
             out.push(Ok(n));
         }
         Pc::Accept => {
@@ -536,7 +690,7 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
             if three {
                 n.clients[i].pc = Pc::L4;
             } else {
-                next_attempt(&mut n.clients[i]);
+                next_attempt_of(&mut n, i);
             }
             out.push(Ok(n));
         }
@@ -569,10 +723,8 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
                 }
                 n.disconnect = me;
             }
-            if n.claim == tok {
-                n.claim = 0;
-            }
-            next_attempt(&mut n.clients[i]);
+            release_own(&mut n, me, tok);
+            next_attempt_of(&mut n, i);
             out.push(Ok(n));
         }
     }
@@ -600,6 +752,16 @@ fn server_steps(rev: Revision, s: &State, out: &mut Vec<Result<State, String>>) 
         Spc::Idle => {
             if n.req {
                 n.req = false;
+                // Быстрый путь R-O на толчке (Task 12): поля владельца --
+                // личность умершего прежнего держателя -- решение «снять
+                // claim `t`». Само снятие -- шагами `RobForget`/`RobCas`
+                // (держатель тем временем может пройти C2..C6).
+                if rob_enabled(rev) && n.claim != 0 && n.owner == DEAD {
+                    let mut m = n;
+                    m.server.t = n.claim;
+                    m.server.pc = Spc::RobForget;
+                    out.push(Ok(m));
+                }
                 if matches!(n.cs, Cs::Hello(_)) {
                     n.server.pc = Spc::S1;
                     out.push(Ok(n));
@@ -622,10 +784,15 @@ fn server_steps(rev: Revision, s: &State, out: &mut Vec<Result<State, String>>) 
             }
         }
         Spc::S1 => {
-            // I4: самоописание владельца заявки к S1 на месте.
+            // I4: самоописание владельца заявки к S1 на месте. После отъёма
+            // живого держателя (только с пиром, не очищающим поля владельца
+            // -- начальное `DEAD`) ограбленный пишет `client_pid` (C5) и
+            // обнуляет его (откат) поверх чужой заявки: I3 не держится, и
+            // самоописание может быть затёрто -- остаток, вне I4 (§h п. 12).
             if let Cs::Hello(owner) = n.cs
                 && three
                 && n.client_pid != owner
+                && !n.any_rob
             {
                 out.push(Err(format!(
                     "I4: к S1 заявки клиента {owner} в client_pid {}",
@@ -740,6 +907,7 @@ fn server_steps(rev: Revision, s: &State, out: &mut Vec<Result<State, String>>) 
         Spc::S7 => {
             if three
                 && n.server.present
+                && !n.any_rob
                 && (n.server.peer != n.server.owner || owner_of(n.server.sclaim) != n.server.owner)
             {
                 out.push(Err(format!(
@@ -785,6 +953,30 @@ fn server_steps(rev: Revision, s: &State, out: &mut Vec<Result<State, String>>) 
             n.server.pc = Spc::Idle;
             out.push(Ok(n));
         }
+        Spc::RobForget => {
+            // Fix round 1 (b): очистить поле умершего владельца CAS-ом;
+            // изменилось (держатель прошёл C2) -- отказ.
+            if n.owner == DEAD {
+                n.owner = 0;
+                n.server.pc = Spc::RobCas;
+            } else {
+                n.server.pc = Spc::Idle;
+            }
+            out.push(Ok(n));
+        }
+        Spc::RobCas => {
+            // Fix round 1 (b): `client_state` перечитан прямо перед CAS --
+            // только `IDLE` (вариант `RobAnyState` -- без перечитывания).
+            let idle = n.cs == Cs::Idle || rev == Revision::RobAnyState;
+            if idle && n.claim == n.server.t {
+                let holder = usize::from(owner_of(n.claim) - 1);
+                n.claim = 0;
+                n.robbed[holder] = true;
+                n.any_rob = true;
+            }
+            n.server.pc = Spc::Idle;
+            out.push(Ok(n));
+        }
     }
 }
 
@@ -821,6 +1013,8 @@ fn explore(rev: Revision) -> Result<Stats, String> {
     let mut queue = VecDeque::from([initial]);
     let mut next = Vec::new();
     let mut accepts = false;
+    let mut robs = false;
+    let mut retakes = false;
     let trace = |parent: &HashMap<State, State>, mut at: State, violation: String| {
         let mut path = vec![brief(&at)];
         while let Some(&prev) = parent.get(&at) {
@@ -845,11 +1039,13 @@ fn explore(rev: Revision) -> Result<Stats, String> {
                 Err(violation) => return Err(trace(&parent, s, violation)),
             };
             if rev != Revision::Two
-                && let Err(violation) = n.check_i2()
+                && let Err(violation) = n.check_i2().and_then(|()| n.check_no_ghost())
             {
-                return Err(trace(&parent, s, violation));
+                return Err(trace(&parent, n, violation));
             }
             accepts |= n.accepted.iter().any(|&c| c != 0);
+            robs |= n.any_rob;
+            retakes |= n.clients.iter().any(|c| c.pc == Pc::Retake);
             if let std::collections::hash_map::Entry::Vacant(entry) = parent.entry(n) {
                 entry.insert(s);
                 queue.push_back(n);
@@ -859,6 +1055,8 @@ fn explore(rev: Revision) -> Result<Stats, String> {
     Ok(Stats {
         states: parent.len(),
         accepts,
+        robs,
+        retakes,
     })
 }
 
@@ -873,6 +1071,36 @@ fn handshake_model() {
     );
     assert!(stats.accepts, "модель ни разу не подключила клиента");
     assert!(stats.states > 1_000, "подозрительно мало состояний");
+    assert!(
+        stats.robs,
+        "модель ни разу не отняла claim живого держателя (R-O)"
+    );
+    assert!(
+        stats.retakes,
+        "модель ни разу не вернула claim на C8-провале"
+    );
+}
+
+/// Fix round 1 (решение AE, I1 (a)): без возврата claim-а на C8-провале
+/// отъём R-O оставляет сессию-призрак -- зафиксированный сервером клиент с
+/// отнятым claim-ом уходит, а CAS пары с его токеном не проходит (W).
+#[test]
+fn handshake_model_rob_without_retake_leaves_ghost() {
+    let violation =
+        explore(Revision::RobPlainLeave).expect_err("отъём без возврата обязан оставлять призрак");
+    println!("handshake_model: отъём без возврата -- {violation}");
+    assert!(violation.starts_with("W:"), "{violation}");
+}
+
+/// Fix round 1 (I1 (b)): отъём без перепроверки `client_state` прямо
+/// перед CAS снимает claim держателя с уже выставленной заявкой: его
+/// сессия -- с чужим claim-ом, уход её не закрывает (W).
+#[test]
+fn handshake_model_rob_of_posted_hello_leaves_ghost() {
+    let violation =
+        explore(Revision::RobAnyState).expect_err("отъём после C6 обязан оставлять призрак");
+    println!("handshake_model: отъём без перепроверки -- {violation}");
+    assert!(violation.starts_with("W:"), "{violation}");
 }
 
 /// Зубы модели: протокол ревизии 2 нарушает I4/I5 (Concern 1).

@@ -322,7 +322,8 @@ pub struct MultiClientOptions {
     /// 0.10 (Task 12, INTEROP R20/R21): **все слоты заняты** (`NoFreeSlot`,
     /// сообщается раз на эпизод) -- тоже без опроса: сон в ядре на
     /// уведомлении «claim освобождён» базы `<база>_multi_free` и процессе
-    /// сервера; освободился любой слот -- захват сразу.
+    /// сервера; освободился любой слот -- захват сразу. Сон -- не дольше
+    /// `discovery_fallback` (fix round 1: страховка от пира без R20).
     ///
     /// Пауза `retry_delay` остаётся: после конца сессии (разово), при чужих
     /// слотах (`AccessDenied`) и как резерв (решение R-M) -- маяк или
@@ -1105,12 +1106,12 @@ impl MultiCore {
             };
             if now >= due {
                 // CAS: если за это время claim сменился, это уже другой захват.
-                // Task 12: с уведомлением ждущих базы (R20).
-                let _ = release_claim_notify(
-                    slot.server.view().control_block(),
-                    claim,
-                    self.free.as_deref(),
-                );
+                // Task 12: с уведомлением ждущих базы (R20); fix round 1 --
+                // сначала очистить поля протухшего владельца (CAS от
+                // прочитанного), чтобы его личность не сошла за следующего.
+                let control = slot.server.view().control_block();
+                control.forget_owner(control.slot_owner_pid.load(Ordering::Acquire));
+                let _ = release_claim_notify(control, claim, self.free.as_deref());
                 slot.claim_seen = None;
             } else {
                 sweep.deadline(due);
@@ -1395,6 +1396,8 @@ impl MultiCore {
             let claim = control.slot_claim.load(Ordering::Acquire);
             let owner = control.slot_owner_pid.load(Ordering::Acquire);
             if claim != CLAIM_FREE && slot.watched_pid() == Some(owner) {
+                // Fix round 1 (решение AE): поля умершего -- до освобождения.
+                control.forget_owner(owner);
                 let _ = release_claim_notify(control, claim, self.free.as_deref());
             }
             // Handle процесса обязан уйти из привязок в любом случае:
@@ -1448,6 +1451,16 @@ impl MultiCore {
             let unchanged = if expected_claim == CLAIM_FREE {
                 control.slot_claim.load(Ordering::Acquire) == CLAIM_FREE
             } else {
+                // Fix round 1 (решение AE): владелец подтверждённо мёртв
+                // (`PeerDied` проверки живости) -- его поля до освобождения.
+                if reason == DisconnectReason::PeerDied
+                    && control.slot_claim.load(Ordering::Acquire) == expected_claim
+                {
+                    let owner = control.slot_owner_pid.load(Ordering::Acquire);
+                    if !win::is_process_alive(owner, control.owner_start_time()) {
+                        control.forget_owner(owner);
+                    }
+                }
                 release_claim_notify(control, expected_claim, self.free.as_deref())
             };
             if !unchanged {
@@ -2539,8 +2552,15 @@ fn client_worker(
             // повтор раз в `retry_delay`; толчок занятых слотов -- раз на
             // набор их захватов (сервер назначит дедлайн протухшему).
             if err == ShmError::NoFreeSlot {
-                waiter.reported.note(&err);
-                handler.on_error(err);
+                // Раз на эпизод занятости (в том числе через страховочные
+                // повторы `discovery_fallback`); база без `_free` -- резерв,
+                // о каждой попытке, как раньше.
+                if waiter.free().is_some() {
+                    waiter.report_once(err);
+                } else {
+                    waiter.reported.note(&err);
+                    handler.on_error(err);
+                }
                 match waiter.await_free(next_slot) {
                     SlotWait::Claimed(v) => break v,
                     SlotWait::Failed(err) => {
@@ -2845,10 +2865,10 @@ impl AbsenceWaiter<'_> {
         let shared = self.shared;
         let handler = self.handler;
         let waited = free_waiter.wait_free(
-            &mut || match claim_free_slot(namespace, base_name, start) {
+            &mut || match claim_or_busy(namespace, base_name, start) {
                 Ok(claimed) => Attempt::Done(claimed),
-                Err(ShmError::NoFreeSlot) => Attempt::Busy(unserved_claims(namespace, base_name)),
-                Err(err) => Attempt::Failed(err),
+                Err((ShmError::NoFreeSlot, busy)) => Attempt::Busy(busy),
+                Err((err, _)) => Attempt::Failed(err),
             },
             &mut || nudge_stale_claims(namespace, base_name),
             &mut WaitCtl {
@@ -2858,7 +2878,13 @@ impl AbsenceWaiter<'_> {
                 wakeup: &|| {
                     shared.wakeups.fetch_add(1, Ordering::AcqRel);
                 },
-                deadline: crate::ring::deadline_of(self.options.poll_timeout),
+                // Fix round 1 (решение AE, I2): страховка от пира без R20
+                // (освобождает claim без уведомления) -- сон не дольше
+                // `discovery_fallback`, как у ожидания обнаружения (W(3)).
+                deadline: crate::ring::deadline_of(presence::min_timeout(
+                    self.options.poll_timeout,
+                    self.options.discovery_fallback,
+                )),
                 renudge: None,
             },
         );
@@ -2986,11 +3012,41 @@ impl AbsenceWaiter<'_> {
 /// `Err(AccessDenied)` (0.10) — слот есть, но DACL не даёт его этому
 /// пользователю (чужой сервер или захватчик имени); любая другая `Err(_)` —
 /// слота с таким именем нет (сегмент не открылся).
+#[cfg(test)]
 fn try_claim_slot(
     namespace: Option<&PrivateNamespace>,
     slot_name: &str,
     token: u32,
 ) -> Result<bool> {
+    Ok(matches!(
+        scan_slot(namespace, slot_name, token)?,
+        SlotScan::Claimed
+    ))
+}
+
+/// Исход захвата одного слота перебором.
+enum SlotScan {
+    /// Захвачен нами.
+    Claimed,
+    /// Занят: claim, есть ли сессия (`server_state == SERVER_READY`),
+    /// личность сервера слота.
+    Busy {
+        claim: u32,
+        served: bool,
+        server: (u32, u64),
+    },
+    /// Не опубликован, другой формат или чужой объект.
+    Skipped,
+}
+
+/// `try_claim_slot` с тем, что увидено в занятом слоте (Task 12 fix round
+/// 1, m5: ждущий Multi строит `Busy` из этого же перебора, без второго
+/// прохода по слотам).
+fn scan_slot(
+    namespace: Option<&PrivateNamespace>,
+    slot_name: &str,
+    token: u32,
+) -> Result<SlotScan> {
     // Сервер создаёт секцию под именем `ObjectPath::mapping(slot_name)` —
     // открываем так же (в том же пространстве), но отображаем только
     // заголовок: кольца для захвата не нужны.
@@ -2998,12 +3054,26 @@ fn try_claim_slot(
     let Some(control) = SharedView::peek_control(&mapping) else {
         // Не опубликован (сервер ещё инициализирует), другой формат или
         // чужой объект -- пропускаем.
-        return Ok(false);
+        return Ok(SlotScan::Skipped);
     };
-    let claimed = control
-        .slot_claim
-        .compare_exchange(CLAIM_FREE, token, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
+    let claimed = match control.slot_claim.compare_exchange(
+        CLAIM_FREE,
+        token,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => true,
+        Err(claim) => {
+            return Ok(SlotScan::Busy {
+                claim,
+                served: control.server_state.load(Ordering::Acquire) == HANDSHAKE_SERVER_READY,
+                server: (
+                    control.server_pid.load(Ordering::Acquire),
+                    control.server_start_time(),
+                ),
+            });
+        }
+    };
     if claimed {
         // Находка 23: время создания своего процесса -- ДО PID, чья
         // Release-запись публикует обе половины: сервер, прочитавший
@@ -3017,7 +3087,7 @@ fn try_claim_slot(
             .slot_owner_pid
             .store(std::process::id(), Ordering::Release);
     }
-    Ok(claimed)
+    Ok(SlotScan::Claimed)
     // mapping размапится здесь; захваченный claim остаётся в shared memory.
 }
 
@@ -3032,49 +3102,46 @@ fn release_claim(
     if let Ok(mapping) = Mapping::open_header(ObjectPath::mapping(namespace, slot_name))
         && let Some(control) = SharedView::peek_control(&mapping)
     {
-        let _ = release_claim_notify(control, token, free);
+        let _ = presence::release_own_claim(control, token, free);
     }
 }
 
-/// Занятость базы для ждущего Multi (Task 12): ключ -- свёртка `(слот,
-/// токен)` занятых слотов без сессии (`server_state != SERVER_READY`; `0`
-/// -- таких нет, толкать нечего), личность сервера -- из слота 0. Перебор
-/// -- как в `nudge_stale_claims`.
-fn unserved_claims(namespace: Option<&PrivateNamespace>, base_name: &str) -> Busy {
-    // FNV-1a: ключ только сравнивается на равенство (толкать ли снова).
-    let mut key: u64 = 0xCBF2_9CE4_8422_2325;
-    let mut any = false;
-    let mut server = None;
-    for slot_id in 0..MAX_MULTI_CLIENTS {
-        let slot_name = format!("{base_name}_{slot_id}");
-        let mapping = match Mapping::open_header(ObjectPath::mapping(namespace, &slot_name)) {
-            Ok(mapping) => mapping,
-            Err(ShmError::AccessDenied) => continue,
-            Err(_) => break,
-        };
-        let Some(control) = SharedView::peek_control(&mapping) else {
-            continue;
-        };
-        if server.is_none() {
-            server = Some((
-                control.server_pid.load(Ordering::Acquire),
-                control.server_start_time(),
-            ));
+/// Занятость базы, собранная одним перебором (Task 12, fix round 1 m5):
+/// ключ -- свёртка `(слот, токен)` занятых слотов без сессии
+/// (`server_state != SERVER_READY`; `0` -- таких нет, толкать нечего),
+/// личность сервера -- из первого опубликованного слота.
+#[derive(Default)]
+struct BusyScan {
+    /// FNV-1a: ключ только сравнивается на равенство (толкать ли снова).
+    key: u64,
+    any: bool,
+    server: Option<(u32, u64)>,
+}
+
+impl BusyScan {
+    fn new() -> Self {
+        Self {
+            key: 0xCBF2_9CE4_8422_2325,
+            ..Self::default()
         }
-        let claim = control.slot_claim.load(Ordering::Acquire);
-        if claim != CLAIM_FREE
-            && control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
-        {
-            any = true;
+    }
+
+    fn note(&mut self, slot_id: u32, claim: u32, served: bool, server: (u32, u64)) {
+        self.server.get_or_insert(server);
+        if claim != CLAIM_FREE && !served {
+            self.any = true;
             for byte in slot_id.to_le_bytes().into_iter().chain(claim.to_le_bytes()) {
-                key = (key ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+                self.key = (self.key ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
             }
         }
     }
-    Busy {
-        key: if any { key.max(1) } else { 0 },
-        holder: None,
-        server,
+
+    fn busy(&self) -> Busy {
+        Busy {
+            key: if self.any { self.key.max(1) } else { 0 },
+            holder: None,
+            server: self.server,
+        }
     }
 }
 
@@ -3141,28 +3208,48 @@ fn claim_free_slot(
     base_name: &str,
     start: u32,
 ) -> Result<(u32, String, u32)> {
+    claim_or_busy(namespace, base_name, start).map_err(|(err, _)| err)
+}
+
+/// `claim_free_slot`, а при неудаче -- ещё и занятость базы из того же
+/// перебора (`Busy` ждущего, Task 12 fix round 1 m5).
+fn claim_or_busy(
+    namespace: Option<&PrivateNamespace>,
+    base_name: &str,
+    start: u32,
+) -> core::result::Result<(u32, String, u32), (ShmError, Busy)> {
     let token = crate::shared::claim_token();
     let mut saw_slot = false;
     let mut denied = false;
+    let mut scan = BusyScan::new();
     let start = start.min(MAX_MULTI_CLIENTS);
     for range in [start..MAX_MULTI_CLIENTS, 0..start] {
         for slot_id in range {
             let slot_name = format!("{base_name}_{slot_id}");
-            match try_claim_slot(namespace, &slot_name, token) {
-                Ok(true) => return Ok((slot_id, slot_name, token)),
-                Ok(false) => saw_slot = true,
+            match scan_slot(namespace, &slot_name, token) {
+                Ok(SlotScan::Claimed) => return Ok((slot_id, slot_name, token)),
+                Ok(SlotScan::Busy {
+                    claim,
+                    served,
+                    server,
+                }) => {
+                    saw_slot = true;
+                    scan.note(slot_id, claim, served, server);
+                }
+                Ok(SlotScan::Skipped) => saw_slot = true,
                 Err(ShmError::AccessDenied) => denied = true,
                 Err(_) => break, // слотов дальше нет
             }
         }
     }
-    if denied {
-        Err(ShmError::AccessDenied) // слоты есть, но DACL их не даёт
+    let err = if denied {
+        ShmError::AccessDenied // слоты есть, но DACL их не даёт
     } else if saw_slot {
-        Err(ShmError::NoFreeSlot) // сервер есть, но все слоты заняты
+        ShmError::NoFreeSlot // сервер есть, но все слоты заняты
     } else {
-        Err(ShmError::NotConnected) // сервер не запущен (нет ни одного слота)
-    }
+        ShmError::NotConnected // сервер не запущен (нет ни одного слота)
+    };
+    Err((err, scan.busy()))
 }
 
 #[cfg(test)]

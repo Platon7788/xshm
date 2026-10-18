@@ -947,6 +947,9 @@ Clients use it on their own — nothing to write:
   holder and server processes; the holder's leave, a crashed holder or a
   stale claim reclaimed by the server wakes it at once. A claim taken without
   a session is nudged once, plus one re-nudge after `RESERVE_TIMEOUT + 1 s`.
+  As a safety net against peers that release a claim without notifying,
+  each such wait is also bounded by `discovery_fallback` (10 s by default,
+  `None` = events only); a connected client never wakes for it.
 - `on_error` reports the same error once while it repeats; a different error
   in between makes the next repeat reported again (`AlreadyConnected` /
   `NoFreeSlot` once per busy episode).

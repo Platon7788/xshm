@@ -11,8 +11,8 @@ use crate::error::{DisconnectReason, Result, ShmError};
 use crate::layout::{ChannelLayout, max_payload_for};
 use crate::namespace::PrivateNamespace;
 use crate::presence::{
-    self, Attempt, ChannelProbe, Failure, FreeNotifier, FreeWait, FreeWaiter, Presence,
-    PresenceWait, PresenceWatch, Reported, WaitCtl,
+    self, Attempt, Failure, FreeNotifier, FreeWait, FreeWaiter, Presence, PresenceWait,
+    PresenceWatch, Reported, WaitCtl,
 };
 use crate::ring::{self, FreeSpace, SpinPolicy, WriteOutcome, frame_size, spin_until};
 use crate::security::ObjectSecurity;
@@ -121,6 +121,8 @@ pub struct AutoOptions {
     /// вместе с маяком, а взводит каждый, кто освобождает claim) и на
     /// процессах держателя и сервера; захват без сессии он толкает сам
     /// (`CONNECT_REQ`) и один раз повторно через `RESERVE_TIMEOUT + 1 с`.
+    /// Страховка (fix round 1): этот сон -- не дольше `discovery_fallback`
+    /// (пир, освободивший claim без уведомления).
     /// Резерв (сервер без `_free`, пир без R20): пауза удваивается с каждой
     /// неудачей до 2 с (или остаётся этой, если она больше); первый повтор
     /// -- через `reconnect_delay`.
@@ -1603,13 +1605,12 @@ impl Worker {
         let Some(notifier) = self.free_notifier(name, free) else {
             return busy_pause(backoff);
         };
-        let Ok(probe) = ChannelProbe::open(namespace, name) else {
-            return busy_pause(backoff);
-        };
         let mut waiter = FreeWaiter::new(Arc::clone(&notifier));
         let mut should_stop = || !self.running();
+        // Заголовок канала -- на каждую попытку, не на всё ожидание (fix
+        // round 1, m4: не держать имя секции упавшего сервера).
         let mut attempt = || {
-            match probe.busy() {
+            match presence::channel_busy(namespace, name) {
                 Ok(Some(busy)) => return Attempt::Busy(busy),
                 Ok(None) => {}
                 Err(err) => return Attempt::Failed(err),
@@ -1629,10 +1630,10 @@ impl Worker {
             );
             match connected {
                 Ok(client) => Attempt::Done(client),
-                // Проиграли гонку другому клиенту -- снова ждать. Claim
-                // свободен, а канал занят (заявка или сессия клиента без
-                // claim, C6) -- уведомление этого не покажет: резерв.
-                Err(ShmError::AlreadyConnected) => match probe.busy() {
+                // Проиграли гонку другому клиенту -- снова ждать (сессия без
+                // claim-а -- тоже занятость, `channel_busy`). Канал по
+                // перепроверке свободен -- гонка с уходом: резерв.
+                Err(ShmError::AlreadyConnected) => match presence::channel_busy(namespace, name) {
                     Ok(Some(busy)) => Attempt::Busy(busy),
                     _ => Attempt::Failed(ShmError::AlreadyConnected),
                 },
@@ -1641,13 +1642,19 @@ impl Worker {
         };
         let waited = waiter.wait_free(
             &mut attempt,
-            &mut || probe.nudge(),
+            &mut || presence::nudge_channel(namespace, name),
             &mut WaitCtl {
                 wake: Some(self.wake.as_handle()),
                 running: &|| self.running(),
                 on_wake: &mut || self.report_evicted(),
                 wakeup: &|| self.stats.wake(),
-                deadline: ring::deadline_of(self.options.poll_timeout),
+                // Fix round 1 (решение AE, I2): страховка от пира без R20
+                // (освобождает claim без уведомления) -- сон не дольше
+                // `discovery_fallback`, как у ожидания обнаружения (W(3)).
+                deadline: ring::deadline_of(presence::min_timeout(
+                    self.options.poll_timeout,
+                    self.options.discovery_fallback,
+                )),
                 renudge: Some(presence::renudge_delay(name)),
             },
         );
@@ -1768,12 +1775,17 @@ fn client_worker(name: &str, worker: &Worker, mode: &ClientMode) {
                 continue 'session;
             }
             if err == ShmError::AlreadyConnected {
-                // Канал занят -- о каждом эпизоде (final review M4), затем
-                // Task 12 (R21): сон на уведомлении «claim освобождён», а
-                // не повтор с отступом. Без `_free` (пир без R20) -- прежний
-                // отступ `BusyBackoff` (резерв, решение R-M).
-                reported.note(&err);
-                worker.handler.on_error(err);
+                // Task 12 (R21): сон на уведомлении «claim освобождён», а не
+                // повтор с отступом; `on_error` -- раз на эпизод занятости (в
+                // том числе через страховочные повторы `discovery_fallback`).
+                // Без `_free` (пир без R20) -- прежний отступ `BusyBackoff`
+                // (резерв, решение R-M) и ошибка о каждой попытке (M4).
+                if worker.free_notifier(name, &mut free).is_some() {
+                    worker.report_once(&mut reported, err);
+                } else {
+                    reported.note(&err);
+                    worker.handler.on_error(err);
+                }
                 worker.report_evicted();
                 match worker.await_free(name, &mut free, &mut busy_backoff) {
                     FreeOutcome::Connected(client) => break *client,
@@ -4310,7 +4322,7 @@ mod free_tests {
     /// Канал занят `SharedClient` A: `AutoClient` B (опции по умолчанию)
     /// получает один `AlreadyConnected` и спит -- не больше одного
     /// пробуждения за секунду (до Task 12: повторы с отступом, ошибка на
-    /// каждом). A ушёл -- B подключён не позже 200 мс.
+    /// каждом). A ушёл -- B подключён не позже 400 мс (m6: запас под нагрузкой; резерв -- 2 с).
     #[test]
     fn busy_channel_waiter_sleeps_without_wakeups() {
         let name = unique("SLEEP");
@@ -4337,7 +4349,7 @@ mod free_tests {
             || log.connected.load(Ordering::Acquire),
         );
         let took = log.connected_at().unwrap() - left;
-        assert!(took <= Duration::from_millis(200), "{took:?}");
+        assert!(took <= Duration::from_millis(400), "{took:?}");
         drop(client);
         drop(server);
     }
@@ -4493,6 +4505,65 @@ mod free_tests {
             drop(b);
             drop(server);
             drop(owner);
+        }
+    }
+
+    /// Fix round 1 (решение AE, I2): держатель освобождает claim без
+    /// уведомления (пир без R20 -- сырой store `0`): ждущий `AutoClient`
+    /// находит свободный канал страховочной проверкой `discovery_fallback`
+    /// (здесь 300 мс); с `None` -- только события, такого освобождения он
+    /// не видит. `on_error(AlreadyConnected)` -- один раз на эпизод, и
+    /// через страховочные повторы.
+    #[test]
+    fn silent_release_found_within_discovery_fallback() {
+        for (tag, fallback, found) in [
+            ("CAP", Some(Duration::from_millis(300)), true),
+            ("NOCAP", None, false),
+        ] {
+            let name = unique(&format!("SILENT_{tag}"));
+            let server =
+                AutoServer::start(&name, Arc::new(Log::default()), AutoOptions::default()).unwrap();
+            let mapping =
+                win::Mapping::open_header(crate::naming::ObjectPath::mapping(None, &name)).unwrap();
+            let control = crate::shared::SharedView::peek_control(&mapping).unwrap();
+            // Захват без сессии живым процессом (наш PID: не «умерший»).
+            control.announce_owner_start(win::current_process_start_time());
+            control
+                .slot_owner_pid
+                .store(std::process::id(), Ordering::Release);
+            control.slot_claim.store(0x5111_E702, Ordering::Release);
+            let log = Arc::new(Log::default());
+            let options = AutoOptions {
+                discovery_fallback: fallback,
+                ..AutoOptions::default()
+            };
+            let client = AutoClient::connect(&name, log.clone(), options).unwrap();
+            wait_until("AlreadyConnected", Duration::from_secs(3), || {
+                !log.errors().is_empty()
+            });
+            thread::sleep(Duration::from_millis(400));
+            control
+                .slot_claim
+                .store(crate::constants::CLAIM_FREE, Ordering::Release);
+            let released = Instant::now();
+            if found {
+                wait_until(
+                    "подключение по страховке",
+                    Duration::from_secs(2),
+                    || log.connected.load(Ordering::Acquire),
+                );
+                let took = log.connected_at().unwrap() - released;
+                assert!(took <= Duration::from_millis(1000), "{tag}: {took:?}");
+            } else {
+                thread::sleep(Duration::from_millis(1500));
+                assert!(
+                    !log.connected.load(Ordering::Acquire),
+                    "{tag}: без страховки освобождение без R20 не видно"
+                );
+            }
+            assert_eq!(log.errors(), [ShmError::AlreadyConnected], "{tag}");
+            drop(client);
+            drop(server);
         }
     }
 }

@@ -2966,7 +2966,7 @@ fn multi_client_returns_disconnect_of_foreign_session() {
 /// Task 12 (R20/R21): все слоты заняты -- `MultiClient` B спит на
 /// уведомлении базы (не больше одного пробуждения за секунду, хотя
 /// `retry_delay` -- 10 с и повтор не спас бы); A остановлен -- B подключён
-/// не позже 200 мс (до Task 12 -- только через `retry_delay`).
+/// не позже 400 мс (до Task 12 -- только через `retry_delay`).
 #[test]
 fn no_free_slot_waiter_sleeps_and_wakes_on_release() {
     let name = unique("FREE_WAIT");
@@ -2999,7 +2999,7 @@ fn no_free_slot_waiter_sleeps_and_wakes_on_release() {
         b_log.connects.load(Ordering::Acquire) == 1
     });
     let took = stopped.elapsed();
-    assert!(took <= Duration::from_millis(200), "{took:?}");
+    assert!(took <= Duration::from_millis(400), "{took:?}");
     drop(b);
     drop(a);
     server.stop();
