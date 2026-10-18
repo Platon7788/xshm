@@ -140,7 +140,8 @@ use std::time::{Duration, Instant};
 
 use crate::beacon::{Beacon, STATE_FREE_GEN_OFFSET, STATE_FREE_WAITERS_OFFSET};
 use crate::constants::{
-    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
+    CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE,
+    HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -905,18 +906,21 @@ pub(crate) fn release_claim_notify(
 }
 
 /// Освободить СВОЙ claim (откат, отзыв, уход; клиент): fix round 1 (решение
-/// AE, INTEROP R18) -- пока claim ещё наш, сначала очистить свои поля
-/// владельца (`ControlBlock::clear_owner`), затем `release_claim_notify`.
-/// Иначе личность ушедшего, если его процесс потом завершится, сошла бы
-/// за следующего держателя в окне C1-C2 (быстрый путь R-O снял бы его
-/// claim). Claim уже не наш -- поля не трогаем (они следующего).
+/// AE, INTEROP R18) -- сначала очистить свои поля владельца, затем
+/// `release_claim_notify`. Иначе личность ушедшего, если его процесс потом
+/// завершится, сошла бы за следующего держателя в окне C1-C2 (быстрый путь
+/// R-O снял бы его claim). Follow-up (N4): очистка -- CAS от своей личности
+/// (PID и время своего процесса, записанные на C2): если claim уже отняли и
+/// следующий держатель записал свои поля, они целы. Остаток: следующий
+/// держатель -- клиент того же процесса (та же личность); тогда его поля
+/// обнулены -- только хуже наблюдение, отъём R-O по PID 0 невозможен.
 pub(crate) fn release_own_claim(
     control: &ControlBlock,
     token: u32,
     notifier: Option<&FreeNotifier>,
 ) -> bool {
     if token != CLAIM_FREE && control.slot_claim.load(Ordering::Acquire) == token {
-        control.clear_owner();
+        control.forget_owner(std::process::id(), crate::win::current_process_start_time());
     }
     release_claim_notify(control, token, notifier)
 }
@@ -1352,11 +1356,24 @@ pub(crate) fn channel_busy(root: Option<&PrivateNamespace>, name: &str) -> Resul
         control.server_start_time(),
     ));
     if claim == CLAIM_FREE {
-        if control.client_state.load(Ordering::Acquire) == HANDSHAKE_IDLE {
+        let state = control.client_state.load(Ordering::Acquire);
+        if state == HANDSHAKE_IDLE {
             return Ok(None);
         }
+        // Follow-up (решение AG, N2): заявка без держателя claim-а (умерший
+        // после отъёма, пир без claim) -- её снимает только сервер (S2) и
+        // только на `CONNECT_REQ`: ненулевой ключ (вне диапазона токенов,
+        // по самоописанию заявки) -- ждущий толкнёт один раз на заявку.
+        // Сессия без claim-а (`SERVER_READY`) -- толкать нечего.
+        let key = if state == HANDSHAKE_CLIENT_HELLO
+            && control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
+        {
+            (1_u64 << 32) | u64::from(control.client_pid.load(Ordering::Acquire))
+        } else {
+            0
+        };
         return Ok(Some(Busy {
-            key: 0,
+            key,
             holder: None,
             server,
         }));
@@ -1443,10 +1460,15 @@ pub(crate) fn wait_connectable(
                 renudge: Some(renudge_delay(name)),
             },
         )?;
+        // Истёк ли таймаут страховки (тогда -- новая проверка), а не
+        // вызывающего (тогда -- `false` сразу: ядро может вернуть таймаут
+        // чуть раньше отметки `Instant`, и лишняя проверка в остаток была
+        // бы случайной).
+        let capped = fallback.is_some_and(|fallback| left.is_none_or(|left| fallback < left));
         match waited {
             FreeWait::Claimed(()) => return Ok(true),
-            // Страховочная проверка (`fallback`) или таймаут вызывающего --
-            // новый круг сверит остаток.
+            FreeWait::TimedOut | FreeWait::Stopped if !capped => return Ok(false),
+            // Страховочная проверка (`fallback`) -- новый круг.
             FreeWait::TimedOut | FreeWait::Stopped => {}
             FreeWait::ServerGone => return Err(ShmError::PeerDied),
             FreeWait::Failed(err) => return Err(err),

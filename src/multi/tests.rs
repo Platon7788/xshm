@@ -2217,6 +2217,18 @@ fn client_dying_after_local_disconnect_frees_slot_at_once() {
         || claim_of_slot0() == CLAIM_FREE,
     );
     println!("claim снят через {:?}", t0.elapsed());
+    // Follow-up (N5): поля умершего «задержавшегося» очищены.
+    let owner_of_slot0 = || {
+        server.slots.read().unwrap()[0]
+            .lock()
+            .unwrap()
+            .server
+            .view()
+            .control_block()
+            .slot_owner_pid
+            .load(Ordering::Acquire)
+    };
+    assert_eq!(owner_of_slot0(), 0, "поля умершего не очищены");
 
     // Клиент этого процесса так и не узнал об отключении -- исчезает без L.
     client.mark_disconnected();
@@ -3068,5 +3080,93 @@ fn dead_owner_claim_released_on_nudge() {
     let took = started.elapsed();
     assert!(took <= Duration::from_millis(500), "{took:?}");
     drop(b);
+    server.stop();
+}
+
+/// Follow-up (решение AG, N5): дедлайн диспетчера снимает протухший
+/// захват (живой владелец, без клиентов-ждущих) и очищает поля владельца.
+#[test]
+fn deadline_reclaim_forgets_owner() {
+    let name = unique("FORGET_DEADLINE");
+    let server = MultiServer::start_with(
+        &name,
+        Arc::new(TestHandler::new()),
+        single_slot(1),
+        Duration::from_millis(150),
+    )
+    .unwrap();
+    let owner = crate::test_support::LiveChild::spawn();
+    let slot_name = format!("{name}_0");
+    let mapping = Mapping::open_header(ObjectPath::mapping(None, &slot_name)).unwrap();
+    let control = SharedView::peek_control(&mapping).unwrap();
+    control.announce_owner_start(owner.start);
+    control.slot_owner_pid.store(owner.pid, Ordering::Release);
+    control.slot_claim.store(0x5A1E_0002, Ordering::Release);
+    // Толчок -- первое наблюдение и дедлайн.
+    EventHandle::open(ObjectPath::event(
+        None,
+        &slot_name,
+        Direction::ClientToServer,
+        EVENT_CONNECT_REQ_SUFFIX,
+    ))
+    .unwrap()
+    .set()
+    .unwrap();
+    wait_for(
+        "отъём по дедлайну",
+        Duration::from_secs(3),
+        || control.slot_claim.load(Ordering::Acquire) == CLAIM_FREE,
+    );
+    assert_eq!(
+        control.slot_owner_pid.load(Ordering::Acquire),
+        0,
+        "поля протухшего"
+    );
+    assert_eq!(control.owner_start_time(), 0);
+    server.stop();
+    drop(owner);
+}
+
+/// Follow-up (N5): смерть клиента в сессии (диспетчер,
+/// `handle_slot_peer_died`) -- claim снят, поля владельца очищены.
+#[test]
+fn peer_died_in_session_forgets_owner() {
+    const TOKEN: u32 = 0x11E6_0002;
+    let name = unique("FORGET_PEER_DIED");
+    let server =
+        MultiServer::start(&name, Arc::new(TestHandler::new()), single_slot(1)).expect("start");
+    let slot_name = format!("{name}_0");
+    assert!(try_claim_slot(None, &slot_name, TOKEN).unwrap());
+    let mut client = connect_held(&slot_name, TOKEN).unwrap();
+    wait_for("подключение", Duration::from_secs(5), || {
+        server.client_count() == 1
+    });
+    let mut child = crate::test_support::LiveChild::spawn();
+    let watch = ProcessWatch::open_peer(child.pid, child.start).expect("наблюдение");
+    server.slots.read().unwrap()[0]
+        .lock()
+        .unwrap()
+        .substitute_owner(watch, child.pid, child.start);
+    // Сверка привязок слота: процесс подменённого владельца -- к порту.
+    server.wake_slot(0);
+    thread::sleep(Duration::from_millis(100));
+    let slot0 = || {
+        let slots = server.slots.read().unwrap();
+        let slot = slots[0].lock().unwrap();
+        let control = slot.server.view().control_block();
+        (
+            control.slot_claim.load(Ordering::Acquire),
+            control.slot_owner_pid.load(Ordering::Acquire),
+        )
+    };
+    child.kill();
+    wait_for(
+        "claim умершего снят",
+        Duration::from_secs(3),
+        || slot0().0 == CLAIM_FREE,
+    );
+    assert_eq!(slot0().1, 0, "поля умершего не очищены");
+    client.mark_disconnected();
+    drop(client);
     server.stop();
 }

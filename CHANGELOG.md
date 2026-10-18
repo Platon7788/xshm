@@ -1339,6 +1339,34 @@
   `auto::free_tests::silent_release_found_within_discovery_fallback`,
   `client::tests::wait_connectable_fallback_finds_silent_release` (с `None` —
   не находит). Пир-видимо: INTEROP R21, §e.1, §e.2 п. 7, §e.5, §h п. 12.
+- **Minor** (повторное ревью Task 12, N1–N5, решение AG) Остатки после
+  отъёма R-O. N1: ограбленный, не вернувший claim за 100 мс, уходил без
+  записей — сессия-призрак навсегда (модель с веткой отказа нарушала W);
+  теперь возврат claim-а ждёт по протоколу R21 на `<имя>_free` и процессе
+  держателя до остатка таймаута подключения (`connect_async` — 100 мс),
+  подтверждённо умершего держателя перехватывает (`CAS held -> T`), а не
+  дождавшись — запасной уход 32-битным CAS при `generation` сессии
+  (`Hello::leave_by_generation`; остаток — ложный конец следующей сессии,
+  не заклинивание; модель — свойство W с веткой отказа,
+  `handshake_model_retake_give_up_without_leave_leaves_ghost`). N2
+  (воспроизведено): заявка умершего при свободном claim-е занимала канал
+  навсегда — теперь клиент, захвативший claim при стоящей заявке, сразу его
+  отпускает и толкает сервер (не перезаписывая C2/C5), откат C6, увидевший
+  заявку, толкает, ждущий получает ненулевой ключ толчка, а S2 судит
+  заявку без держателя claim-а по самоописанию и уведомляет ждущих. N3:
+  откат C6 и отзыв снимают своё самоописание CAS-ом от своих значений
+  (`ControlBlock::retract_client`). N4: поля владельца очищаются CAS-ом от
+  личности, прочитанной вместе с токеном (сервер), или своей (клиент) —
+  `ControlBlock::forget_owner(pid, start)`. N5: тесты очистки полей в
+  отъёме по `RESERVE_TIMEOUT`, дедлайне Multi, смерти в сессии Multi и
+  `mark_disconnected`. Тесты: `client::tests::{robbed_leave_takes_over_dead_holder,
+  robbed_leave_falls_back_by_generation, dead_hello_with_free_claim_is_cleared_by_nudge,
+  wait_connectable_nudges_dead_hello, withdraw_keeps_next_claimant_self_description,
+  own_release_keeps_foreign_owner_fields}`, `server::rob_tests::{reserve_reclaim_forgets_owner,
+  mark_disconnected_of_dead_client_forgets_owner}`,
+  `multi::tests::{deadline_reclaim_forgets_owner, peer_died_in_session_forgets_owner}`.
+  Пир-видимо: INTEROP §d.2 C1/C2/C6/C8/S2, §e.2 п. 7, §h п. 12, §g п. 17,
+  п. 39.
 - **Minor** (ревью Task 12, m2–m9) `wait_connectable` и ждущий `AutoClient`
   считают занятым и канал без claim-а с заявкой или сессией (`client_state
   != IDLE`): «свободен» уже не возвращает вызывающего в горячий цикл с

@@ -16,7 +16,10 @@ use crate::events::SharedEvents;
 use crate::layout::ChannelLayout;
 use crate::namespace::PrivateNamespace;
 use crate::naming::ObjectPath;
-use crate::presence::{FreeNotifier, release_own_claim};
+use crate::presence::{
+    Attempt, Busy, FreeNotifier, FreeWait, FreeWaiter, WaitCtl, release_claim_notify,
+    release_own_claim,
+};
 use crate::ring::{DisconnectWatch, FreeSpace, RingBuffer, SpinPolicy, WriteOutcome};
 use crate::shared::SharedView;
 use crate::win::{EventHandle, Mapping, ProcessWatch, wait_any};
@@ -92,9 +95,14 @@ fn announced_start_time() -> u64 {
 /// сменившемся `generation` (зафиксировал и уже отключил: `DISCONNECT`
 /// взведён, worker дочитает кольцо). `false` -- заявка отозвана (или её
 /// снял сервер без рукопожатия: уход, заявка «умершего» S2) и откатана:
-/// PID/время клиента и заголовки -- в `IDLE`. Claim здесь не трогается --
-/// его освобождает `Hello::withdraw` (после отката, R18).
-fn withdraw_hello(view: &SharedView, generation_before: u32) -> bool {
+/// PID/время клиента (`announced` -- своё самоописание C5; CAS от него,
+/// follow-up N3) и заголовки -- в `IDLE`. Claim здесь не трогается -- его
+/// освобождает `Hello::withdraw` (после отката, R18).
+fn withdraw_hello(
+    view: &SharedView,
+    generation_before: u32,
+    announced: Option<(u32, u64)>,
+) -> bool {
     let control = view.control_block();
     match control.client_state.compare_exchange(
         HANDSHAKE_CLIENT_HELLO,
@@ -111,9 +119,12 @@ fn withdraw_hello(view: &SharedView, generation_before: u32) -> bool {
     }
     // Откат. Заявленные PID и время процесса отзываем вместе с HELLO: иначе
     // клиент старой версии, пришедший следом, унаследовал бы их (см.
-    // `ControlBlock::client_pid`). Claim ещё наш -- чужих записей здесь нет.
-    control.client_pid.store(0, Ordering::Release);
-    control.announce_client_start(0);
+    // `ControlBlock::client_pid`). Follow-up (решение AG, N3): CAS от своих
+    // значений, а не store нуля -- после отъёма claim-а (R-O, протухший
+    // захват) следующий заявитель мог уже записать своё самоописание (C5).
+    if let Some((pid, start)) = announced {
+        control.retract_client(pid, start);
+    }
     let (header_a, header_b) = view.headers();
     header_a
         .handshake_state
@@ -512,7 +523,7 @@ impl SharedClient {
         free: FreeLink,
         mut interrupt: Option<Interrupt<'_>>,
     ) -> Result<Self> {
-        let hello = Hello::post(namespace, name, announce_pid, claim, free)?;
+        let hello = Hello::post_with(namespace, name, announce_pid, claim, free, timeout)?;
         // Сервер подтверждённо завершился ещё до открытия его процесса
         // (решение U): `S2C_CONNECT` никто не пошлёт, а наблюдать нечего --
         // ожидание заняло бы весь таймаут (с `Duration::MAX` -- вечно).
@@ -673,6 +684,9 @@ pub(crate) struct Hello {
     /// Уведомитель «claim освобождён» (Task 12, R20): освобождения заявки
     /// (откат C6, C8, отзыв W) -- с уведомлением; переходит клиенту.
     free: Option<Arc<FreeNotifier>>,
+    /// Своё самоописание C5 (`client_pid`, `client_start`; `None` -- без
+    /// обмена PID): отзыв W снимает его CAS-ом от этих значений (N3).
+    announced: Option<(u32, u64)>,
     /// Сервер подтверждённо ушёл ещё до открытия его процесса
     /// (`is_process_gone`; `open_peer` не наблюдает мёртвый процесс). Им
     /// пользуется `connect_async` (`PeerDied` на первом опросе, Task 18);
@@ -713,12 +727,24 @@ fn release_claim(view: &SharedView, token: u32, free: Option<&FreeNotifier>) {
     let _ = release_own_claim(view.control_block(), token, free);
 }
 
-/// Сколько ждать возврата claim-а на C8-провале (fix round 1, решение AE):
-/// claim держит клиент, чей C6 упрётся в нашу зафиксированную заявку, --
-/// он откатится и освободит claim за микросекунды (допущение A2
-/// `handshake_model`). Путь редкий: только после отъёма R-O claim-а живого
-/// держателя (пир, не очищающий поля владельца, INTEROP §h п. 12).
+/// Сколько ждать возврата claim-а на C8-провале, когда таймаута
+/// подключения нет (`connect_async`, тесты `Hello::post`; follow-up N1):
+/// синхронное подключение ждёт остаток своего таймаута. Claim держит
+/// клиент, чей C6 упрётся в нашу зафиксированную заявку, -- он откатится и
+/// освободит claim за микросекунды. Путь редкий: только после отъёма R-O
+/// claim-а живого держателя (пир, не очищающий поля владельца, INTEROP §h
+/// п. 12). Не дождались -- запасной уход (`Hello::leave_by_generation`).
 const ROB_LEAVE_WAIT: Duration = Duration::from_millis(100);
+
+/// Исход возврата claim-а на C8-провале (`Hello::retake`).
+enum Retake {
+    /// Сессии уже нет (`client_state != SERVER_READY`) -- уходить не из чего.
+    Gone,
+    /// Claim снова наш -- обычный уход L.
+    Taken,
+    /// Не дождались -- запасной уход по `generation`.
+    TimedOut,
+}
 
 impl Hello {
     /// Открыть канал и выставить заявку (C0-C8 ревизии 3, INTEROP R15, R18;
@@ -740,6 +766,19 @@ impl Hello {
         announce_pid: bool,
         claim: ClaimMode,
         free: FreeLink,
+    ) -> Result<Self> {
+        Self::post_with(namespace, name, announce_pid, claim, free, ROB_LEAVE_WAIT)
+    }
+
+    /// `post` с бюджетом возврата claim-а на C8-провале `retake` (follow-up
+    /// N1: синхронное подключение -- остаток своего таймаута).
+    pub(crate) fn post_with(
+        namespace: Option<&PrivateNamespace>,
+        name: &str,
+        announce_pid: bool,
+        claim: ClaimMode,
+        free: FreeLink,
+        retake: Duration,
     ) -> Result<Self> {
         // C0: открыть всё, не трогая память (ошибки -- без побочных эффектов).
         let mapping = Mapping::open(ObjectPath::mapping(namespace, name))?;
@@ -791,6 +830,22 @@ impl Hello {
                     }
                     return Err(ShmError::AlreadyConnected);
                 }
+                // Follow-up (решение AG, N2): claim был свободен, а заявка
+                // или сессия уже стоит (держатель ограблен и умер, пир без
+                // claim): C6 всё равно провалится. Не писать ни поля
+                // владельца (C2), ни самоописание (C5) поверх -- по ним S2
+                // опознаёт умершего; claim отпустить сразу (с уведомлением)
+                // и, если стоит заявка, а сервер не в сессии, толкнуть его.
+                let standing = control.client_state.load(Ordering::Acquire);
+                if standing != HANDSHAKE_IDLE {
+                    let _ = release_claim_notify(control, token, free.as_deref());
+                    if standing == HANDSHAKE_CLIENT_HELLO
+                        && control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
+                    {
+                        let _ = events.connect_req.set();
+                    }
+                    return Err(ShmError::AlreadyConnected);
+                }
                 // C2: время своего процесса -- ДО PID, чья Release-запись
                 // публикует обе половины (как `try_claim_slot` Multi). Время
                 // -- настоящее, не заявляемое: по нему сервер подтверждает
@@ -820,15 +875,15 @@ impl Hello {
 
         // C5: время процесса, затем PID -- ДО `CLIENT_HELLO`: Release-CAS
         // заявки делает их видимыми серверу вместе с ней (находка 23).
-        if announce_pid {
-            control.announce_client_start(announced_start_time());
-            control
-                .client_pid
-                .store(std::process::id(), Ordering::Release);
+        let announced = announce_pid.then(|| (std::process::id(), announced_start_time()));
+        if let Some((pid, start)) = announced {
+            control.announce_client_start(start);
+            control.client_pid.store(pid, Ordering::Release);
         }
 
         // C6: заявка -- только CAS из `IDLE` (ревизия 3): чужие `HELLO` или
         // сессия (клиент без claim) не перетираются.
+        let mut stale_hello = false;
         let posted = match claim {
             #[cfg(test)]
             ClaimMode::Legacy => {
@@ -837,22 +892,35 @@ impl Hello {
                     .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
                 true
             }
-            _ => control
-                .client_state
-                .compare_exchange(
-                    HANDSHAKE_IDLE,
-                    HANDSHAKE_CLIENT_HELLO,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_ok(),
+            _ => match control.client_state.compare_exchange(
+                HANDSHAKE_IDLE,
+                HANDSHAKE_CLIENT_HELLO,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => true,
+                Err(observed) => {
+                    stale_hello = observed == HANDSHAKE_CLIENT_HELLO;
+                    false
+                }
+            },
         };
         if !posted {
-            if announce_pid {
-                control.client_pid.store(0, Ordering::Release);
-                control.announce_client_start(0);
+            // Follow-up (N3): своё самоописание -- CAS от своих значений.
+            if let Some((pid, start)) = announced {
+                control.retract_client(pid, start);
             }
             release();
+            // Follow-up (решение AG, N2): claim был свободен, а заявка уже
+            // стоит -- заявка без держателя (умерший после отъёма claim-а,
+            // пир без claim). Снять её может только сервер (S2) и только на
+            // `CONNECT_REQ`: толчок -- после своего освобождения claim-а (S2
+            // заявки без claim-а судит по claim `0`), если сервер не в
+            // сессии.
+            if stale_hello && control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
+            {
+                let _ = events.connect_req.set();
+            }
             return Err(if matches!(claim, ClaimMode::Held(_)) {
                 ShmError::HandshakeFailed
             } else {
@@ -896,6 +964,7 @@ impl Hello {
             owns_claim,
             server,
             free,
+            announced,
             server_gone,
             server_exited,
             mapping,
@@ -915,7 +984,7 @@ impl Hello {
                 != token
         {
             if hello.withdraw() {
-                hello.leave_robbed();
+                hello.leave_robbed(retake);
             }
             return Err(ShmError::AlreadyConnected);
         }
@@ -935,10 +1004,11 @@ impl Hello {
     /// выхода нашего процесса (каждый следующий клиент -- `AlreadyConnected`).
     ///
     /// Теперь: пока `client_state == SERVER_READY` -- вернуть свой claim (CAS
-    /// `0 -> T`; занят -- ждать не дольше `ROB_LEAVE_WAIT`), записать поля
-    /// владельца (C2) и уйти обычным L (`SharedClient::drop`: CAS пары,
-    /// `DISCONNECT`, claim последним). `IDLE` -- сервер сессию уже закрыл,
-    /// уходить не из чего.
+    /// `0 -> T`; занят -- ждать освобождения на `<имя>_free` по протоколу
+    /// R21 не дольше `wait`, а подтверждённо умершего держателя -- перехват
+    /// его claim-а; follow-up N1), записать поля владельца (C2) и уйти
+    /// обычным L (`SharedClient::drop`: CAS пары, `DISCONNECT`, claim
+    /// последним). `IDLE` -- сервер сессию уже закрыл, уходить не из чего.
     ///
     /// Почему не 32-битный CAS `client_state` при `generation == G`: после
     /// отъёма I2 не держится -- claim у другого клиента, и между сверкой и
@@ -947,40 +1017,151 @@ impl Hello {
     /// тогда уже его). С возвращённым claim-ом действует довод AB: новую
     /// заявку выставляет только держатель claim-а, а он -- мы, поэтому
     /// `SERVER_READY` при CAS пары -- наша сессия (или сессия-призрак другого
-    /// ограбленного, чей владелец уходит так же). Claim занят дольше
-    /// `ROB_LEAVE_WAIT` (держатель вытеснен на C1..C6) -- уход без записей:
-    /// остаток задокументирован (INTEROP §h п. 12), а заявка держателя на C6
-    /// упрётся в сессию и откатится.
-    pub(crate) fn leave_robbed(self) {
+    /// ограбленного, чей владелец уходит так же). Claim занят до дедлайна
+    /// (держатель жив и всё это время не дошёл до C6) -- запасной уход
+    /// 32-битным CAS при `generation` нашей сессии (`leave_by_generation`):
+    /// уход без записей оставил бы сессию-призрак навсегда (re-review N1,
+    /// модель), а остаток запасного ухода -- ложный конец следующей сессии,
+    /// не заклинивание (INTEROP §h п. 12).
+    pub(crate) fn leave_robbed(self, wait: Duration) {
         let control = self.view.control_block();
-        let deadline = Instant::now().checked_add(ROB_LEAVE_WAIT);
-        loop {
-            if control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
-                return;
+        // `generation` нашей сессии: отзыв только что наблюдал её
+        // зафиксированной (`SERVER_READY`). Нужен лишь запасному уходу
+        // ниже.
+        let session = control.generation.load(Ordering::Acquire);
+        match self.retake(wait) {
+            Retake::Gone => {}
+            Retake::Taken => {
+                // C2 -- как при захвате: время своего процесса, затем PID.
+                control.announce_owner_start(crate::win::current_process_start_time());
+                control
+                    .slot_owner_pid
+                    .store(std::process::id(), Ordering::Release);
+                #[cfg(test)]
+                if let Some(hook) = BEFORE_ROB_LEAVE.with(|hook| hook.borrow_mut().take()) {
+                    hook(&self.view);
+                }
+                drop(self.finish());
             }
-            match control.slot_claim.compare_exchange(
+            Retake::TimedOut => self.leave_by_generation(session),
+        }
+    }
+
+    /// Вернуть claim на C8-провале (follow-up N1, R21): ждать освобождения
+    /// на `<имя>_free` (протокол ждущего) и процессе держателя не дольше
+    /// `wait`; держатель подтверждённо умер -- перехватить его claim.
+    fn retake(&self, wait: Duration) -> Retake {
+        let control = self.view.control_block();
+        let deadline = Instant::now().checked_add(wait);
+        let mut attempt = || {
+            if control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
+                return Attempt::Done(Retake::Gone);
+            }
+            let Err(held) = control.slot_claim.compare_exchange(
                 CLAIM_FREE,
                 self.claim,
                 Ordering::AcqRel,
                 Ordering::Acquire,
-            ) {
-                Ok(_) => break,
-                Err(_) if deadline.is_some_and(|at| Instant::now() < at) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(_) => return,
+            ) else {
+                return Attempt::Done(Retake::Taken);
+            };
+            // Держатель подтверждённо умер (до C6 -- заявки у него нет: она
+            // упёрлась бы в нашу сессию) -- его claim не освободит никто,
+            // кроме дедлайна сервера, а тот при `SERVER_READY` не идёт:
+            // перехват CAS-ом его токена, поля умершего -- CAS-ом от них.
+            let (owner, owner_start) = (
+                control.slot_owner_pid.load(Ordering::Acquire),
+                control.owner_start_time(),
+            );
+            if owner != 0
+                && crate::win::is_process_gone(owner, owner_start)
+                && control.slot_claim.load(Ordering::Acquire) == held
+                && control.forget_owner(owner, owner_start)
+                && control
+                    .slot_claim
+                    .compare_exchange(held, self.claim, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return Attempt::Done(Retake::Taken);
             }
+            Attempt::Busy(Busy {
+                key: 0,
+                holder: Some((owner, owner_start)),
+                server: Some((
+                    control.server_pid.load(Ordering::Acquire),
+                    control.server_start_time(),
+                )),
+            })
+        };
+        let Some(free) = self.free.clone() else {
+            // Пир без R20: проверка раз в 5 мс в пределах `wait`.
+            loop {
+                match attempt() {
+                    Attempt::Done(outcome) => return outcome,
+                    Attempt::Failed(_) => return Retake::Gone,
+                    Attempt::Busy(_) => {}
+                }
+                if deadline.is_none_or(|at| Instant::now() >= at) {
+                    return Retake::TimedOut;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let mut waiter = FreeWaiter::new(free);
+        match waiter.wait_free(
+            &mut attempt,
+            &mut || {},
+            &mut WaitCtl {
+                wake: None,
+                running: &|| true,
+                on_wake: &mut || {},
+                wakeup: &|| {},
+                deadline,
+                renudge: None,
+            },
+        ) {
+            Ok(FreeWait::Claimed(outcome)) => outcome,
+            Ok(FreeWait::Failed(_) | FreeWait::ServerGone | FreeWait::Stopped) => Retake::Gone,
+            Ok(FreeWait::TimedOut) | Err(_) => Retake::TimedOut,
         }
-        // C2 -- как при захвате: время своего процесса, затем PID.
-        control.announce_owner_start(crate::win::current_process_start_time());
-        control
-            .slot_owner_pid
-            .store(std::process::id(), Ordering::Release);
-        #[cfg(test)]
-        if let Some(hook) = BEFORE_ROB_LEAVE.with(|hook| hook.borrow_mut().take()) {
-            hook(&self.view);
+    }
+
+    /// Запасной уход (follow-up N1): claim вернуть не удалось до дедлайна
+    /// (держатель жив и не дошёл до C6 всё это время). Сессия-призрак
+    /// заклинила бы канал до выхода нашего процесса, поэтому -- уход
+    /// 32-битным CAS `client_state: SERVER_READY -> IDLE` при `generation ==
+    /// session` (наблюдённого отзывом), затем `DISCONNECT`.
+    ///
+    /// Остаток (довод решения AB, `handshake_model`): если МЕЖДУ сверкой
+    /// `generation` и CAS сервер сам закрыл нашу сессию и успел
+    /// зафиксировать сессию держателя, CAS закроет её -- ложный конец
+    /// живой сессии, а не заклинивание: её клиент увидит уход сервера
+    /// (`server_state`), его claim снимет уход L или дедлайн
+    /// `RESERVE_TIMEOUT` (модель: свойство W держится).
+    fn leave_by_generation(&self, session: u32) {
+        let control = self.view.control_block();
+        if control.generation.load(Ordering::Acquire) != session {
+            return;
         }
-        drop(self.finish());
+        if control
+            .client_state
+            .compare_exchange(
+                HANDSHAKE_SERVER_READY,
+                HANDSHAKE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let (header_a, header_b) = self.view.headers();
+            header_a
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+            header_b
+                .handshake_state
+                .store(HANDSHAKE_IDLE, Ordering::Release);
+            let _ = self.events.disconnect.set();
+        }
     }
 
     /// Сигнал `S2C_CONNECT` -- ответ на эту заявку (C10).
@@ -1093,7 +1274,7 @@ impl Hello {
     /// подключённые); `false` -- заявка отозвана и откатана, claim (свой)
     /// освобождён последним.
     pub(crate) fn withdraw(&self) -> bool {
-        if withdraw_hello(&self.view, self.generation_before) {
+        if withdraw_hello(&self.view, self.generation_before, self.announced) {
             return true;
         }
         if self.owns_claim {
@@ -1128,6 +1309,7 @@ impl Hello {
             owns_claim,
             server: peer,
             free,
+            announced: _,
             server_gone: _,
             server_exited,
             mapping,
@@ -1885,7 +2067,7 @@ mod tests {
         control
             .client_state
             .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
-        assert!(!withdraw_hello(view, before));
+        assert!(!withdraw_hello(view, before, None));
         assert_eq!(control.client_state.load(Ordering::Acquire), HANDSHAKE_IDLE);
 
         // Сервер успел: generation опубликован, CAS HELLO -> READY выигран.
@@ -1902,7 +2084,7 @@ mod tests {
                 Ordering::Acquire,
             )
             .unwrap();
-        assert!(withdraw_hello(view, before), "рукопожатие состоялось");
+        assert!(withdraw_hello(view, before, None), "рукопожатие состоялось");
         assert_eq!(
             control.client_state.load(Ordering::Acquire),
             HANDSHAKE_SERVER_READY
@@ -1913,7 +2095,7 @@ mod tests {
         control
             .client_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
-        assert!(!withdraw_hello(view, before));
+        assert!(!withdraw_hello(view, before, None));
     }
 
     /// Task 18 (Task 16 N1): сервер умер раньше, чем `connect_async` открыл
@@ -3158,7 +3340,16 @@ mod tests {
                 );
                 (result, started.elapsed())
             });
-            std::thread::sleep(Duration::from_millis(100));
+            // Освобождать -- только когда ждущий уже спит (учтён в
+            // `free_waiters`): иначе его первая проверка застанет канал
+            // свободным, и без страховки он ответит `true`.
+            let free = FreeNotifier::open(None, &name).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while free.waiters() == 0 {
+                assert!(Instant::now() < deadline, "{tag}: ждущий не встал");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
             control.slot_claim.store(CLAIM_FREE, Ordering::Release);
             let (result, took) = waiter.join().unwrap();
             assert_eq!(result, Ok(found), "{tag}: {took:?}");
@@ -3167,6 +3358,243 @@ mod tests {
             }
             drop(server);
         }
+    }
+
+    /// Отъём + фиксация как в `robbed_committed_hello_leaves_no_ghost`, но
+    /// claim после отъёма занят держателем `holder` (его поля владельца --
+    /// `owner`).
+    fn robbed_with_holder(
+        tag: &str,
+        holder: u32,
+        owner: (u32, u64),
+        budget: Duration,
+    ) -> (Duration, u32) {
+        let name = format!("XSHM_ROB_{tag}_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let hook_name = name.clone();
+        AFTER_HELLO.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |view: &SharedView| {
+                let control = view.control_block();
+                // Отъём R-O, затем claim занял держатель (до своего C6).
+                control.announce_owner_start(owner.1);
+                control.slot_owner_pid.store(owner.0, Ordering::Release);
+                control.slot_claim.store(holder, Ordering::Release);
+                EventHandle::open(ObjectPath::event(
+                    None,
+                    &hook_name,
+                    crate::naming::Direction::ClientToServer,
+                    crate::constants::EVENT_CONNECT_REQ_SUFFIX,
+                ))
+                .unwrap()
+                .set()
+                .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                while control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY {
+                    assert!(Instant::now() < deadline, "сервер не зафиксировал заявку");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }));
+        });
+        let acceptor = std::thread::spawn(move || {
+            let accepted = server.wait_for_client(Some(Duration::from_secs(5)));
+            (server, accepted)
+        });
+        let started = Instant::now();
+        let robbed = SharedClient::connect(&name, budget);
+        let took = started.elapsed();
+        let (mut server, accepted) = acceptor.join().unwrap();
+        assert_eq!(robbed.err(), Some(ShmError::AlreadyConnected), "{tag}");
+        assert_eq!(accepted, Ok(()), "{tag}: сервер зафиксировал заявку");
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .client_state
+                .load(Ordering::Acquire),
+            HANDSHAKE_IDLE,
+            "{tag}: сессия-призрак ({took:?})"
+        );
+        assert_eq!(
+            server.poll_client(Some(Duration::from_secs(2))),
+            Err(ShmError::NotConnected),
+            "{tag}: сервер не увидел ухода"
+        );
+        let claim = server
+            .view()
+            .control_block()
+            .slot_claim
+            .load(Ordering::Acquire);
+        (took, claim)
+    }
+
+    /// Follow-up (решение AG, N1): claim после отъёма держит умерший до C6
+    /// держатель -- ограбленный перехватывает его claim и уходит обычным L;
+    /// claim и поля владельца после ухода свободны.
+    #[test]
+    fn robbed_leave_takes_over_dead_holder() {
+        let dead = crate::test_support::dead_process();
+        let (took, claim) =
+            robbed_with_holder("TAKEOVER", 0xDEAD_7777, dead, Duration::from_secs(3));
+        // Перехват -- сразу, не по истечении бюджета (запасной уход).
+        assert!(took < Duration::from_secs(1), "перехвата не было: {took:?}");
+        assert_eq!(claim, CLAIM_FREE, "claim умершего не перехвачен");
+    }
+
+    /// Follow-up (N1): claim держит живой держатель, не дошедший до C6, всё
+    /// время бюджета (здесь -- таймаут подключения 300 мс): запасной уход
+    /// по `generation` закрывает сессию-призрак (до follow-up -- уход без
+    /// записей, призрак навсегда).
+    #[test]
+    fn robbed_leave_falls_back_by_generation() {
+        let live = crate::test_support::LiveChild::spawn();
+        let (took, claim) = robbed_with_holder(
+            "FALLBACK",
+            0x1111_7777,
+            (live.pid, live.start),
+            Duration::from_millis(300),
+        );
+        assert!(took >= Duration::from_millis(250), "{took:?}");
+        assert_eq!(claim, 0x1111_7777, "claim живого держателя тронут");
+        drop(live);
+    }
+
+    /// Follow-up (решение AG, N2; воспроизведение re-review): заявка
+    /// умершего клиента при свободном claim-е. Раньше канал был занят
+    /// навсегда: C1 удаётся (толчка проигравшего нет), C6 проваливается без
+    /// толчка, а ждущий не толкал (ключ 0) -- S2 сервера не запускался.
+    /// Теперь откат C6, увидевший заявку, толкает сервер, S2 снимает её, и
+    /// следующая попытка подключается.
+    #[test]
+    fn dead_hello_with_free_claim_is_cleared_by_nudge() {
+        let name = format!("XSHM_DEAD_HELLO_FREE_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let (pid, start) = crate::test_support::dead_process();
+        {
+            let control = server.view().control_block();
+            control.announce_owner_start(start);
+            control.slot_owner_pid.store(pid, Ordering::Release);
+            control.announce_client_start(start);
+            control.client_pid.store(pid, Ordering::Release);
+            control
+                .client_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        }
+        let acceptor = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match server.wait_for_client(Some(Duration::from_secs(5))) {
+                    Ok(()) => return server,
+                    Err(ShmError::HandshakeFailed) if Instant::now() < deadline => {}
+                    Err(err) => panic!("сервер: {err:?}"),
+                }
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = loop {
+            match SharedClient::connect(&name, Duration::from_secs(2)) {
+                Ok(client) => break client,
+                Err(ShmError::AlreadyConnected) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("канал занят навсегда: {err:?}"),
+            }
+        };
+        let server = acceptor.join().unwrap();
+        assert!(client.is_connected());
+        drop(client);
+        drop(server);
+    }
+
+    /// Follow-up (N2): то же для ждущего -- занятость «заявка без claim-а»
+    /// получила ненулевой ключ, ждущий толкает сервер, и `wait_connectable`
+    /// дожидается свободного канала (до follow-up -- `Ok(false)`).
+    #[test]
+    fn wait_connectable_nudges_dead_hello() {
+        let name = format!("XSHM_WAIT_DEAD_HELLO_{}", std::process::id());
+        let mut server = SharedServer::start(&name).unwrap();
+        let (pid, start) = crate::test_support::dead_process();
+        {
+            let control = server.view().control_block();
+            control.announce_owner_start(start);
+            control.slot_owner_pid.store(pid, Ordering::Release);
+            control.announce_client_start(start);
+            control.client_pid.store(pid, Ordering::Release);
+            control
+                .client_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+        }
+        let acceptor = std::thread::spawn(move || {
+            assert_eq!(
+                server.wait_for_client(Some(Duration::from_secs(3))),
+                Err(ShmError::HandshakeFailed),
+                "S2 снимает заявку умершего"
+            );
+            server
+        });
+        let options = crate::DiscoveryOptions::default().fallback(None);
+        assert_eq!(
+            SharedClient::wait_connectable_with(&name, Some(Duration::from_secs(2)), &options),
+            Ok(true)
+        );
+        drop(acceptor.join().unwrap());
+    }
+
+    /// Follow-up (решение AG, N3): отзыв снимает своё самоописание CAS-ом
+    /// от своих значений -- самоописание следующего заявителя (его C5 после
+    /// отъёма нашего claim-а) не затирается.
+    #[test]
+    fn withdraw_keeps_next_claimant_self_description() {
+        let name = format!("XSHM_RETRACT_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        assert_eq!(
+            control.client_pid.load(Ordering::Acquire),
+            std::process::id()
+        );
+        // Следующий заявитель записал своё самоописание (C5).
+        control.announce_client_start(0x1234_5678_9ABC);
+        control.client_pid.store(4242, Ordering::Release);
+        assert!(!hello.withdraw());
+        assert_eq!(
+            control.client_pid.load(Ordering::Acquire),
+            4242,
+            "PID затёрт"
+        );
+        assert_eq!(
+            control.client_start_time(),
+            0x1234_5678_9ABC,
+            "время затёрто"
+        );
+        // Своё -- снимается.
+        control.client_pid.store(0, Ordering::Release);
+        control.announce_client_start(0);
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        assert!(!hello.withdraw());
+        assert_eq!(control.client_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.client_start_time(), 0);
+    }
+
+    /// Follow-up (решение AG, N4): своё освобождение очищает поля владельца
+    /// CAS-ом от своей личности -- поля, уже переписанные следующим
+    /// держателем (окно между сверкой claim-а и очисткой), целы.
+    #[test]
+    fn own_release_keeps_foreign_owner_fields() {
+        let name = format!("XSHM_OWNER_KEEP_{}", std::process::id());
+        let server = SharedServer::start(&name).unwrap();
+        let control = server.view().control_block();
+        let hello = Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        // Окно: claim ещё наш, а поля уже следующего держателя (его C2).
+        control.announce_owner_start(0x0BAD_0000_0001);
+        control.slot_owner_pid.store(4242, Ordering::Release);
+        assert!(!hello.withdraw());
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(
+            control.slot_owner_pid.load(Ordering::Acquire),
+            4242,
+            "поля следующего"
+        );
+        assert_eq!(control.owner_start_time(), 0x0BAD_0000_0001);
     }
 
     /// Fix round 1 (R18): клиент перед освобождением своего claim-а очищает

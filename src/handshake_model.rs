@@ -70,9 +70,17 @@
 //! отзыв, а проигранный отзыв при `SERVER_READY` -- возврат claim-а
 //! (`Retake`: CAS `0 -> T`, C2) и обычный уход L с CAS пары (I1 (a));
 //! `IDLE` при сменившемся `generation` -- сервер сессию уже закрыл.
-//! Допущение A2: держатель, занявший claim, пока стоит сессия-призрак,
-//! откатывается на C6 (заявка невозможна) и освобождает claim -- в коде
-//! ожидание `Retake` ограничено (`ROB_LEAVE_WAIT`), в модели -- нет.
+//! Ожидание `Retake` ограничено (follow-up N1: остаток таймаута
+//! подключения, R21 на `<имя>_free`): истёк бюджет -- запасной уход
+//! `GiveUp1..3` (сверка `generation`, наблюдённого отзывом, 32-битный CAS
+//! `SERVER_READY -> IDLE`, `DISCONNECT`). Его остаток -- закрыть сессию
+//! следующего держателя, если сервер сам закрыл призрак и зафиксировал её
+//! между сверкой и CAS (призрак `spurious`; проверки G1 тогда сняты): это
+//! ложный конец сессии, а не заклинивание -- свойство W держится; в
+//! переборе двух клиентов остаток недостижим. Вариант `RetakeGiveUpPlain`
+//! (уход без записей, как в fix round 1) перебор опровергает свойством W.
+//! Перехват claim-а подтверждённо умершего держателя -- в коде (смерти вне
+//! модели).
 //! Отъём нарушает I2 намеренно; после него I2 не проверяется, а охраняют
 //! I4 (подключение), I5, G1 и новое свойство **W** -- когда все клиенты
 //! ушли, `client_state == IDLE` (нет сессии-призрака). Остаток (только с
@@ -154,6 +162,10 @@ enum Revision {
     /// claim отнимается и у держателя с уже выставленной заявкой --
     /// перебор обязан найти нарушение.
     RobAnyState,
+    /// Fix round 1 до follow-up (re-review N1): не дождавшись возврата
+    /// claim-а, ограбленный уходит без записей -- перебор обязан найти
+    /// сессию-призрак (W).
+    RetakeGiveUpPlain,
     /// Ревизия 3 буквально по дизайну, но C10 -- «`SERVER_READY` или
     /// `generation != g0`» (без отклонения §2.1 C10).
     DesignC10,
@@ -210,8 +222,15 @@ enum Pc {
     Forgotten,
     /// Fix round 1 (решение AE, I1 (a)): отзыв на C8 проигран при сессии,
     /// а claim отнят -- вернуть свой claim (CAS `0 -> T`), затем обычный
-    /// уход L (CAS пары).
+    /// уход L (CAS пары). Follow-up (N1): истёк бюджет ожидания --
+    /// запасной уход `GiveUp1..3`.
     Retake,
+    /// Запасной уход: сверка `generation == g` (наблюдённого отзывом).
+    GiveUp1,
+    /// Запасной уход: 32-битный CAS `SERVER_READY -> IDLE`.
+    GiveUp2,
+    /// Запасной уход: `DISCONNECT`.
+    GiveUp3,
     Done,
 }
 
@@ -303,6 +322,9 @@ struct State {
     robbed: [bool; CLIENTS],
     /// Призрак: отъём живого держателя случился в этом прогоне.
     any_rob: bool,
+    /// Призрак: запасной уход (`GiveUp2`) закрыл чужую сессию -- остаток
+    /// follow-up N1 (ложный конец следующей сессии, не заклинивание).
+    spurious: bool,
 }
 
 /// Итог перебора.
@@ -314,6 +336,10 @@ struct Stats {
     robs: bool,
     /// Достигнут возврат claim-а на C8-провале (`Retake`).
     retakes: bool,
+    /// Достигнут запасной уход (`GiveUp2`).
+    give_ups: bool,
+    /// Достигнут остаток N1 (запасной уход закрыл чужую сессию).
+    spurious: bool,
 }
 
 /// Токен попытки: уникален на (клиент, попытку), как у `claim_token`.
@@ -363,6 +389,7 @@ impl State {
             owner: DEAD,
             robbed: [false; CLIENTS],
             any_rob: false,
+            spurious: false,
         }
     }
 
@@ -432,14 +459,20 @@ const fn release_own(n: &mut State, me: u8, tok: u8) {
 
 /// Возврат claim-а на C8-провале (fix round 1, I1 (a)) есть в варианте.
 fn rob_retake(rev: Revision) -> bool {
-    matches!(rev, Revision::Three | Revision::RobAnyState)
+    matches!(
+        rev,
+        Revision::Three | Revision::RobAnyState | Revision::RetakeGiveUpPlain
+    )
 }
 
 /// Быстрый путь R-O (Task 12) есть в варианте.
 fn rob_enabled(rev: Revision) -> bool {
     matches!(
         rev,
-        Revision::Three | Revision::RobPlainLeave | Revision::RobAnyState
+        Revision::Three
+            | Revision::RobPlainLeave
+            | Revision::RobAnyState
+            | Revision::RetakeGiveUpPlain
     )
 }
 
@@ -561,7 +594,12 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
                 // Fix round 1 (I1 (a)): отзыв на C8 проигран при сессии --
                 // вернуть claim и уйти (`Retake`); сервер уже закрыл её
                 // (`IDLE` при `generation != g0`) -- уходить не из чего.
-                Cs::Ready(_) if c.leave_now && rob_retake(rev) => n.clients[i].pc = Pc::Retake,
+                Cs::Ready(_) if c.leave_now && rob_retake(rev) => {
+                    // `generation` нашей сессии -- для запасного ухода
+                    // (читается следом за отзывом; слитое чтение, как у W).
+                    n.clients[i].g = n.generation;
+                    n.clients[i].pc = Pc::Retake;
+                }
                 _ if c.leave_now && rob_retake(rev) && n.generation != c.g0 => {
                     next_attempt_of(&mut n, i);
                 }
@@ -586,7 +624,42 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
                 n.robbed[i] = false;
                 n.clients[i].pc = Pc::L2;
                 out.push(Ok(n));
+            } else {
+                // Follow-up (N1): claim занят -- ждать (перехода нет) или
+                // истёк бюджет: запасной уход (вариант `RetakeGiveUpPlain`
+                // -- уход без записей, как в fix round 1).
+                if rev == Revision::RetakeGiveUpPlain {
+                    next_attempt_of(&mut n, i);
+                } else {
+                    n.clients[i].pc = Pc::GiveUp1;
+                }
+                out.push(Ok(n));
             }
+        }
+        Pc::GiveUp1 => {
+            if n.generation == c.g {
+                n.clients[i].pc = Pc::GiveUp2;
+            } else {
+                next_attempt_of(&mut n, i);
+            }
+            out.push(Ok(n));
+        }
+        Pc::GiveUp2 => {
+            if let Cs::Ready(owner) = n.cs {
+                // Остаток N1: между сверкой и CAS сервер сам закрыл нашу
+                // сессию и зафиксировал следующую -- CAS закрывает её.
+                n.spurious |= owner != me;
+                n.cs = Cs::Idle;
+                n.clients[i].pc = Pc::GiveUp3;
+            } else {
+                next_attempt_of(&mut n, i);
+            }
+            out.push(Ok(n));
+        }
+        Pc::GiveUp3 => {
+            n.disconnect = me;
+            next_attempt_of(&mut n, i);
+            out.push(Ok(n));
         }
         Pc::RollbackPid => {
             n.client_pid = 0;
@@ -635,7 +708,7 @@ fn client_steps(rev: Revision, s: &State, i: usize, out: &mut Vec<Result<State, 
             // сессии; `mark_disconnected` клиента -- при уходе только CAS
             // `T -> 0`. Сигнал обязан быть от сервера этой сессии.
             if n.disconnect != 0 {
-                if three && n.disconnect != SERVER {
+                if three && n.disconnect != SERVER && !n.spurious {
                     out.push(Err(format!(
                         "G1: клиент {me} разобрал DISCONNECT клиента {}",
                         n.disconnect
@@ -926,7 +999,7 @@ fn server_steps(rev: Revision, s: &State, out: &mut Vec<Result<State, String>>) 
             // клиента. Сигнал обязан быть от клиента этой сессии (иначе --
             // разрыв чужой сессии, G1/призрак).
             if n.disconnect != 0 {
-                if three && n.disconnect != n.server.owner {
+                if three && n.disconnect != n.server.owner && !n.spurious {
                     out.push(Err(format!(
                         "G1: сервер разобрал DISCONNECT {} в сессии клиента {}",
                         n.disconnect, n.server.owner
@@ -1015,6 +1088,8 @@ fn explore(rev: Revision) -> Result<Stats, String> {
     let mut accepts = false;
     let mut robs = false;
     let mut retakes = false;
+    let mut give_ups = false;
+    let mut spurious = false;
     let trace = |parent: &HashMap<State, State>, mut at: State, violation: String| {
         let mut path = vec![brief(&at)];
         while let Some(&prev) = parent.get(&at) {
@@ -1046,6 +1121,8 @@ fn explore(rev: Revision) -> Result<Stats, String> {
             accepts |= n.accepted.iter().any(|&c| c != 0);
             robs |= n.any_rob;
             retakes |= n.clients.iter().any(|c| c.pc == Pc::Retake);
+            give_ups |= n.clients.iter().any(|c| c.pc == Pc::GiveUp2);
+            spurious |= n.spurious;
             if let std::collections::hash_map::Entry::Vacant(entry) = parent.entry(n) {
                 entry.insert(s);
                 queue.push_back(n);
@@ -1057,6 +1134,8 @@ fn explore(rev: Revision) -> Result<Stats, String> {
         accepts,
         robs,
         retakes,
+        give_ups,
+        spurious,
     })
 }
 
@@ -1079,6 +1158,15 @@ fn handshake_model() {
         stats.retakes,
         "модель ни разу не вернула claim на C8-провале"
     );
+    assert!(stats.give_ups, "модель ни разу не дошла до запасного ухода");
+    println!(
+        "handshake_model: остаток N1 (запасной уход закрыл чужую сессию) {}",
+        if stats.spurious {
+            "достижим, W держится"
+        } else {
+            "недостижим"
+        }
+    );
 }
 
 /// Fix round 1 (решение AE, I1 (a)): без возврата claim-а на C8-провале
@@ -1089,6 +1177,17 @@ fn handshake_model_rob_without_retake_leaves_ghost() {
     let violation =
         explore(Revision::RobPlainLeave).expect_err("отъём без возврата обязан оставлять призрак");
     println!("handshake_model: отъём без возврата -- {violation}");
+    assert!(violation.starts_with("W:"), "{violation}");
+}
+
+/// Follow-up (re-review N1): уход без записей, когда claim вернуть не
+/// удалось за бюджет ожидания, оставляет сессию-призрак (W) -- поэтому
+/// запасной уход по `generation`.
+#[test]
+fn handshake_model_retake_give_up_without_leave_leaves_ghost() {
+    let violation = explore(Revision::RetakeGiveUpPlain)
+        .expect_err("уход без записей обязан оставлять призрак");
+    println!("handshake_model: отказ от возврата без ухода -- {violation}");
     assert!(violation.starts_with("W:"), "{violation}");
 }
 

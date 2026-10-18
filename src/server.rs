@@ -200,8 +200,15 @@ pub(crate) fn release_if_holder_dead(
         && {
             // Fix round 1 (решение AE, I1 (b)): личность умершего -- из полей
             // владельца до освобождения, иначе в окне C1-C2 следующего
-            // держателя она сошла бы за его (быстрый путь R-O).
-            control.forget_owner(watch.pid());
+            // держателя она сошла бы за его (быстрый путь R-O). Follow-up
+            // (N4): CAS от личности умершего -- время его процесса из
+            // наблюдения (открыто с проверкой времени), иначе из полей.
+            control.forget_owner(
+                watch.pid(),
+                watch
+                    .start_time()
+                    .unwrap_or_else(|| control.owner_start_time()),
+            );
             release_claim_notify(control, token, free)
         }
 }
@@ -238,7 +245,8 @@ pub(crate) fn release_if_owner_gone(
         return false;
     }
     let owner = control.slot_owner_pid.load(Ordering::Acquire);
-    if !claim_holder_gone(control, owner, control.owner_start_time()) {
+    let owner_start = control.owner_start_time();
+    if !claim_holder_gone(control, owner, owner_start) {
         return false;
     }
     #[cfg(test)]
@@ -249,7 +257,7 @@ pub(crate) fn release_if_owner_gone(
     // выставить заявку или записать свои поля (C2).
     if control.client_state.load(Ordering::Acquire) != HANDSHAKE_IDLE
         || control.slot_owner_pid.load(Ordering::Acquire) != owner
-        || !control.forget_owner(owner)
+        || !control.forget_owner(owner, owner_start)
     {
         return false;
     }
@@ -305,10 +313,18 @@ fn observe_idle_claim(
                 && control.client_state.load(Ordering::Acquire) != HANDSHAKE_CLIENT_HELLO
             {
                 // CAS: если claim успел смениться, это уже другой захват.
-                // Fix round 1: поля протухшего владельца -- очистить (CAS
-                // от прочитанного): если его процесс потом завершится, его
-                // личность не сойдёт за следующего держателя (R-O).
-                control.forget_owner(control.slot_owner_pid.load(Ordering::Acquire));
+                // Fix round 1: поля протухшего владельца -- очистить: если его
+                // процесс потом завершится, его личность не сойдёт за
+                // следующего держателя (R-O). Follow-up (N4): личность --
+                // прочитанная вместе с токеном (claim перечитан после неё),
+                // CAS от неё: поля держателя, успевшего занять канал, целы.
+                let (owner, owner_start) = (
+                    control.slot_owner_pid.load(Ordering::Acquire),
+                    control.owner_start_time(),
+                );
+                if control.slot_claim.load(Ordering::Acquire) == claim {
+                    control.forget_owner(owner, owner_start);
+                }
                 let _ = release_claim_notify(control, claim, free);
                 *seen = None;
             }
@@ -970,13 +986,32 @@ impl SharedServer {
         // claim сменился -- S2 пропускается, заявку A фиксируют S3-S7 (S6
         // наблюдает процесс A по его самоописанию). Клиент без claim
         // (`T == 0`, наследный путь) -- без перепроверки.
-        let holder_dead = watch.is_none() && claim_holder_gone(control, pid, start);
+        //
+        // Follow-up (решение AG, N2): заявка без держателя claim-а (`T ==
+        // 0`: держатель ограблен и умер, пир без claim) -- поля владельца не
+        // её (их перепишет C2 любого следующего захватчика), поэтому смерть
+        // подтверждается самоописанием заявки: ненулевые PID и время, процесс
+        // подтверждённо ушёл. Живой ограбленный держатель «умершим» не
+        // станет, а claim, занятый между S1 и CAS, следующему не мешает: его
+        // C6 при стоящей заявке и так провалится.
+        let holder_dead = watch.is_none()
+            && if claim == CLAIM_FREE {
+                pid != 0 && start != 0 && crate::win::is_process_gone(pid, start)
+            } else {
+                claim_holder_gone(control, pid, start)
+            };
         #[cfg(test)]
         if holder_dead {
             handshake_hook(&self.view, HandshakePoint::BeforeDeadWithdraw);
         }
         if holder_dead
-            && (claim == CLAIM_FREE || control.slot_claim.load(Ordering::Acquire) == claim)
+            && (claim == CLAIM_FREE || {
+                // Follow-up (N2): claim с S1 освобождён -- держателя у
+                // стоящей заявки нет (живой следующий выставить свою при
+                // стоящей не может: его C6 -- CAS из `IDLE`), снимать можно.
+                let now = control.slot_claim.load(Ordering::Acquire);
+                now == claim || now == CLAIM_FREE
+            })
         {
             // Fix round 2: самоописание и заголовки умершего обнуляются ДО
             // CAS, который делает `IDLE` видимым. После CAS (claim умершего
@@ -1010,9 +1045,17 @@ impl SharedServer {
                 handshake_hook(&self.view, HandshakePoint::AfterDeadWithdraw);
                 // Claim -- последним: пока он стоит, новой заявки нет.
                 // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
-                // очистить поля умершего владельца (`pid == slot_owner_pid`).
-                control.forget_owner(pid);
+                // очистить поля умершего владельца (`pid == slot_owner_pid`;
+                // claim всё ещё его -- чужого C2 быть не может).
+                control.forget_owner(pid, control.owner_start_time());
                 let _ = release_claim_notify(control, claim, self.free.as_deref());
+                // Заявка без claim-а (N2): освобождения claim-а нет, а канал
+                // освободился -- уведомить ждущих (R20).
+                if claim == CLAIM_FREE
+                    && let Some(free) = self.free.as_deref()
+                {
+                    free.notify();
+                }
             }
             return Err(ShmError::HandshakeFailed);
         }
@@ -1158,8 +1201,8 @@ impl SharedServer {
             .handshake_state
             .store(HANDSHAKE_IDLE, Ordering::Release);
         // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
-        // очистить поля умершего владельца.
-        control.forget_owner(owner);
+        // очистить поля умершего владельца (claim всё ещё его).
+        control.forget_owner(owner, control.owner_start_time());
         let _ = release_claim_notify(control, claim, self.free.as_deref());
         let _ = self.events.disconnect.set();
         ShmError::HandshakeFailed
@@ -1267,8 +1310,9 @@ impl SharedServer {
         }
         if self.exclusive && peer.has_exited() {
             // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
-            // очистить поля умершего владельца (если они его).
-            control.forget_owner(peer.pid());
+            // очистить поля умершего владельца (если они его; claim сессии
+            // всё ещё его).
+            control.forget_owner(peer.pid(), control.owner_start_time());
             let _ = release_claim_notify(control, session_claim, self.free.as_deref());
             return;
         }
@@ -3293,6 +3337,78 @@ mod rob_tests {
         assert_eq!(control.owner_start_time(), 0);
     }
 
+    /// Follow-up (решение AG, N5): отъём протухшего захвата по
+    /// `RESERVE_TIMEOUT` очищает поля владельца (личность, прочитанную
+    /// вместе с токеном) -- иначе, когда его процесс завершится, она сошла
+    /// бы за следующего держателя (R-O).
+    #[test]
+    fn reserve_reclaim_forgets_owner() {
+        let server = SharedServer::start(&unique("RESERVE")).unwrap();
+        let control = server.view().control_block();
+        let owner = crate::test_support::LiveChild::spawn();
+        control.announce_owner_start(owner.start);
+        control.slot_owner_pid.store(owner.pid, Ordering::Release);
+        control.slot_claim.store(TOKEN, Ordering::Release);
+        let (mut seen, mut lingering) = (None, None);
+        // Первое наблюдение, затем отъём (срок -- ноль).
+        observe_idle_claim(
+            server.view(),
+            &mut seen,
+            &mut lingering,
+            Duration::ZERO,
+            None,
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN);
+        observe_idle_claim(
+            server.view(),
+            &mut seen,
+            &mut lingering,
+            Duration::ZERO,
+            None,
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(
+            control.slot_owner_pid.load(Ordering::Acquire),
+            0,
+            "поля протухшего"
+        );
+        assert_eq!(control.owner_start_time(), 0);
+        drop(owner);
+    }
+
+    /// Follow-up (N5): `mark_disconnected` после смерти клиента в сессии
+    /// очищает его поля владельца.
+    #[test]
+    fn mark_disconnected_of_dead_client_forgets_owner() {
+        let name = unique("MARKDEAD");
+        let mut server = SharedServer::start(&name).unwrap();
+        let client = std::thread::spawn(move || {
+            crate::client::SharedClient::connect(&name, Duration::from_secs(3)).unwrap()
+        });
+        server
+            .wait_for_client(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut client = client.join().unwrap();
+        // Сессия -- «умершего»: наблюдение -- завершившийся процесс, поля
+        // владельца -- его.
+        let dead = ProcessWatch::exited(4343).unwrap();
+        drop(server.replace_peer(dead));
+        let control = server.view().control_block();
+        control.announce_owner_start(9);
+        control.slot_owner_pid.store(4343, Ordering::Release);
+        server.mark_disconnected();
+        let control = server.view().control_block();
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
+        assert_eq!(
+            control.slot_owner_pid.load(Ordering::Acquire),
+            0,
+            "поля умершего"
+        );
+        assert_eq!(control.owner_start_time(), 0);
+        client.mark_disconnected();
+        drop(client);
+    }
+
     /// `forget_owner` не трогает поля, уже переписанные следующим
     /// держателем.
     #[test]
@@ -3301,11 +3417,17 @@ mod rob_tests {
         let control = server.view().control_block();
         control.announce_owner_start(11);
         control.slot_owner_pid.store(22, Ordering::Release);
-        assert!(!control.forget_owner(33), "чужой PID");
+        assert!(!control.forget_owner(33, 11), "чужой PID");
         assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 22);
         assert_eq!(control.owner_start_time(), 11);
-        assert!(control.forget_owner(22));
+        // Время уже следующего держателя (C2: время до PID) -- не тронуто.
+        control.announce_owner_start(44);
+        assert!(control.forget_owner(22, 11));
         assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
+        assert_eq!(control.owner_start_time(), 44, "время следующего затёрто");
+        control.announce_owner_start(11);
+        control.slot_owner_pid.store(22, Ordering::Release);
+        assert!(control.forget_owner(22, 11));
         assert_eq!(control.owner_start_time(), 0);
     }
 }

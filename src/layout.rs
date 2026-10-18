@@ -458,41 +458,25 @@ impl ControlBlock {
         )
     }
 
-    /// Держатель claim-а перед освобождением своего claim-а (Task 12 fix
-    /// round 1, решение AE, INTEROP R18): очистить свои поля владельца --
-    /// PID первым (по нему читающий решает, есть ли владелец), затем время.
-    /// Без этого личность ушедшего, если его процесс потом завершится,
-    /// оставалась бы в полях до C2 следующего держателя, и быстрый путь
-    /// сервера (R-O) в окне C1-C2 снял бы claim живого держателя.
-    /// Вызывать, пока claim ещё свой (до CAS `T -> 0`): поля держателя
-    /// пишет только он сам.
-    pub(crate) fn clear_owner(&self) {
-        self.slot_owner_pid.store(0, Ordering::Release);
-        self.owner_start_lo.store(0, Ordering::Release);
-        self.owner_start_hi.store(0, Ordering::Release);
-    }
-
-    /// Сервер перед снятием claim-а подтверждённо умершего владельца `pid`
-    /// (Task 12 fix round 1): очистить его личность в полях владельца --
-    /// только если она всё ещё там (CAS `pid -> 0`; время -- CAS каждой
-    /// половины от прочитанного значения), чтобы не затереть поля
-    /// следующего держателя, уже прошедшего C2. `true` -- поле PID очищено
-    /// этим вызовом (личность была умершего).
-    pub(crate) fn forget_owner(&self, pid: u32) -> bool {
-        if pid == 0 {
-            return false;
-        }
-        let lo = self.owner_start_lo.load(Ordering::Acquire);
-        let hi = self.owner_start_hi.load(Ordering::Acquire);
-        if self
-            .slot_owner_pid
-            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    /// Очистить личность владельца claim-а `(pid, start)` -- только если в
+    /// полях именно она (Task 12 follow-up, решение AG, N4): CAS `pid -> 0`,
+    /// затем CAS каждой половины времени от `start`. Личность -- та, что
+    /// прочитана вместе с токеном снимаемого claim-а (сервер: умерший или
+    /// протухший владелец) или своя (клиент перед освобождением своего
+    /// claim-а, `presence::release_own_claim`). Следующий держатель пишет
+    /// время ДО PID (C2): если он уже записал хоть что-то своё, CAS от
+    /// чужих значений его не тронет -- проверка «claim всё ещё тот» и
+    /// очистка больше не разделены окном. `true` -- PID очищен этим вызовом.
+    pub(crate) fn forget_owner(&self, pid: u32, start: u64) -> bool {
+        if pid == 0
+            || self
+                .slot_owner_pid
+                .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
         {
             return false;
         }
-        // Следующий держатель пишет время ДО PID (C2): если он уже записал
-        // своё, значение отличается от прочитанного, и CAS его не тронет.
+        let (lo, hi) = split_time(start);
         let _ = self
             .owner_start_lo
             .compare_exchange(lo, 0, Ordering::AcqRel, Ordering::Acquire);
@@ -500,6 +484,28 @@ impl ControlBlock {
             .owner_start_hi
             .compare_exchange(hi, 0, Ordering::AcqRel, Ordering::Acquire);
         true
+    }
+
+    /// Отозвать своё самоописание `(pid, start)` из `client_pid`/
+    /// `client_start` (отзыв W и откат C6; Task 12 follow-up, N3): CAS от
+    /// своих значений, а не store нуля -- после отъёма claim-а следующий
+    /// заявитель мог уже записать своё (C5), и безусловный ноль оставил бы
+    /// его зафиксированную заявку без наблюдения процесса.
+    pub(crate) fn retract_client(&self, pid: u32, start: u64) {
+        if self
+            .client_pid
+            .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let (lo, hi) = split_time(start);
+        let _ = self
+            .client_start_lo
+            .compare_exchange(lo, 0, Ordering::AcqRel, Ordering::Acquire);
+        let _ = self
+            .client_start_hi
+            .compare_exchange(hi, 0, Ordering::AcqRel, Ordering::Acquire);
     }
 }
 

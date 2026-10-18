@@ -1107,8 +1107,16 @@ impl MultiCore {
                 // Task 12: с уведомлением ждущих базы (R20); fix round 1 --
                 // сначала очистить поля протухшего владельца (CAS от
                 // прочитанного), чтобы его личность не сошла за следующего.
+                // Follow-up (N4): личность -- прочитанная вместе с токеном
+                // (claim перечитан после неё), CAS от неё.
                 let control = slot.server.view().control_block();
-                control.forget_owner(control.slot_owner_pid.load(Ordering::Acquire));
+                let (owner, owner_start) = (
+                    control.slot_owner_pid.load(Ordering::Acquire),
+                    control.owner_start_time(),
+                );
+                if control.slot_claim.load(Ordering::Acquire) == claim {
+                    control.forget_owner(owner, owner_start);
+                }
                 let _ = release_claim_notify(control, claim, self.free.as_deref());
                 slot.claim_seen = None;
             } else {
@@ -1392,8 +1400,9 @@ impl MultiCore {
             let claim = control.slot_claim.load(Ordering::Acquire);
             let owner = control.slot_owner_pid.load(Ordering::Acquire);
             if claim != CLAIM_FREE && slot.watched_pid() == Some(owner) {
-                // Fix round 1 (решение AE): поля умершего -- до освобождения.
-                control.forget_owner(owner);
+                // Fix round 1 (решение AE): поля умершего -- до освобождения
+                // (claim всё ещё его).
+                control.forget_owner(owner, control.owner_start_time());
                 let _ = release_claim_notify(control, claim, self.free.as_deref());
             }
             // Handle процесса обязан уйти из привязок в любом случае:
@@ -1453,8 +1462,9 @@ impl MultiCore {
                     && control.slot_claim.load(Ordering::Acquire) == expected_claim
                 {
                     let owner = control.slot_owner_pid.load(Ordering::Acquire);
-                    if !win::is_process_alive(owner, control.owner_start_time()) {
-                        control.forget_owner(owner);
+                    let owner_start = control.owner_start_time();
+                    if !win::is_process_alive(owner, owner_start) {
+                        control.forget_owner(owner, owner_start);
                     }
                 }
                 release_claim_notify(control, expected_claim, self.free.as_deref())
