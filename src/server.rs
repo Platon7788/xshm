@@ -2982,6 +2982,17 @@ mod anonymous_tests {
         SPACE_KERNEL_WAITS.with(Cell::get)
     }
 
+    /// Ожидание до таймаута -- одно ожидание в ядре. Ядро может вернуть
+    /// таймаут на такт таймера раньше дедлайна по `Instant` -- тогда
+    /// ожидание доливает остаток вторым, и это не нарезка (нарезка или опрос
+    /// дали бы десятки-сотни ожиданий за 200 мс).
+    fn assert_timeout_waits(waits: u32) {
+        assert!(
+            (1..=2).contains(&waits),
+            "ожиданий в ядре до таймаута: {waits} (ожидалось одно, с доливом -- два)"
+        );
+    }
+
     /// 7 различных ненулевых handle-ов, каждый -- SynchronizationEvent
     /// (`NtQueryEvent`), ни один не совпадает с handle секции.
     #[test]
@@ -3047,7 +3058,7 @@ mod anonymous_tests {
             "вернулся через {:?}",
             started.elapsed()
         );
-        assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
+        assert_timeout_waits(data_waits() - before);
 
         let before = data_waits();
         let started = Instant::now();
@@ -3082,7 +3093,7 @@ mod anonymous_tests {
             server.wait_for_space(LEN, Some(Duration::from_millis(200))),
             Ok(false)
         );
-        assert_eq!(space_waits() - before, 1, "одно ожидание в ядре");
+        assert_timeout_waits(space_waits() - before);
 
         let before = space_waits();
         let started = Instant::now();
