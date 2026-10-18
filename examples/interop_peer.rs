@@ -31,7 +31,8 @@
 //! ждёт перед остановкой; без него -- `hold=<мс>`, 0), `max_clients=<k>`
 //! (`dispatch-server`, 64), `name=<s>` (имя регистрации `dispatch-client`,
 //! `rust`), `boundary=<s>` (имя границы частного пространства имён `ns-*`),
-//! `low=1` (граница с меткой Low: `ObjectSecurity::CurrentUserAllowLowIntegrity`).
+//! `low=0|1` (1 -- граница с меткой Low:
+//! `ObjectSecurity::CurrentUserAllowLowIntegrity`; иное значение -- ошибка).
 //!
 //! Сценарии (`server-*` -- `SharedServer`, ждёт клиента после `READY`;
 //! `client-*` -- `SharedClient`, повторяет подключение, пока канала нет):
@@ -100,7 +101,10 @@
 //!   `client-echo`, `multi-server` в частном пространстве имён границы
 //!   `boundary` (`PrivateNamespace::open_or_create`, псевдоним `rust`;
 //!   `low=1` -- граница с меткой Low); перед остальным -- `INFO
-//!   ns=created|opened` (создал ли пространство этот пир).
+//!   ns=created|opened` (создал ли пространство этот пир);
+//! - `ns-dispatch-server`, `ns-dispatch-client` -- `dispatch-server`,
+//!   `dispatch-client` с лобби, его мьютексом и каналами в пространстве
+//!   `boundary` (`DispatchOptions`/`DispatchClientOptions::namespace`).
 //!
 //! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
 //! перед `INFO sent=`.
@@ -345,7 +349,13 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
             "max_clients" => args.max_clients = value.parse().map_err(|_| bad())?,
             "name" => value.clone_into(&mut args.cname),
             "boundary" => value.clone_into(&mut args.boundary),
-            "low" => args.low = value == "1",
+            "low" => {
+                args.low = match value {
+                    "0" => false,
+                    "1" => true,
+                    _ => return Err(bad()),
+                }
+            }
             _ => return Err(format!("unknown key {key}")),
         }
     }
@@ -1174,11 +1184,18 @@ enum BeaconRole {
 
 /// `DispatchServer` с лобби по умолчанию (16 КиБ) и `max_clients`; эхо до
 /// `ends` отключений клиентов (по умолчанию 1). `beacon` -- явный маяк
-/// лобби (`BeaconRole`).
-fn dispatch_server(name: &str, args: &Args, beacon: BeaconRole) -> Result<(), String> {
+/// лобби (`BeaconRole`); `ns` -- лобби, его мьютекс и каналы в частном
+/// пространстве имён.
+fn dispatch_server(
+    name: &str,
+    args: &Args,
+    beacon: BeaconRole,
+    ns: Option<Arc<PrivateNamespace>>,
+) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let options = DispatchOptions {
         max_clients: args.max_clients,
+        namespace: ns,
         ..DispatchOptions::default()
     };
     let handler = Arc::new(DispatchEcho {
@@ -1341,6 +1358,8 @@ struct DispatchPlan {
     cname: String,
     frames: u32,
     ping: bool,
+    /// Лобби и канал в частном пространстве имён.
+    ns: Option<Arc<PrivateNamespace>>,
 }
 
 /// Один `DispatchClient` (регистрация `ClientRegistration` своего PID).
@@ -1360,11 +1379,15 @@ fn dispatch_connect(
     });
     let dyn_handler: Arc<dyn DispatchClientHandler> = handler.clone();
     let registration = ClientRegistration::new(std::process::id(), 1, plan.cname);
+    let options = DispatchClientOptions {
+        namespace: plan.ns,
+        ..DispatchClientOptions::default()
+    };
     let client = Arc::new(DispatchClient::connect(
         lobby,
         registration,
         dyn_handler,
-        DispatchClientOptions::default(),
+        options,
     )?);
     handler.attach(&client);
     Ok(client)
@@ -1376,7 +1399,11 @@ fn dispatch_connect(
 /// `echo`: ответ XOR на кадры сервера до `ends` разрывов. `expect=<вариант>`
 /// -- регистрация обязана провалиться этой ошибкой (`INFO err=`; отказ
 /// сервера -- `HandshakeFailed`).
-fn dispatch_client(lobby: &str, args: &Args) -> Result<(), String> {
+fn dispatch_client(
+    lobby: &str,
+    args: &Args,
+    ns: Option<Arc<PrivateNamespace>>,
+) -> Result<(), String> {
     let ping = match args.mode.as_str() {
         "" | "ping" => true,
         "echo" => false,
@@ -1386,6 +1413,7 @@ fn dispatch_client(lobby: &str, args: &Args) -> Result<(), String> {
         cname: args.cname.clone(),
         frames: args.frames,
         ping,
+        ns,
     };
     let (tx, rx) = mpsc::channel();
     if !args.expect.is_empty() {
@@ -1614,11 +1642,15 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         ),
         "ns-multi-server" => multi_server(name, args, Some(namespace(args)?)),
         "multi-client" => multi_client(name, args),
-        "dispatch-server" => dispatch_server(name, args, BeaconRole::None),
-        "beacon-server" => dispatch_server(name, args, BeaconRole::Raise),
-        "beacon-server-crash" => dispatch_server(name, args, BeaconRole::Crash),
+        "dispatch-server" => dispatch_server(name, args, BeaconRole::None, None),
+        "ns-dispatch-server" => {
+            dispatch_server(name, args, BeaconRole::None, Some(namespace(args)?))
+        }
+        "beacon-server" => dispatch_server(name, args, BeaconRole::Raise, None),
+        "beacon-server-crash" => dispatch_server(name, args, BeaconRole::Crash, None),
         "beacon-client" => beacon_client(name),
-        "dispatch-client" => dispatch_client(name, args),
+        "dispatch-client" => dispatch_client(name, args, None),
+        "ns-dispatch-client" => dispatch_client(name, args, Some(namespace(args)?)),
         other => Err(format!("unknown scenario {other}")),
     }
 }
