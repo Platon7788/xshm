@@ -11,6 +11,7 @@ mod error;
 mod multi;
 mod options;
 mod resources;
+mod worker;
 
 pub use cancel::CancellationToken;
 pub use connection::{Client, Server, Session};
@@ -25,3 +26,4 @@ pub use options::{
 };
 pub use options::{DispatchClientOptions, DispatchOptions};
 pub use resources::{Beacon, PrivateNamespace};
+pub use worker::{CommandCompletion, DispatchSender, DispatchWorker, QueueLimits};
