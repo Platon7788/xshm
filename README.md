@@ -64,6 +64,8 @@ API change and [INTEROP](INTEROP.md) for the C wire contract and test matrix.
 
 ## Verification
 
+GitHub CI is not used; builds and release validation run locally.
+
 `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
 `cargo fmt --all --check`, and `RUSTDOCFLAGS='-D warnings' cargo doc --workspace
 --no-deps` are required. Run Debug and Release on both MSVC targets.

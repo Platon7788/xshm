@@ -2,13 +2,17 @@
 
 Единственная реализация wire-протокола находится в `xhook/ipc`. Rust xshm
 линкует её через xipc-sys; самостоятельного Rust-протокола нет. Нормативны
-заголовки `xhook/ipc/include/xipc/` и документация xhook `xipc.md` / `xipc.ru.md`.
+заголовки `xhook/ipc/include/xipc/` и документация xhook [xipc.md](https://github.com/Platon7788/xhook/blob/main/docs/xipc.md) /
+[xipc.ru.md](https://github.com/Platon7788/xhook/blob/main/docs/xipc.ru.md).
 
 Общий формат памяти: `0x00020000`, рукопожатие ревизии 3. C/C++ и Rust
 должны использовать совместимые версии C-ядра. Политика безопасности по
 умолчанию — текущий пользователь и SYSTEM. PID регистрации диагностический.
 
 ## Проверки
+
+Все команды выполняются локально; GitHub CI не используется. Команду матрицы
+запускайте внутри PowerShell, чтобы списки разрядностей передавались массивами.
 
 Rust: все unit/integration/doctests, x86/x64 Debug/Release, Clippy и rustdoc.
 C: 38 native IPC suites, каждая в четырёх конфигурациях. Отдельно installed
@@ -21,7 +25,7 @@ API xshm 1.0. CLI-сценарии оркестратора сохраняютс
 
 ```powershell
 $env:XIPC_SOURCE_DIR = 'D:/GitHub/VsProjects/xhook/ipc'
-pwsh D:/GitHub/VsProjects/xhook/scripts/run_interop.ps1 -Repeat 2
+& D:/GitHub/VsProjects/xhook/scripts/run_interop.ps1 -XshmRoot 'D:/GitHub/Rust_Projects/xshm' -Architecture x86,x64 -RustTarget x86_64,i686 -Configuration Release -Repeat 2
 ```
 
 Матрица: C x86/x64 × Rust x86/x64, шесть suites, два повтора (48 запусков).
