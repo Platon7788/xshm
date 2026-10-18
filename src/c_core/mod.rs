@@ -7,9 +7,16 @@
 mod cancel;
 mod connection;
 mod error;
+mod multi;
 mod options;
+mod resources;
 
 pub use cancel::CancellationToken;
 pub use connection::{Client, Server, Session};
 pub use error::{DisconnectReason, Error, Result};
-pub use options::{ChannelConfig, Layout, RingConfig, Security, Wait};
+pub use multi::{MultiEvent, MultiPeer, MultiServer, MultiWake};
+pub use options::{
+    ChannelConfig, ConnectBudget, Layout, MultiClientOptions, MultiOptions, RingConfig, Security,
+    Wait,
+};
+pub use resources::{Beacon, PrivateNamespace};

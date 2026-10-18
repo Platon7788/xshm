@@ -1,6 +1,6 @@
 //! Эксклюзивное владение C-соединениями и заимствованная серверная сессия.
 use super::error::check;
-use super::{CancellationToken, ChannelConfig, Error, Result, Wait};
+use super::{CancellationToken, ChannelConfig, Error, PrivateNamespace, Result, Wait};
 use std::cell::Cell;
 use std::ffi::CString;
 use std::marker::PhantomData;
@@ -10,17 +10,19 @@ use std::ptr::NonNull;
 struct Owned {
     ptr: NonNull<xipc_sys::Conn>,
     _not_sync: PhantomData<Cell<()>>,
+    namespace: Option<PrivateNamespace>,
 }
 // SAFETY: перемещаем только эксклюзивного владельца. C conn не привязан к
 // потоку; mutex лобби принадлежит только синхронному connect, не сессии.
 unsafe impl Send for Owned {}
 impl Owned {
-    fn new() -> Result<Self> {
+    fn new(namespace: Option<PrivateNamespace>) -> Result<Self> {
         // SAFETY: C-аллокатор не имеет предусловий.
         let ptr = NonNull::new(unsafe { xipc_sys::xipc_conn_alloc() }).ok_or(Error::Allocation)?;
         Ok(Self {
             ptr,
             _not_sync: PhantomData,
+            namespace,
         })
     }
     fn status(&mut self, code: i32) -> Result<()> {
@@ -117,18 +119,86 @@ impl Drop for Owned {
 #[derive(Debug)]
 pub struct Client(Owned);
 impl Client {
+    /// Занять свободный слот Multi. Полученный клиент владеет заявкой до Drop.
+    /// Возвращённый номер слота служит диагностике, а не идентификатором сессии.
+    pub fn connect_multi(
+        base: &str,
+        options: super::MultiClientOptions,
+        budget: super::ConnectBudget,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(Self, u32)> {
+        let base = CString::new(base)?;
+        let ms = budget.milliseconds()?;
+        let security = options.security.raw();
+        let discovery_fallback_ms = match options.discovery_fallback {
+            None => u32::MAX,
+            Some(duration) if duration.is_zero() => return Err(Error::InvalidConfig),
+            Some(duration) => Wait::For(duration).milliseconds()?,
+        };
+        let raw = xipc_sys::MultiClientOptions {
+            slot_timeout_ms: Wait::For(options.handshake_timeout).milliseconds()?,
+            retry_delay_ms: Wait::For(options.retry_delay).milliseconds()?,
+            ns: options
+                .namespace
+                .as_ref()
+                .map_or(std::ptr::null(), PrivateNamespace::raw),
+            discovery_fallback_ms,
+            security: &raw const security,
+        };
+        let mut conn = Owned::new(options.namespace)?;
+        let mut slot = u32::MAX;
+        // SAFETY: уникальный нулевой conn, строки/параметры/токен живы весь
+        // вызов. Namespace удерживается conn, claim освобождается C free.
+        let code = unsafe {
+            xipc_sys::xipc_multi_client_connect(
+                conn.ptr.as_ptr(),
+                base.as_ptr(),
+                &raw const raw,
+                ms,
+                CancellationToken::handle(cancel),
+                &raw mut slot,
+            )
+        };
+        conn.status(code)?;
+        if slot >= 256 {
+            return Err(Error::InvalidCoreResult);
+        }
+        Ok((Self(conn), slot))
+    }
+
     /// Одна попытка соединения. Имя проверяет C-ядро; NUL отвергается Rust.
     pub fn connect(name: &str, wait: Wait, cancel: Option<&CancellationToken>) -> Result<Self> {
+        Self::connect_with_namespace(name, None, wait, cancel)
+    }
+    /// Соединиться в пространстве имён и удерживать его до закрытия канала.
+    pub fn connect_in(
+        name: &str,
+        namespace: &PrivateNamespace,
+        wait: Wait,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Self> {
+        Self::connect_with_namespace(name, Some(namespace.clone()), wait, cancel)
+    }
+    fn connect_with_namespace(
+        name: &str,
+        namespace: Option<PrivateNamespace>,
+        wait: Wait,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Self> {
         let name = CString::new(name)?;
         let ms = wait.milliseconds()?;
-        let mut conn = Owned::new()?;
-        // SAFETY: C-строка, уникальный нулевой conn, namespace NULL;
+        let mut conn = Owned::new(namespace)?;
+        let ns = conn
+            .namespace
+            .as_ref()
+            .map_or(std::ptr::null(), PrivateNamespace::raw);
+        // SAFETY: C-строка, уникальный нулевой conn; namespace удерживается conn;
         // заимствованный cancel держит событие живым всё рукопожатие.
         let code = unsafe {
             xipc_sys::xipc_client_connect(
                 conn.ptr.as_ptr(),
                 name.as_ptr(),
-                std::ptr::null(),
+                ns,
                 ms,
                 CancellationToken::handle(cancel),
             )
@@ -153,12 +223,12 @@ impl Server {
     /// Создать именованный канал. Политика по умолчанию ограничена пользователем.
     pub fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
         let name = CString::new(name)?;
-        let config = config.raw();
-        let mut conn = Owned::new()?;
-        // SAFETY: конфигурация без заимствованных указателей; C-строка и
-        // уникальный conn живут весь вызов, C копирует нужные значения.
+        let raw_config = config.raw();
+        let mut conn = Owned::new(config.namespace)?;
+        // SAFETY: C-строка и уникальный conn живут весь вызов; namespace
+        // удерживается conn до закрытия всех заимствующих его C-объектов.
         let code = unsafe {
-            xipc_sys::xipc_server_start(conn.ptr.as_ptr(), name.as_ptr(), &raw const config)
+            xipc_sys::xipc_server_start(conn.ptr.as_ptr(), name.as_ptr(), &raw const raw_config)
         };
         conn.status(code)?;
         Ok(Self(conn))

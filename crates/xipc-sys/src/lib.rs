@@ -9,6 +9,31 @@ pub struct Conn {
     _private: [u8; 0],
 }
 
+/// Непрозрачное пространство имён, которым владеет C.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Namespace {
+    _private: [u8; 0],
+}
+/// Непрозрачный маяк, которым владеет C.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Beacon {
+    _private: [u8; 0],
+}
+
+/// Непрозрачный многоклиентский сервер и заимствованное хранилище слотов.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Multi {
+    _private: [u8; 0],
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct MultiSlot {
+    _private: [u8; 0],
+}
+
 /// Параметры одного кольца, стабильная публичная структура C.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -38,18 +63,53 @@ pub struct Security {
 pub struct ChannelConfig {
     pub layout: Layout,
     pub security: Security,
-    pub ns: *const c_void,
+    pub ns: *const Namespace,
+}
+
+/// Публичные параметры и событие Multi; enum C представлен числом.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MultiOptions {
+    pub layout: Layout,
+    pub security: Security,
+    pub ns: *const Namespace,
+    pub recv_batch: u32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MultiEvent {
+    pub kind: i32,
+    pub slot: u32,
+    pub len: u32,
+    pub reason: i32,
+    pub error: i32,
+}
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MultiClientOptions {
+    pub slot_timeout_ms: u32,
+    pub retry_delay_ms: u32,
+    pub ns: *const Namespace,
+    pub discovery_fallback_ms: u32,
+    pub security: *const Security,
 }
 
 const _: () = {
     assert!(size_of::<Layout>() == 24);
+    assert!(size_of::<MultiEvent>() == 20);
     assert!(std::mem::offset_of!(ChannelConfig, security) == 24);
     if cfg!(target_pointer_width = "64") {
         assert!(size_of::<Security>() == 24 && size_of::<ChannelConfig>() == 56);
         assert!(std::mem::offset_of!(ChannelConfig, ns) == 48);
+        assert!(size_of::<MultiOptions>() == 64);
+        assert!(size_of::<MultiClientOptions>() == 32);
+        assert!(std::mem::offset_of!(MultiClientOptions, security) == 24);
     } else {
         assert!(size_of::<Security>() == 12 && size_of::<ChannelConfig>() == 40);
         assert!(std::mem::offset_of!(ChannelConfig, ns) == 36);
+        assert!(size_of::<MultiOptions>() == 44);
+        assert!(size_of::<MultiClientOptions>() == 20);
+        assert!(std::mem::offset_of!(MultiClientOptions, security) == 16);
     }
 };
 
@@ -70,7 +130,7 @@ unsafe extern "C" {
     pub fn xipc_client_connect(
         conn: *mut Conn,
         name: *const c_char,
-        ns: *const c_void,
+        ns: *const Namespace,
         timeout: u32,
         cancel: *mut c_void,
     ) -> i32;
@@ -87,4 +147,58 @@ unsafe extern "C" {
     pub fn xipc_peer_pid(conn: *const Conn) -> u32;
     pub fn xipc_conn_generation(conn: *const Conn) -> u32;
     pub fn xipc_conn_end_reason(conn: *const Conn) -> i32;
+    pub fn xipc_namespace_alloc() -> *mut Namespace;
+    pub fn xipc_namespace_free(ns: *mut Namespace);
+    pub fn xipc_namespace_open(
+        ns: *mut Namespace,
+        boundary: *const c_char,
+        alias: *const c_char,
+        security: *const Security,
+    ) -> i32;
+    pub fn xipc_beacon_alloc() -> *mut Beacon;
+    pub fn xipc_beacon_free(beacon: *mut Beacon);
+    pub fn xipc_beacon_open(
+        beacon: *mut Beacon,
+        name: *const c_char,
+        security: *const Security,
+        ns: *const Namespace,
+    ) -> i32;
+    pub fn xipc_beacon_unnamed(beacon: *mut Beacon) -> i32;
+    pub fn xipc_beacon_raise(beacon: *mut Beacon) -> i32;
+    pub fn xipc_beacon_lower(beacon: *mut Beacon) -> i32;
+    pub fn xipc_beacon_clear_if_stale(beacon: *mut Beacon, cleared: *mut bool) -> i32;
+    pub fn xipc_beacon_wait(beacon: *const Beacon, timeout: u32) -> i32;
+    pub fn xipc_beacon_handle(beacon: *const Beacon) -> *mut c_void;
+    pub fn xipc_wait_any(handles: *const *mut c_void, count: u32, timeout: u32) -> i32;
+    pub fn xipc_multi_options_default() -> MultiOptions;
+    pub fn xipc_multi_client_options_default() -> MultiClientOptions;
+    pub fn xipc_multi_alloc(count: u32, slots: *mut *mut MultiSlot) -> *mut Multi;
+    pub fn xipc_multi_free(server: *mut Multi);
+    pub fn xipc_multi_start(
+        server: *mut Multi,
+        slots: *mut MultiSlot,
+        count: u32,
+        base: *const c_char,
+        options: *const MultiOptions,
+    ) -> i32;
+    pub fn xipc_multi_next(
+        server: *mut Multi,
+        buffer: *mut c_void,
+        capacity: u32,
+        timeout: u32,
+        event: *mut MultiEvent,
+    ) -> i32;
+    pub fn xipc_multi_try_send(server: *mut Multi, slot: u32, data: *const c_void, len: u32)
+    -> i32;
+    pub fn xipc_multi_send(server: *mut Multi, slot: u32, data: *const c_void, len: u32) -> i32;
+    pub fn xipc_multi_disconnect_client(server: *mut Multi, slot: u32) -> i32;
+    pub fn xipc_multi_wake(server: *mut Multi) -> i32;
+    pub fn xipc_multi_client_connect(
+        conn: *mut Conn,
+        base: *const c_char,
+        options: *const MultiClientOptions,
+        timeout: u32,
+        cancel: *mut c_void,
+        slot: *mut u32,
+    ) -> i32;
 }

@@ -110,6 +110,7 @@ fn main() {
     };
     let header = prefix.join("include/xipc/types.h");
     let archive = prefix.join("lib/xipc.lib");
+    watch(&prefix.join("include/xipc"));
     println!("cargo:rerun-if-changed={}", header.display());
     println!("cargo:rerun-if-changed={}", archive.display());
     assert!(
@@ -123,6 +124,18 @@ fn main() {
             .any(|line| line.split_whitespace().collect::<Vec<_>>()
                 == ["#define", "XIPC_VERSION_MAJOR", "2"]),
         "нужен xipc ABI 2"
+    );
+    let minor = text.lines().find_map(|line| {
+        let mut words = line.split_whitespace();
+        if words.next() == Some("#define") && words.next() == Some("XIPC_VERSION_MINOR") {
+            words.next().and_then(|n| n.parse::<u32>().ok())
+        } else {
+            None
+        }
+    });
+    assert!(
+        minor.is_some_and(|n| n >= 1),
+        "нужен xipc 2.1+ с владеющей C-аллокацией объектов"
     );
     let probe = out.join("abi-check");
     run(Command::new(&cmake)
