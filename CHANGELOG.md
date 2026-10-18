@@ -232,6 +232,10 @@
   `multi-server` (`kick=` — `disconnect_client`), `multi-client`
   (`mode=echo|ping`), `server-sessions` (передача claim-а между языками),
   `*-stall-leave`/`*-fill-wait`, `client-hello-die`, `client-echo busy=1`.
+  Сценарии отправки и колбэки Auto/Multi/Dispatch отмечают успешный
+  прогресс для watchdog; `busy=1` ждёт доступность через публичный
+  событийный API. Исправления C-обвязки завершения/очистки дочерних
+  процессов находятся в xhook; семантика завершения Rust-процесса сохранена.
 
 - **`SharedServer::disconnect()`** (решение T): отключить текущего клиента
   штатно — `IDLE`, затем `S2C_DISCONNECT`; данные в кольце клиент
