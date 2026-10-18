@@ -176,7 +176,7 @@ impl Client {
     ) -> Result<Self> {
         let name = CString::new(name)?;
         let timeout = budget.milliseconds()?;
-        let security = options.security.raw();
+        let security = options.security.raw()?;
         let fallback = match options.discovery_fallback {
             None => u32::MAX,
             Some(duration) if duration.is_zero() => return Err(Error::InvalidConfig),
@@ -223,7 +223,7 @@ impl Client {
             lobby_timeout_ms: options.lobby_timeout.milliseconds()?,
             response_timeout_ms: options.response_timeout.milliseconds()?,
             channel_timeout_ms: options.channel_timeout.milliseconds()?,
-            security: options.security.raw(),
+            security: options.security.raw()?,
             ns: options
                 .namespace
                 .as_ref()
@@ -276,7 +276,7 @@ impl Client {
     ) -> Result<(Self, u32)> {
         let base = CString::new(base)?;
         let ms = budget.milliseconds()?;
-        let security = options.security.raw();
+        let security = options.security.raw()?;
         let discovery_fallback_ms = match options.discovery_fallback {
             None => u32::MAX,
             Some(duration) if duration.is_zero() => return Err(Error::InvalidConfig),
@@ -370,7 +370,7 @@ impl Server {
     /// Создать именованный канал. Политика по умолчанию ограничена пользователем.
     pub fn bind(name: &str, config: ChannelConfig) -> Result<Self> {
         let name = CString::new(name)?;
-        let raw_config = config.raw();
+        let raw_config = config.raw()?;
         let mut conn = Owned::new(config.namespace)?;
         // SAFETY: C-строка и уникальный conn живут весь вызов; namespace
         // удерживается conn до закрытия всех заимствующих его C-объектов.

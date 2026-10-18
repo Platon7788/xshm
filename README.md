@@ -2,7 +2,8 @@
 > feature exposes `xshm::c_core` backed by the shared xipc C implementation.
 > Single channels, namespace/beacon ownership and caller-driven Multi/Dispatch
 > loops, bounded Dispatch/client workers and full-duplex backpressure waits
-> are implemented. Consumer integration and the default API switch are pending.
+> are implemented. The prof-shm consumer is being migrated in a separate branch;
+> the default API switch is pending.
 > This is not the complete replacement release. The default 0.10 API below
 > remains a temporary reference.
 > API compatibility is secondary to ownership and safety. The final migration
@@ -17,6 +18,12 @@
 > C ABI layout, architecture and CRT are checked before linking.
 > Multi loops stay on their creating thread; only their wake handle crosses
 > threads. Session identities reject stale slots and identities from other servers.
+> Both workers inherit the creator thread's startup hook (including profiler
+> suppression). Security::Descriptor uses immutable Arc bytes; C validates and
+> copies the descriptor before returning, including policy for future channels.
+> CommandCompletion confirms the C operation, not peer consumption. wait_timeout
+> limits the wait without cancelling a queued command; callbacks cannot wait on
+> their own worker. lobby_exists is a discovery hint, not an access check.
 
 <div align="center">
 

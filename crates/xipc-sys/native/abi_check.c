@@ -2,6 +2,7 @@
 #include <xipc/xipc.h>
 _Static_assert(XIPC_VERSION_MAJOR == 2 && XIPC_VERSION_MINOR >= 2, "xipc 2.2+ activity wait required");
 _Static_assert(XIPC_READY_READABLE == 1 && XIPC_READY_WRITABLE == 2, "activity mask ABI");
+_Static_assert(XIPC_SECURITY_CURRENT_USER_ALLOW_LOW == 1 && XIPC_SECURITY_DESCRIPTOR == 3, "security kinds ABI");
 _Static_assert(sizeof(xipc_status) == 4, "status ABI");
 _Static_assert(sizeof(xipc_disconnect_reason) == 4, "reason ABI");
 _Static_assert(sizeof(xipc_layout) == 24, "layout ABI");

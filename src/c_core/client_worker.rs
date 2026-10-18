@@ -51,9 +51,9 @@ impl ClientWorker {
             .ok_or(Error::Disconnected(DisconnectReason::Unknown))?;
         let peer_pid = client.peer_pid();
         let (ready, receiver) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("xshm-client".to_owned())
-            .spawn(move || {
+        let thread = crate::thread_hook::spawn(
+            thread::Builder::new().name("xshm-client".to_owned()),
+            move || {
                 let sender = match ClientSender::new(limits) {
                     Ok(sender) => sender,
                     Err(error) => {
@@ -94,7 +94,8 @@ impl ClientWorker {
                         Err(Error::WorkerFailed(error))
                     }
                 }
-            })?;
+            },
+        )?;
         let sender = match receiver.recv() {
             Ok(Ok(sender)) => sender,
             Ok(Err(error)) => {

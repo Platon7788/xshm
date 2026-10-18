@@ -111,7 +111,7 @@ impl MultiServer {
             return Err(Error::InvalidConfig);
         }
         let base = CString::new(base)?;
-        let channel = options.channel.raw();
+        let channel = options.channel.raw()?;
         let raw = xipc_sys::MultiOptions {
             layout: channel.layout,
             security: channel.security,

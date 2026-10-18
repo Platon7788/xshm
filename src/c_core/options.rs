@@ -52,7 +52,7 @@ pub type RingConfig = xipc_sys::RingConfig;
 pub type Layout = xipc_sys::Layout;
 
 /// Политика доступа к создаваемым объектам.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub enum Security {
     /// Текущий пользователь и SYSTEM.
     #[default]
@@ -61,19 +61,30 @@ pub enum Security {
     CurrentUserAllowLow,
     /// NULL DACL: намеренно разрешить доступ всем пользователям.
     Everyone,
+    /// Неизменяемые байты SELF-RELATIVE security descriptor. C проверяет
+    /// структуру и копирует её на время создания/для будущих каналов Dispatch.
+    Descriptor(std::sync::Arc<[u8]>),
 }
 
 impl Security {
-    pub(super) const fn raw(self) -> xipc_sys::Security {
-        xipc_sys::Security {
+    pub(super) fn raw(&self) -> Result<xipc_sys::Security> {
+        let (descriptor, descriptor_len) = match self {
+            Self::Descriptor(bytes) => (
+                bytes.as_ptr().cast(),
+                u32::try_from(bytes.len()).map_err(|_| Error::LengthTooLarge)?,
+            ),
+            _ => (std::ptr::null(), 0),
+        };
+        Ok(xipc_sys::Security {
             kind: match self {
                 Self::CurrentUser => 0,
                 Self::CurrentUserAllowLow => 1,
                 Self::Everyone => 2,
+                Self::Descriptor(_) => 3,
             },
-            descriptor: std::ptr::null(),
-            descriptor_len: 0,
-        }
+            descriptor,
+            descriptor_len,
+        })
     }
 }
 
@@ -99,15 +110,15 @@ impl Default for ChannelConfig {
     }
 }
 impl ChannelConfig {
-    pub(super) fn raw(&self) -> xipc_sys::ChannelConfig {
-        xipc_sys::ChannelConfig {
+    pub(super) fn raw(&self) -> Result<xipc_sys::ChannelConfig> {
+        Ok(xipc_sys::ChannelConfig {
             layout: self.layout,
-            security: self.security.raw(),
+            security: self.security.raw()?,
             ns: self
                 .namespace
                 .as_ref()
                 .map_or(std::ptr::null(), PrivateNamespace::raw),
-        }
+        })
     }
 }
 

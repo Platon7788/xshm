@@ -27,7 +27,7 @@ impl PrivateNamespace {
     /// объектов внутри задаётся отдельно в ChannelConfig/Beacon::open_with.
     pub fn open(boundary: &str, security: Security) -> Result<Self> {
         let boundary = CString::new(boundary)?;
-        let security = security.raw();
+        let raw_security = security.raw()?;
         // SAFETY: C-аллокатор создаёт нулевой объект и не имеет предусловий.
         let ptr =
             NonNull::new(unsafe { xipc_sys::xipc_namespace_alloc() }).ok_or(Error::Allocation)?;
@@ -39,7 +39,7 @@ impl PrivateNamespace {
                 ptr.as_ptr(),
                 boundary.as_ptr(),
                 c"xshm".as_ptr(),
-                &raw const security,
+                &raw const raw_security,
             )
         };
         check(code)?;
@@ -95,7 +95,7 @@ impl Beacon {
         namespace: Option<PrivateNamespace>,
     ) -> Result<Self> {
         let name = CString::new(name)?;
-        let security = security.raw();
+        let raw_security = security.raw()?;
         let inner = BeaconInner::new(namespace)?;
         let ns = inner
             .namespace
@@ -104,7 +104,12 @@ impl Beacon {
         // SAFETY: уникальная C-аллокация; строки и политика живут до возврата,
         // namespace удерживается inner до закрытия маяка.
         let code = unsafe {
-            xipc_sys::xipc_beacon_open(inner.ptr.as_ptr(), name.as_ptr(), &raw const security, ns)
+            xipc_sys::xipc_beacon_open(
+                inner.ptr.as_ptr(),
+                name.as_ptr(),
+                &raw const raw_security,
+                ns,
+            )
         };
         check(code)?;
         Ok(Self(Arc::new(inner)))
@@ -167,4 +172,14 @@ impl Beacon {
         // SAFETY: Arc удерживает открытый маяк; возвращаемый HANDLE заимствован.
         unsafe { xipc_sys::xipc_beacon_handle(self.0.ptr.as_ptr()) }
     }
+}
+
+/// Проверить существование лобби, не подключаясь к нему. Как и в C API,
+/// отсутствие доступа или ошибка открытия дают false; это подсказка для
+/// обнаружения, а не проверка аутентичности или гарантированное подключение.
+pub fn lobby_exists(name: &str, namespace: Option<&PrivateNamespace>) -> Result<bool> {
+    let name = CString::new(name)?;
+    let ns = namespace.map_or(std::ptr::null(), PrivateNamespace::raw);
+    // SAFETY: строка и заимствованный namespace живы на всё время C-вызова.
+    Ok(unsafe { xipc_sys::xipc_lobby_exists(name.as_ptr(), ns) })
 }

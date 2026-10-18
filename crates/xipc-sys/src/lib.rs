@@ -299,6 +299,7 @@ unsafe extern "C" {
         alias: *const c_char,
         security: *const Security,
     ) -> i32;
+    pub fn xipc_lobby_exists(name: *const core::ffi::c_char, ns: *const Namespace) -> bool;
     pub fn xipc_beacon_alloc() -> *mut Beacon;
     pub fn xipc_beacon_free(beacon: *mut Beacon);
     pub fn xipc_beacon_open(

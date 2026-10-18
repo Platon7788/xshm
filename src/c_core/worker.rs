@@ -43,6 +43,20 @@ impl CommandCompletion {
         }
         self.receiver.recv().map_err(|_| Error::WorkerStopped)?
     }
+    /// Ждать подтверждение не дольше указанного срока. Timeout не отменяет
+    /// команду; для отмены очереди остановите worker. В его callback ожидание
+    /// запрещено так же, как для wait. Результат подтверждает C-операцию,
+    /// но не чтение сообщения пиром.
+    pub fn wait_timeout(self, duration: std::time::Duration) -> Result<()> {
+        if self.worker == thread::current().id() {
+            return Err(Error::WouldDeadlock);
+        }
+        match self.receiver.recv_timeout(duration) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(Error::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(Error::WorkerStopped),
+        }
+    }
     /// Проверить подтверждение без ожидания. Some означает успешное завершение;
     /// после результата подтверждение повторно не используется.
     pub fn try_result(&self) -> Result<Option<()>> {
@@ -268,9 +282,9 @@ impl DispatchWorker {
         let capacity = options.channel.layout.c2s.max_message_size as usize;
         let lobby = lobby.to_owned();
         let (ready, receiver) = mpsc::channel();
-        let thread = thread::Builder::new()
-            .name("xshm-dispatch".to_owned())
-            .spawn(move || {
+        let thread = crate::thread_hook::spawn(
+            thread::Builder::new().name("xshm-dispatch".to_owned()),
+            move || {
                 let server = match admission {
                     Some(admission) => {
                         DispatchServer::bind_with_admission(&lobby, options, admission)
@@ -350,7 +364,8 @@ impl DispatchWorker {
                         event => handler(&sender, event),
                     }
                 }
-            })?;
+            },
+        )?;
         let shared = match receiver.recv() {
             Ok(Ok(shared)) => shared,
             Ok(Err(error)) => {

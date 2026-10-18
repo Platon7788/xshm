@@ -229,7 +229,7 @@ impl DispatchServer {
             return Err(Error::InvalidConfig);
         }
         let lobby = CString::new(lobby)?;
-        let channel = options.channel.raw();
+        let channel = options.channel.raw()?;
         let mut raw = xipc_sys::DispatchOptions {
             max_clients: count,
             lobby_timeout_ms: Wait::For(options.lobby_timeout).milliseconds()?,
