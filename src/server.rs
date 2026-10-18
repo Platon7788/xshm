@@ -2782,7 +2782,6 @@ mod anonymous_tests {
     use crate::ntapi::SYNCHRONIZATION_EVENT;
     use crate::ring::{DATA_KERNEL_WAITS, SPACE_KERNEL_WAITS};
     use core::mem::ManuallyDrop;
-    use std::sync::mpsc;
 
     /// Сторона драйвера: своё отображение секции и заимствованные события.
     struct Driver {
@@ -2882,10 +2881,15 @@ mod anonymous_tests {
             out
         }
 
-        /// Уход R14: сначала `IDLE`, потом `DISCONNECT`.
-        fn leave(&self) {
-            self.view
-                .control_block()
+        /// Уход L (§b.5 п. 1): сессия своя (`generation == g`), CAS
+        /// `SERVER_READY -> IDLE`, `DISCONNECT` -- только при удаче CAS.
+        /// `true` -- ушёл с сигналом.
+        fn leave_session(&self, g: u32) -> bool {
+            let control = self.view.control_block();
+            if control.generation.load(Ordering::Acquire) != g {
+                return false;
+            }
+            let left = control
                 .client_state
                 .compare_exchange(
                     HANDSHAKE_SERVER_READY,
@@ -2893,8 +2897,62 @@ mod anonymous_tests {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .unwrap();
-            self.events[DISCONNECT].set().unwrap();
+                .is_ok();
+            if left {
+                self.events[DISCONNECT].set().unwrap();
+            }
+            left
+        }
+
+        /// Уход из текущей сессии (тесты, где сессия заведомо своя).
+        fn leave(&self) {
+            let g = self.view.control_block().generation.load(Ordering::Acquire);
+            assert!(self.leave_session(g), "сессия драйвера уже закрыта");
+        }
+    }
+
+    /// Исход собственного ждущего `DISCONNECT` драйвера (§b.5 п. 5).
+    #[derive(Debug, PartialEq, Eq)]
+    enum WaiterOutcome {
+        /// Проснулся после ухода своей стороны -- взвёл событие обратно.
+        Resignalled,
+        /// Сервер ушёл.
+        ServerLeft,
+        /// Таймаут.
+        TimedOut,
+    }
+
+    /// Ждущий `DISCONNECT` драйвера по правилу §b.5 п. 5: `leaving` --
+    /// флаг ухода драйвера (п. 1), `g` -- сессия. `resignal = false` --
+    /// ошибочное правило «устаревший при живом сервере -- поглотить» без
+    /// п. 5.1 (тест показывает, что тогда сервер ухода не видит).
+    fn driver_waiter(
+        driver: &Driver,
+        leaving: &std::sync::atomic::AtomicBool,
+        g: u32,
+        resignal: bool,
+    ) -> WaiterOutcome {
+        let control = driver.view.control_block();
+        loop {
+            if !driver.events[DISCONNECT]
+                .wait(Some(Duration::from_secs(5)))
+                .unwrap()
+            {
+                return WaiterOutcome::TimedOut;
+            }
+            if resignal
+                && (leaving.load(Ordering::Acquire)
+                    || control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY)
+            {
+                driver.events[DISCONNECT].set().unwrap();
+                return WaiterOutcome::Resignalled;
+            }
+            if control.server_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY
+                || control.generation.load(Ordering::Acquire) != g
+            {
+                return WaiterOutcome::ServerLeft;
+            }
+            // Устаревший сигнал -- поглощён (п. 5.3).
         }
     }
 
@@ -2943,32 +3001,30 @@ mod anonymous_tests {
         }
     }
 
+    /// Таймаут «долгих» ожиданий: исход, который даёт только сигнал, и
+    /// возврат раньше половины таймаута -- без хрупких границ задержки.
+    const LONG: Duration = Duration::from_secs(5);
+
     /// Драйвер пишет `CLIENT_HELLO` и взводит `CONNECT_REQ`: сервер,
-    /// спящий в ядре, просыпается один раз и сразу принимает; `S2C_CONNECT`
-    /// у драйвера взведён.
+    /// спящий в ядре, просыпается один раз и принимает; `S2C_CONNECT` у
+    /// драйвера взведён.
     #[test]
     fn anonymous_handshake_signalled_by_driver() {
         let mut server = SharedServer::start_anonymous().unwrap();
         let handoff = Handoff::of(&server);
         let wakeups = server.wait_wakeups();
-        let (tx, rx) = mpsc::channel();
         let driver = std::thread::spawn(move || {
             let driver = handoff.attach();
             std::thread::sleep(Duration::from_millis(100));
-            let signalled = Instant::now();
             driver.hello();
-            tx.send(signalled).unwrap();
-            driver.events[CONNECT_ACK].wait(Some(Duration::from_secs(2)))
+            driver.events[CONNECT_ACK].wait(Some(LONG))
         });
-        server
-            .wait_for_client(Some(Duration::from_secs(2)))
-            .unwrap();
-        let accepted = Instant::now();
-        let signalled = rx.recv().unwrap();
+        let started = Instant::now();
+        server.wait_for_client(Some(LONG)).unwrap();
         assert!(
-            accepted.duration_since(signalled) <= Duration::from_millis(50),
-            "принят через {:?} после сигнала",
-            accepted.duration_since(signalled)
+            started.elapsed() < LONG / 2,
+            "принят через {:?} -- не по сигналу",
+            started.elapsed()
         );
         assert_eq!(wakeups.load(Ordering::Acquire), 1, "одно пробуждение");
         assert_eq!(driver.join().unwrap(), Ok(true), "S2C_CONNECT взведён");
@@ -2976,40 +3032,38 @@ mod anonymous_tests {
     }
 
     /// `poll_client` без данных спит в ядре весь таймаут (одно ожидание);
-    /// кадр драйвера с `C2S_DATA` будит его сразу.
+    /// кадр драйвера с `C2S_DATA` будит его -- тоже одним ожиданием.
     #[test]
     fn anonymous_poll_client_sleeps_in_kernel() {
+        const SHORT: Duration = Duration::from_millis(200);
         let (mut server, driver) = connected();
         let before = data_waits();
         let started = Instant::now();
-        assert_eq!(
-            server.poll_client(Some(Duration::from_millis(200))),
-            Ok(false)
-        );
+        assert_eq!(server.poll_client(Some(SHORT)), Ok(false));
+        // Таймер ядра -- с шагом до ~16 мс; число ожиданий доказывает, что
+        // это сон в ядре, а не возврат.
         assert!(
-            started.elapsed() >= Duration::from_millis(190),
+            started.elapsed() + Duration::from_millis(16) >= SHORT,
             "вернулся через {:?}",
             started.elapsed()
         );
         assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
 
-        let (tx, rx) = mpsc::channel();
+        let before = data_waits();
+        let started = Instant::now();
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
-                let signalled = Instant::now();
                 driver.send(b"frame");
-                tx.send(signalled).unwrap();
             });
-            assert_eq!(server.poll_client(Some(Duration::from_secs(2))), Ok(true));
+            assert_eq!(server.poll_client(Some(LONG)), Ok(true));
         });
-        let woke = Instant::now();
-        let signalled = rx.recv().unwrap();
         assert!(
-            woke.duration_since(signalled) <= Duration::from_millis(20),
-            "проснулся через {:?} после сигнала",
-            woke.duration_since(signalled)
+            started.elapsed() < LONG / 2,
+            "проснулся через {:?} -- не по сигналу",
+            started.elapsed()
         );
+        assert_eq!(data_waits() - before, 1, "пробуждение по DATA");
         let mut out = Vec::new();
         assert_eq!(server.receive_from_client(&mut out), Ok(5));
         assert_eq!(out, b"frame");
@@ -3031,16 +3085,15 @@ mod anonymous_tests {
         assert_eq!(space_waits() - before, 1, "одно ожидание в ядре");
 
         let before = space_waits();
+        let started = Instant::now();
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
                 assert_eq!(driver.receive().len(), LEN);
             });
-            assert_eq!(
-                server.wait_for_space(LEN, Some(Duration::from_secs(2))),
-                Ok(true)
-            );
+            assert_eq!(server.wait_for_space(LEN, Some(LONG)), Ok(true));
         });
+        assert!(started.elapsed() < LONG / 2, "не по сигналу");
         assert_eq!(space_waits() - before, 1, "пробуждение по SPACE");
     }
 
@@ -3051,33 +3104,66 @@ mod anonymous_tests {
     fn anonymous_driver_leave_is_seen() {
         let (mut server, driver) = connected();
         let before = data_waits();
-        let (tx, rx) = mpsc::channel();
+        let started = Instant::now();
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
-                let signalled = Instant::now();
                 driver.leave();
-                tx.send(signalled).unwrap();
             });
-            assert_eq!(
-                server.poll_client(Some(Duration::from_secs(5))),
-                Err(ShmError::NotConnected)
-            );
+            assert_eq!(server.poll_client(Some(LONG)), Err(ShmError::NotConnected));
         });
-        let woke = Instant::now();
-        assert!(
-            woke.duration_since(rx.recv().unwrap()) <= Duration::from_millis(50),
-            "уход замечен не по сигналу"
-        );
+        assert!(started.elapsed() < LONG / 2, "уход замечен не по сигналу");
         assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
         assert!(!server.is_connected());
 
         // Канал снова принимает драйвер.
         driver.hello();
-        server
-            .wait_for_client(Some(Duration::from_secs(2)))
-            .unwrap();
+        server.wait_for_client(Some(LONG)).unwrap();
         assert!(server.is_connected());
+    }
+
+    /// Fix round 1 (ревью T13, I1): `DISCONNECT` -- одно автосбросное
+    /// событие на обе стороны. Ждущий `DISCONNECT` поток драйвера, вставший
+    /// в очередь раньше сервера, получает сигнал ухода самого драйвера;
+    /// по §b.5 п. 5.1 он видит свой уход, взводит событие обратно и
+    /// выходит -- сервер, спящий в `poll_client`, уход видит. С ошибочным
+    /// правилом (поглотить как устаревший при живом сервере; `resignal =
+    /// false`) сервер ждал бы до таймаута.
+    #[test]
+    fn anonymous_driver_own_waiter_resignals_leave() {
+        use std::sync::atomic::AtomicBool;
+        let (mut server, driver) = connected();
+        let g = driver
+            .view
+            .control_block()
+            .generation
+            .load(Ordering::Acquire);
+        let leaving = AtomicBool::new(false);
+        let before = data_waits();
+        let started = Instant::now();
+        let outcome = std::thread::scope(|s| {
+            // Ждущий драйвера -- первым в очереди события.
+            let waiter = s.spawn(|| driver_waiter(&driver, &leaving, g, true));
+            std::thread::sleep(Duration::from_millis(50));
+            s.spawn(|| {
+                // Сервер к этому моменту спит в `poll_client`.
+                std::thread::sleep(Duration::from_millis(100));
+                leaving.store(true, Ordering::Release);
+                assert!(driver.leave_session(g));
+            });
+            assert_eq!(server.poll_client(Some(LONG)), Err(ShmError::NotConnected));
+            waiter.join().unwrap()
+        });
+        assert!(
+            started.elapsed() < LONG / 2,
+            "сервер увидел уход через {:?} -- сигнал съеден",
+            started.elapsed()
+        );
+        assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
+        // Ядро отпускает ждущих автосбросного события по очереди: сигнал
+        // достаётся ждущему драйвера (встал раньше) -- он и вернул его.
+        assert_eq!(outcome, WaiterOutcome::Resignalled);
+        assert!(!server.is_connected());
     }
 
     /// Обратное направление: уход сервера (`disconnect`) виден драйверу по

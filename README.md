@@ -1086,9 +1086,13 @@ of the server process) and owns those references. All events are
 auto-reset (`SynchronizationEvent`): the driver signals with `KeSetEvent`
 only, never `KePulseEvent`/`KeResetEvent`, and MUST follow the signalling
 rules — `CONNECT_REQ` after `CLIENT_HELLO`, `DATA`/`SPACE` by ring
-positions, and on unload a graceful leave (`client_state = IDLE`, then
-`DISCONNECT`): the driver has no process, so the server cannot notice it
-vanishing. The full driver contract is [`INTEROP.md`](INTEROP.md) §b.5.
+positions, and on unload a graceful leave (still in its session: CAS
+`client_state` `SERVER_READY -> IDLE`, then `DISCONNECT` only if that CAS
+succeeded): the driver has no process, so the server cannot notice it
+vanishing. `DISCONNECT` is one auto-reset event for both sides: before
+signalling its leave the driver must stop its own `DISCONNECT` waiters, and
+a driver waiter woken after its own side left must re-signal it and exit —
+otherwise the driver swallows its own leave and the server never sees it. The full driver contract is [`INTEROP.md`](INTEROP.md) §b.5.
 
 ## Limitations
 

@@ -33,6 +33,8 @@ unsafe extern "system" {
 
 /// `DACL_SECURITY_INFORMATION`.
 const DACL_SECURITY_INFORMATION: u32 = 4;
+/// `OWNER_SECURITY_INFORMATION` -- владелец.
+const OWNER_SECURITY_INFORMATION: u32 = 1;
 /// `LABEL_SECURITY_INFORMATION` -- метка целостности (SACL).
 const LABEL_SECURITY_INFORMATION: u32 = 0x10;
 /// `SE_DACL_PRESENT` в `Control` дескриптора.
@@ -108,7 +110,9 @@ fn default_channel_works_for_same_user() {
 /// DACL ядро отображает в права типа (`SECTION_ALL_ACCESS` у секции,
 /// `EVENT_ALL_ACCESS` у события), поэтому байты DACL сверяются с объектами
 /// того же типа именованного канала той же политики: секция -- с секцией,
-/// каждое из 7 событий -- с событием.
+/// каждое из 7 событий -- с событием. Владелец (ревью T13, M7) и метка
+/// целостности от типа не зависят -- у всех 8 объектов те же, что у
+/// секции (чужой владелец получил бы `WRITE_DAC`).
 #[test]
 fn anonymous_events_share_section_descriptor() {
     let server = SharedServer::start_anonymous().unwrap();
@@ -121,6 +125,16 @@ fn anonymous_events_share_section_descriptor() {
         "DACL секции"
     );
     let event = dacl(named.get_event_handles().s2c_data);
+    let owner = |handle| query_security(handle, OWNER_SECURITY_INFORMATION);
+    let label = |handle| query_security(handle, LABEL_SECURITY_INFORMATION);
+    let section_owner = owner(server.section_handle());
+    let section_label = label(server.section_handle());
+    assert_eq!(
+        section_owner,
+        owner(named.section_handle()),
+        "владелец секции"
+    );
+    assert_eq!(section_label, label(named.section_handle()), "метка секции");
     let h = server.get_event_handles();
     for (what, handle) in [
         ("s2c_data", h.s2c_data),
@@ -132,6 +146,8 @@ fn anonymous_events_share_section_descriptor() {
         ("disconnect", h.disconnect),
     ] {
         assert_eq!(dacl(handle), event, "DACL события {what}");
+        assert_eq!(owner(handle), section_owner, "владелец события {what}");
+        assert_eq!(label(handle), section_label, "метка события {what}");
     }
 }
 
