@@ -30,7 +30,8 @@
 //! `release=<имя>` (маяк `<имя>_beacon`, которого `multi-client mode=ping`
 //! ждёт перед остановкой; без него -- `hold=<мс>`, 0), `max_clients=<k>`
 //! (`dispatch-server`, 64), `name=<s>` (имя регистрации `dispatch-client`,
-//! `rust`).
+//! `rust`), `boundary=<s>` (имя границы частного пространства имён `ns-*`),
+//! `low=1` (граница с меткой Low: `ObjectSecurity::CurrentUserAllowLowIntegrity`).
 //!
 //! Сценарии (`server-*` -- `SharedServer`, ждёт клиента после `READY`;
 //! `client-*` -- `SharedClient`, повторяет подключение, пока канала нет):
@@ -94,7 +95,12 @@
 //!   без `lower` (маяк упавшего сервера остаётся взведённым);
 //! - `beacon-client` -- `Beacon::open` (`INFO waiting=1`), ожидание взвода
 //!   (20 с), затем `INFO lobby=<0|1>` (`DispatchClient::lobby_exists`),
-//!   `INFO cleared=<true|false>` (`clear_if_stale`), `INFO raised=<0|1>`.
+//!   `INFO cleared=<true|false>` (`clear_if_stale`), `INFO raised=<0|1>`;
+//! - `ns-server`, `ns-client`, `ns-multi-server` -- `server-echo`,
+//!   `client-echo`, `multi-server` в частном пространстве имён границы
+//!   `boundary` (`PrivateNamespace::open_or_create`, псевдоним `rust`;
+//!   `low=1` -- граница с меткой Low); перед остальным -- `INFO
+//!   ns=created|opened` (создал ли пространство этот пир).
 //!
 //! Писатель без потерь печатает `INFO waits=<k>` (сколько раз ждал места)
 //! перед `INFO sent=`.
@@ -118,8 +124,8 @@ use xshm::{
     AutoClient, AutoHandler, AutoOptions, AutoServer, Beacon, ChannelConfig, ChannelKind,
     ChannelLayout, ClientRegistration, DisconnectReason, DispatchClient, DispatchClientHandler,
     DispatchClientOptions, DispatchHandler, DispatchOptions, DispatchServer, MultiClient,
-    MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer, RingConfig,
-    SharedClient, SharedServer, ShmError,
+    MultiClientHandler, MultiClientOptions, MultiHandler, MultiOptions, MultiServer,
+    ObjectSecurity, PrivateNamespace, RingConfig, SharedClient, SharedServer, ShmError,
 };
 
 /// Самотаймаут пира: оркестратор не должен ждать зависший пир. Зависание --
@@ -272,6 +278,8 @@ struct Args {
     release: String,
     max_clients: usize,
     cname: String,
+    boundary: String,
+    low: bool,
 }
 
 /// `<ёмкость>:<сообщений>:<макс. размер>`.
@@ -309,6 +317,8 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
         release: String::new(),
         max_clients: DispatchOptions::default().max_clients,
         cname: "rust".to_owned(),
+        boundary: String::new(),
+        low: false,
     };
     for pair in pairs {
         let (key, value) = pair
@@ -334,10 +344,33 @@ fn parse_args(pairs: &[String]) -> Result<Args, String> {
             "release" => value.clone_into(&mut args.release),
             "max_clients" => args.max_clients = value.parse().map_err(|_| bad())?,
             "name" => value.clone_into(&mut args.cname),
+            "boundary" => value.clone_into(&mut args.boundary),
+            "low" => args.low = value == "1",
             _ => return Err(format!("unknown key {key}")),
         }
     }
     Ok(args)
+}
+
+/// Частное пространство имён границы `boundary` (обязательна для `ns-*`);
+/// `low=1` -- граница с меткой Low. Печатает `INFO ns=created|opened`.
+fn namespace(args: &Args) -> Result<Arc<PrivateNamespace>, String> {
+    if args.boundary.is_empty() {
+        return Err("boundary= is required".to_owned());
+    }
+    let security = if args.low {
+        ObjectSecurity::CurrentUserAllowLowIntegrity
+    } else {
+        ObjectSecurity::default()
+    };
+    let ns = PrivateNamespace::open_or_create(&args.boundary, "rust", &security)
+        .map_err(|e| format!("namespace: {}", err_name(&e)))?;
+    out(if ns.created() {
+        "INFO ns=created"
+    } else {
+        "INFO ns=opened"
+    });
+    Ok(ns)
 }
 
 fn ring_text(ring: &RingConfig) -> String {
@@ -396,7 +429,20 @@ impl Side {
     /// затем ожидание клиента (`HandshakeFailed` -- брошенная заявка --
     /// не конец: ждём следующего).
     fn serve(name: &str, layout: ChannelLayout) -> Result<Self, String> {
-        let mut server = SharedServer::start_with(name, &ChannelConfig::new(layout))
+        Self::serve_in(name, layout, None)
+    }
+
+    /// `serve`; `ns` -- объекты канала в частном пространстве имён.
+    fn serve_in(
+        name: &str,
+        layout: ChannelLayout,
+        ns: Option<Arc<PrivateNamespace>>,
+    ) -> Result<Self, String> {
+        let mut config = ChannelConfig::new(layout);
+        if let Some(ns) = ns {
+            config = config.namespace(ns);
+        }
+        let mut server = SharedServer::start_with(name, &config)
             .map_err(|e| format!("start: {}", err_name(&e)))?;
         out("READY");
         loop {
@@ -412,17 +458,22 @@ impl Side {
 
     /// Клиент `name` (повтор, пока канала ещё нет); `READY` -- подключён.
     fn connect(name: &str) -> Result<Self, String> {
-        Self::connect_with(name, false)
+        Self::connect_with(name, false, None)
     }
 
     /// `connect`; `busy` -- повторять и `AlreadyConnected` (канал держит
     /// чужой захват: каждая попытка толкает сервер `CONNECT_REQ`, и тот
-    /// снимает протухший захват через `RESERVE_TIMEOUT`), с `INFO busy_ms=`.
-    fn connect_with(name: &str, busy: bool) -> Result<Self, String> {
+    /// снимает протухший захват через `RESERVE_TIMEOUT`), с `INFO busy_ms=`;
+    /// `ns` -- канал в частном пространстве имён (`connect_in`).
+    fn connect_with(name: &str, busy: bool, ns: Option<&PrivateNamespace>) -> Result<Self, String> {
         let started = Instant::now();
         let mut busy_seen = false;
         let client = loop {
-            match SharedClient::connect(name, CONNECT_TIMEOUT) {
+            let attempt = match ns {
+                Some(ns) => SharedClient::connect_in(ns, name, CONNECT_TIMEOUT),
+                None => SharedClient::connect(name, CONNECT_TIMEOUT),
+            };
+            match attempt {
                 Ok(client) => break client,
                 Err(ShmError::WindowsError { .. } | ShmError::NotReady)
                     if started.elapsed() < CONNECT_RETRY_FOR =>
@@ -886,8 +937,9 @@ impl MultiHandler for MultiEcho {
 }
 
 /// `MultiServer` на `n` слотов до `ends` отключений; `kick` -- отключить
-/// слот сервером после его первого кадра.
-fn multi_server(name: &str, args: &Args) -> Result<(), String> {
+/// слот сервером после его первого кадра; `ns` -- слоты в частном
+/// пространстве имён.
+fn multi_server(name: &str, args: &Args, ns: Option<Arc<PrivateNamespace>>) -> Result<(), String> {
     let (tx, rx) = mpsc::channel();
     let handler = Arc::new(MultiEcho {
         server: OnceLock::new(),
@@ -898,6 +950,7 @@ fn multi_server(name: &str, args: &Args) -> Result<(), String> {
     let options = MultiOptions {
         max_clients: args.n,
         layout: args.layout,
+        namespace: ns,
         ..MultiOptions::default()
     };
     let server = MultiServer::start(name, dyn_handler, options)
@@ -1526,7 +1579,7 @@ fn auto_echo(name: &str, args: &Args, server: bool) -> Result<(), String> {
 fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
     match scenario {
         "server-echo" => echo(&mut Side::serve(name, args.layout)?, args),
-        "client-echo" => echo(&mut Side::connect_with(name, args.busy)?, args),
+        "client-echo" => echo(&mut Side::connect_with(name, args.busy, None)?, args),
         "server-lossless-sink" => lossless_sink(&mut Side::serve(name, args.layout)?, args),
         "client-lossless-sink" => lossless_sink(&mut Side::connect(name)?, args),
         "server-lossless-source" => lossless_source(&mut Side::serve(name, args.layout)?, args),
@@ -1550,7 +1603,16 @@ fn run(scenario: &str, name: &str, args: &Args) -> Result<(), String> {
         "client-fill-wait" => fill_wait(&Side::connect(name)?, args),
         "client-hello-die" => client_hello_die(name),
         "client-ping" => client_ping(name, args),
-        "multi-server" => multi_server(name, args),
+        "multi-server" => multi_server(name, args, None),
+        "ns-server" => echo(
+            &mut Side::serve_in(name, args.layout, Some(namespace(args)?))?,
+            args,
+        ),
+        "ns-client" => echo(
+            &mut Side::connect_with(name, false, Some(&*namespace(args)?))?,
+            args,
+        ),
+        "ns-multi-server" => multi_server(name, args, Some(namespace(args)?)),
         "multi-client" => multi_client(name, args),
         "dispatch-server" => dispatch_server(name, args, BeaconRole::None),
         "beacon-server" => dispatch_server(name, args, BeaconRole::Raise),
