@@ -3058,8 +3058,9 @@ fn slot_deadline_reclaim_notifies_waiters() {
 }
 
 /// Task 12 (R-O): владелец claim-а без заявки подтверждённо умер --
-/// диспетчер снимает claim на первом же толчке (не через
-/// `reserve_timeout`, здесь -- 10 с), ждущий B подключён сразу.
+/// диспетчер видит это на первом же толчке и снимает claim на дедлайне
+/// подтверждения `OWNER_DEATH_CONFIRM` (round 3; не через
+/// `reserve_timeout`, здесь -- 10 с), ждущий B подключён следом.
 #[test]
 fn dead_owner_claim_released_on_nudge() {
     let name = unique("FREE_DEAD_OWNER");
@@ -3078,7 +3079,14 @@ fn dead_owner_claim_released_on_nudge() {
         b_log.connects.load(Ordering::Acquire) == 1
     });
     let took = started.elapsed();
-    assert!(took <= Duration::from_millis(500), "{took:?}");
+    assert!(
+        took >= crate::constants::OWNER_DEATH_CONFIRM,
+        "снят без подтверждения: {took:?}"
+    );
+    assert!(
+        took <= crate::constants::OWNER_DEATH_CONFIRM + Duration::from_millis(500),
+        "{took:?}"
+    );
     drop(b);
     server.stop();
 }

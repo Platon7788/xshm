@@ -25,6 +25,10 @@ use xshm::{
 const CHILD_ENV: &str = "XSHM_PEER_DEATH_CHILD";
 /// Граница задержки детекции, которую проверяем.
 const BOUND: Duration = Duration::from_millis(500);
+/// Граница снятия claim-а умершего держателя быстрым путём R-O (round 3):
+/// подтверждение `OWNER_DEATH_CONFIRM` (1 с), повторный толчок ждущего
+/// через 1,25 с и `BOUND` на всё остальное.
+const CONFIRM_BOUND: Duration = Duration::from_millis(1750);
 
 #[expect(
     clippy::unwrap_used,
@@ -1439,11 +1443,12 @@ fn busy_waiter_wakes_on_holder_crash_in_session() {
 
 /// Держатель (дочерний процесс) захватил claim и вышел, не выставив
 /// заявки. Ждущий B просыпается по процессу держателя и толкает сервер,
-/// сервер подтверждает смерть и освобождает claim сразу (R18, быстрый
-/// путь): B подключён не позже 500 мс (до Task 12 -- через
-/// `RESERVE_TIMEOUT` 10 с повторными толчками).
+/// сервер видит смерть владельца, а через `OWNER_DEATH_CONFIRM` (1 с) на
+/// повторном толчке B подтверждает её и освобождает claim (R18, быстрый
+/// путь, round 3): B подключён не позже `CONFIRM_BOUND` (до Task 12 --
+/// через `RESERVE_TIMEOUT` 10 с повторными толчками).
 #[test]
-fn holder_dead_before_hello_reclaimed_on_first_nudge() {
+fn holder_dead_before_hello_reclaimed_after_confirmation() {
     let name = unique_name("FREE_NOHELLO");
     let server = AutoServer::start(&name, Arc::new(Noop), AutoOptions::default()).unwrap();
     let mut peer = Peer::spawn("claim_and_exit", &name);
@@ -1460,8 +1465,8 @@ fn holder_dead_before_hello_reclaimed_on_first_nudge() {
         b_log.get().is_some()
     });
     let took = b_log.get().unwrap().saturating_duration_since(t0);
-    report("busy waiter after holder died before hello", took);
-    assert!(took <= BOUND, "{took:?}");
+    println!("busy waiter after holder died before hello: {took:?} after exit");
+    assert!(took <= CONFIRM_BOUND, "{took:?}");
     drop(b);
     drop(segment);
     drop(server);

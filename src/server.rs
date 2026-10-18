@@ -9,6 +9,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use crate::asynch::{Endpoint, OP, RecvFuture, SendFuture, WaitSet};
+use crate::constants::OWNER_DEATH_CONFIRM;
 use crate::constants::{
     CLAIM_FREE, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE, HANDSHAKE_SERVER_READY,
 };
@@ -213,55 +214,105 @@ pub(crate) fn release_if_holder_dead(
         }
 }
 
+/// Наблюдение быстрого пути R-O (round 3, решение AI): тройка claim-а без
+/// заявки, впервые увиденная с подтверждённо умершим владельцем, и момент.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OwnerSighting {
+    claim: u32,
+    owner: u32,
+    owner_start: u64,
+    at: Instant,
+}
+
+/// Исход быстрого пути R-O (`release_if_owner_gone`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerGone {
+    /// Снимать нечего: claim свободен, есть заявка, владелец жив или не
+    /// подтверждён, либо перепроверка перед снятием не прошла.
+    No,
+    /// Тройка увидена умершей, подтверждение -- не раньше этого момента
+    /// (следующий толчок / дедлайн диспетчера Multi).
+    Pending(Instant),
+    /// Claim снят, ждущие уведомлены.
+    Released,
+}
+
 /// Быстрый путь толчка (Task 12, решение R-O, INTEROP R18): claim без
 /// заявки, а его владелец (`slot_owner_pid` + `owner_start`) подтверждённо
-/// умер -- освободить сразу, без `RESERVE_TIMEOUT`, и уведомить ждущих.
-/// `true` -- освобождён.
+/// умер -- освободить без `RESERVE_TIMEOUT` и уведомить ждущих.
 ///
-/// Fix round 1 (решение AE, I1 (b)), порядок: claim -> `client_state` ->
-/// поля владельца -> проверка смерти (системные вызовы) -> **перечитать**
-/// `client_state == IDLE` и PID владельца прямо перед снятием ->
-/// очистить поля умершего CAS-ом (`ControlBlock::forget_owner`;
-/// изменились -- отказ) -> CAS `claim -> 0`.
+/// Round 3 (решение AI): только тройку (токен, PID, время владельца),
+/// увиденную умершей не меньше `OWNER_DEATH_CONFIRM` назад (`sighting`) и
+/// ту же -- и умершую -- сейчас (`now`). ABA окна C1-C2: claim уже нового
+/// держателя, а поля -- прежнего (умершего пира, не очистившего их, R18).
+/// Без подтверждения во времени живой держатель терял claim, и отзыв на C8
+/// или его сессия оставляли сессию-призрак / нарушали I4 (модель, вариант
+/// `live_rob`). С подтверждением его снимут, только если поток простоял
+/// между двумя соседними записями C1 и C2 дольше срока (A1').
 ///
-/// ABA (окно C1-C2 нового держателя): claim уже его, а поля -- прежнего.
-/// Клиенты Rust очищают свои поля перед каждым освобождением claim-а, а
-/// сервер -- поля умершего перед снятием его claim-а (R18 fix round 1),
-/// поэтому устаревшая личность в полях остаётся только после пира, этого не
-/// делающего и потом умершего. Тогда живой держатель теряет claim. Двух
-/// писателей нет: его C6 -- CAS из `IDLE`, а снятие -- только при `IDLE`,
-/// перечитанном прямо перед CAS, то есть до его заявки. Его заявка после
-/// снятия может быть зафиксирована (толчок другого клиента): тогда отзыв
-/// на C8 проигран, и клиент возвращает себе claim и уходит L
-/// (`Hello::leave_robbed`), а не оставляет сессию-призрак. Доказательство
-/// -- `handshake_model` (свойство W, варианты `RobPlainLeave` и
-/// `RobAnyState`).
+/// Порядок (fix round 1, I1 (b)): claim -> `client_state` -> поля
+/// владельца -> проверка смерти (системные вызовы) -> подтверждение ->
+/// **перечитать** `client_state == IDLE` прямо перед снятием -> очистить
+/// поля умершего CAS-ом от прочитанной личности (`ControlBlock::
+/// forget_owner`; PID сменился -- отказ) -> CAS `claim -> 0`.
 pub(crate) fn release_if_owner_gone(
     control: &crate::layout::ControlBlock,
+    sighting: &mut Option<OwnerSighting>,
+    now: Instant,
     free: Option<&FreeNotifier>,
-) -> bool {
+) -> OwnerGone {
     let claim = control.slot_claim.load(Ordering::Acquire);
     if claim == CLAIM_FREE || control.client_state.load(Ordering::Acquire) != HANDSHAKE_IDLE {
-        return false;
+        *sighting = None;
+        return OwnerGone::No;
     }
     let owner = control.slot_owner_pid.load(Ordering::Acquire);
     let owner_start = control.owner_start_time();
     if !claim_holder_gone(control, owner, owner_start) {
-        return false;
+        *sighting = None;
+        return OwnerGone::No;
     }
+    let first = match *sighting {
+        Some(seen)
+            if seen.claim == claim && seen.owner == owner && seen.owner_start == owner_start =>
+        {
+            seen.at
+        }
+        _ => {
+            *sighting = Some(OwnerSighting {
+                claim,
+                owner,
+                owner_start,
+                at: now,
+            });
+            now
+        }
+    };
+    let Some(due) = first.checked_add(OWNER_DEATH_CONFIRM) else {
+        return OwnerGone::No;
+    };
+    if now < due {
+        return OwnerGone::Pending(due);
+    }
+    *sighting = None;
     #[cfg(test)]
     if let Some(hook) = ROB_CHECK_HOOK.with(|hook| hook.borrow_mut().take()) {
         hook(control);
     }
     // Проверка смерти заняла системные вызовы: держатель мог тем временем
-    // выставить заявку или записать свои поля (C2).
+    // выставить заявку или записать свои поля (C2) -- тогда CAS очистки от
+    // прочитанного PID не пройдёт (`forget_owner`; отдельное перечитывание
+    // PID ему равносильно и убрано в round 3).
     if control.client_state.load(Ordering::Acquire) != HANDSHAKE_IDLE
-        || control.slot_owner_pid.load(Ordering::Acquire) != owner
         || !control.forget_owner(owner, owner_start)
     {
-        return false;
+        return OwnerGone::No;
     }
-    release_claim_notify(control, claim, free)
+    if release_claim_notify(control, claim, free) {
+        OwnerGone::Released
+    } else {
+        OwnerGone::No
+    }
 }
 
 /// Протухший захват single-client канала (ревизия 3, §2.3 дизайна, R18):
@@ -281,11 +332,14 @@ pub(crate) fn release_if_owner_gone(
 /// наблюдение больше не нужно.
 ///
 /// Task 12 (решение R-O): владелец claim-а без заявки подтверждённо умер --
-/// claim снимается на этом же толчке (`release_if_owner_gone`), без
-/// `reserve`. Все освобождения -- с уведомлением `free` (R20).
+/// claim снимается на толчке не раньше `OWNER_DEATH_CONFIRM` после первого
+/// такого наблюдения (`owner_seen`; round 3, `release_if_owner_gone`), без
+/// `reserve`; повторный толчок шлёт ждущий (`FreeWaiter`). Все освобождения
+/// -- с уведомлением `free` (R20).
 fn observe_idle_claim(
     view: &SharedView,
     seen: &mut Option<(u32, Instant)>,
+    owner_seen: &mut Option<OwnerSighting>,
     lingering: &mut Option<Lingering>,
     reserve: Duration,
     free: Option<&FreeNotifier>,
@@ -297,7 +351,7 @@ fn observe_idle_claim(
     {
         *lingering = None;
     }
-    if release_if_owner_gone(control, free) {
+    if release_if_owner_gone(control, owner_seen, Instant::now(), free) == OwnerGone::Released {
         *seen = None;
         return;
     }
@@ -462,6 +516,9 @@ pub struct SharedServer {
     /// Не подключён: чужой claim без заявки и момент его ПЕРВОГО наблюдения
     /// (отъём -- не раньше `reserve_timeout` от него, §2.3 дизайна).
     claim_seen: Option<(u32, Instant)>,
+    /// Не подключён: тройка claim-а без заявки с подтверждённо умершим
+    /// владельцем и момент первого наблюдения (быстрый путь R-O, round 3).
+    owner_seen: Option<OwnerSighting>,
     /// Task 7: клиент сессии, закрытой сервером (`mark_disconnected` при
     /// живом процессе и claim-е сессии), -- handle его процесса и токен.
     /// Single-client: разбирается на толчке (`observe_idle_claim`), без
@@ -696,6 +753,7 @@ impl SharedServer {
             exclusive: false,
             session_claim: CLAIM_FREE,
             claim_seen: None,
+            owner_seen: None,
             lingering: None,
             reserve_timeout: crate::constants::RESERVE_TIMEOUT,
             presence: None,
@@ -755,6 +813,7 @@ impl SharedServer {
                 observe_idle_claim(
                     &self.view,
                     &mut self.claim_seen,
+                    &mut self.owner_seen,
                     &mut self.lingering,
                     self.reserve_timeout,
                     self.free.as_deref(),
@@ -914,6 +973,7 @@ impl SharedServer {
                 observe_idle_claim(
                     &self.view,
                     &mut self.claim_seen,
+                    &mut self.owner_seen,
                     &mut self.lingering,
                     self.reserve_timeout,
                     self.free.as_deref(),
@@ -1162,6 +1222,7 @@ impl SharedServer {
         self.peer = watch;
         self.session_claim = claim;
         self.claim_seen = None;
+        self.owner_seen = None;
         // Новая сессия: наблюдение за клиентом прошлой (Task 7) больше не
         // нужно -- claim уже не его (новый держатель взял его свободным).
         self.lingering = None;
@@ -1398,6 +1459,7 @@ impl SharedServer {
             observe_idle_claim(
                 &self.view,
                 &mut self.claim_seen,
+                &mut self.owner_seen,
                 &mut self.lingering,
                 self.reserve_timeout,
                 self.free.as_deref(),
@@ -3378,12 +3440,26 @@ mod rob_tests {
         ROB_CHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
     }
 
-    /// Владелец мёртв, заявки нет: claim снят, поля владельца очищены.
+    /// Первое наблюдение умершей тройки (`now`) и подтверждение (`now +
+    /// OWNER_DEATH_CONFIRM`) -- исход второго вызова.
+    fn confirm(control: &crate::layout::ControlBlock) -> OwnerGone {
+        let now = Instant::now();
+        let mut sighting = None;
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, now, None),
+            OwnerGone::Pending(now + OWNER_DEATH_CONFIRM),
+            "первое наблюдение"
+        );
+        release_if_owner_gone(control, &mut sighting, now + OWNER_DEATH_CONFIRM, None)
+    }
+
+    /// Владелец мёртв, заявки нет: claim снят только после подтверждения,
+    /// поля владельца очищены.
     #[test]
     fn dead_owner_claim_released_and_owner_forgotten() {
         let (server, _) = dead_owned("OK");
         let control = server.view().control_block();
-        assert!(release_if_owner_gone(control, None));
+        assert_eq!(confirm(control), OwnerGone::Released);
         assert_eq!(control.slot_claim.load(Ordering::Acquire), CLAIM_FREE);
         assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), 0);
         assert_eq!(control.owner_start_time(), 0);
@@ -3400,7 +3476,7 @@ mod rob_tests {
                 .client_state
                 .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
         });
-        assert!(!release_if_owner_gone(control, None), "снят claim заявки");
+        assert_eq!(confirm(control), OwnerGone::No, "снят claim заявки");
         assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN);
     }
 
@@ -3415,9 +3491,63 @@ mod rob_tests {
             control.announce_owner_start(crate::win::current_process_start_time());
             control.slot_owner_pid.store(me, Ordering::Release);
         });
-        assert!(!release_if_owner_gone(control, None), "снят claim живого");
+        assert_eq!(confirm(control), OwnerGone::No, "снят claim живого");
         assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN);
         assert_eq!(control.slot_owner_pid.load(Ordering::Acquire), me);
+    }
+
+    /// Round 3 (решение AI): до `OWNER_DEATH_CONFIRM` claim не снимается;
+    /// сменившаяся тройка (новый токен, новые поля) -- новый отсчёт.
+    #[test]
+    fn rob_waits_for_confirmation_of_same_triple() {
+        let (server, _) = dead_owned("CONFIRM");
+        let control = server.view().control_block();
+        let now = Instant::now();
+        let mut sighting = None;
+        let early = now + OWNER_DEATH_CONFIRM - Duration::from_millis(1);
+        let first = release_if_owner_gone(control, &mut sighting, now, None);
+        assert_eq!(first, OwnerGone::Pending(now + OWNER_DEATH_CONFIRM));
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, early, None),
+            OwnerGone::Pending(now + OWNER_DEATH_CONFIRM),
+            "снят до подтверждения"
+        );
+        // Новый держатель (тот же умерший в полях -- окно C1-C2): отсчёт
+        // заново от этого наблюдения.
+        control.slot_claim.store(TOKEN + 1, Ordering::Release);
+        let later = now + OWNER_DEATH_CONFIRM;
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, later, None),
+            OwnerGone::Pending(later + OWNER_DEATH_CONFIRM),
+            "новый токен унаследовал возраст"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN + 1);
+        // Сменилось одно время владельца, затем один PID (другие
+        // умершие) -- каждый раз заново.
+        let mut at = later;
+        let start = control.owner_start_time();
+        control.announce_owner_start(start ^ 1);
+        at += OWNER_DEATH_CONFIRM;
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, at, None),
+            OwnerGone::Pending(at + OWNER_DEATH_CONFIRM),
+            "сменившееся время унаследовало возраст"
+        );
+        let (other, _) = dead_process();
+        control.slot_owner_pid.store(other, Ordering::Release);
+        at += OWNER_DEATH_CONFIRM;
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, at, None),
+            OwnerGone::Pending(at + OWNER_DEATH_CONFIRM),
+            "сменившийся PID унаследовал возраст"
+        );
+        assert_eq!(control.slot_claim.load(Ordering::Acquire), TOKEN + 1);
+        // Та же тройка спустя срок -- снята.
+        at += OWNER_DEATH_CONFIRM;
+        assert_eq!(
+            release_if_owner_gone(control, &mut sighting, at, None),
+            OwnerGone::Released
+        );
     }
 
     /// Снятие claim-а «задержавшегося» умершего (Task 7) очищает его поля.
@@ -3446,11 +3576,12 @@ mod rob_tests {
         control.announce_owner_start(owner.start);
         control.slot_owner_pid.store(owner.pid, Ordering::Release);
         control.slot_claim.store(TOKEN, Ordering::Release);
-        let (mut seen, mut lingering) = (None, None);
+        let (mut seen, mut owner_seen, mut lingering) = (None, None, None);
         // Первое наблюдение, затем отъём (срок -- ноль).
         observe_idle_claim(
             server.view(),
             &mut seen,
+            &mut owner_seen,
             &mut lingering,
             Duration::ZERO,
             None,
@@ -3459,6 +3590,7 @@ mod rob_tests {
         observe_idle_claim(
             server.view(),
             &mut seen,
+            &mut owner_seen,
             &mut lingering,
             Duration::ZERO,
             None,

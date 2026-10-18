@@ -99,7 +99,10 @@ use crate::ring::{
     DrainBound, FreeSpace, SpinPolicy, UnreadProbe, rest_after_stale_disconnect, spin_until,
 };
 use crate::security::ObjectSecurity;
-use crate::server::{Lingering, SharedServer, release_if_holder_dead, release_if_owner_gone};
+use crate::server::{
+    Lingering, OwnerGone, OwnerSighting, SharedServer, release_if_holder_dead,
+    release_if_owner_gone,
+};
 use crate::shared::SharedView;
 use crate::sync_ext::{LockExt, RwLockExt, join_worker, panic_error};
 use crate::wait_delay_or;
@@ -397,6 +400,11 @@ struct ClientSlot {
     /// увидел -- дедлайн освобождения = момент + `reserve_timeout`. Token
     /// хранится, чтобы новый захват не унаследовал возраст прежнего.
     claim_seen: Option<(u32, Instant)>,
+    /// Не подключён: тройка claim-а без заявки с подтверждённо умершим
+    /// владельцем и момент первого наблюдения (быстрый путь R-O, round 3):
+    /// подтверждение -- на дедлайне `момент + OWNER_DEATH_CONFIRM` в полном
+    /// проходе (`reclaim_stale_claims`).
+    owner_seen: Option<OwnerSighting>,
     /// Подключён: разовый дедлайн проверки брошенного рукопожатия.
     verify_at: Option<Instant>,
     /// Подключён: claim (token) клиента на момент рукопожатия -- при его
@@ -434,6 +442,7 @@ impl ClientSlot {
             server,
             connected: false,
             claim_seen: None,
+            owner_seen: None,
             verify_at: None,
             session_claim: CLAIM_FREE,
             owner_watch: None,
@@ -469,6 +478,7 @@ impl ClientSlot {
     fn reset_connection(&mut self, linger: bool) {
         self.connected = false;
         self.claim_seen = None;
+        self.owner_seen = None;
         self.verify_at = None;
         self.last_liveness_check = None;
         let watch = match (self.server.take_peer(), self.owner_watch.take()) {
@@ -1097,8 +1107,23 @@ impl MultiCore {
                 slot.retire_lingering();
                 sweep.relinquished.push(slot.id);
             }
+            // Round 3: подтверждение смерти владельца, увиденной на толчке
+            // (быстрый путь R-O), -- на своём дедлайне.
+            let ClientSlot {
+                server, owner_seen, ..
+            } = &mut *slot;
+            if owner_seen.is_some()
+                && let OwnerGone::Pending(at) = release_if_owner_gone(
+                    server.view().control_block(),
+                    owner_seen,
+                    now,
+                    self.free.as_deref(),
+                )
+            {
+                sweep.deadline(at);
+            }
             // Протухший захват -- по дедлайну (claim перечитывается: снятие
-            // умершего «задержавшегося» его освободило).
+            // умершего «задержавшегося» или R-O его освободило).
             let Some((claim, due)) = self.observe_claim(&mut slot, now) else {
                 continue;
             };
@@ -1179,6 +1204,7 @@ impl MultiCore {
                 // владельца зафиксированной заявки, а не следующего клиента).
                 slot.session_claim = slot.server.session_claim();
                 slot.claim_seen = None;
+                slot.owner_seen = None;
                 slot.last_liveness_check = None;
                 let verify_at = Instant::now() + HANDSHAKE_VERIFY_DELAY;
                 slot.verify_at = Some(verify_at);
@@ -1209,13 +1235,23 @@ impl MultiCore {
                     slot.lingering = Some(lingering);
                 }
                 // Task 12 (решение R-O): толчок без заявки, а владелец
-                // claim-а подтверждённо умер -- claim снимается сразу (не
-                // через `reserve_timeout`), ждущие базы уведомлены.
-                if matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected) {
-                    let _ = release_if_owner_gone(
-                        slot.server.view().control_block(),
+                // claim-а подтверждённо умер -- claim снимается (не через
+                // `reserve_timeout`), ждущие базы уведомлены. Round 3: не
+                // раньше `OWNER_DEATH_CONFIRM` от первого наблюдения той же
+                // тройки -- дедлайн подтверждения уходит диспетчеру.
+                let mut due = None;
+                let ClientSlot {
+                    server, owner_seen, ..
+                } = &mut *slot;
+                if matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected)
+                    && let OwnerGone::Pending(at) = release_if_owner_gone(
+                        server.view().control_block(),
+                        owner_seen,
+                        Instant::now(),
                         self.free.as_deref(),
-                    );
+                    )
+                {
+                    due = Some(at);
                 }
                 drop(slot);
                 drop(slots);
@@ -1231,7 +1267,7 @@ impl MultiCore {
                 if !matches!(err, ShmError::HandshakeFailed | ShmError::AlreadyConnected) {
                     report(self, Some(slot_id), err);
                 }
-                None
+                due
             }
         }
     }

@@ -120,16 +120,21 @@
 //! ([`release_own_claim`]), сервер -- поля умершего перед снятием его
 //! claim-а (`ControlBlock::forget_owner`); иначе быстрый путь R-O в окне
 //! C1-C2 следующего держателя принял бы личность ушедшего (и потом
-//! умершего) за его и снял бы claim живого. Ограбленный пиром без очистки
-//! держатель, чью заявку сервер уже зафиксировал, возвращает claim и уходит
-//! (`Hello::leave_robbed`), -- доказательство в `handshake_model` (W).
+//! умершего) за его. После пира без очистки это остаётся возможным, поэтому
+//! сервер снимает claim R-O только по тройке (токен, личность), умершей не
+//! меньше `OWNER_DEATH_CONFIRM` (round 3, решение AI): живого держателя так
+//! снимут, лишь если его поток простоял между C1 и C2 дольше срока (A1').
+//! Отъём живого держателя модель опровергает (`handshake_model`, вариант
+//! `live_rob`: сессия-призрак W, при 3 попытках -- I4).
 //!
 //! **Толчки без опроса**: захват без сессии (`server_state !=
 //! SERVER_READY`) ждущий толкает один раз на наблюдённый токен и ставит
 //! разовый повторный толчок через `RESERVE_TIMEOUT + 1 с` (решение R-N) --
 //! сервер отнимает протухший захват на нём; подключённая сессия держателя
 //! ни толчков, ни таймаута не даёт. Подтверждённо умершего держателя без
-//! заявки сервер снимает на первом же толчке (решение R-O). Ждущий Multi
+//! заявки сервер снимает на толчке не раньше `OWNER_DEATH_CONFIRM` после
+//! первого (решение R-O, round 3): толкнув при умершем держателе, ждущий
+//! толкает ещё раз через `CONFIRM_RENUDGE_DELAY`. Ждущий Multi
 //! толкает занятые слоты без сессии раз на их набор; повторный толчок ему
 //! не нужен -- протухший снимает дедлайн диспетчера.
 
@@ -141,7 +146,7 @@ use std::time::{Duration, Instant};
 use crate::beacon::{Beacon, STATE_FREE_GEN_OFFSET, STATE_FREE_WAITERS_OFFSET};
 use crate::constants::{
     CLAIM_FREE, EVENT_CONNECT_REQ_SUFFIX, HANDSHAKE_CLIENT_HELLO, HANDSHAKE_IDLE,
-    HANDSHAKE_SERVER_READY, RESERVE_TIMEOUT,
+    HANDSHAKE_SERVER_READY, OWNER_DEATH_CONFIRM, RESERVE_TIMEOUT,
 };
 use crate::error::{Result, ShmError};
 use crate::events::SharedEvents;
@@ -1017,7 +1022,17 @@ pub(crate) struct WaitCtl<'a> {
 
 /// Наблюдаемый процесс по личности: открывается один раз на личность.
 #[derive(Debug, Default)]
-struct Watched(Option<((u32, u64), Option<ProcessWatch>)>);
+struct Watched(Option<Watch>);
+
+/// Личность, её процесс и подтверждённая смерть.
+#[derive(Debug)]
+struct Watch {
+    identity: (u32, u64),
+    process: Option<ProcessWatch>,
+    /// Процесс подтверждённо завершился (сработал handle или его уже не
+    /// было при открытии, `win::is_process_gone`).
+    dead: bool,
+}
 
 impl Watched {
     /// Новая личность -- открыть её процесс (только доверенную, решение
@@ -1026,8 +1041,14 @@ impl Watched {
         match identity.filter(trusted) {
             None => self.0 = None,
             Some(identity) => {
-                if self.0.as_ref().map(|(seen, _)| *seen) != Some(identity) {
-                    self.0 = Some((identity, ProcessWatch::open_peer(identity.0, identity.1)));
+                if self.0.as_ref().map(|watch| watch.identity) != Some(identity) {
+                    let process = ProcessWatch::open_peer(identity.0, identity.1);
+                    let dead = process.is_none() && is_process_gone(identity.0, identity.1);
+                    self.0 = Some(Watch {
+                        identity,
+                        process,
+                        dead,
+                    });
                 }
             }
         }
@@ -1036,18 +1057,34 @@ impl Watched {
     fn handle(&self) -> Option<BorrowedHandle<'_>> {
         self.0
             .as_ref()
-            .and_then(|(_, watch)| watch.as_ref())
+            .and_then(|watch| watch.process.as_ref())
             .map(AsHandle::as_handle)
     }
 
     /// Процесс завершился: handle сигнален навсегда -- из набора долой
     /// (иначе каждый круг возвращался бы сразу), личность помним.
     fn retire(&mut self) {
-        if let Some((_, watch)) = self.0.as_mut() {
-            *watch = None;
+        if let Some(watch) = self.0.as_mut() {
+            watch.process = None;
+            watch.dead = true;
         }
     }
+
+    /// Процесс личности подтверждённо завершился.
+    fn is_dead(&self) -> bool {
+        self.0.as_ref().is_some_and(|watch| watch.dead)
+    }
 }
+
+/// Повторный толчок подтверждения смерти держателя (round 3, решение AI):
+/// сервер снимает claim умершего держателя (R-O) только на толчке не
+/// раньше `OWNER_DEATH_CONFIRM` после первого такого наблюдения, поэтому
+/// ждущий, толкнувший при подтверждённо умершем держателе, толкает ещё раз
+/// через срок и запас на задержку обработки толчка сервером. Не успел
+/// сервер (был занят дольше запаса) -- остаётся отъём по `RESERVE_TIMEOUT`
+/// и разовый повторный толчок R-N.
+pub(crate) const CONFIRM_RENUDGE_DELAY: Duration =
+    OWNER_DEATH_CONFIRM.saturating_add(Duration::from_millis(250));
 
 /// Тесты: точки вмешательства в круг ждущего (детерминированные
 /// интерлинии `free_waiter_interleavings`).
@@ -1069,6 +1106,8 @@ enum Timer {
     Deadline,
     /// Разовый повторный толчок (R-N).
     Renudge,
+    /// Повторный толчок подтверждения смерти держателя (round 3).
+    Confirm,
 }
 
 /// Объект набора ожидания ждущего.
@@ -1088,6 +1127,9 @@ pub(crate) struct FreeWaiter {
     nudged: Option<u64>,
     /// Разовый повторный толчок (R-N) этого ключа.
     renudge_at: Option<Instant>,
+    /// Повторный толчок подтверждения смерти держателя (round 3,
+    /// `CONFIRM_RENUDGE_DELAY`).
+    confirm_at: Option<Instant>,
     holder: Watched,
     server: Watched,
     #[cfg(test)]
@@ -1105,6 +1147,7 @@ impl std::fmt::Debug for FreeWaiter {
         f.debug_struct("FreeWaiter")
             .field("nudged", &self.nudged)
             .field("renudge_at", &self.renudge_at)
+            .field("confirm_at", &self.confirm_at)
             .finish_non_exhaustive()
     }
 }
@@ -1120,6 +1163,7 @@ impl FreeWaiter {
             notifier,
             nudged: None,
             renudge_at: None,
+            confirm_at: None,
             holder: Watched::default(),
             server: Watched::default(),
             #[cfg(test)]
@@ -1211,19 +1255,28 @@ impl FreeWaiter {
 
     /// Учесть занятость: процессы держателя и сервера; толчок -- раз на
     /// ключ (и разовый повторный через `renudge`); подключённая сессия
-    /// (`key == 0`) -- ни толчков, ни таймаута.
+    /// (`key == 0`) -- ни толчков, ни таймаута. Толчок при подтверждённо
+    /// умершем держателе -- и повторный через `CONFIRM_RENUDGE_DELAY`
+    /// (round 3: сервер подтверждает смерть во времени).
     fn observe(&mut self, busy: &Busy, nudge: &mut dyn FnMut(), renudge: Option<Duration>) {
         self.holder.update(busy.holder);
         self.server.update(busy.server);
         if busy.key == 0 {
             self.nudged = None;
             self.renudge_at = None;
+            self.confirm_at = None;
             return;
         }
         if self.nudged != Some(busy.key) {
             nudge();
+            let now = Instant::now();
             self.nudged = Some(busy.key);
-            self.renudge_at = renudge.and_then(|delay| Instant::now().checked_add(delay));
+            self.renudge_at = renudge.and_then(|delay| now.checked_add(delay));
+            self.confirm_at = if self.holder.is_dead() {
+                now.checked_add(CONFIRM_RENUDGE_DELAY)
+            } else {
+                None
+            };
         }
     }
 
@@ -1239,14 +1292,16 @@ impl FreeWaiter {
         // ИМЕННО этому таймеру, без повторной сверки `Instant`: ядро может
         // вернуть таймаут чуть раньше отметки `Instant` (разрешение таймера),
         // и сверка дала бы лишний короткий сон -- лишнее пробуждение.
-        let timer = match (ctl.deadline, self.renudge_at) {
-            (Some(deadline), Some(renudge)) if renudge < deadline => {
-                Some((renudge, Timer::Renudge))
-            }
-            (Some(deadline), _) => Some((deadline, Timer::Deadline)),
-            (None, Some(renudge)) => Some((renudge, Timer::Renudge)),
-            (None, None) => None,
-        };
+        // Повторные толчки -- строго раньше дедлайна, иначе он важнее.
+        let timer = [
+            self.confirm_at.map(|at| (at, Timer::Confirm)),
+            self.renudge_at.map(|at| (at, Timer::Renudge)),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|(at, _)| *at)
+        .filter(|(at, _)| ctl.deadline.is_none_or(|deadline| *at < deadline))
+        .or_else(|| ctl.deadline.map(|at| (at, Timer::Deadline)));
         let timeout = timer.map(|(at, _)| at.saturating_duration_since(now));
         #[cfg(test)]
         let (timeout, capped) = match (timeout, self.kernel_cap) {
@@ -1312,6 +1367,13 @@ impl FreeWaiter {
                         // ставится.
                         nudge();
                         self.renudge_at = None;
+                        Ok(None)
+                    }
+                    Some(Timer::Confirm) => {
+                        // Разовый на толчок: сервер подтвердил смерть и
+                        // снимет claim (освобождение разбудит `_free`).
+                        nudge();
+                        self.confirm_at = None;
                         Ok(None)
                     }
                     Some(Timer::Deadline) => Ok(Some(FreeWait::TimedOut)),
@@ -2142,5 +2204,48 @@ mod tests {
         let waited = run(&mut waiter, 0, Duration::from_millis(300));
         assert!(matches!(waited, FreeWait::TimedOut), "{waited:?}");
         assert_eq!(nudges.load(Ordering::Relaxed), 0, "сессия -- без толчков");
+    }
+
+    /// Round 3 (решение AI): держатель подтверждённо умер -- после толчка
+    /// ещё один через `CONFIRM_RENUDGE_DELAY` (сервер снимает claim R-O
+    /// только на толчке после подтверждения смерти во времени); живой
+    /// держатель -- один толчок.
+    #[test]
+    fn dead_holder_is_renudged_after_confirmation() {
+        let free = notifier("CONFIRM");
+        let nudges = AtomicU32::new(0);
+        let run = |holder: (u32, u64)| {
+            nudges.store(0, Ordering::Relaxed);
+            let mut waiter = FreeWaiter::new(Arc::clone(&free));
+            let started = Instant::now();
+            let waited = waiter
+                .wait_free::<()>(
+                    &mut || {
+                        Attempt::Busy(Busy {
+                            key: 9,
+                            holder: Some(holder),
+                            server: None,
+                        })
+                    },
+                    &mut || {
+                        nudges.fetch_add(1, Ordering::Relaxed);
+                    },
+                    &mut WaitCtl {
+                        wake: None,
+                        running: &|| true,
+                        on_wake: &mut || {},
+                        wakeup: &|| {},
+                        deadline: started.checked_add(CONFIRM_RENUDGE_DELAY * 2),
+                        renudge: None,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(waited, FreeWait::TimedOut), "{waited:?}");
+            nudges.load(Ordering::Relaxed)
+        };
+        assert_eq!(run(dead_process()), 2, "толчок + подтверждение");
+        let live = LiveChild::spawn();
+        assert_eq!(run((live.pid, live.start)), 1, "живой -- один толчок");
+        drop(live);
     }
 }
