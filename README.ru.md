@@ -776,7 +776,10 @@ runtime. Объекты ядра ждёт один поток реактора I
 - Методы берут `&mut self`, поэтому future — `Send` (`tokio::spawn`
   работает). *Одновременные* приём и отправка одной стороны требуют
   разделения: `Mutex` или задача-владелец, которой команды идут через канал.
-- Anonymous-сервер (без событий) — `Err(InvalidConfig)`.
+- Anonymous-сервер поддерживает те же async-ожидания: у него всегда есть
+  семь безымянных событий. При подключении в частном пространстве имён
+  используйте `SharedClient::connect_async_in(Arc::clone(&ns), name)`;
+  future держит пространство до своего уничтожения, включая время после `Ready`.
 
 ```rust,ignore
 // Пример с tokio (xshm от него не зависит).
@@ -855,7 +858,7 @@ fn checksum_in_place(client: &mut SharedClient) -> xshm::Result<u32> {
 use std::time::Duration;
 use xshm::{AutoOptions, SharedClient, SpinPolicy};
 
-fn poll_fast(client: &SharedClient) -> xshm::Result<bool> {
+fn poll_fast(client: &mut SharedClient) -> xshm::Result<bool> {
     client.poll_server_spin(Some(Duration::from_millis(10)), SpinPolicy::new(2000))
 }
 
@@ -904,6 +907,24 @@ let options = AutoOptions { spin: SpinPolicy::new(2000), ..Default::default() };
 
 ### Обнаружение сервера
 
+Именованные серверы single-client, Auto, Multi и Dispatch сами поднимают
+маяк после публикации своих объектов и опускают его до закрытия.
+Маяк создаётся по возможности: его ошибка не запрещает запуск сервера,
+состояние доступно через `presence()`. Auto/Multi-клиенты ждут сервер по
+событиям; `discovery_fallback` (по умолчанию 10 с, `None` — только события)
+страхует отсутствие маяка, его подмену и старых нативных пиров. Этот резерв
+работает вне подключения; подключённый простой не создаёт пробуждений.
+
+Для синхронного клиента есть `SharedClient::wait_for_server(name, timeout)`
+и варианты `_in`/`_with`. Занятый канал ожидается через
+`SharedClient::wait_connectable(name, timeout)` (также `_in`/`_with`):
+`Ok(true)` означает, что claim был свободен; метод его не захватывает,
+поэтому проигравший следующую гонку `connect` ждёт снова. Освобождающие
+стороны обязаны уведомлять `_free` (INTEROP R20); без этого ожидание
+ограничено страховкой. Multi использует общий маяк `<база>_multi_beacon`
+и уведомление `<база>_multi_free`; имя обычного канала `<база>_multi`
+совпадает с этой базой, поэтому такие имена нельзя совмещать.
+
 Клиенту, который ждёт сервер (например, профайлер ждёт свой вьюер), незачем
 его опрашивать. `Beacon` — именованное событие с ручным сбросом:
 
@@ -937,8 +958,9 @@ loop {
 }
 ```
 
-Порядок сервера: сначала лобби (`DispatchServer::start` синхронный), потом
-`raise()`; при остановке — сначала `lower()`, потом остановка. Клиенты
+Порядок сервера: сначала лобби (`DispatchServer::start` синхронный и сам
+поднимает маяк); повторный ручной `raise()` безвреден. При остановке —
+сначала `lower()`, потом закрытие объектов. Клиенты
 `raise`/`lower` именованного маяка не вызывают: `raise` записывает
 вызывающего как сервер в `<имя>_beacon_state`.
 `ProcessExit::open(pid)` вместе с `xshm::wait_any` позволяет клиенту, которому
@@ -969,24 +991,37 @@ loop {
 
 ## Event Handles для kernel-драйверов
 
-Любой именованный сервер может отдать свои raw NT event handles, чтобы
-kernel-драйвер мог ждать на них напрямую (event-driven, без polling) вместо
-обращения через Rust API на каждое уведомление. Handles — обычные `isize`:
-передайте их драйверу через IOCTL, дальше их временем жизни управляет драйвер.
+Каждый сервер, именованный или anonymous, выдаёт handle секции и семи
+событий канала. Anonymous-объекты не имеют имён и доступны только по
+handle: периодический опрос не нужен.
 
-```rust
-use xshm::{SharedServer, EventHandles};
+```rust,no_run
+use xshm::SharedServer;
 
-let server = SharedServer::start("MyChannel")?;
-if let Some(handles) = server.get_event_handles() {
-    // handles.s2c_data - событие данных Сервер→Клиент
-    // handles.c2s_data - событие данных Клиент→Сервер
-}
+let mut server = SharedServer::start_anonymous()?;
+let section = server.section_handle();
+let events = server.get_event_handles();
+// Передайте section и поля events драйверу через IOCTL:
+// connect_req, connect_ack, c2s_data, s2c_data,
+// c2s_space, s2c_space, disconnect.
+server.wait_for_client(None)?;
+# Ok::<(), xshm::ShmError>(())
 ```
 
-**Примечание**: для anonymous-серверов (`SharedServer::start_anonymous()`)
-возвращается `None` — именованные события не создаются. В этом
-случае используйте polling.
+Handle принадлежат серверу и живут до его уничтожения: драйвер их не
+закрывает. Он получает собственные ссылки на объекты через
+`ObReferenceObjectByHandle(.., UserMode, ..)` в контексте процесса сервера.
+Все семь событий — автосбросные `SynchronizationEvent`; сигналить только
+`KeSetEvent`, без `KePulseEvent`/`KeResetEvent`. Обязательны сигналы
+`CONNECT_REQ` после `CLIENT_HELLO`, DATA/SPACE по позициям кольца и уход при
+выгрузке: CAS `client_state: SERVER_READY -> IDLE`, затем DISCONNECT,
+только если CAS удался. У драйвера нет процесса, смерть которого заметит сервер.
+
+DISCONNECT общий для обеих сторон: до своего ухода драйвер останавливает
+собственных ждущих этого события. Ждущий, проснувшийся после начала
+собственного ухода, возвращает сигнал и выходит. Свой уход определяется
+только флагом драйвера, выставленным до CAS, а не значением `client_state`.
+Полный контракт — [`INTEROP.md`](INTEROP.md) §b.5.
 
 ## Ограничения
 

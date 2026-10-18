@@ -1092,7 +1092,10 @@ succeeded): the driver has no process, so the server cannot notice it
 vanishing. `DISCONNECT` is one auto-reset event for both sides: before
 signalling its leave the driver must stop its own `DISCONNECT` waiters, and
 a driver waiter woken after its own side left must re-signal it and exit —
-otherwise the driver swallows its own leave and the server never sees it. The full driver contract is [`INTEROP.md`](INTEROP.md) §b.5.
+otherwise the driver swallows its own leave and the server never sees it.
+The driver determines its own departure from its own leaving flag, set
+before the leave CAS; `client_state` alone does not identify who left.
+The full driver contract is [`INTEROP.md`](INTEROP.md) §b.5.
 
 ## Limitations
 

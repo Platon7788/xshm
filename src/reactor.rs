@@ -700,7 +700,8 @@ impl Reactor {
     /// Отказ создания (`NtCreateWaitCompletionPacket`) -- `Err`, таблица и
     /// сигнал объекта не тронуты. Отказ привязки, в котором не доказана
     /// вина объекта ([`WaitPacket::survives_arm_failure`]), закрывает пакет;
-    /// если он был из пула -- один повтор с новым пакетом.
+    /// если он был из пула -- один повтор с новым пакетом, а не следующим
+    /// из пула: отказавшая привязка не усложняет перебор пула.
     pub(crate) fn register(&'static self, handle: isize, waker: Waker) -> Result<Registration> {
         // Пакет из пула -- под блокировкой; новый создаём вне её. Привязка
         // -- под блокировкой: пакет может прийти сразу, и поток реактора
@@ -1457,7 +1458,7 @@ mod tests {
         count
     }
 
-    /// Ruling 22: не сработало -- `NotFired`, сигнал цел.
+    /// Отмена несработавшей регистрации -- `NotFired`, сигнал цел.
     #[test]
     fn registration_cancel_not_fired() {
         let reactor = manual_reactor();
@@ -1473,7 +1474,7 @@ mod tests {
         assert!(event.wait(Some(Duration::ZERO)).unwrap(), "сигнал цел");
     }
 
-    /// Ruling 22: сработало, пакет в очереди, реактор его ещё не извлёк --
+    /// Регистрация сработала, пакет в очереди, реактор его ещё не извлёк --
     /// `FiredNotDelivered` (путь `STATUS_PENDING` -> `TRUE`), пакет вынут,
     /// waker не будится, сигнал потреблён.
     #[test]
@@ -1494,7 +1495,7 @@ mod tests {
         assert_eq!(counter.get(), 0);
     }
 
-    /// Ruling 22: пакет уже извлечён реактором, но запись снята отменой
+    /// Пакет уже извлечён реактором, но запись снята отменой
     /// раньше, чем он дошёл до таблицы -- `FiredNotDelivered`, пакет
     /// отброшен как устаревший, waker не будится.
     #[test]
@@ -1517,7 +1518,7 @@ mod tests {
         assert_eq!(counter.get(), 0);
     }
 
-    /// Ruling 22: реактор уже доставил -- `AlreadyDelivered`, waker
+    /// Реактор уже доставил -- `AlreadyDelivered`, waker
     /// разбужен ровно один раз.
     #[test]
     fn registration_cancel_already_delivered() {

@@ -1348,7 +1348,8 @@ impl FreeWaiter {
             Some(Slot::Server) => Ok(Some(FreeWait::ServerGone)),
             Some(Slot::Holder) => {
                 // Держатель умер: снова попытка и толчок того же ключа
-                // (сервер подтвердит смерть и освободит claim сразу, R18).
+                // (сервер подтвердит смерть во времени и освободит claim
+                // после повторного толчка, R18).
                 self.holder.retire();
                 self.nudged = None;
                 Ok(None)

@@ -2453,7 +2453,15 @@ fn lost_wake_post_closes_retired_on_next_pass() {
         slot.retired
             .push(ProcessWatch::open(std::process::id()).unwrap());
     }
-    server.wake_lost.store(true, Ordering::Release);
+    // Ошибка проходит через настоящий wake_slot, а не через ручную
+    // установку флага: без обработки неудачного поста ресурс не закроется.
+    server.fail_posts.store(1, Ordering::Relaxed);
+    server.wake_slot(0);
+    assert_eq!(
+        server.fail_posts.load(Ordering::Relaxed),
+        0,
+        "инъекция не сработала"
+    );
     slot_connect_req(&name, 1).set().unwrap();
     wait_for(
         "retired слота 0 закрыты",

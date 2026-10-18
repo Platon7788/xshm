@@ -1255,12 +1255,16 @@ impl SharedServer {
             Ordering::Acquire,
         );
         let (header_a, header_b) = self.view.headers();
-        header_a
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
-        header_b
-            .handshake_state
-            .store(HANDSHAKE_IDLE, Ordering::Release);
+        // Следующий заявитель мог опубликовать HELLO после отзыва
+        // состояния. Как в mark_disconnected, его отметку не затираем.
+        for header in [header_a, header_b] {
+            let _ = header.handshake_state.compare_exchange(
+                HANDSHAKE_SERVER_READY,
+                HANDSHAKE_IDLE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
         // Task 12: с уведомлением ждущих (R20); fix round 1 -- сначала
         // очистить поля умершего владельца (claim всё ещё его).
         control.forget_owner(owner, control.owner_start_time());
@@ -1377,13 +1381,15 @@ impl SharedServer {
             let _ = release_claim_notify(control, session_claim, self.free.as_deref());
             return;
         }
-        // Task 7: клиент жив (или это слот Multi), а claim всё ещё его --
-        // он может умереть, так и не заметив закрытия сессии (`DISCONNECT`
+        // Task 7: смерть клиента здесь не подтверждена, а claim всё ещё
+        // его (в том числе во время штатного ухода). Он может умереть,
+        // так и не заметив закрытия сессии (`DISCONNECT`
         // сервера, порча кольца). Handle его процесса не закрываем, а
         // держим с токеном («задержавшийся владелец»): подтверждённая смерть
         // освобождает claim сразу (`release_if_holder_dead`), а не через
         // `RESERVE_TIMEOUT`. Ушёл сам (L) -- claim сменится, и наблюдение
-        // снимется при первой проверке.
+        // снимется при первой проверке, новом handshake или Drop. Даже
+        // на пути без отъёма удерживается не больше одного handle.
         if control.slot_claim.load(Ordering::Acquire) == session_claim {
             self.lingering = Some((peer, session_claim));
         }
@@ -2256,6 +2262,48 @@ mod handshake_tests {
 
     /// Task 12 fix round 1 (m7): S6 -- зафиксирована заявка, чьё
     /// самоописание сменилось на подтверждённо умершего держателя (G2):
+    /// Новая заявка после отзыва старой не теряет диагностическое состояние
+    /// колец при поздней очистке S6 (например, перехват лобби после смерти).
+    #[test]
+    fn s6_abort_preserves_next_hello_headers() {
+        let mut server = SharedServer::start(&unique("S6NEXT")).unwrap();
+        {
+            let control = server.view().control_block();
+            control.slot_claim.store(2, Ordering::Release);
+            control
+                .client_state
+                .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+            for header in [server.view().headers().0, server.view().headers().1] {
+                header
+                    .handshake_state
+                    .store(HANDSHAKE_CLIENT_HELLO, Ordering::Release);
+            }
+        }
+        assert_eq!(server.abort_session(1, 1234), ShmError::HandshakeFailed);
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .slot_claim
+                .load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            server
+                .view()
+                .control_block()
+                .client_state
+                .load(Ordering::Acquire),
+            HANDSHAKE_CLIENT_HELLO
+        );
+        for header in [server.view().headers().0, server.view().headers().1] {
+            assert_eq!(
+                header.handshake_state.load(Ordering::Acquire),
+                HANDSHAKE_CLIENT_HELLO
+            );
+        }
+    }
+
     /// `abort_session` освобождает claim с уведомлением и очищает поля.
     #[test]
     fn s6_dead_holder_abort_notifies() {
@@ -2608,7 +2656,9 @@ mod stray_tests {
             attacker.join().unwrap();
         }
         waiter.join().unwrap();
-        assert!(worst <= Duration::from_millis(200), "{worst:?}");
+        // Планирование тестового потока тоже входит в задержку; потолок
+        // заметно короче аварийного recv_timeout (5 с) при голодании.
+        assert!(worst <= Duration::from_secs(1), "{worst:?}");
     }
 
     /// Task 10 (П2, страж): поток `wake` (команды worker-а) не голодит
@@ -3002,10 +3052,7 @@ mod anonymous_tests {
             {
                 return WaiterOutcome::TimedOut;
             }
-            if resignal
-                && (leaving.load(Ordering::Acquire)
-                    || control.client_state.load(Ordering::Acquire) != HANDSHAKE_SERVER_READY)
-            {
+            if resignal && leaving.load(Ordering::Acquire) {
                 driver.events[DISCONNECT].set().unwrap();
                 return WaiterOutcome::Resignalled;
             }
@@ -3120,7 +3167,7 @@ mod anonymous_tests {
             "вернулся через {:?}",
             started.elapsed()
         );
-        assert_timeout_waits(data_waits() - before);
+        assert_eq!(data_waits() - before, 1, "таймаут poll_client без долива");
 
         let before = data_waits();
         let started = Instant::now();
@@ -3196,12 +3243,11 @@ mod anonymous_tests {
     }
 
     /// Fix round 1 (ревью T13, I1): `DISCONNECT` -- одно автосбросное
-    /// событие на обе стороны. Ждущий `DISCONNECT` поток драйвера, вставший
-    /// в очередь раньше сервера, получает сигнал ухода самого драйвера;
-    /// по §b.5 п. 5.1 он видит свой уход, взводит событие обратно и
-    /// выходит -- сервер, спящий в `poll_client`, уход видит. С ошибочным
-    /// правилом (поглотить как устаревший при живом сервере; `resignal =
-    /// false`) сервер ждал бы до таймаута.
+    /// событие на обе стороны. Собственный ждущий драйвера получает его
+    /// сигнал, возвращает событие серверу и выходит (§b.5 п. 5.1).
+    /// Сервер начинает проверку после ждущего: тест не зависит от порядка
+    /// отпускания потоков ядром. Пробуждение уже спящего сервера проверяет
+    /// `anonymous_driver_leave_is_seen`.
     #[test]
     fn anonymous_driver_own_waiter_resignals_leave() {
         use std::sync::atomic::AtomicBool;
@@ -3212,30 +3258,28 @@ mod anonymous_tests {
             .generation
             .load(Ordering::Acquire);
         let leaving = AtomicBool::new(false);
-        let before = data_waits();
         let started = Instant::now();
         let outcome = std::thread::scope(|s| {
-            // Ждущий драйвера -- первым в очереди события.
+            // Пока драйвер не вернул свой сигнал, сервер не ждёт это
+            // событие: порядок отпускания ждущих Windows не гарантирует.
             let waiter = s.spawn(|| driver_waiter(&driver, &leaving, g, true));
-            std::thread::sleep(Duration::from_millis(50));
-            s.spawn(|| {
-                // Сервер к этому моменту спит в `poll_client`.
-                std::thread::sleep(Duration::from_millis(100));
-                leaving.store(true, Ordering::Release);
-                assert!(driver.leave_session(g));
-            });
-            assert_eq!(server.poll_client(Some(LONG)), Err(ShmError::NotConnected));
+            leaving.store(true, Ordering::Release);
+            assert!(driver.leave_session(g));
             waiter.join().unwrap()
         });
+        assert_eq!(outcome, WaiterOutcome::Resignalled);
+        assert!(
+            driver.events[DISCONNECT]
+                .wait(Some(Duration::ZERO))
+                .unwrap(),
+            "ждущий драйвера не вернул сигнал серверу"
+        );
+        assert_eq!(server.poll_client(Some(LONG)), Err(ShmError::NotConnected));
         assert!(
             started.elapsed() < LONG / 2,
             "сервер увидел уход через {:?} -- сигнал съеден",
             started.elapsed()
         );
-        assert_eq!(data_waits() - before, 1, "одно ожидание в ядре");
-        // Ядро отпускает ждущих автосбросного события по очереди: сигнал
-        // достаётся ждущему драйвера (встал раньше) -- он и вернул его.
-        assert_eq!(outcome, WaiterOutcome::Resignalled);
         assert!(!server.is_connected());
     }
 
@@ -3246,11 +3290,21 @@ mod anonymous_tests {
     #[test]
     fn anonymous_server_leave_signals_driver() {
         let (mut server, driver) = connected();
+        let generation = driver
+            .view
+            .control_block()
+            .generation
+            .load(Ordering::Acquire);
         server.disconnect().unwrap();
-        assert!(
-            driver.events[DISCONNECT]
-                .wait(Some(Duration::ZERO))
-                .unwrap()
+        assert_eq!(
+            driver_waiter(
+                &driver,
+                &std::sync::atomic::AtomicBool::new(false),
+                generation,
+                true
+            ),
+            WaiterOutcome::ServerLeft,
+            "уход сервера нельзя принять за собственный уход драйвера"
         );
         let control = driver.view.control_block();
         assert_eq!(control.server_state.load(Ordering::Acquire), HANDSHAKE_IDLE);

@@ -179,8 +179,9 @@ pub(crate) const fn validate_relative(name: &str) -> Result<()> {
 }
 
 impl PrivateNamespace {
-    /// Создать или открыть (OBJ_OPENIF) пространство с границей `boundary`, в которую
-    /// входит SID текущего пользователя (и, если `allow_low_integrity`, метка Low).
+    /// Создать или открыть (OBJ_OPENIF) пространство с границей `boundary`,
+    /// в которую входит SID текущего пользователя (и, если
+    /// `allow_low_integrity`, метка Low).
     ///
     /// Метка Low добавляется, когда `security` --
     /// [`ObjectSecurity::CurrentUserAllowLowIntegrity`]. Тот же `security`

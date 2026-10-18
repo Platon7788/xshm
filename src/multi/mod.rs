@@ -430,8 +430,8 @@ struct ClientSlot {
     /// её claim-а, пока claim всё ещё его. Процесс привязан к порту
     /// (`WaitKind::Peer`): подтверждённая смерть снимает claim сразу
     /// (`release_if_holder_dead`), без `reserve_timeout`. Один на слот;
-    /// снимается, когда claim сменился (клиент ушёл сам), при новом
-    /// рукопожатии и при остановке.
+    /// снимается на ближайшей проверке после смены claim-а (клиент ушёл
+    /// сам), по выходу процесса, при новом рукопожатии и при остановке.
     lingering: Option<Lingering>,
 }
 
@@ -646,6 +646,10 @@ mod core_type {
         /// Сколько ближайших привязок провалить (тест повтора привязки).
         #[cfg(test)]
         pub(in crate::multi) fail_arms: std::sync::atomic::AtomicU32,
+        /// Сколько ближайших постов пробуждения слота провалить. Relaxed:
+        /// тестовая инъекция ошибки, данные сессии этим не публикуются.
+        #[cfg(test)]
+        pub(in crate::multi) fail_posts: std::sync::atomic::AtomicU32,
     }
 }
 use core_type::MultiCore;
@@ -725,6 +729,8 @@ impl MultiServer {
             free: free.clone(),
             #[cfg(test)]
             fail_arms: AtomicU32::new(0),
+            #[cfg(test)]
+            fail_posts: AtomicU32::new(0),
         });
 
         let server_clone = server.clone();
@@ -1006,7 +1012,21 @@ impl MultiCore {
     /// handle отключённых клиентов (`ClientSlot::retired`), а не ждёт
     /// события именно этого слота (Task 10, fix round 1, M5).
     fn wake_slot(&self, slot_id: u32) {
-        if self.port.post(WAKE_KEY, slot_id as usize).is_err() {
+        let injected = {
+            #[cfg(test)]
+            {
+                self.fail_posts
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        if injected || self.port.post(WAKE_KEY, slot_id as usize).is_err() {
             self.wake_lost.store(true, Ordering::Release);
         }
     }

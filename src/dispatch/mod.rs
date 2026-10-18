@@ -4004,9 +4004,87 @@ mod tests {
         }
     }
 
-    /// П1: «клиент» лобби подключился и молчит, а поток пустых `C2S_DATA`
+    /// Пустые DATA не скрывают смерть клиента регистрации за младшим
+    /// индексом события: процесс проверяется на каждом пустом проходе.
+    #[test]
+    fn registration_data_flood_does_not_hide_client_death() {
+        #[derive(Default)]
+        struct Errors(Mutex<Vec<ShmError>>);
+        impl DispatchHandler for Errors {
+            fn on_client_connect(&self, _id: u32, _info: &ClientRegistration) {}
+            fn on_client_disconnect(&self, _id: u32) {}
+            fn on_message(&self, _id: u32, _data: &[u8]) {}
+            fn on_error(&self, _id: Option<u32>, err: ShmError) {
+                self.0.lock_clean().push(err);
+            }
+        }
+
+        let suffix = format!(
+            "{}_{}",
+            std::process::id(),
+            win::current_process_start_time()
+        );
+        let errors = Arc::new(Errors::default());
+        let server = DispatchServer::start(
+            &format!("TEST_REG_FLOOD_CORE_{suffix}"),
+            errors.clone(),
+            DispatchOptions {
+                lobby_timeout: Duration::from_secs(10),
+                ..DispatchOptions::default()
+            },
+        )
+        .unwrap();
+        let name = format!("TEST_REG_FLOOD_PEER_{suffix}");
+        let mut lobby = SharedServer::start(&name).unwrap();
+        let mut child = crate::test_support::LiveChild::spawn();
+        let hello =
+            crate::client::Hello::post(None, &name, true, ClaimMode::Take, FreeLink::Open).unwrap();
+        {
+            // Реальная наблюдаемая личность — живой дочерний процесс.
+            // Родитель держит его кольца, чтобы после смерти секция жила.
+            let control = lobby.view().control_block();
+            control.announce_owner_start(child.start);
+            control.slot_owner_pid.store(child.pid, Ordering::Release);
+            control.announce_client_start(child.start);
+            control.client_pid.store(child.pid, Ordering::Release);
+            control
+                .slot_count
+                .store(crate::server::ADVERSARY_MARK, Ordering::Release);
+        }
+        // Hello::post готовит C1..C8; C9 выполняет вызывающий.
+        lobby.events().connect_req.set().unwrap();
+        lobby.wait_for_client(Some(Duration::from_secs(2))).unwrap();
+        let client = hello.finish();
+        let data = Arc::new(crate::events::SharedEvents::open(&name).unwrap().c2s.data);
+        let run = Arc::new(AtomicBool::new(true));
+        let attacker = flood(data, Arc::clone(&run));
+        let before = server.lobby_wakeups.load(Ordering::Relaxed);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                server.handle_lobby_client(&mut lobby, &mut Vec::new());
+                done_tx.send(()).unwrap();
+            });
+            wait_for(
+                "обработка пустых DATA",
+                Duration::from_secs(2),
+                || server.lobby_wakeups.load(Ordering::Relaxed) > before,
+            );
+            child.kill();
+            let finished = done_rx.recv_timeout(Duration::from_secs(2));
+            run.store(false, Ordering::Release);
+            attacker.join().unwrap();
+            assert!(finished.is_ok(), "смерть скрыта потоком DATA: {finished:?}");
+        });
+        assert_eq!(&*errors.0.lock_clean(), &[ShmError::PeerDied]);
+        drop(client);
+        server.stop();
+    }
+
+    /// Регрессионный страж: «клиент» лобби подключился и молчит, а поток пустых `C2S_DATA`
     /// лобби (атакующий и `ADVERSARY_MARK`) не держит `stop()` до
-    /// `lobby_timeout`.
+    /// `lobby_timeout`. Старый порядок также проходил этот тест благодаря
+    /// проверке `running`; приоритет индекса проверяется отдельно.
     #[test]
     fn stop_not_starved_by_registration_data_flood() {
         let name = format!("TEST_DISPATCH_DATAFLOOD_{}", std::process::id());
