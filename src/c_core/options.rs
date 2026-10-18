@@ -29,6 +29,23 @@ impl Wait {
     }
 }
 
+/// Готовность, проверенная C-ядром; оба направления могут быть готовы вместе.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Readiness {
+    pub(super) readable: bool,
+    pub(super) writable: bool,
+}
+impl Readiness {
+    /// Доступен приём: сообщение копируется последующим receive_into.
+    pub const fn readable(self) -> bool {
+        self.readable
+    }
+    /// Есть место для длины, переданной в wait_activity.
+    pub const fn writable(self) -> bool {
+        self.writable
+    }
+}
+
 /// Ограничения одного направления кольца.
 pub type RingConfig = xipc_sys::RingConfig;
 /// Ограничения обоих направлений канала.

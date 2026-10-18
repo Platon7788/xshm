@@ -25,12 +25,16 @@ impl Default for QueueLimits {
 }
 
 /// Однократное подтверждение фактической операции C, а не постановки в очередь.
+/// Drop подтверждения не отменяет команду; stop отменяет невыполненные команды.
 #[derive(Debug)]
 pub struct CommandCompletion {
     receiver: mpsc::Receiver<Result<()>>,
     worker: ThreadId,
 }
 impl CommandCompletion {
+    pub(super) const fn new(receiver: mpsc::Receiver<Result<()>>, worker: ThreadId) -> Self {
+        Self { receiver, worker }
+    }
     /// Дождаться исполнения. В callback своего worker вернёт WouldDeadlock;
     /// команда останется в очереди и будет исполнена после callback.
     pub fn wait(self) -> Result<()> {
@@ -202,7 +206,7 @@ impl DispatchSender {
 /// ```no_run
 /// use xshm::c_core::{DispatchEvent, DispatchOptions, DispatchWorker, QueueLimits};
 /// let mut worker = DispatchWorker::start("my_lobby", DispatchOptions::default(),
-///     QueueLimits::default(), |event| {
+///     QueueLimits::default(), |_, event| {
 ///         if let DispatchEvent::Connected { peer, registration } = event {
 ///             println!("{}: {}", peer.client_id(), registration.name);
 ///         }
@@ -221,7 +225,8 @@ pub struct DispatchWorker {
 type Admission = dyn FnMut(&Registration) -> bool + Send;
 impl DispatchWorker {
     /// Запустить C-сервер в его потоке-владельце. Ошибка bind возвращается
-    /// синхронно. Handler работает без внутренних блокировок очереди.
+    /// синхронно. Handler работает без внутренних блокировок очереди и сразу
+    /// получает отправителя, без внешней инициализации через OnceLock.
     pub fn start<F>(
         lobby: &str,
         options: DispatchOptions,
@@ -229,7 +234,7 @@ impl DispatchWorker {
         handler: F,
     ) -> Result<Self>
     where
-        F: for<'a> FnMut(DispatchEvent<'a>) + Send + 'static,
+        F: for<'a> FnMut(&DispatchSender, DispatchEvent<'a>) + Send + 'static,
     {
         Self::start_inner(lobby, options, limits, None, handler)
     }
@@ -243,7 +248,7 @@ impl DispatchWorker {
     ) -> Result<Self>
     where
         A: FnMut(&Registration) -> bool + Send + 'static,
-        F: for<'a> FnMut(DispatchEvent<'a>) + Send + 'static,
+        F: for<'a> FnMut(&DispatchSender, DispatchEvent<'a>) + Send + 'static,
     {
         Self::start_inner(lobby, options, limits, Some(Box::new(admission)), handler)
     }
@@ -255,7 +260,7 @@ impl DispatchWorker {
         mut handler: F,
     ) -> Result<Self>
     where
-        F: for<'a> FnMut(DispatchEvent<'a>) + Send + 'static,
+        F: for<'a> FnMut(&DispatchSender, DispatchEvent<'a>) + Send + 'static,
     {
         if limits.commands == 0 || limits.bytes == 0 {
             return Err(Error::InvalidConfig);
@@ -290,6 +295,7 @@ impl DispatchWorker {
                 if ready.send(Ok(shared.clone())).is_err() {
                     return Ok(());
                 }
+                let sender = DispatchSender(shared.clone());
                 let mut buffer = vec![0; capacity];
                 loop {
                     // Ограниченная пачка команд: входящие события не голодают
@@ -341,7 +347,7 @@ impl DispatchWorker {
                     };
                     match server.next_event(&mut buffer, wait)? {
                         DispatchEvent::Wake | DispatchEvent::Timeout => {}
-                        event => handler(event),
+                        event => handler(&sender, event),
                     }
                 }
             })?;

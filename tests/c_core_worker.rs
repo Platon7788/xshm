@@ -1,11 +1,11 @@
 #![cfg(feature = "c-core")]
 //! Очередь команд и stop/join проверяются с настоящим C-диспетчером.
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use xshm::c_core::{
-    Client, DispatchClientOptions, DispatchEvent, DispatchOptions, DispatchSender, DispatchWorker,
-    Error, QueueLimits, Wait,
+    Client, DispatchClientOptions, DispatchEvent, DispatchOptions, DispatchWorker, Error,
+    QueueLimits, Wait,
 };
 
 fn name() -> String {
@@ -35,20 +35,14 @@ fn worker_confirms_delivery_and_callback_can_submit_without_self_deadlock() {
     let lobby = name();
     let (connected_tx, connected_rx) = mpsc::channel();
     let (callback_tx, callback_rx) = mpsc::channel();
-    let sender = Arc::new(OnceLock::<DispatchSender>::new());
-    let callback_sender = sender.clone();
     let mut worker = DispatchWorker::start(
         &lobby,
         options(),
         QueueLimits::default(),
-        move |event| match event {
+        move |sender, event| match event {
             DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
             DispatchEvent::Message { peer, data, .. } => {
-                let completion = callback_sender
-                    .get()
-                    .unwrap()
-                    .submit_try_send(&peer, data)
-                    .unwrap();
+                let completion = sender.submit_try_send(&peer, data).unwrap();
                 assert!(matches!(completion.wait(), Err(Error::WouldDeadlock)));
                 callback_tx.send(()).unwrap();
             }
@@ -56,12 +50,10 @@ fn worker_confirms_delivery_and_callback_can_submit_without_self_deadlock() {
         },
     )
     .unwrap();
-    sender.set(worker.sender()).unwrap();
+    let sender = worker.sender();
     let mut client = connect(&lobby).unwrap();
     let peer = connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     sender
-        .get()
-        .unwrap()
         .submit_try_send(&peer, b"push")
         .unwrap()
         .wait()
@@ -75,13 +67,7 @@ fn worker_confirms_delivery_and_callback_can_submit_without_self_deadlock() {
     client.wait_readable(finite(), None).unwrap();
     assert_eq!(client.receive_into(&mut buffer).unwrap(), 4);
     assert_eq!(&buffer, b"echo");
-    sender
-        .get()
-        .unwrap()
-        .submit_disconnect(&peer)
-        .unwrap()
-        .wait()
-        .unwrap();
+    sender.submit_disconnect(&peer).unwrap().wait().unwrap();
     assert!(matches!(
         client.wait_readable(finite(), None),
         Err(Error::Disconnected(_))
@@ -90,7 +76,7 @@ fn worker_confirms_delivery_and_callback_can_submit_without_self_deadlock() {
     worker.stop().unwrap();
     assert!(worker.is_stopped());
     assert!(matches!(
-        sender.get().unwrap().submit_try_send(&peer, b"late"),
+        sender.submit_try_send(&peer, b"late"),
         Err(Error::WorkerStopped)
     ));
 }
@@ -108,7 +94,7 @@ fn worker_queue_is_bounded_and_stop_cancels_pending_sends_without_overwriting() 
             commands: 2,
             bytes: 4,
         },
-        move |event| match event {
+        move |_sender, event| match event {
             DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
             DispatchEvent::Message { .. } => {
                 entered_tx.send(()).unwrap();
@@ -154,21 +140,20 @@ fn worker_drop_waits_for_running_callback_and_closes_external_sender() {
     let (connected_tx, connected_rx) = mpsc::channel();
     let (entered_tx, entered_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    let worker =
-        DispatchWorker::start(
-            &lobby,
-            options(),
-            QueueLimits::default(),
-            move |event| match event {
-                DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
-                DispatchEvent::Message { .. } => {
-                    entered_tx.send(()).unwrap();
-                    resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-                }
-                _ => {}
-            },
-        )
-        .unwrap();
+    let worker = DispatchWorker::start(
+        &lobby,
+        options(),
+        QueueLimits::default(),
+        move |_sender, event| match event {
+            DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
+            DispatchEvent::Message { .. } => {
+                entered_tx.send(()).unwrap();
+                resume_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            _ => {}
+        },
+    )
+    .unwrap();
     let mut client = connect(&lobby).unwrap();
     let peer = connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let sender = worker.sender();
@@ -201,14 +186,18 @@ fn worker_drop_waits_for_running_callback_and_closes_external_sender() {
 fn worker_panic_closes_queue_and_is_reported_on_every_stop() {
     let lobby = name();
     let (connected_tx, connected_rx) = mpsc::channel();
-    let mut worker =
-        DispatchWorker::start(&lobby, options(), QueueLimits::default(), move |event| {
+    let mut worker = DispatchWorker::start(
+        &lobby,
+        options(),
+        QueueLimits::default(),
+        move |_sender, event| {
             if let DispatchEvent::Connected { peer, .. } = event {
                 connected_tx.send(peer).unwrap();
                 panic!("ошибка обработчика worker");
             }
-        })
-        .unwrap();
+        },
+    )
+    .unwrap();
     let mut client = connect(&lobby).unwrap();
     let peer = connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let sender = worker.sender();
@@ -231,9 +220,9 @@ fn worker_panic_closes_queue_and_is_reported_on_every_stop() {
 fn worker_start_reports_bind_failure_synchronously_and_validates_limits() {
     let lobby = name();
     let mut first =
-        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_| {}).unwrap();
+        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_, _| {}).unwrap();
     assert!(matches!(
-        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_| {}),
+        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_, _| {}),
         Err(Error::NameCollision)
     ));
     let invalid = QueueLimits {
@@ -241,12 +230,12 @@ fn worker_start_reports_bind_failure_synchronously_and_validates_limits() {
         ..QueueLimits::default()
     };
     assert!(matches!(
-        DispatchWorker::start(&name(), options(), invalid, |_| {}),
+        DispatchWorker::start(&name(), options(), invalid, |_, _| {}),
         Err(Error::InvalidConfig)
     ));
     first.stop().unwrap();
     let mut next =
-        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_| {}).unwrap();
+        DispatchWorker::start(&lobby, options(), QueueLimits::default(), |_, _| {}).unwrap();
     next.stop().unwrap();
 }
 
@@ -257,17 +246,22 @@ fn worker_owner_can_be_dropped_in_its_callback_without_self_join() {
     let callback_owner = owner.clone();
     let (connected_tx, connected_rx) = mpsc::channel();
     let (dropped_tx, dropped_rx) = mpsc::channel();
-    let worker = DispatchWorker::start(&lobby, options(), QueueLimits::default(), move |event| {
-        match event {
-            DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
-            DispatchEvent::Message { .. } => {
-                let worker = callback_owner.lock().unwrap().take().unwrap();
-                drop(worker); // запрос stop без попытки join самого себя
-                dropped_tx.send(()).unwrap();
+    let worker = DispatchWorker::start(
+        &lobby,
+        options(),
+        QueueLimits::default(),
+        move |_sender, event| {
+            match event {
+                DispatchEvent::Connected { peer, .. } => connected_tx.send(peer).unwrap(),
+                DispatchEvent::Message { .. } => {
+                    let worker = callback_owner.lock().unwrap().take().unwrap();
+                    drop(worker); // запрос stop без попытки join самого себя
+                    dropped_tx.send(()).unwrap();
+                }
+                _ => {}
             }
-            _ => {}
-        }
-    })
+        },
+    )
     .unwrap();
     let sender = worker.sender();
     *owner.lock().unwrap() = Some(worker);
@@ -295,7 +289,7 @@ fn worker_preserves_admission_failure_and_stops_without_extra_callbacks() {
         options(),
         QueueLimits::default(),
         |_| panic!("ошибка допуска"),
-        |_| panic!("событий быть не должно"),
+        |_, _| panic!("событий быть не должно"),
     )
     .unwrap();
     assert!(matches!(connect(&lobby), Err(Error::Rejected)));
@@ -314,11 +308,16 @@ fn worker_reports_transport_full_without_losing_the_previous_frame() {
         max_messages: 1,
         max_message_size: 1024,
     };
-    let mut worker = DispatchWorker::start(&lobby, config, QueueLimits::default(), move |event| {
-        if let DispatchEvent::Connected { peer, .. } = event {
-            connected_tx.send(peer).unwrap();
-        }
-    })
+    let mut worker = DispatchWorker::start(
+        &lobby,
+        config,
+        QueueLimits::default(),
+        move |_sender, event| {
+            if let DispatchEvent::Connected { peer, .. } = event {
+                connected_tx.send(peer).unwrap();
+            }
+        },
+    )
     .unwrap();
     let mut client = connect(&lobby).unwrap();
     let peer = connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();

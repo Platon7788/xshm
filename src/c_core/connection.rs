@@ -4,6 +4,7 @@ use super::{CancellationToken, ChannelConfig, Error, PrivateNamespace, Result, W
 use std::cell::Cell;
 use std::ffi::CString;
 use std::marker::PhantomData;
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle};
 use std::ptr::NonNull;
 
 #[derive(Debug)]
@@ -16,6 +17,44 @@ struct Owned {
 // потоку; mutex лобби принадлежит только синхронному connect, не сессии.
 unsafe impl Send for Owned {}
 impl Owned {
+    fn activity(
+        &mut self,
+        pending: Option<usize>,
+        wait: Wait,
+        signal: Option<BorrowedHandle<'_>>,
+    ) -> Result<super::Readiness> {
+        let pending = match pending {
+            Some(0) => return Err(Error::MessageTooSmall),
+            Some(len) => u32::try_from(len).map_err(|_| Error::LengthTooLarge)?,
+            None => 0,
+        };
+        let timeout = wait.milliseconds()?;
+        let mut ready = 0;
+        let mut reason = 0;
+        // SAFETY: уникальный conn, живой заимствованный HANDLE и доступные
+        // выходные числа. Проверки протокола/arm/recheck выполняет только C.
+        let code = unsafe {
+            xipc_sys::xipc_wait_activity(
+                self.ptr.as_ptr(),
+                pending,
+                timeout,
+                signal.map_or(std::ptr::null_mut(), |h| h.as_raw_handle()),
+                &raw mut ready,
+                &raw mut reason,
+            )
+        };
+        if code == 14 {
+            return Err(Error::Disconnected(reason.into()));
+        }
+        self.status(code)?;
+        if ready == 0 || ready & !3 != 0 || (pending == 0 && ready & 2 != 0) {
+            return Err(Error::InvalidCoreResult);
+        }
+        Ok(super::Readiness {
+            readable: ready & 1 != 0,
+            writable: ready & 2 != 0,
+        })
+    }
     fn new(namespace: Option<PrivateNamespace>) -> Result<Self> {
         // SAFETY: C-аллокатор не имеет предусловий.
         let ptr = NonNull::new(unsafe { xipc_sys::xipc_conn_alloc() }).ok_or(Error::Allocation)?;
@@ -119,6 +158,14 @@ impl Drop for Owned {
 #[derive(Debug)]
 pub struct Client(Owned);
 impl Client {
+    pub(super) fn wait_activity_with_wake(
+        &mut self,
+        pending: Option<usize>,
+        wait: Wait,
+        wake: &super::Beacon,
+    ) -> Result<super::Readiness> {
+        self.0.activity(pending, wait, Some(wake.as_handle()))
+    }
     /// Дождаться доступного канала через C discovery/claim-free события.
     /// При исчерпании бюджета возвращается последняя ошибка попытки C.
     pub fn connect_when_available(
@@ -363,6 +410,18 @@ impl Drop for Session<'_> {
 
 macro_rules! channel_methods {
     () => {
+        /// Одним ожиданием дождаться входящих данных либо места для pending.
+        /// None отключает ожидание записи; Some(0) отвергается. Оба флага
+        /// могут быть готовы вместе; проверка и уведомления реализованы в C.
+        pub fn wait_activity(
+            &mut self,
+            pending: Option<usize>,
+            wait: Wait,
+            cancel: Option<&CancellationToken>,
+        ) -> Result<super::Readiness> {
+            self.0
+                .activity(pending, wait, cancel.map(AsHandle::as_handle))
+        }
         /// Известное C-ядру состояние текущей сессии.
         pub fn is_connected(&mut self) -> bool {
             // SAFETY: эксклюзивное обращение к живому C-объекту.

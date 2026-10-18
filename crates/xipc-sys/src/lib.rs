@@ -211,6 +211,14 @@ unsafe extern "C" {
         timeout: u32,
         cancel: *mut c_void,
     ) -> i32;
+    pub fn xipc_wait_activity(
+        conn: *mut Conn,
+        pending_len: u32,
+        timeout: u32,
+        cancel: *mut c_void,
+        ready: *mut u32,
+        reason: *mut i32,
+    ) -> i32;
     pub fn xipc_conn_layout(conn: *const Conn) -> *const Layout;
     pub fn xipc_process_exit_open(pid: u32, handle: *mut *mut c_void) -> i32;
     pub fn xipc_process_exit_close(handle: *mut c_void);

@@ -1,16 +1,16 @@
 > **C-core migration preview (`feat/c-core`).** The experimental `c-core`
 > feature exposes `xshm::c_core` backed by the shared xipc C implementation.
 > Single channels, namespace/beacon ownership and caller-driven Multi/Dispatch
-> loops and a bounded Dispatch command worker are implemented. Remaining
-> background client modes and consumer integration are still being migrated.
+> loops, bounded Dispatch/client workers and full-duplex backpressure waits
+> are implemented. Consumer integration and the default API switch are pending.
 > This is not the complete replacement release. The default 0.10 API below
 > remains a temporary reference.
 > API compatibility is secondary to ownership and safety. The final migration
 > will remove the independent Rust protocol implementation.
 >
 > Set `XIPC_SOURCE_DIR` to the canonical `xhook/ipc` source directory, then run
-> `cargo test --features c-core --test c_core -- --test-threads=1`.
-> This requires xipc 2.1+, CMake 4 and MSVC. Alternatively set `XIPC_SDK_PREFIX` (not both)
+> `cargo test --features c-core --test 'c_core*' -- --test-threads=1`.
+> This requires xipc 2.2+, CMake 4 and MSVC. Alternatively set `XIPC_SDK_PREFIX` (not both)
 > to an installed hosted Release SDK matching the Rust target and CRT.
 > With this repository's static CRT flags, build the SDK using
 > `-DXIPC_CRT_FREE=OFF -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`.

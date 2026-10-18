@@ -134,8 +134,8 @@ fn main() {
         }
     });
     assert!(
-        minor.is_some_and(|n| n >= 1),
-        "нужен xipc 2.1+ с владеющей C-аллокацией объектов"
+        minor.is_some_and(|n| n >= 2),
+        "нужен xipc 2.2+ с объединённым ожиданием активности"
     );
     let probe = out.join("abi-check");
     run(Command::new(&cmake)

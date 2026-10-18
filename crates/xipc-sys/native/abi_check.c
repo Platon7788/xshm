@@ -1,6 +1,7 @@
 // Только проверка ABI при сборке: не новая реализация протокола и не shim.
 #include <xipc/xipc.h>
-_Static_assert(XIPC_VERSION_MAJOR == 2 && XIPC_VERSION_MINOR >= 1, "xipc 2.1+ owned objects required");
+_Static_assert(XIPC_VERSION_MAJOR == 2 && XIPC_VERSION_MINOR >= 2, "xipc 2.2+ activity wait required");
+_Static_assert(XIPC_READY_READABLE == 1 && XIPC_READY_WRITABLE == 2, "activity mask ABI");
 _Static_assert(sizeof(xipc_status) == 4, "status ABI");
 _Static_assert(sizeof(xipc_disconnect_reason) == 4, "reason ABI");
 _Static_assert(sizeof(xipc_layout) == 24, "layout ABI");
