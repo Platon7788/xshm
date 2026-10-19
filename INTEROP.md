@@ -1,4 +1,4 @@
-# Межъязыковый контракт xshm 1.0 / xipc 2.2+
+# Межъязыковый контракт xshm 1.1 / xipc 2.2+
 
 Единственная реализация wire-протокола находится в `xhook/ipc`. Rust xshm
 линкует её через xipc-sys; самостоятельного Rust-протокола нет. Нормативны
@@ -20,7 +20,7 @@ SDK consumers (C, C++, Rust ABI), CRT-free consumers и hosted ASan.
 
 `examples/interop_peer.rs` — Rust-пир для шести нативных наборов xhook:
 single, session, Multi, Dispatch, namespace, beacon. Использует публичный
-API xshm 1.0. CLI-сценарии оркестратора сохраняются как тестовый протокол;
+API xshm 1.1. CLI-сценарии оркестратора сохраняются как тестовый протокол;
 библиотека не содержит прежнего API или переходных aliases.
 
 ```powershell

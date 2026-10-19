@@ -53,7 +53,7 @@ fn worker_confirms_delivery_and_callback_can_submit_without_self_deadlock() {
     let mut client = connect(&lobby).unwrap();
     let peer = connected_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     sender
-        .submit_try_send(&peer, b"push")
+        .submit_try_send_owned(&peer, b"push".to_vec())
         .unwrap()
         .wait()
         .unwrap();

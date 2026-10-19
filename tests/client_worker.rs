@@ -52,7 +52,7 @@ fn client_worker_receives_while_lossless_head_waits_and_bounds_inflight_payload(
     )
     .unwrap();
     let sender = worker.sender();
-    let pending = sender.submit_lossless(b"next").unwrap();
+    let pending = sender.submit_lossless_owned(b"next".to_vec()).unwrap();
     session.try_send(b"ping").unwrap();
     assert_eq!(
         received_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
@@ -349,4 +349,41 @@ fn peer_close_during_send_drains_last_callback_before_publishing_queue_close() {
         "очередь не опережает доставку BYE"
     );
     assert!(matches!(pending.unwrap().wait(), Err(Error::WorkerStopped)));
+}
+
+#[test]
+fn owned_try_and_overwrite_keep_distinct_ring_policies() {
+    let (mut server, connecting) = listener(1).unwrap();
+    let mut session = server.accept(finite(), None).unwrap();
+    let client = connecting.join().unwrap().unwrap();
+    let mut worker = ClientWorker::spawn(client, QueueLimits::default(), |_, _| {}).unwrap();
+    let sender = worker.sender();
+    sender
+        .submit_try_send_owned(b"first".to_vec())
+        .unwrap()
+        .wait()
+        .unwrap();
+    // Принятие очередью ещё не означает успех C: кольцо уже заполнено.
+    let full = sender.submit_try_send_owned(b"second".to_vec()).unwrap();
+    assert!(matches!(full.wait(), Err(Error::Full)));
+    sender
+        .submit_overwriting_owned(b"latest".to_vec())
+        .unwrap()
+        .wait()
+        .unwrap();
+    let mut buffer = [0; 16];
+    session.wait_readable(finite(), None).unwrap();
+    let len = session.receive_into(&mut buffer).unwrap();
+    assert_eq!(&buffer[..len], b"latest");
+    assert!(matches!(
+        session.receive_into(&mut buffer),
+        Err(Error::Empty)
+    ));
+    worker.stop().unwrap();
+    let data = b"retry".to_vec();
+    let pointer = data.as_ptr();
+    let error = sender.submit_lossless_owned(data).unwrap_err();
+    assert!(matches!(error.error, Error::WorkerStopped));
+    assert_eq!(error.data.as_ptr(), pointer);
+    assert_eq!(error.data, b"retry");
 }

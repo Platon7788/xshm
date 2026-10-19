@@ -1,4 +1,4 @@
-# xshm 1.0
+# xshm 1.1
 
 Safe Rust IPC for Windows over the single **xipc 2.2+ C core**.
 C and C++ use the same core directly; Rust adds ownership, checked lifetimes,
@@ -61,6 +61,23 @@ according to the application's panic policy.
 
 See generated rustdoc for examples, [CHANGELOG](CHANGELOG.md) for the breaking
 API change and [INTEROP](INTEROP.md) for the C wire contract and test matrix.
+
+## Owned queue buffers
+
+`ClientSender` provides `submit_try_send_owned`, `submit_lossless_owned` and
+`submit_overwriting_owned`; `DispatchSender` provides `submit_try_send_owned`
+and `submit_overwriting_owned` with a typed peer. These accept `Vec<u8>` and
+move its allocation into the command queue without copying payload. Existing
+`&[u8]` methods remain available and copy into an owned queue buffer.
+Queue bookkeeping and completion channels can still allocate; this API avoids
+the extra payload allocation and copy, not every allocation.
+
+On enqueue failure, `OwnedSendError { error, data }` returns the original Vec
+unchanged for retry, including its capacity. On success the worker owns it;
+`CommandCompletion` reports execution and does not return the buffer. Queue
+byte limits charge the Vec's **capacity**, not just its length. There are still
+two normal payload copies across IPC: into shared memory and into the receiver's
+buffer. Retries during concurrent overwriting can repeat a receive copy.
 
 ## Verification
 

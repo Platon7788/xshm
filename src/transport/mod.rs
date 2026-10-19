@@ -32,4 +32,4 @@ pub use options::{ClientConnectOptions, Readiness};
 pub use options::{DispatchClientOptions, DispatchOptions};
 pub use resources::{Beacon, PrivateNamespace, lobby_exists};
 pub use wait::{ProcessExit, wait_any};
-pub use worker::{CommandCompletion, DispatchSender, DispatchWorker, QueueLimits};
+pub use worker::{CommandCompletion, DispatchSender, DispatchWorker, OwnedSendError, QueueLimits};

@@ -12,7 +12,7 @@ use std::thread::{self, JoinHandle, ThreadId};
 pub struct QueueLimits {
     /// Максимум команд, ожидающих выполнения.
     pub commands: usize,
-    /// Максимум байт payload в ожидающих командах.
+    /// Максимум байт буферов: длина для `&[u8]`, capacity для `Vec<u8>`.
     pub bytes: usize,
 }
 impl Default for QueueLimits {
@@ -22,6 +22,20 @@ impl Default for QueueLimits {
             bytes: 8 * 1024 * 1024,
         }
     }
+}
+
+/// Отказ постановки owned-буфера в очередь. Команда не принята и не будет
+/// выполнена; исходный Vec возвращён без копирования или изменения capacity.
+/// После успешной постановки ошибки C приходят через CommandCompletion:
+/// в этом случае буфер уже принадлежит worker и не возвращается.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct OwnedSendError {
+    /// Причина отказа, например Full или WorkerStopped.
+    #[source]
+    pub error: Error,
+    /// Исходный буфер для повторной попытки или повторного использования.
+    pub data: Vec<u8>,
 }
 
 /// Однократное подтверждение фактической операции C, а не постановки в очередь.
@@ -78,13 +92,11 @@ struct Command {
     peer: DispatchPeer,
     operation: Operation,
     reply: mpsc::Sender<Result<()>>,
+    bytes: usize,
 }
 impl Command {
     const fn bytes(&self) -> usize {
-        match &self.operation {
-            Operation::Send { data, .. } => data.len(),
-            Operation::Disconnect => 0,
-        }
+        self.bytes
     }
 }
 #[derive(Debug, Default)]
@@ -144,44 +156,43 @@ impl Drop for CloseQueue {
 #[derive(Debug, Clone)]
 pub struct DispatchSender(Arc<Shared>);
 impl DispatchSender {
-    fn submit(
+    fn submit<T>(
         &self,
         peer: &DispatchPeer,
-        data: Option<(&[u8], bool)>,
-    ) -> Result<CommandCompletion> {
-        let bytes = data.map_or(0, |(data, _)| data.len());
-        u32::try_from(bytes).map_err(|_| Error::LengthTooLarge)?;
+        len: usize,
+        bytes: usize,
+        input: T,
+        operation: impl FnOnce(T) -> Operation,
+    ) -> std::result::Result<CommandCompletion, (Error, T)> {
+        if u32::try_from(len).is_err() {
+            return Err((Error::LengthTooLarge, input));
+        }
         let mut queue = self
             .0
             .queue
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if queue.stop || queue.closed {
-            return Err(Error::WorkerStopped);
+            return Err((Error::WorkerStopped, input));
         }
-        let total = queue.bytes.checked_add(bytes).ok_or(Error::Full)?;
+        let Some(total) = queue.bytes.checked_add(bytes) else {
+            return Err((Error::Full, input));
+        };
         if queue.commands.len() >= self.0.limits.commands || total > self.0.limits.bytes {
-            return Err(Error::Full);
+            return Err((Error::Full, input));
+        }
+        // Worker берёт команды под этим же lock. Сигнал до вставки безопасен:
+        // он не увидит пустую очередь, а при ошибке исходный input не потреблён.
+        if let Err(error) = self.0.wake.wake() {
+            return Err((error, input));
         }
         let (reply, receiver) = mpsc::channel();
-        let operation = match data {
-            Some((data, overwrite)) => Operation::Send {
-                data: data.to_vec(),
-                overwrite,
-            },
-            None => Operation::Disconnect,
-        };
         queue.commands.push_back(Command {
             peer: peer.clone(),
-            operation,
+            operation: operation(input),
             reply,
+            bytes,
         });
-        // Worker не заберёт команду под этим lock. Неудачный wake откатывает
-        // только что добавленную команду: Err не скрывает будущую отправку.
-        if let Err(error) = self.0.wake.wake() {
-            let _removed = queue.commands.pop_back();
-            return Err(error);
-        }
         queue.bytes = total;
         Ok(CommandCompletion {
             receiver,
@@ -191,7 +202,11 @@ impl DispatchSender {
     /// Поставить отправку без вытеснения. Full здесь означает очередь команд;
     /// Full в подтверждении означает заполненное кольцо. Автоповтора нет.
     pub fn submit_try_send(&self, peer: &DispatchPeer, data: &[u8]) -> Result<CommandCompletion> {
-        self.submit(peer, Some((data, false)))
+        self.submit(peer, data.len(), data.len(), data, |data| Operation::Send {
+            data: data.to_vec(),
+            overwrite: false,
+        })
+        .map_err(|(error, _)| error)
     }
     /// Явно разрешить C вытеснить старые сообщения транспортного кольца.
     pub fn submit_overwriting(
@@ -199,11 +214,48 @@ impl DispatchSender {
         peer: &DispatchPeer,
         data: &[u8],
     ) -> Result<CommandCompletion> {
-        self.submit(peer, Some((data, true)))
+        self.submit(peer, data.len(), data.len(), data, |data| Operation::Send {
+            data: data.to_vec(),
+            overwrite: true,
+        })
+        .map_err(|(error, _)| error)
+    }
+    /// Одна попытка C try_send с передачей Vec без копирования в очередь.
+    /// В лимите учитывается capacity; при отказе исходный Vec возвращается.
+    /// Ошибки исполнения C приходят через CommandCompletion без возврата Vec.
+    pub fn submit_try_send_owned(
+        &self,
+        peer: &DispatchPeer,
+        data: Vec<u8>,
+    ) -> std::result::Result<CommandCompletion, OwnedSendError> {
+        self.submit(peer, data.len(), data.capacity(), data, |data| {
+            Operation::Send {
+                data,
+                overwrite: false,
+            }
+        })
+        .map_err(|(error, data)| OwnedSendError { error, data })
+    }
+    /// Вытесняющая отправка с передачей Vec без копирования в очередь.
+    /// В лимите учитывается capacity; при отказе исходный Vec возвращается.
+    /// Ошибки исполнения C приходят через CommandCompletion без возврата Vec.
+    pub fn submit_overwriting_owned(
+        &self,
+        peer: &DispatchPeer,
+        data: Vec<u8>,
+    ) -> std::result::Result<CommandCompletion, OwnedSendError> {
+        self.submit(peer, data.len(), data.capacity(), data, |data| {
+            Operation::Send {
+                data,
+                overwrite: true,
+            }
+        })
+        .map_err(|(error, data)| OwnedSendError { error, data })
     }
     /// Отключить конкретную сессию; повторно занятый id не адресуется.
     pub fn submit_disconnect(&self, peer: &DispatchPeer) -> Result<CommandCompletion> {
-        self.submit(peer, None)
+        self.submit(peer, 0, 0, (), |()| Operation::Disconnect)
+            .map_err(|(error, ())| error)
     }
     /// Попросить остановку, в том числе из callback; не ждёт завершения потока.
     pub fn request_stop(&self) -> Result<()> {
@@ -419,5 +471,109 @@ impl DispatchWorker {
 impl Drop for DispatchWorker {
     fn drop(&mut self) {
         let _stopped = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Client, DispatchClientOptions};
+    use std::time::Duration;
+
+    #[test]
+    fn dispatch_owned_buffers_preserve_allocation_on_accept_full_and_close() {
+        let lobby = format!("xshm_owned_dispatch_{}", std::process::id());
+        let mut server = DispatchServer::bind(&lobby, DispatchOptions::default()).unwrap();
+        let connecting = thread::spawn(move || {
+            Client::connect_dispatch(&lobby, 1, "owned", DispatchClientOptions::default(), None)
+        });
+        let mut buffer = vec![0; 65535];
+        let peer = loop {
+            if let DispatchEvent::Connected { peer, .. } = server
+                .next_event(&mut buffer, Wait::For(Duration::from_secs(5)))
+                .unwrap()
+            {
+                break peer;
+            }
+        };
+        let (_client, _) = connecting.join().unwrap().unwrap();
+        let sender = DispatchSender(Arc::new(Shared {
+            queue: Mutex::new(Queue::default()),
+            wake: server.wake_handle(),
+            limits: QueueLimits {
+                commands: 1,
+                bytes: 64,
+            },
+            worker: thread::current().id(),
+        }));
+        for overwrite in [false, true] {
+            let mut data = Vec::with_capacity(64);
+            data.extend_from_slice(b"move");
+            let pointer = data.as_ptr();
+            let completion = if overwrite {
+                sender.submit_overwriting_owned(&peer, data)
+            } else {
+                sender.submit_try_send_owned(&peer, data)
+            }
+            .unwrap();
+            let mut oversized = Vec::with_capacity(65);
+            oversized.push(9);
+            let rejected_pointer = oversized.as_ptr();
+            let error = sender.submit_try_send_owned(&peer, oversized).unwrap_err();
+            assert!(matches!(error.error, Error::Full));
+            assert_eq!(error.data.as_ptr(), rejected_pointer);
+            let command = {
+                let mut queue = sender.0.queue.lock().unwrap();
+                assert_eq!(queue.bytes, 64);
+                let command = queue.commands.pop_front().unwrap();
+                queue.bytes -= command.bytes();
+                command
+            };
+            match command.operation {
+                Operation::Send {
+                    data,
+                    overwrite: actual,
+                } => {
+                    assert_eq!(data.as_ptr(), pointer);
+                    assert_eq!(data, b"move");
+                    assert_eq!(actual, overwrite);
+                }
+                Operation::Disconnect => panic!("expected send"),
+            }
+            command.reply.send(Ok(())).unwrap();
+            assert_eq!(completion.try_result().unwrap(), Some(()));
+            // Даже пустая очередь отказывает из-за capacity, а не len.
+            let error = sender
+                .submit_overwriting_owned(&peer, error.data)
+                .unwrap_err();
+            assert!(matches!(error.error, Error::Full));
+            assert_eq!(error.data.as_ptr(), rejected_pointer);
+        }
+        let pending = sender.submit_try_send_owned(&peer, vec![1]).unwrap();
+        drop(CloseQueue(sender.0.clone()));
+        assert!(matches!(pending.try_result(), Err(Error::WorkerStopped)));
+        let data = vec![2];
+        let pointer = data.as_ptr();
+        let error = sender.submit_overwriting_owned(&peer, data).unwrap_err();
+        assert!(matches!(error.error, Error::WorkerStopped));
+        assert_eq!(error.data.as_ptr(), pointer);
+        // Отказ wake после закрытия C-сервера тоже возвращает исходный Vec,
+        // не оставляя скрытой команды или занятого бюджета.
+        let sender = DispatchSender(Arc::new(Shared {
+            queue: Mutex::new(Queue::default()),
+            wake: server.wake_handle(),
+            limits: QueueLimits::default(),
+            worker: thread::current().id(),
+        }));
+        drop(server);
+        let error = sender.submit_try_send_owned(&peer, error.data).unwrap_err();
+        assert!(matches!(
+            error.error,
+            Error::Disconnected(super::super::DisconnectReason::Local)
+        ));
+        assert_eq!(error.data.as_ptr(), pointer);
+        let queue = sender.0.queue.lock().unwrap();
+        assert!(queue.commands.is_empty());
+        assert_eq!(queue.bytes, 0);
     }
 }
